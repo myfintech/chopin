@@ -1,6 +1,7 @@
 import { BACKGROUND_TOOL_NAMES, PLANNER_TOOL_NAMES } from "./tool-names";
 import { createJustBashNetworkSandboxSession } from "@ai-sdk/sandbox-just-bash";
 import { headingPlannerAgent, plannerAgent, prosePlannerAgent, refinePlannerAgent } from "./agents";
+import { extensionTools } from "../fork/planner-extensions";
 import { githubTools, type GitHubToolsError, type Result } from "./github-tools";
 import { registerCredential } from "./harnesses";
 import {
@@ -68,6 +69,7 @@ export type PlannerSessionDependencies = {
 	refineAgent?: PlannerAgent;
 	proseAgent?: PlannerAgent;
 	githubTools?: typeof githubTools;
+	extensionTools?: typeof extensionTools;
 	createSandbox?: () => Promise<Sandbox>;
 	registerCredential?: typeof registerCredential;
 	timeoutMs?: number;
@@ -105,6 +107,7 @@ export async function openPlannerSession(
 		return { ok: false, error: { kind: "Unavailable", cause } };
 	}
 	if (!tools.ok) return tools;
+	let extensions = await (deps.extensionTools ?? extensionTools)(channel.repository);
 	let sandbox: Sandbox;
 	try {
 		sandbox = await (deps.createSandbox ?? createJustBashNetworkSandboxSession)();
@@ -202,6 +205,7 @@ export async function openPlannerSession(
 							instructions,
 							owner,
 							githubTools: tools.value,
+							extensionTools: extensions,
 						},
 					}),
 				destroy: () =>

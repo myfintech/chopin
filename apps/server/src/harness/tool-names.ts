@@ -1,5 +1,6 @@
 import type { ConversationPlan } from "@chopin/protocol";
 import { WRITE_TOOLS } from "../agent/job-scope";
+import { extensionToolNames } from "../fork/planner-extensions/config";
 
 export const PLANNER_TOOL_NAMES = [
 	"read_plan",
@@ -20,6 +21,7 @@ export const PLANNER_TOOL_NAMES = [
 	"pull_request_read",
 	"revise_open_decision",
 ];
+PLANNER_TOOL_NAMES.push(...extensionToolNames(PLANNER_TOOL_NAMES));
 
 function jobNames(own: string): readonly string[] {
 	return Object.freeze([...PLANNER_TOOL_NAMES.filter(name => !WRITE_TOOLS.has(name)), own]);
