@@ -16,6 +16,8 @@
 // browser rich-text editor into a module that builds a prompt string.
 import { COMPONENTS, DIFF_LANGUAGE, MERMAID_LANGUAGE } from "@chopin/dialect/dialect";
 
+import { extensionInstructions } from "../fork/planner-extensions";
+
 import type { Component } from "@chopin/dialect/dialect";
 import type { PlannerWorkspace } from "../harness/atomic/workspace";
 
@@ -240,10 +242,11 @@ export function plannerInstructions(
 \`read_repository_file\`, \`list_repository_tree\`, \`search_repository\` and
 \`repository_history\` for its code, and \`list_pull_requests\` and
 \`pull_request_read\` for its pull requests. Every repository tool is fixed to this repository.`;
+	let extensions = extensionInstructions(repository);
 	if (!workspace) {
 		let isolated = `You have no shell, checkout, host filesystem, skills or repository instructions,
 and cannot change GitHub. Ground the plan in what those reading tools return.`;
-		return [PROMPT, reading, isolated, bootstrap].filter(Boolean).join("\n\n");
+		return [PROMPT, reading, isolated, extensions, bootstrap].filter(Boolean).join("\n\n");
 	}
 	let place = workspace.checkout
 		? `Your working directory, ${workspace.cwd}, is a local checkout of ${repository}
@@ -269,7 +272,6 @@ now, rather than prepare its task graph, your \`intercom\` tool can reach other 
 machine: one working in a checkout of ${repository}, such as a session that handed you this
 document, can take the request along with what it needs to find this document. Tell the member
 where the work continues, or that no session could take it.`;
-	return [PROMPT, reading, place, questions, surface, implementing, bootstrap].filter(Boolean).join(
-		"\n\n",
-	);
+	return [PROMPT, reading, place, questions, surface, implementing, extensions, bootstrap]
+		.filter(Boolean).join("\n\n");
 }
