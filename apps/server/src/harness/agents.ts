@@ -5,6 +5,7 @@ import { z } from "zod";
 import { type DocumentRoom, documentTools } from "../agent/tools";
 import { type HostedRepository, repositoryTools } from "../agent/repository";
 import { harnessSelection } from "../config";
+import { extensionPlaceholders } from "../fork/planner-extensions";
 import { GITHUB_TOOL_SCHEMAS } from "./github-tools";
 import { PLANNER_TOOL_NAMES } from "./tool-names";
 import { harnessFor } from "./harnesses";
@@ -27,7 +28,12 @@ const githubPlaceholders: ToolSet = Object.fromEntries(
 	]),
 );
 
-const plannerTools: ToolSet = { ...documentTools, ...repositories, ...githubPlaceholders };
+const plannerTools: ToolSet = {
+	...documentTools,
+	...repositories,
+	...githubPlaceholders,
+	...extensionPlaceholders(),
+};
 export { PLANNER_TOOL_NAMES } from "./tool-names";
 
 type PlannerCallOptions = {
@@ -35,6 +41,7 @@ type PlannerCallOptions = {
 	repository: HostedRepository;
 	owner: ActiveOwnerBinding;
 	githubTools: ToolSet;
+	extensionTools?: ToolSet;
 	instructions: string;
 	model?: string;
 };
@@ -50,7 +57,7 @@ export function createPlannerAgent(harness: HarnessV1) {
 			...rest,
 			model: options.model,
 			instructions: options.instructions,
-			tools: { ...rest.tools, ...options.githubTools },
+			tools: { ...rest.tools, ...options.githubTools, ...options.extensionTools },
 			toolsContext: Object.fromEntries(PLANNER_TOOL_NAMES.map(name => [name, {
 				room: options.room,
 				repository: options.repository,

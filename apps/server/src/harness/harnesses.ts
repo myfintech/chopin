@@ -1,4 +1,5 @@
 import { createCopilotSdk } from "./copilot-sdk/adapter";
+import { shutdownPlannerExtensions } from "../fork/planner-extensions";
 import { createPiAdapter } from "./pi/adapter";
 
 import type { HarnessV1 } from "@ai-sdk/harness";
@@ -88,6 +89,7 @@ export function registerCredential(
 
 export async function shutdownHarnesses(): Promise<void> {
 	credentials.clear();
+	await shutdownPlannerExtensions();
 	await selected?.shutdown();
 	selected = undefined;
 }
