@@ -1,5 +1,9 @@
 # Working on Chopin
 
+> **Fork notice:** This is `myfintech/chopin`, a fork of `githubnext/chopin` that we regularly
+> rebase onto upstream. Read [FORK.md](FORK.md) before making changes. Every change must stay
+> rebase-friendly: add instead of modifying, and keep edits to upstream files minimal.
+
 Chopin is an experimental collaborative authoring system: several people and a
 hosted agent share one rich, repository-connected document. Plans are one
 document workflow, not the product boundary. Read
