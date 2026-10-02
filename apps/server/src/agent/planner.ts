@@ -16,6 +16,8 @@
 // browser rich-text editor into a module that builds a prompt string.
 import { COMPONENTS, DIFF_LANGUAGE, MERMAID_LANGUAGE } from "@chopin/dialect/dialect";
 
+import { extensionInstructions } from "../fork/planner-extensions";
+
 import type { Component } from "@chopin/dialect/dialect";
 
 /** Components the agent writes itself. The rest are created for it. */
@@ -238,5 +240,6 @@ export function plannerInstructions(repository: string, bootstrap?: string): str
 
 You have no shell, checkout, host filesystem, skills or repository instructions,
 and cannot change GitHub. Ground the plan in what those reading tools return.`;
-	return [PROMPT, access, bootstrap].filter(Boolean).join("\n\n");
+	let extensions = extensionInstructions(repository);
+	return [PROMPT, access, extensions, bootstrap].filter(Boolean).join("\n\n");
 }

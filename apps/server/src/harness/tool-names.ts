@@ -1,3 +1,5 @@
+import { extensionToolNames } from "../fork/planner-extensions/config";
+
 export const PLANNER_TOOL_NAMES = [
 	"read_plan",
 	"read_reference",
@@ -16,3 +18,4 @@ export const PLANNER_TOOL_NAMES = [
 	"list_pull_requests",
 	"pull_request_read",
 ];
+PLANNER_TOOL_NAMES.push(...extensionToolNames(PLANNER_TOOL_NAMES));
