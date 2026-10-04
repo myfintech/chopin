@@ -22,6 +22,7 @@
 
 import { Component, useEffect, useMemo, useState } from "react";
 
+import { useColorScheme } from "../color-scheme";
 import { fileNameOf, repaired, titled } from "./code";
 
 import type { ErrorInfo, ReactNode } from "react";
@@ -40,14 +41,8 @@ type Renderer = {
 /** What the highlighter calls text it has no grammar for. */
 const PLAIN = "text";
 
-/**
- * One theme, named once.
- *
- * The page is light only — `theme.css` says so and carries no second palette —
- * so a `{ dark, light }` pair would load a second set of colours nothing can
- * ever ask for.
- */
-const THEME = "pierre-light";
+/** One pair, named once; the page's resolved colour scheme picks between them. */
+const THEME = { dark: "pierre-dark", light: "pierre-light" };
 
 let loading: Promise<Renderer> | undefined;
 
@@ -187,23 +182,24 @@ function View({ kind, source, language, meta }: CodeViewProps) {
 		}
 	}, [kind, renderer, source]);
 
+	let scheme = useColorScheme();
 	let options = useMemo(
 		() => ({
 			theme: THEME,
-			themeType: "light" as const,
+			themeType: scheme,
 			// A diff's fallback has no title in the block's own header.
 			disableFileHeader: kind !== "diff" || !titled(meta),
 			disableLineNumbers: true,
 			overflow: "scroll" as const,
 			disableWorkerPool: true,
 		}),
-		[kind, meta],
+		[kind, meta, scheme],
 	);
 
 	let diffOptions = useMemo(
 		() => ({
 			theme: THEME,
-			themeType: "light" as const,
+			themeType: scheme,
 			// Three panes wide, so side by side would be two unreadable
 			// columns. The filename comes from the patch and is the whole
 			// point of rendering one, so its header stays.
@@ -218,7 +214,7 @@ function View({ kind, source, language, meta }: CodeViewProps) {
 			overflow: "scroll" as const,
 			disableWorkerPool: true,
 		}),
-		[],
+		[scheme],
 	);
 
 	if (broken) return <div data-plan-error="">could not be rendered</div>;

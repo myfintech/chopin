@@ -68,6 +68,7 @@ import type {
 	UserRecord,
 	WebSession,
 } from "./model";
+import type { PreferenceStore } from "../user-preferences/model";
 
 export interface UserStore {
 	put(user: PutUser): Promise<UserRecord>;
@@ -236,6 +237,7 @@ export interface StorageAdapter {
 	readonly leases: LeaseStore;
 	readonly jobs: BackgroundJobStore;
 	readonly research: ResearchWorkspaceStore;
+	readonly preferences: PreferenceStore;
 
 	migrate(): Promise<void>;
 	health(): Promise<void>;

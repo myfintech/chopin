@@ -7,6 +7,7 @@ import { DocumentActionsMenu } from "./document-actions-menu";
 import { motionContract } from "./motion-contract";
 import { motionImmediately } from "./motion-input";
 import { canManageProject } from "./navigation-model";
+import { ThemeToggle } from "./theme-toggle";
 import { MotionDisclosure, MotionDisclosureIcon } from "@chopin/editor";
 import { childDocumentPath, documentPath } from "@chopin/protocol/document-url";
 
@@ -406,6 +407,7 @@ export function ProjectSidebar(
 					>
 						<NavigationIcon src={collapseIcon} />
 					</button>
+					<ThemeToggle />
 				</header>
 
 				{primaryActions}

@@ -43,6 +43,7 @@ import { JobService } from "./jobs/service";
 import { DocumentSummaryCoordinator } from "./jobs/summary-coordinator";
 import { registerMcpRoutes } from "./mcp/routes";
 import { registerNavigationRoutes } from "./navigation/routes";
+import { registerPreferenceRoutes } from "./user-preferences/routes";
 import * as Service from "./plan/service";
 import * as Inject from "./questions/inject";
 import * as Marks from "./comments/inject";
@@ -1463,6 +1464,7 @@ registerResearchWorkspaceRoutes(router, hostedAuth, {
 	},
 });
 registerNavigationRoutes(router, hostedAuth, { storage });
+registerPreferenceRoutes(router, hostedAuth, { storage });
 
 try {
 	await storage.health();

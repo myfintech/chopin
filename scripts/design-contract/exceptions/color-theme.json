@@ -1,0 +1,574 @@
+[
+	{
+		"file": "apps/web/src/dark-theme.css",
+		"reason": "Dark-scheme value of a canonical token. The light value stays canonical in packages/visuals/theme.css; this is its counterpart under :root[data-theme=\"dark\"], applied only when the user or system selects dark.",
+		"cases": [
+			[
+				"color",
+				"--color-white",
+				"oklch(0.2 0.006 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-ruby-1",
+				"oklch(0.2 0.012 10)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-ruby-2",
+				"oklch(0.225 0.02 10)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-ruby-3",
+				"oklch(0.27 0.05 10)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-ruby-4",
+				"oklch(0.31 0.07 10)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-ruby-5",
+				"oklch(0.35 0.08 10)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-ruby-6",
+				"oklch(0.4 0.09 10)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-ruby-7",
+				"oklch(0.46 0.11 10)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-ruby-8",
+				"oklch(0.54 0.14 11)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-ruby-9",
+				"oklch(0.64 0.17 13)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-ruby-10",
+				"oklch(0.69 0.16 13)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-ruby-11",
+				"oklch(0.8 0.11 12)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-ruby-12",
+				"oklch(0.92 0.04 10)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-orange-1",
+				"oklch(0.2 0.01 55)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-orange-2",
+				"oklch(0.225 0.018 55)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-orange-3",
+				"oklch(0.27 0.04 60)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-orange-4",
+				"oklch(0.31 0.06 60)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-orange-5",
+				"oklch(0.35 0.07 60)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-orange-6",
+				"oklch(0.4 0.08 58)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-orange-7",
+				"oklch(0.47 0.1 55)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-orange-8",
+				"oklch(0.56 0.12 52)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-orange-9",
+				"oklch(0.72 0.146 45)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-orange-10",
+				"oklch(0.77 0.13 47)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-orange-11",
+				"oklch(0.83 0.1 60)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-orange-12",
+				"oklch(0.93 0.04 70)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-lime-1",
+				"oklch(0.2 0.01 125)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-lime-2",
+				"oklch(0.225 0.018 125)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-lime-3",
+				"oklch(0.27 0.04 122)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-lime-4",
+				"oklch(0.31 0.055 122)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-lime-5",
+				"oklch(0.35 0.065 123)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-lime-6",
+				"oklch(0.4 0.075 124)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-lime-7",
+				"oklch(0.47 0.09 125)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-lime-8",
+				"oklch(0.56 0.11 127)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-lime-9",
+				"oklch(0.68 0.12 126)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-lime-10",
+				"oklch(0.74 0.12 126)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-lime-11",
+				"oklch(0.83 0.11 124)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-lime-12",
+				"oklch(0.93 0.05 120)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-gray-50",
+				"oklch(0.25 0.006 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-gray-100",
+				"oklch(0.268 0.006 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-gray-150",
+				"oklch(0.285 0.006 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-gray-200",
+				"oklch(0.31 0.007 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-gray-300",
+				"oklch(0.37 0.008 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-gray-400",
+				"oklch(0.48 0.009 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-gray-450",
+				"oklch(0.55 0.01 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-gray-500",
+				"oklch(0.63 0.011 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-gray-600",
+				"oklch(0.71 0.011 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-gray-700",
+				"oklch(0.8 0.009 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-gray-750",
+				"oklch(0.86 0.007 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-gray-800",
+				"oklch(0.9 0.006 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-gray-900",
+				"oklch(0.955 0.004 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-page",
+				"oklch(0.232 0.006 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-ground",
+				"oklch(0.2 0.006 95)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-chat-body",
+				"oklch(0.86 0.02 136)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-brand",
+				"oklch(0.7 0.095 210)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-brand-hover",
+				"oklch(0.76 0.085 210)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-brand-active",
+				"oklch(0.8 0.075 210)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-brand-wash",
+				"oklch(0.33 0.045 210)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-brand-ink",
+				"oklch(0.82 0.08 210)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-success",
+				"oklch(0.7 0.13 145)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-success-wash",
+				"oklch(0.31 0.05 145)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-success-ink",
+				"oklch(0.84 0.11 145)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-warning",
+				"oklch(0.76 0.13 75)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-warning-wash",
+				"oklch(0.32 0.05 75)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-warning-ink",
+				"oklch(0.86 0.1 80)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-destructive",
+				"oklch(0.66 0.17 24)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-destructive-hover",
+				"oklch(0.71 0.155 24)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-destructive-active",
+				"oklch(0.75 0.14 24)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-destructive-ink",
+				"oklch(0.8 0.12 22)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-edge",
+				"oklch(1 0 0 / 9%)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-control-edge",
+				"oklch(1 0 0 / 18%)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"shadow",
+				"--shadow-color",
+				"0 0 0",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"shadow",
+				"--shadow-resting",
+				"0 0 1px oklch(var(--shadow-color) / 30%),\n\t\t0 1px 1px oklch(var(--shadow-color) / 20%),\n\t\t0 3px 2px oklch(var(--shadow-color) / 12%)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"shadow",
+				"--shadow-resting-strong",
+				"0 0 1px oklch(var(--shadow-color) / 35%),\n\t\t0 1px 2px oklch(var(--shadow-color) / 25%),\n\t\t0 4px 3px oklch(var(--shadow-color) / 15%),\n\t\t0 7px 4px oklch(var(--shadow-color) / 6%)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"shadow",
+				"--shadow-raised",
+				"0 1px 2px oklch(var(--shadow-color) / 30%),\n\t\t0 3px 3px oklch(var(--shadow-color) / 24%),\n\t\t0 8px 5px oklch(var(--shadow-color) / 14%),\n\t\t0 14px 5px oklch(var(--shadow-color) / 5%)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"shadow",
+				"--shadow-overlay",
+				"0 2px 3px oklch(var(--shadow-color) / 40%),\n\t\t0 7px 6px oklch(var(--shadow-color) / 32%),\n\t\t0 15px 8px oklch(var(--shadow-color) / 18%),\n\t\t0 26px 10px oklch(var(--shadow-color) / 6%)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			]
+		]
+	},
+	{
+		"file": "apps/web/src/dark-theme.css",
+		"reason": "Dark counterpart of the callout's preserved top-edge highlight; the light 55% white sheen would read as a bright stripe on a dark wash.",
+		"cases": [
+			[
+				"shadow",
+				"box-shadow",
+				"inset 0 1px oklch(1 0 0 / 4%), var(--shadow-resting)",
+				"CSS > :root[data-theme=\"dark\"] > .plan-content [data-plan-type]",
+				1
+			]
+		]
+	},
+	{
+		"file": "packages/icons/src/theme.tsx",
+		"reason": "Icon wrapper forwards SVG accessibility, sizing, and caller styling props. Literal style/class call sites are scanned; no ambient rendering code is executed.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > SunIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > MoonIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > MonitorIcon > <LineIcon>",
+				1
+			]
+		],
+		"sourceHash": "aaa7a04607b7705e235b148092355db9976f0fee1fb95b8be2ab986227925c61"
+	}
+]

@@ -1,0 +1,184 @@
+/*
+ * The dark half of the theme.
+ *
+ * `color-theme.ts` resolves the user's preference, including "system", onto
+ * `<html data-theme>`, so this file only ever answers one question: what does
+ * each light token become at night. Everything that reads a token follows.
+ *
+ * The neutral scale keeps its meaning rather than its lightness: low steps are
+ * still surfaces and high steps are still ink, so `gray-200` remains "a little
+ * above the page" in both schemes. The ground sits *below* the page here, the
+ * way paper sits above a desk, so the document still reads as the lifted thing.
+ */
+:root[data-theme="dark"] {
+	color-scheme: dark;
+
+	/* Things drawn in white sit on brand or inverted surfaces: they become ink. */
+	--color-white: oklch(0.2 0.006 95);
+
+	--color-ruby-1: oklch(0.2 0.012 10);
+	--color-ruby-2: oklch(0.225 0.02 10);
+	--color-ruby-3: oklch(0.27 0.05 10);
+	--color-ruby-4: oklch(0.31 0.07 10);
+	--color-ruby-5: oklch(0.35 0.08 10);
+	--color-ruby-6: oklch(0.4 0.09 10);
+	--color-ruby-7: oklch(0.46 0.11 10);
+	--color-ruby-8: oklch(0.54 0.14 11);
+	--color-ruby-9: oklch(0.64 0.17 13);
+	--color-ruby-10: oklch(0.69 0.16 13);
+	--color-ruby-11: oklch(0.8 0.11 12);
+	--color-ruby-12: oklch(0.92 0.04 10);
+	--color-orange-1: oklch(0.2 0.01 55);
+	--color-orange-2: oklch(0.225 0.018 55);
+	--color-orange-3: oklch(0.27 0.04 60);
+	--color-orange-4: oklch(0.31 0.06 60);
+	--color-orange-5: oklch(0.35 0.07 60);
+	--color-orange-6: oklch(0.4 0.08 58);
+	--color-orange-7: oklch(0.47 0.1 55);
+	--color-orange-8: oklch(0.56 0.12 52);
+	--color-orange-9: oklch(0.72 0.146 45);
+	--color-orange-10: oklch(0.77 0.13 47);
+	--color-orange-11: oklch(0.83 0.1 60);
+	--color-orange-12: oklch(0.93 0.04 70);
+	--color-lime-1: oklch(0.2 0.01 125);
+	--color-lime-2: oklch(0.225 0.018 125);
+	--color-lime-3: oklch(0.27 0.04 122);
+	--color-lime-4: oklch(0.31 0.055 122);
+	--color-lime-5: oklch(0.35 0.065 123);
+	--color-lime-6: oklch(0.4 0.075 124);
+	--color-lime-7: oklch(0.47 0.09 125);
+	--color-lime-8: oklch(0.56 0.11 127);
+	--color-lime-9: oklch(0.68 0.12 126);
+	--color-lime-10: oklch(0.74 0.12 126);
+	--color-lime-11: oklch(0.83 0.11 124);
+	--color-lime-12: oklch(0.93 0.05 120);
+
+	--color-gray-50: oklch(0.25 0.006 95);
+	--color-gray-100: oklch(0.268 0.006 95);
+	--color-gray-150: oklch(0.285 0.006 95);
+	--color-gray-200: oklch(0.31 0.007 95);
+	--color-gray-300: oklch(0.37 0.008 95);
+	--color-gray-400: oklch(0.48 0.009 95);
+	--color-gray-450: oklch(0.55 0.01 95);
+	--color-gray-500: oklch(0.63 0.011 95);
+	--color-gray-600: oklch(0.71 0.011 95);
+	--color-gray-700: oklch(0.8 0.009 95);
+	--color-gray-750: oklch(0.86 0.007 95);
+	--color-gray-800: oklch(0.9 0.006 95);
+	--color-gray-900: oklch(0.955 0.004 95);
+
+	--color-page: oklch(0.232 0.006 95);
+	--color-ground: oklch(0.2 0.006 95);
+	--color-chat-body: oklch(0.86 0.02 136);
+
+	--color-brand: oklch(0.7 0.095 210);
+	--color-brand-hover: oklch(0.76 0.085 210);
+	--color-brand-active: oklch(0.8 0.075 210);
+	--color-brand-wash: oklch(0.33 0.045 210);
+	--color-brand-ink: oklch(0.82 0.08 210);
+
+	--color-success: oklch(0.7 0.13 145);
+	--color-success-wash: oklch(0.31 0.05 145);
+	--color-success-ink: oklch(0.84 0.11 145);
+	--color-warning: oklch(0.76 0.13 75);
+	--color-warning-wash: oklch(0.32 0.05 75);
+	--color-warning-ink: oklch(0.86 0.1 80);
+	--color-destructive: oklch(0.66 0.17 24);
+	--color-destructive-hover: oklch(0.71 0.155 24);
+	--color-destructive-active: oklch(0.75 0.14 24);
+	--color-destructive-ink: oklch(0.8 0.12 22);
+
+	--color-edge: oklch(1 0 0 / 9%);
+	--color-control-edge: oklch(1 0 0 / 18%);
+
+	/* The same four depths, darker and denser so they still read against a dark ground. */
+	--shadow-color: 0 0 0;
+	--shadow-resting:
+		0 0 1px oklch(var(--shadow-color) / 30%),
+		0 1px 1px oklch(var(--shadow-color) / 20%),
+		0 3px 2px oklch(var(--shadow-color) / 12%);
+	--shadow-resting-strong:
+		0 0 1px oklch(var(--shadow-color) / 35%),
+		0 1px 2px oklch(var(--shadow-color) / 25%),
+		0 4px 3px oklch(var(--shadow-color) / 15%),
+		0 7px 4px oklch(var(--shadow-color) / 6%);
+	--shadow-raised:
+		0 1px 2px oklch(var(--shadow-color) / 30%),
+		0 3px 3px oklch(var(--shadow-color) / 24%),
+		0 8px 5px oklch(var(--shadow-color) / 14%),
+		0 14px 5px oklch(var(--shadow-color) / 5%);
+	--shadow-overlay:
+		0 2px 3px oklch(var(--shadow-color) / 40%),
+		0 7px 6px oklch(var(--shadow-color) / 32%),
+		0 15px 8px oklch(var(--shadow-color) / 18%),
+		0 26px 10px oklch(var(--shadow-color) / 6%);
+}
+
+/* Literal colours in the light stylesheets that have no token to follow. */
+:root[data-theme="dark"] {
+	.workspace-frame .workspace-chat-panel {
+		border-color: var(--color-edge);
+	}
+
+	.plan-content [data-plan-type] {
+		box-shadow: inset 0 1px oklch(1 0 0 / 4%), var(--shadow-resting);
+	}
+
+	.choice-control[type="checkbox"]:checked {
+		background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath fill='none' stroke='%23282723' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m3 7 2.5 2.5L11 4'/%3E%3C/svg%3E");
+	}
+
+	/* The logo and header icons are image SVGs drawn in fixed light-scheme colours. */
+	.project-sidebar-header img {
+		filter: brightness(1.9) saturate(0.9);
+	}
+
+	/*
+	 * Mermaid paints subgraphs and edge-label grounds from its stock `neutral`
+	 * theme, which is light only. Its rules are scoped under the diagram's id,
+	 * so these need `!important` to win.
+	 */
+	svg[id^="ace-mermaid-"] {
+		.cluster rect {
+			fill: var(--color-gray-50) !important;
+			stroke: var(--color-gray-400) !important;
+		}
+
+		.cluster-label .nodeLabel,
+		.cluster-label text,
+		.cluster text {
+			color: var(--color-text-secondary) !important;
+			fill: var(--color-text-secondary) !important;
+		}
+
+		.edgeLabel,
+		.edgeLabel p {
+			background-color: transparent !important;
+		}
+	}
+}
+
+/* Pushes the sidebar's header actions together at its trailing edge. */
+.project-sidebar-header > :first-child {
+	margin-inline-end: auto;
+}
+
+.theme-toggle {
+	display: inline-flex;
+	width: 24px;
+	height: 24px;
+	flex: 0 0 auto;
+	align-items: center;
+	justify-content: center;
+	border-radius: var(--radius-sm);
+	margin-inline-start: 2px;
+	padding: 5px;
+	color: var(--color-icon);
+	transition: background var(--duration-fast) var(--ease-out);
+
+	&:hover,
+	&:focus-visible {
+		background: var(--project-sidebar-selected);
+		color: var(--color-text-secondary);
+	}
+}
