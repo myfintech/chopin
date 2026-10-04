@@ -63,13 +63,14 @@ offers.
 
 ### `mcpServers`
 
-| Field          | Required | Meaning                                                                                                                                                       |
-| -------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `transport`    | yes      | `{ "type": "http" \| "sse", "url", "headers"? }` or `{ "type": "stdio", "command", "args"?, "env"?, "cwd"? }`.                                                |
-| `tools`        | yes      | Allowlist of remote tool names. Every other tool the server offers is dropped.                                                                                |
-| `instructions` | no       | One line shown to the Planner next to this server's tools.                                                                                                    |
-| `repositories` | no       | `owner/name`, `owner/*`, or `*` patterns. Without it, the server applies to every repository. Other repositories never connect and see the tools as disabled. |
-| `timeoutMs`    | no       | Connection and tool-list timeout, 1,000 to 120,000. Default 15,000.                                                                                           |
+| Field           | Required | Meaning                                                                                                                                                                                         |
+| --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `transport`     | yes      | `{ "type": "http" \| "sse", "url", "headers"? }` or `{ "type": "stdio", "command", "args"?, "env"?, "cwd"? }`.                                                                                  |
+| `tools`         | yes      | Allowlist of remote tool names. Every other tool the server offers is dropped.                                                                                                                  |
+| `instructions`  | no       | One line shown to the Planner next to this server's tools.                                                                                                                                      |
+| `repositories`  | no       | `owner/name`, `owner/*`, or `*` patterns. Without it, the server applies to every repository. Other repositories never connect and see the tools as disabled.                                   |
+| `timeoutMs`     | no       | Connection and tool-list timeout, 1,000 to 120,000. Default 15,000.                                                                                                                             |
+| `callTimeoutMs` | no       | Bound on one tool call, 5,000 to 900,000. Default 180,000. A call that runs longer returns an error to the Planner and reconnects the server, so a stalled remote call cannot hold a turn open. |
 
 Server names are lowercase letters, digits, and hyphens. The Planner sees each tool
 as `<server>__<tool>`, with hyphens in the server name and dots in the tool name
@@ -129,6 +130,7 @@ the built-in repository tools.
   the server does not offer, along with what it does offer.
 - Before every call, the tool rechecks the Planner owner's admission, session,
   generation, credential, and repository access, like the built-in tools.
+- Each call is bounded by `callTimeoutMs` and also ends when the turn is aborted.
 - Results are flattened to text and truncated at 60,000 characters. Non-text content
   is omitted.
 - Extensions apply to Planner turns only, not research or summary workers.

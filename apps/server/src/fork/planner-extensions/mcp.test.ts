@@ -15,6 +15,7 @@ let server = (name: string, overrides: Partial<ExtensionServer> = {}): Extension
 	transport: { type: "http", url: "https://mcp.example.test" },
 	tools: [{ name: `${name}__search`, remote: "search" }],
 	timeoutMs: 1_000,
+	callTimeoutMs: 60_000,
 	...overrides,
 });
 
@@ -51,6 +52,42 @@ describe("serverTools", () => {
 		expect(output).toBe("found plans");
 	});
 
+	it("ends a call the server never answers, then reconnects for the next one", async () => {
+		let opened = 0;
+		let hanging = tool({
+			description: "Never answers.",
+			inputSchema: jsonSchema({ type: "object" }),
+			execute: () => new Promise(() => {}),
+		});
+		let createClient: CreateClient = async () => {
+			opened++;
+			return { tools: async () => ({ search: hanging }), close: async () => {} };
+		};
+		let tools = await serverTools([server("slow", { callTimeoutMs: 50 })], "o/r", createClient);
+		let started = Date.now();
+		let output = await tools.slow__search!.execute!({}, context(true) as never);
+		expect(output).toContain("did not answer within");
+		expect(Date.now() - started).toBeLessThan(1_000);
+		await serverTools([server("slow", { callTimeoutMs: 50 })], "o/r", createClient);
+		expect(opened).toBe(2);
+	});
+
+	it("propagates a turn abort instead of reporting it as a tool error", async () => {
+		let hanging = tool({
+			description: "Never answers.",
+			inputSchema: jsonSchema({ type: "object" }),
+			execute: () => new Promise(() => {}),
+		});
+		let tools = await serverTools([server("slow")], "o/r", fakeClient({ search: hanging }));
+		let turn = new AbortController();
+		let call = tools.slow__search!.execute!(
+			{},
+			{ ...context(true), abortSignal: turn.signal } as never,
+		);
+		turn.abort(new Error("turn aborted"));
+		await expect(call).rejects.toThrow("turn aborted");
+	});
+
 	it("rechecks the Planner owner before every call", async () => {
 		let tools = await serverTools([server("ctx")], "o/r", fakeClient({ search: remoteSearch }));
 		let output = await tools.ctx__search!.execute!({ query: "plans" }, context(false) as never);
@@ -73,6 +110,38 @@ describe("serverTools", () => {
 			throw new Error("connection refused");
 		});
 		expect(tools).toEqual({});
+	});
+
+	it("skips protocol discovery only for stdio servers, which may still be starting", async () => {
+		let calls: Array<{ protocolVersionDiscovery?: boolean }> = [];
+		let stdio = server("local", {
+			transport: { type: "stdio", command: "npx", args: ["-y", "some-server"] },
+		});
+		await serverTools(
+			[stdio, server("remote")],
+			"o/r",
+			fakeClient({ search: remoteSearch }, calls),
+		);
+		expect(calls.map(call => call.protocolVersionDiscovery).sort()).toEqual([false, true]);
+	});
+
+	it("keeps a connection whose opening reported a stray protocol error", async () => {
+		let opened = 0;
+		let createClient: CreateClient = async config => {
+			opened++;
+			return {
+				tools: async () => {
+					config.onUncaughtError?.(new Error("response for an unknown message ID"));
+					return { search: remoteSearch };
+				},
+				close: async () => {},
+			};
+		};
+		let first = await serverTools([server("ctx")], "o/r", createClient);
+		let second = await serverTools([server("ctx")], "o/r", createClient);
+		expect(Object.keys(first)).toEqual(["ctx__search"]);
+		expect(Object.keys(second)).toEqual(["ctx__search"]);
+		expect(opened).toBe(1);
 	});
 
 	it("refuses redirects on remote transports", async () => {

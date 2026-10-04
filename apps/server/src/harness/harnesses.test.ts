@@ -1,9 +1,13 @@
-import { afterEach, expect, it } from "bun:test";
+import { afterEach, beforeEach, expect, it } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { harnesses, harnessFor, registerCredential, shutdownHarnesses } from "./harnesses";
 
+// A developer's .env can select HARNESS=pi; agents.ts then constructs and
+// caches that harness at import time in an earlier test file. Reset before
+// each test so construction under test starts from a clean selector.
+beforeEach(shutdownHarnesses);
 afterEach(shutdownHarnesses);
 
 it("selects the tested Copilot SDK, Pi, and Atomic harnesses", () => {

@@ -5,6 +5,9 @@ import { ATOMIC_AUTH_MODES, createAtomicAdapter } from "./atomic/adapter";
 import { forgetWorkspaces } from "./atomic/workspace";
 import { createCopilotSdk } from "./copilot-sdk/adapter";
 import { shutdownPlannerExtensions } from "../fork/planner-extensions";
+import { piProviders } from "../fork/pi-providers";
+import { redeliverToolResults } from "../fork/pi-redelivery";
+import { traceHarness } from "../fork/harness-trace.debug"; // TEMP DEBUG
 import { createPiAdapter } from "./pi/adapter";
 
 import type { HarnessV1 } from "@ai-sdk/harness";
@@ -18,7 +21,9 @@ const credentials = new Map<string, {
 function createPiHarness(settings: { auth?: string }): HarnessV1 & { shutdown(): Promise<void> } {
 	// Pi has no notion of a GitHub credential or a per-turn credit limit; only
 	// `auth` (validated by `harnessFor` below) reaches the real adapter.
-	return createPiAdapter({ auth: settings.auth as never });
+	return redeliverToolResults(
+		traceHarness(createPiAdapter({ auth: settings.auth as never, providers: piProviders() })), // TEMP DEBUG
+	);
 }
 
 function createAtomicHarness(

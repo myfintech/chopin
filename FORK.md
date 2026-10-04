@@ -82,15 +82,19 @@ table and check that each seam still lands where its fork code expects it.
 
 ## Fork divergences
 
-| Path                                       | Kind                | Purpose                                                                                      |
-| ------------------------------------------ | ------------------- | -------------------------------------------------------------------------------------------- |
-| `FORK.md`                                  | Fork-owned file     | Fork rules, rebase workflow, divergence list                                                 |
-| `AGENTS.md`                                | Upstream file, seam | Notice under the H1 pointing agents to this file                                             |
-| `apps/server/src/fork/planner-extensions/` | Fork-owned files    | [Planner extensions](docs/fork-planner-extensions.md): MCP tools, skills, instructions       |
-| `docs/fork-planner-extensions.md`          | Fork-owned file     | Planner extensions configuration and security model                                          |
-| `apps/server/src/harness/tool-names.ts`    | Upstream file, seam | Import plus one `push` appending configured tool names                                       |
-| `apps/server/src/harness/agents.ts`        | Upstream file, seam | Extension placeholders in the tool set; `extensionTools` call option merged in `prepareCall` |
-| `apps/server/src/harness/session.ts`       | Upstream file, seam | Binds `extensionTools` for the repository when a Planner session opens                       |
-| `apps/server/src/harness/harnesses.ts`     | Upstream file, seam | Closes extension MCP clients in `shutdownHarnesses`                                          |
-| `apps/server/src/agent/planner.ts`         | Upstream file, seam | Appends `extensionInstructions` to the Planner prompt                                        |
-| `Dockerfile`                               | Upstream file, seam | One block in the runtime stage adding Node.js (`npx`), `uv`/`uvx`, and `python3`             |
+| Path                                          | Kind                | Purpose                                                                                                                             |
+| --------------------------------------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `FORK.md`                                     | Fork-owned file     | Fork rules, rebase workflow, divergence list                                                                                        |
+| `AGENTS.md`                                   | Upstream file, seam | Notice under the H1 pointing agents to this file                                                                                    |
+| `apps/server/src/fork/planner-extensions/`    | Fork-owned files    | [Planner extensions](docs/fork-planner-extensions.md): MCP tools, skills, instructions                                              |
+| `docs/fork-planner-extensions.md`             | Fork-owned file     | Planner extensions configuration and security model                                                                                 |
+| `apps/server/src/fork/pi-providers/`          | Fork-owned files    | [Pi providers](docs/fork-pi-providers.md): models missing from Pi's catalog                                                         |
+| `apps/server/config/pi-providers.mantl.jsonc` | Fork-owned file     | Pi provider configuration for the MANTL LLM gateway                                                                                 |
+| `docs/fork-pi-providers.md`                   | Fork-owned file     | Pi providers configuration and value research method                                                                                |
+| `apps/server/src/fork/pi-redelivery/`         | Fork-owned files    | Resubmits host tool results `@ai-sdk/harness-pi` drops when they arrive before Pi waits for them; drop once fixed upstream          |
+| `apps/server/src/harness/tool-names.ts`       | Upstream file, seam | Import plus one `push` appending configured tool names                                                                              |
+| `apps/server/src/harness/agents.ts`           | Upstream file, seam | Extension placeholders in the tool set; `extensionTools` call option merged in `prepareCall`                                        |
+| `apps/server/src/harness/session.ts`          | Upstream file, seam | Binds `extensionTools` for the repository when a Planner session opens                                                              |
+| `apps/server/src/harness/harnesses.ts`        | Upstream file, seam | Closes extension MCP clients in `shutdownHarnesses`; wraps the Pi adapter with `redeliverToolResults` and passes it `piProviders()` |
+| `apps/server/src/agent/planner.ts`            | Upstream file, seam | Appends `extensionInstructions` to the Planner prompt                                                                               |
+| `Dockerfile`                                  | Upstream file, seam | One block in the runtime stage adding Node.js (`npx`), `uv`/`uvx`, and `python3`                                                    |
