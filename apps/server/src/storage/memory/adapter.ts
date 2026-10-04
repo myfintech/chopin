@@ -4,6 +4,7 @@ import { availableChannelTitle } from "../../channels/title";
 import { MemoryBackgroundJobStore } from "./jobs";
 import { MemoryResearchWorkspaceStore } from "./research";
 import { MemoryPreferenceStore } from "../../user-preferences/memory";
+import { MemoryProvenanceStore } from "../../document-provenance/memory";
 import { researchProjectionAllowed, ResearchProjectionConflict } from "../model";
 
 import type {
@@ -315,6 +316,7 @@ export class MemoryStorage implements StorageAdapter {
 	});
 	readonly research: ResearchWorkspaceStore = this.#research;
 	readonly preferences: PreferenceStore = new MemoryPreferenceStore();
+	readonly provenance = new MemoryProvenanceStore();
 
 	readonly leases: LeaseStore = {
 		acquire: (name, owner, ttlMs) => this.#acquire(name, owner, ttlMs),
@@ -439,6 +441,7 @@ export class MemoryStorage implements StorageAdapter {
 				sidecar: json(initial.sidecar),
 				createdAt: now,
 			});
+			if (initial.provenance) this.provenance.record(saved.id, initial.provenance, now);
 		}
 		return channel(saved);
 	}
@@ -508,6 +511,7 @@ export class MemoryStorage implements StorageAdapter {
 		this.#sidecars.delete(id);
 		this.#operations.delete(id);
 		this.#agents.delete(id);
+		this.provenance.forget(id);
 		let aliases = this.#channelSlugs.get(found.repositoryId);
 		if (aliases) {
 			for (let [slug, owner] of aliases) {
@@ -818,6 +822,7 @@ export class MemoryStorage implements StorageAdapter {
 			updatedAt: new Date(Math.max(found.updatedAt.getTime(), input.now.getTime())),
 		});
 		this.#sequences.set(input.channelId, sequence + 1);
+		if (input.provenance) this.provenance.record(input.channelId, input.provenance, input.now);
 		let result = { revision, sequence, repeated: false };
 		operations.set(input.operationId, result);
 		return Promise.resolve(result);
