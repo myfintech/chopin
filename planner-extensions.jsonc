@@ -1,0 +1,63 @@
+// Planner extensions for local testing (fork feature). See
+// docs/fork-planner-extensions.md. Credentials are substituted from the
+// environment at startup (.env): a missing variable refuses startup, so fill
+// in every referenced key or comment out the servers you are not testing.
+// Tool allowlists verified against the pinned server versions by MCP probe.
+// a mentioned Jira key (like ABC-123) goes to jira__jira_get_issue or jira__jira_search;
+{
+	"instructions": "Always start by using unblocked__context_research to answer questions. Always use unblocked__context_get_urls to retrieve repository files. Fall back to searching the reading the repository directly ONLY when unblocked cannot provide you with the necessary information. Project briefs live in Notion (notion__API-post-search, then notion__API-retrieve-page-markdown).",
+
+	"mcpServers": {
+		"unblocked": {
+			"transport": {
+				"type": "http",
+				"url": "https://getunblocked.com/api/mcpsse",
+				"headers": { "Authorization": "Bearer ${UNBLOCKED_TOKEN}" },
+			},
+			// Current tool surface (April 2026): the earlier five-tool surface
+			// was replaced by these two. Startup logs name any mismatch.
+			"tools": ["context_research", "context_get_urls"],
+			"instructions": "Organizational context across code, PRs, docs, issues, and messaging, with citations.",
+		},
+		// "jira": {
+		// 	"transport": {
+		// 		"type": "stdio",
+		// 		"command": "uvx",
+		// 		"args": ["--from", "mcp-atlassian==0.23.1", "mcp-atlassian"],
+		// 		"env": {
+		// 			"JIRA_URL": "${JIRA_URL}",
+		// 			"JIRA_USERNAME": "${JIRA_USERNAME}",
+		// 			"JIRA_API_TOKEN": "${JIRA_API_TOKEN}",
+		// 			"READ_ONLY_MODE": "true",
+		// 		},
+		// 	},
+		// 	// READ_ONLY_MODE makes the server refuse write tools entirely; this
+		// 	// allowlist is the read subset worth exposing to the Planner.
+		// 	"tools": ["jira_get_issue", "jira_search", "jira_get_project_issues"],
+		// 	"instructions": "Look up a ticket when a participant mentions a Jira key such as ABC-123.",
+		// 	"timeoutMs": 30000,
+		// },
+		"notion": {
+			"transport": {
+				"type": "stdio",
+				"command": "npx",
+				"args": ["-y", "@notionhq/notion-mcp-server@2.5.2"],
+				"env": { "NOTION_TOKEN": "${NOTION_TOKEN}" },
+			},
+			// Read-only subset of the offered tools; every create/update/delete/
+			// move/patch tool is deliberately excluded. Create the integration
+			// with only "Reading" capabilities and share specific pages with it.
+			"tools": [
+				"API-post-search",
+				"API-retrieve-a-page",
+				"API-retrieve-a-database",
+				"API-retrieve-a-data-source",
+				"API-query-data-source",
+				"API-get-block-children",
+				"API-retrieve-page-markdown",
+			],
+			"instructions": "Find and read project briefs, specs, and decision documents in Notion.",
+			"timeoutMs": 30000,
+		},
+	},
+}
