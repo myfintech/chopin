@@ -618,6 +618,7 @@ if (url) {
 				"013_research_child_publication",
 				"014_inline_research",
 				"015_planner_inline_reference",
+				"mantl_document_provenance",
 				"mantl_user_preferences",
 			]);
 			expect(await sql<{ table: string | null }[]>`SELECT to_regclass('channel_slugs') AS table`)

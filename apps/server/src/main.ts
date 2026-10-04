@@ -45,6 +45,7 @@ import { registerMcpRoutes } from "./mcp/routes";
 import { registerNavigationRoutes } from "./navigation/routes";
 import { registerPreferenceRoutes } from "./user-preferences/routes";
 import * as Service from "./plan/service";
+import * as DocumentProvenance from "./document-provenance";
 import * as Inject from "./questions/inject";
 import * as Marks from "./comments/inject";
 import * as Questions from "./questions/service";
@@ -808,7 +809,7 @@ function listen(): Server<SocketData> {
 
 			message(ws: Socket, raw) {
 				if (typeof raw !== "string") return;
-				void receive(ws, raw).catch(err => {
+				void DocumentProvenance.receive(ws, raw, receive).catch(err => {
 					console.error("chopin: WebSocket receive failed -", err);
 				});
 			},

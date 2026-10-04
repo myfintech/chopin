@@ -9,6 +9,7 @@ import { createScopedTools } from "../agent/scoped-tools";
 import type { ConversationPlan } from "@chopin/protocol";
 import { harnessSelection } from "../config";
 import { extensionPlaceholders } from "../planner-extensions";
+import { agentTools } from "../document-provenance";
 import { GITHUB_TOOL_SCHEMAS } from "./github-tools";
 import { BACKGROUND_TOOL_NAMES, PLANNER_TOOL_NAMES } from "./tool-names";
 import { harnessFor } from "./harnesses";
@@ -64,10 +65,10 @@ export function createPlannerAgent(harness: HarnessV1, profile?: ConversationPla
 				...rest,
 				model: options.model,
 				instructions: options.instructions,
-				tools: scopedJobTools(
+				tools: agentTools(scopedJobTools(
 					{ ...rest.tools, ...options.githubTools, ...options.extensionTools },
 					options.room,
-				),
+				)),
 				toolsContext: Object.fromEntries(names.map(name => [name, {
 					room: options.room,
 					repository: options.repository,

@@ -28,6 +28,7 @@ import { plannerInstructions } from "../agent/planner";
 import type { ActiveOwnerBinding } from "../agent/active-owner";
 import type { DocumentRoom, ResearchWorkspaceRequest } from "../agent/tools";
 import * as Service from "../plan/service";
+import * as DocumentProvenance from "../document-provenance";
 import { instruction } from "@chopin/protocol/address";
 
 import { annotatedText, compose, referenceCatalog, remember } from "./address";
@@ -1729,7 +1730,7 @@ async function run(
 		let nextId = next.id;
 		let entry = next.message ? chat.entries.find(item => item.id === nextId) : undefined;
 		if (entry && !next.posted) announce(server, room, entry);
-		await run(
+		await DocumentProvenance.plannerTurn(run)(
 			{ ...context, invokedBy: next.invokedBy },
 			next.handle,
 			next.text,
@@ -1763,7 +1764,7 @@ function startRun(
 		if (jobTurn) finishJob(jobTurn, { status: "failed", reason: "The document closed." });
 		return;
 	}
-	let running = run(
+	let running = DocumentProvenance.plannerTurn(run)(
 		context,
 		handle,
 		text,
