@@ -47,6 +47,7 @@ let serverSchema = z.object({
 	instructions: z.string().optional(),
 	repositories: z.array(z.string().regex(/^(\*|[^/\s]+\/(\*|[^/\s]+))$/)).min(1).optional(),
 	timeoutMs: z.number().int().min(1_000).max(120_000).optional(),
+	callTimeoutMs: z.number().int().min(5_000).max(900_000).optional(),
 }).strict();
 
 let fileSchema = z.object({
@@ -79,6 +80,8 @@ export type ExtensionServer = {
 	instructions?: string;
 	repositories?: string[];
 	timeoutMs: number;
+	/** Bound on one tool call, so a stalled remote call cannot hold a Planner turn open. */
+	callTimeoutMs: number;
 };
 
 export type Skill = {
@@ -97,7 +100,11 @@ export type ExtensionConfig = {
 
 /** Replaces `${NAME}` with the environment value, failing on a missing one so a
  * secret is never sent as a literal placeholder. */
-function substitute(value: string, env: Record<string, string | undefined>, where: string): string {
+export function substitute(
+	value: string,
+	env: Record<string, string | undefined>,
+	where: string,
+): string {
 	return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name: string) => {
 		let found = env[name];
 		if (found === undefined) {
@@ -230,6 +237,7 @@ export function parseConfig(
 			instructions: server.instructions?.trim() || undefined,
 			repositories: server.repositories,
 			timeoutMs: server.timeoutMs ?? 15_000,
+			callTimeoutMs: server.callTimeoutMs ?? 180_000,
 		};
 	});
 
