@@ -1,6 +1,6 @@
-# Planner extensions (fork)
+# Planner extensions
 
-> Fork-owned feature. See [FORK.md](../FORK.md). Upstream behavior is unchanged when
+> MANTL-owned feature. See [MANTL.md](../MANTL.md). Upstream behavior is unchanged when
 > `PLANNER_EXTENSIONS` is unset.
 
 Planner extensions let an operator give the hosted Planner extra read-only context
@@ -164,8 +164,8 @@ purpose:
 
 ## Implementation
 
-- Configuration and skill loading: `apps/server/src/fork/planner-extensions/config.ts`
-- MCP connections and bound tools: `apps/server/src/fork/planner-extensions/mcp.ts`
+- Configuration and skill loading: `apps/server/src/planner-extensions/config.ts`
+- MCP connections and bound tools: `apps/server/src/planner-extensions/mcp.ts`
 - Placeholders, session tools, prompt text, and shutdown:
-  `apps/server/src/fork/planner-extensions/index.ts`
-- Seams in upstream files are listed in [FORK.md](../FORK.md#fork-divergences).
+  `apps/server/src/planner-extensions/index.ts`
+- Seams in upstream files are listed in [MANTL.md](../MANTL.md#upstream-divergences).

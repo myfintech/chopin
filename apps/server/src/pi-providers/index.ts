@@ -3,7 +3,7 @@
  * not list, reached through a gateway Pi already speaks to. Read once from the
  * file named by `PI_PROVIDERS` and passed to `@ai-sdk/harness-pi` as its public
  * `providers` setting, which registers them before Pi resolves `MODEL`.
- * Without `PI_PROVIDERS`, the harness is unchanged. See docs/fork-pi-providers.md.
+ * Without `PI_PROVIDERS`, the harness is unchanged. See docs/pi-providers.md.
  */
 
 import { readFileSync } from "node:fs";

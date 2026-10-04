@@ -37,7 +37,7 @@ RUN apt-get update \
 	&& apt-get install -y --no-install-recommends ca-certificates \
 	&& rm -rf /var/lib/apt/lists/*
 
-# Fork: npx and uvx for stdio Planner extension MCP servers (docs/fork-planner-extensions.md).
+# MANTL: npx and uvx for stdio Planner extension MCP servers (docs/planner-extensions.md).
 COPY --from=node:24.21.0-trixie-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=node:24.21.0-trixie-slim /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 COPY --from=ghcr.io/astral-sh/uv:0.12.22 /uv /uvx /usr/local/bin/

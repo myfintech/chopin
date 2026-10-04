@@ -1,5 +1,5 @@
 // Pi providers for the MANTL LLM gateway (LiteLLM in front of Vertex AI).
-// Fork feature: see docs/fork-pi-providers.md. Select a model with
+// See docs/pi-providers.md. Select a model with
 // MODEL=mantl/<id>, for example MODEL=mantl/claude-opus-5-5.
 //
 // Sources, checked 2026-10-02:

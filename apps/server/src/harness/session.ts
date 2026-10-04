@@ -1,7 +1,7 @@
 import { BACKGROUND_TOOL_NAMES, PLANNER_TOOL_NAMES } from "./tool-names";
 import { createJustBashNetworkSandboxSession } from "@ai-sdk/sandbox-just-bash";
 import { headingPlannerAgent, plannerAgent, prosePlannerAgent, refinePlannerAgent } from "./agents";
-import { extensionTools } from "../fork/planner-extensions";
+import { extensionTools } from "../planner-extensions";
 import { githubTools, type GitHubToolsError, type Result } from "./github-tools";
 import { registerCredential } from "./harnesses";
 import {

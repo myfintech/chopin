@@ -1,6 +1,6 @@
 import type { ConversationPlan } from "@chopin/protocol";
 import { WRITE_TOOLS } from "../agent/job-scope";
-import { extensionToolNames } from "../fork/planner-extensions/config";
+import { extensionToolNames } from "../planner-extensions/config";
 
 export const PLANNER_TOOL_NAMES = [
 	"read_plan",

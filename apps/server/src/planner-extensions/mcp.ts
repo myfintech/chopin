@@ -7,7 +7,7 @@ import { appliesTo } from "./config";
 
 import type { MCPClientConfig } from "@ai-sdk/mcp";
 import type { Tool, ToolSet } from "ai";
-import type { ActiveOwnerBinding } from "../../agent/active-owner";
+import type { ActiveOwnerBinding } from "../agent/active-owner";
 import type { ExtensionServer, ExtensionTool } from "./config";
 
 /** Bound on the text returned to the model from one call. */
