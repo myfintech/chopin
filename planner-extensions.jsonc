@@ -1,5 +1,5 @@
-// Planner extensions for local testing (fork feature). See
-// docs/fork-planner-extensions.md. Credentials are substituted from the
+// Planner extensions for local testing. See
+// docs/planner-extensions.md. Credentials are substituted from the
 // environment at startup (.env): a missing variable refuses startup, so fill
 // in every referenced key or comment out the servers you are not testing.
 // Tool allowlists verified against the pinned server versions by MCP probe.

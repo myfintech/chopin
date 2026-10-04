@@ -1,5 +1,5 @@
 import { createJustBashNetworkSandboxSession } from "@ai-sdk/sandbox-just-bash";
-import { extensionTools } from "../fork/planner-extensions";
+import { extensionTools } from "../planner-extensions";
 import { plannerAgent } from "./agents";
 import { githubTools, type GitHubToolsError, type Result } from "./github-tools";
 import { registerCredential } from "./harnesses";

@@ -1,17 +1,17 @@
 /**
  * Planner extensions: operator-configured MCP tools, skills, and instructions.
- * See docs/fork-planner-extensions.md. Every export is a no-op when
+ * See docs/planner-extensions.md. Every export is a no-op when
  * `PLANNER_EXTENSIONS` is unset, so upstream behavior is unchanged.
  */
 
 import { jsonSchema, tool } from "ai";
 
-import { PLANNER_TOOL_NAMES } from "../../harness/tool-names";
+import { PLANNER_TOOL_NAMES } from "../harness/tool-names";
 import { appliesTo, extensionConfig, SKILL_TOOL_NAME } from "./config";
 import { closeConnections, serverTools, unavailableTool } from "./mcp";
 
 import type { ToolSet } from "ai";
-import type { HostedRepository } from "../../agent/repository";
+import type { HostedRepository } from "../agent/repository";
 import type { ExtensionConfig, Skill } from "./config";
 import type { CreateClient } from "./mcp";
 

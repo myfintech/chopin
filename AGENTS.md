@@ -1,7 +1,7 @@
 # Working on Chopin
 
-> **Fork notice:** This is `myfintech/chopin`, a fork of `githubnext/chopin` that we regularly
-> rebase onto upstream. Read [FORK.md](FORK.md) before making changes. Every change must stay
+> **MANTL notice:** This is `myfintech/chopin`, MANTL's downstream copy of `githubnext/chopin`
+> that we regularly rebase onto upstream. Read [MANTL.md](MANTL.md) before making changes. Every change must stay
 > rebase-friendly: add instead of modifying, and keep edits to upstream files minimal.
 
 Chopin is an experimental collaborative authoring system: several people and a

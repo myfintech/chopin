@@ -1,6 +1,6 @@
-# Pi providers (fork)
+# Pi providers
 
-> Fork-owned feature. See [FORK.md](../FORK.md). Upstream behavior is unchanged when
+> MANTL-owned feature. See [MANTL.md](../MANTL.md). Upstream behavior is unchanged when
 > `PI_PROVIDERS` is unset.
 
 Under `HARNESS=pi`, `MODEL` must name a model in Pi's built-in catalog, and Chopin's
@@ -115,6 +115,6 @@ its own operator key, never a developer's host subscription.
 
 ## Implementation
 
-- Loading and validation: `apps/server/src/fork/pi-providers/index.ts`
+- Loading and validation: `apps/server/src/pi-providers/index.ts`
 - MANTL configuration: `apps/server/config/pi-providers.mantl.jsonc`
 - Seam: `createPiHarness` in `apps/server/src/harness/harnesses.ts` passes `providers`.

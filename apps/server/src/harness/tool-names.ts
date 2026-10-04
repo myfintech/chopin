@@ -1,4 +1,4 @@
-import { extensionToolNames } from "../fork/planner-extensions/config";
+import { extensionToolNames } from "../planner-extensions/config";
 
 export const PLANNER_TOOL_NAMES = [
 	"read_plan",
