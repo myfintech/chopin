@@ -8,7 +8,7 @@ import { jobTools, scopedJobTools } from "../agent/job-tools";
 import { createScopedTools } from "../agent/scoped-tools";
 import type { ConversationPlan } from "@chopin/protocol";
 import { harnessSelection } from "../config";
-import { extensionPlaceholders } from "../fork/planner-extensions";
+import { extensionPlaceholders } from "../planner-extensions";
 import { GITHUB_TOOL_SCHEMAS } from "./github-tools";
 import { BACKGROUND_TOOL_NAMES, PLANNER_TOOL_NAMES } from "./tool-names";
 import { harnessFor } from "./harnesses";

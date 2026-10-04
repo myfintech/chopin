@@ -4,10 +4,10 @@ import { isAbsolute } from "node:path";
 import { ATOMIC_AUTH_MODES, createAtomicAdapter } from "./atomic/adapter";
 import { forgetWorkspaces } from "./atomic/workspace";
 import { createCopilotSdk } from "./copilot-sdk/adapter";
-import { shutdownPlannerExtensions } from "../fork/planner-extensions";
-import { piProviders } from "../fork/pi-providers";
-import { redeliverToolResults } from "../fork/pi-redelivery";
-import { traceHarness } from "../fork/harness-trace.debug"; // TEMP DEBUG
+import { shutdownPlannerExtensions } from "../planner-extensions";
+import { piProviders } from "../pi-providers";
+import { redeliverToolResults } from "../pi-redelivery";
+import { traceHarness } from "../harness-trace.debug"; // TEMP DEBUG
 import { createPiAdapter } from "./pi/adapter";
 
 import type { HarnessV1 } from "@ai-sdk/harness";

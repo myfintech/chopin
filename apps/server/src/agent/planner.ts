@@ -16,7 +16,7 @@
 // browser rich-text editor into a module that builds a prompt string.
 import { COMPONENTS, DIFF_LANGUAGE, MERMAID_LANGUAGE } from "@chopin/dialect/dialect";
 
-import { extensionInstructions } from "../fork/planner-extensions";
+import { extensionInstructions } from "../planner-extensions";
 
 import type { Component } from "@chopin/dialect/dialect";
 import type { PlannerWorkspace } from "../harness/atomic/workspace";

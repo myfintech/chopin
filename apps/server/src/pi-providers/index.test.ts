@@ -29,7 +29,7 @@ function file(provider: Record<string, unknown>, name = "gateway"): string {
 
 describe("parseProviders", () => {
 	it("accepts the shipped MANTL gateway configuration", async () => {
-		let path = join(import.meta.dir, "../../../config/pi-providers.mantl.jsonc");
+		let path = join(import.meta.dir, "../../config/pi-providers.mantl.jsonc");
 		let providers = parseProviders(await Bun.file(path).text(), { path, env });
 		expect(providers.mantl!.baseUrl).toBe("https://gateway.example.test");
 		expect(providers.mantl!.models.map(model => model.id)).toEqual([
