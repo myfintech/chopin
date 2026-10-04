@@ -21,3 +21,4 @@ export {
 	WrenchIcon,
 } from "./line";
 export { ArchiveIcon, DocumentIcon, LoaderIcon, SearchIcon } from "./system";
+export { MonitorIcon, MoonIcon, SunIcon } from "./theme";

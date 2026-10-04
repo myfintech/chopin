@@ -7,6 +7,7 @@ import { migrate, verifyMigrations } from "./migrations";
 import { PostgresNavigationStore } from "./navigation";
 import { PostgresBackgroundJobStore } from "./jobs";
 import { PostgresResearchWorkspaceStore } from "./research";
+import { PostgresPreferenceStore } from "../../user-preferences/postgres";
 import { researchProjectionAllowed, ResearchProjectionConflict } from "../model";
 
 import type { TransactionSQL } from "bun";
@@ -50,6 +51,7 @@ import type {
 	StorageAdapter,
 	UserStore,
 } from "../port";
+import type { PreferenceStore } from "../../user-preferences/model";
 
 type Timestamp = Date | string;
 type Integer = bigint | number | string;
@@ -470,6 +472,10 @@ export class PostgresStorage implements StorageAdapter {
 			},
 			(transaction, input) => this.#createAvailableChannelInTransaction(transaction, input),
 		);
+		this.preferences = new PostgresPreferenceStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+		);
 	}
 
 	readonly users: UserStore = {
@@ -572,6 +578,7 @@ export class PostgresStorage implements StorageAdapter {
 	readonly navigation: NavigationStore;
 	readonly jobs: BackgroundJobStore;
 	readonly research: ResearchWorkspaceStore;
+	readonly preferences: PreferenceStore;
 
 	readonly channels: ChannelStore = {
 		create: input => this.#createChannel(input),

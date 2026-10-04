@@ -3,6 +3,7 @@ import { documentSlug, documentSlugCandidate } from "../../channels/slug";
 import { availableChannelTitle } from "../../channels/title";
 import { MemoryBackgroundJobStore } from "./jobs";
 import { MemoryResearchWorkspaceStore } from "./research";
+import { MemoryPreferenceStore } from "../../user-preferences/memory";
 import { researchProjectionAllowed, ResearchProjectionConflict } from "../model";
 
 import type {
@@ -49,6 +50,7 @@ import type {
 	StorageAdapter,
 	UserStore,
 } from "../port";
+import type { PreferenceStore } from "../../user-preferences/model";
 
 function bytes(value: Uint8Array): Uint8Array {
 	return new Uint8Array(value);
@@ -312,6 +314,7 @@ export class MemoryStorage implements StorageAdapter {
 		assertLease: held => this.#assertLease(held),
 	});
 	readonly research: ResearchWorkspaceStore = this.#research;
+	readonly preferences: PreferenceStore = new MemoryPreferenceStore();
 
 	readonly leases: LeaseStore = {
 		acquire: (name, owner, ttlMs) => this.#acquire(name, owner, ttlMs),

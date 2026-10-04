@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { usePointerCapabilities } from "@chopin/editor/pointer";
 
 import { App } from "./app";
+import { bootColorTheme } from "./color-theme-boot";
 import { isDesignAuditRoute } from "./design-audit/route";
 import { useFocusInput } from "./focus-input";
 import { useMotionInput } from "./motion-input";
@@ -16,6 +17,9 @@ import "./navigation.css";
 import "./icon-tooltip.css";
 import "./local-login.css";
 import "./chat/run-card.css";
+import "./dark-theme.css";
+
+bootColorTheme();
 
 let root = document.getElementById("root");
 if (!root) throw new Error("missing #root");
