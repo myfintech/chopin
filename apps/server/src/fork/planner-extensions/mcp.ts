@@ -92,7 +92,16 @@ export async function connect(
 				createClient({
 					transport,
 					name: "chopin-planner",
-					onUncaughtError: cause => invalidate(server, connection, cause),
+					// A stdio server that is still starting (an `npx` or `uvx` download) can
+					// miss the client's 1 s `server/discover` probe and answer it after the
+					// fallback `initialize`; that stray reply is an uncaught protocol error.
+					protocolVersionDiscovery: server.transport.type !== "stdio",
+					// `connect` handles failures while opening; only an established
+					// connection is dropped and reopened.
+					onUncaughtError: cause => {
+						if (connection.client) invalidate(server, connection, cause);
+						else console.error(`[planner-extensions] ${server.name} error while opening:`, cause);
+					},
 				}),
 				server.timeoutMs,
 				`${server.name} connection`,
@@ -198,10 +207,26 @@ function boundTool(
 			let current = (await connect(server, createClient))?.get(entry.remote);
 			if (!current?.execute) return `Error: ${server.name} is unavailable right now.`;
 			let connection = connections.get(server.name);
+			let timeout = AbortSignal.timeout(server.callTimeoutMs);
+			let signal = options.abortSignal ? AbortSignal.any([options.abortSignal, timeout]) : timeout;
+			let call = Promise.resolve(current.execute(input, { ...options, abortSignal: signal }));
+			// A client that ignores the signal must not hold the turn open either.
+			call.catch(() => {});
+			let stopped = new Promise<never>((_, reject) => {
+				if (signal.aborted) reject(signal.reason);
+				signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+			});
+			stopped.catch(() => {});
 			try {
-				return outputText(await current.execute(input, options));
+				return outputText(await Promise.race([call, stopped]));
 			} catch (cause) {
+				if (options.abortSignal?.aborted) throw cause;
 				if (connection) invalidate(server, connection, cause);
+				if (timeout.aborted) {
+					return `Error: ${server.name} did not answer within ${
+						Math.round(server.callTimeoutMs / 1000)
+					} seconds. Continue without it or try a narrower request.`;
+				}
 				let message = cause instanceof Error ? cause.message : String(cause);
 				return `Error: ${server.name} call failed: ${message}`;
 			}
