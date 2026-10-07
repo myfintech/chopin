@@ -93,6 +93,13 @@ table and check that each seam still lands where its MANTL code expects it. If `
 reports a changed dynamic owner, renew it as described in
 [Pinned design exceptions](#pinned-design-exceptions).
 
+Upstream's repository automation (PR readiness, rebase, CI fix, issue triage, and the weekly
+React Effect review) needs secrets that `myfintech/chopin` does not have. Those workflows are
+disabled in the repository's Actions settings, not by editing their files. After a rebase,
+check `gh workflow list --repo myfintech/chopin --all` and disable any new upstream workflow
+that cannot run here with `gh workflow disable`. A workflow can only be disabled once it is
+on `main`.
+
 ## Pinned design exceptions
 
 `bun run ci` runs `scripts/check-design-contract.ts`. It checks that every colour, radius,
