@@ -396,7 +396,7 @@
 				1
 			]
 		],
-		"sourceHash": "56b43a3c7e560aa5ebfc013513ee16e22dd5bc4bbe556a68beeaa0e8cf04446b"
+		"sourceHash": "14a4fa0dc3588db62d80c31b718311645d26d070e014c87be28a53a7d2a308b8"
 	},
 	{
 		"file": "packages/editor/src/changes.ts",
