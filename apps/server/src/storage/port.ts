@@ -69,6 +69,7 @@ import type {
 	WebSession,
 } from "./model";
 import type { PreferenceStore } from "../user-preferences/model";
+import type { ProvenanceStore } from "../document-provenance/model";
 
 export interface UserStore {
 	put(user: PutUser): Promise<UserRecord>;
@@ -238,6 +239,7 @@ export interface StorageAdapter {
 	readonly jobs: BackgroundJobStore;
 	readonly research: ResearchWorkspaceStore;
 	readonly preferences: PreferenceStore;
+	readonly provenance: ProvenanceStore;
 
 	migrate(): Promise<void>;
 	health(): Promise<void>;

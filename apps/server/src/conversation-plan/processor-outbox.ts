@@ -1,6 +1,7 @@
 import { effectsFor, MAX_EFFECTS, recoverable, runEffects } from "./effects";
 import type { Dependencies, EffectCommands } from "./processor-types";
 import { appendEffects } from "./processor-fields";
+import { plannerAuthored } from "../document-provenance";
 // Exact archive 446a9779a937fa5be7cd3eb52fd7f3023d691ed2, service.ts; import/export and synchronous closure wrappers only.
 
 export function createOutbox(
@@ -82,7 +83,7 @@ export function createOutbox(
 				structuredClone(plan.conversationPlanPendingEffects)
 			);
 			if (snapshot.length === 0) return;
-			let completed = await runEffects({
+			let completed = await plannerAuthored(runEffects)({
 				...commands,
 				applied: key => plan.conversationPlanEffects.includes(key),
 				markApplied,

@@ -21,7 +21,6 @@ export const PLANNER_TOOL_NAMES = [
 	"pull_request_read",
 	"revise_open_decision",
 ];
-PLANNER_TOOL_NAMES.push(...extensionToolNames(PLANNER_TOOL_NAMES));
 
 function jobNames(own: string): readonly string[] {
 	return Object.freeze([...PLANNER_TOOL_NAMES.filter(name => !WRITE_TOOLS.has(name)), own]);
@@ -36,3 +35,6 @@ export const BACKGROUND_TOOL_NAMES: Readonly<Record<ConversationPlan.JobKind, re
 	});
 
 export const HEADING_TOOL_NAMES = BACKGROUND_TOOL_NAMES.heading;
+
+// Extensions are Planner-only; background job profiles keep upstream's tool set.
+PLANNER_TOOL_NAMES.push(...extensionToolNames(PLANNER_TOOL_NAMES));

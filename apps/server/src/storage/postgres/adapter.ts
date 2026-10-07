@@ -8,6 +8,7 @@ import { PostgresNavigationStore } from "./navigation";
 import { PostgresBackgroundJobStore } from "./jobs";
 import { PostgresResearchWorkspaceStore } from "./research";
 import { PostgresPreferenceStore } from "../../user-preferences/postgres";
+import { PostgresProvenanceStore } from "../../document-provenance/postgres";
 import { researchProjectionAllowed, ResearchProjectionConflict } from "../model";
 
 import type { TransactionSQL } from "bun";
@@ -476,6 +477,10 @@ export class PostgresStorage implements StorageAdapter {
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
 		);
+		this.provenance = new PostgresProvenanceStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+		);
 	}
 
 	readonly users: UserStore = {
@@ -579,6 +584,7 @@ export class PostgresStorage implements StorageAdapter {
 	readonly jobs: BackgroundJobStore;
 	readonly research: ResearchWorkspaceStore;
 	readonly preferences: PreferenceStore;
+	readonly provenance: PostgresProvenanceStore;
 
 	readonly channels: ChannelStore = {
 		create: input => this.#createChannel(input),
@@ -734,6 +740,9 @@ export class PostgresStorage implements StorageAdapter {
 					${input.now}
 				)
 			`;
+			if (input.initial.provenance) {
+				await this.provenance.record(transaction, input.id, input.initial.provenance, input.now);
+			}
 		}
 		return channel({ ...saved, slug });
 	}
@@ -1397,6 +1406,9 @@ export class PostgresStorage implements StorageAdapter {
 					updated_at = GREATEST(updated_at, ${input.now})
 				WHERE id = ${input.channelId}
 			`;
+				if (input.provenance) {
+					await this.provenance.record(transaction, input.channelId, input.provenance, input.now);
+				}
 				return { revision, sequence, repeated: false };
 			}));
 	}

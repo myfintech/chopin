@@ -1,5 +1,7 @@
 import { StorageError } from "./errors";
 
+import type { ProvenanceChange } from "../document-provenance/model";
+
 /** Values storage adapters may persist without knowing their domain schema. */
 export type JsonValue =
 	| null
@@ -95,10 +97,12 @@ export type ChannelRecord = {
 	description?: ChannelDescription;
 };
 
-export type InitialChannel = Omit<
-	ChannelSnapshot,
-	"channelId" | "revision" | "throughSequence" | "createdAt"
->;
+export type InitialChannel =
+	& Omit<
+		ChannelSnapshot,
+		"channelId" | "revision" | "throughSequence" | "createdAt"
+	>
+	& { provenance?: ProvenanceChange };
 
 export type CreateChannel =
 	& Omit<
@@ -242,6 +246,7 @@ export type CommitChannel = {
 	researchProjections?: ResearchProjectionChange[];
 	/** Lifecycle and shutdown maintenance may persist after document archival. */
 	allowArchived?: boolean;
+	provenance?: ProvenanceChange;
 };
 
 export type ResearchProjectionChange = { id: string; action: "add" | "remove" };

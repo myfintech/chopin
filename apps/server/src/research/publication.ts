@@ -1,4 +1,5 @@
 import * as Plan from "../plan/service";
+import { plannerAuthored } from "../document-provenance";
 import { StorageError } from "../storage/errors";
 
 import type { ResearchEvidence, ResearchReport } from "../jobs/research-workspace";
@@ -57,7 +58,9 @@ export async function publishInitialResearchChild(input: {
 	lease: Lease;
 	changed: (workspace: ResearchWorkspace) => void | Promise<void>;
 }): Promise<"published" | "pending"> {
-	let initial = await Plan.initial(researchReportSource(input.report, input.sources));
+	let initial = await plannerAuthored(Plan.initial)(
+		researchReportSource(input.report, input.sources),
+	);
 	let published;
 	try {
 		published = await input.storage.research.publishInitialReport({

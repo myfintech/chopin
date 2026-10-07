@@ -4,6 +4,7 @@ import { deterministicChannelId, isChannelId } from "../channels/id";
 import { documentSlug } from "../channels/slug";
 import { GitHubError } from "../github/client";
 import * as Plan from "../plan/service";
+import { codingAgent } from "../document-provenance";
 import * as Rooms from "../rooms";
 import { claimImplementation, reportImplementationLifecycle } from "../tasks/plan-graphs";
 import { StorageError } from "../storage/errors";
@@ -494,7 +495,8 @@ export function hosted(
 				});
 				let { brief, plan, ...origin } = input;
 				let creation: Plan.CreationMetadata = { brief, origin };
-				let initial = await Plan.initial(plan, creation);
+				let start = codingAgent(caller.user, undefined, Plan.initial);
+				let initial = await start(plan, creation);
 				let created: ChannelRecord;
 				try {
 					created = await auth.storage.channels.create({
@@ -607,7 +609,8 @@ export function hosted(
 							}
 
 							let url = documentPath(repository.owner, repository.name, channel.slug);
-							let outcome = await Plan.rewrite(plan, input.plan, (source, revision) => ({
+							let rewrite = codingAgent(caller.user, client, Plan.rewrite);
+							let outcome = await rewrite(plan, input.plan, (source, revision) => ({
 								idempotencyKey: input.idempotencyKey,
 								fingerprint: input.fingerprint,
 								fromRevision: input.revision,

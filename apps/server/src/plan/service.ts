@@ -37,6 +37,7 @@ import * as Questions from "../questions/service";
 import { claim, restore as restoreGraph, restoreRun } from "../tasks/graphs";
 import { claimEligibility, restoreLifecycle, transition } from "../tasks/lifecycle";
 import { broadcast, fail, relay, reply, tell } from "../wire";
+import * as DocumentProvenance from "../document-provenance";
 
 import type { Server } from "bun";
 import type { ConversationPlan, Plan as Wire, Request } from "@chopin/protocol";
@@ -804,6 +805,7 @@ export async function initial(
 			sourceHash: sourceHash(canonical),
 			document: Y.encodeStateAsUpdate(document.doc),
 			sidecar: JSON.parse(JSON.stringify(sidecar)) as JsonValue,
+			...DocumentProvenance.creationField(canonical),
 		};
 	} finally {
 		document.doc.destroy();
@@ -848,6 +850,7 @@ async function commitHosted(
 			now: new Date(),
 			...(researchProjections.length > 0 ? { researchProjections } : {}),
 			...(allowArchived ? { allowArchived: true } : {}),
+			...DocumentProvenance.commitField(durable.committedSource, captured),
 		});
 		if (!result.repeated) {
 			durable.revision = result.revision;
@@ -1395,9 +1398,10 @@ async function rejectBatch(plan: Plan, batch: Queued[], issues: string[]): Promi
  * remedy — which is why the senders in the batch are the ones charged for it.
  */
 async function commit(plan: Plan): Promise<void> {
-	let batch = plan.queue;
+	let [batch, rest] = DocumentProvenance.take(plan.queue, plan.document.epoch);
+	plan.queue = rest;
 	if (batch.length === 0) return;
-	plan.queue = [];
+	if (rest.length > 0) schedule(plan);
 
 	let outcome = await room.apply(
 		plan.document,
@@ -1442,7 +1446,7 @@ async function commit(plan: Plan): Promise<void> {
 		createHash("sha256").update(merged).digest("hex")
 	}`;
 	try {
-		await commitHosted(
+		await DocumentProvenance.browser(batch[0]!.ws, commitHosted)(
 			plan,
 			merged,
 			operationId,

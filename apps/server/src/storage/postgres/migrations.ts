@@ -63,6 +63,9 @@ const MIGRATIONS = [{
 }, {
 	id: "mantl_user_preferences",
 	path: join(import.meta.dir, "migrations/mantl_user_preferences.sql"),
+}, {
+	id: "mantl_document_provenance",
+	path: join(import.meta.dir, "migrations/mantl_document_provenance.sql"),
 }] satisfies Migration[];
 
 /** Navigation shipped as 002 before document slugs claimed that number on main. */
