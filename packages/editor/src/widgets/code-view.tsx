@@ -41,8 +41,14 @@ type Renderer = {
 /** What the highlighter calls text it has no grammar for. */
 const PLAIN = "text";
 
-/** One pair, named once; the page's resolved colour scheme picks between them. */
-const THEME = { dark: "pierre-dark", light: "pierre-light" };
+/**
+ * One theme per scheme, picked from the page's resolved colour scheme.
+ *
+ * A single theme name, not a `{ dark, light }` pair: a pair paints tokens
+ * through CSS variables instead of an inline colour, and the page's scheme is
+ * already resolved, so the second palette would never apply.
+ */
+const THEME = { dark: "pierre-dark", light: "pierre-light" } as const;
 
 let loading: Promise<Renderer> | undefined;
 
@@ -185,7 +191,7 @@ function View({ kind, source, language, meta }: CodeViewProps) {
 	let scheme = useColorScheme();
 	let options = useMemo(
 		() => ({
-			theme: THEME,
+			theme: THEME[scheme],
 			themeType: scheme,
 			// A diff's fallback has no title in the block's own header.
 			disableFileHeader: kind !== "diff" || !titled(meta),
@@ -198,7 +204,7 @@ function View({ kind, source, language, meta }: CodeViewProps) {
 
 	let diffOptions = useMemo(
 		() => ({
-			theme: THEME,
+			theme: THEME[scheme],
 			themeType: scheme,
 			// Three panes wide, so side by side would be two unreadable
 			// columns. The filename comes from the patch and is the whole

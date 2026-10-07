@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: Full commit SHA to deploy (default: head of main)
+        description: 'Full commit SHA to deploy (default: head of main)'
         required: false
 
 # Chopin allows one writer per database and every deploy restarts it, so
@@ -92,23 +92,26 @@ jobs:
           gcloud sql backups create --instance "$NAME-pg" --project "$PROJECT" \
             --description "pre-deploy ${{ steps.ref.outputs.sha }}"
 
-      # chopin-image-watch on the VM restarts Chopin within ~15s of this changing.
+      # chopin-image-watch on the VM pulls this image, then restarts Chopin on it.
       - name: Roll the VM
         run: |
           gcloud compute instances add-metadata "$NAME" --project "$PROJECT" --zone "$ZONE" \
             --metadata "chopin-image=${{ steps.image.outputs.name }}"
 
-      # The load balancer's health check URL is public. The VM stops and starts
-      # Chopin, so allow several minutes for migrations and the first probe.
-      - name: Wait for Chopin to serve
+      # The VM pulls the image while the old one serves, restarts Chopin, and
+      # reports the image as guest attribute chopin/image once it answers.
+      - name: Wait for Chopin to serve the new image
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
         run: |
-          sleep 30
-          for i in $(seq 1 30); do
-            if curl -fsS -o /dev/null "$URL/api/session"; then
-              echo "Chopin is serving ${{ steps.ref.outputs.sha }}"
+          for _ in $(seq 1 60); do
+            serving="$(gcloud compute instances get-guest-attributes "$NAME" --project "$PROJECT" \
+              --zone "$ZONE" --query-path chopin/image --format='value(value)' 2>/dev/null || true)"
+            if [ "$serving" = "$IMAGE" ] && curl -fsS -o /dev/null "$URL/api/session"; then
+              echo "Chopin is serving $IMAGE"
               exit 0
             fi
-            sleep 10
+            sleep 5
           done
-          echo "Chopin did not become healthy; see the logs commands in myfintech/ai infra/chopin/README.md" >&2
+          echo "Chopin did not start $IMAGE within 5 minutes; see the logs commands in myfintech/ai infra/chopin/README.md" >&2
           exit 1
