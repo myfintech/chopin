@@ -104,7 +104,7 @@ jobs:
         env:
           IMAGE: ${{ steps.image.outputs.name }}
         run: |
-          for _ in $(seq 1 60); do
+          for _ in $(seq 1 120); do
             serving="$(gcloud compute instances get-guest-attributes "$NAME" --project "$PROJECT" \
               --zone "$ZONE" --query-path chopin/image --format='value(value)' 2>/dev/null || true)"
             if [ "$serving" = "$IMAGE" ] && curl -fsS -o /dev/null "$URL/api/session"; then
@@ -113,5 +113,5 @@ jobs:
             fi
             sleep 5
           done
-          echo "Chopin did not start $IMAGE within 5 minutes; see the logs commands in myfintech/ai infra/chopin/README.md" >&2
+          echo "Chopin did not start $IMAGE within 10 minutes; see the logs commands in myfintech/ai infra/chopin/README.md" >&2
           exit 1
