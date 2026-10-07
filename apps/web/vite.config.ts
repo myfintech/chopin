@@ -4,6 +4,7 @@ import react from "@vitejs/plugin-react";
 import tsconfigPaths from "vite-tsconfig-paths";
 
 import { initialJavaScriptBudget } from "./bundle-budget";
+import { MANTL_INITIAL_JAVASCRIPT_BUDGET } from "./bundle-budget.mantl";
 
 import type { ServerOptions } from "vite";
 
@@ -31,7 +32,12 @@ export function devNetwork(exeHost: string | undefined, port = PORT): DevNetwork
 }
 
 export default defineConfig({
-	plugins: [react(), tailwindcss(), tsconfigPaths(), initialJavaScriptBudget()],
+	plugins: [
+		react(),
+		tailwindcss(),
+		tsconfigPaths(),
+		initialJavaScriptBudget(MANTL_INITIAL_JAVASCRIPT_BUDGET),
+	],
 
 	resolve: {
 		// Only what this app resolves itself. Lexical and Yjs belong to the
