@@ -459,14 +459,14 @@
 .plan-comment-button {
 	position: absolute;
 	display: grid;
-	width: 24px;
-	height: 24px;
+	width: 18px;
+	height: 18px;
 	place-items: center;
-	border-radius: var(--radius-md);
+	border-radius: var(--radius-sm);
 	font-size: var(--text-xs);
 }
 
-:root[data-plan-coarse-pointer] .plan-comment-button {
+:root[data-plan-primary-coarse-pointer] .plan-comment-button {
 	width: 44px;
 	height: 44px;
 }

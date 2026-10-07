@@ -13,7 +13,7 @@ import { CommentSheet, usesCommentSheet } from "./comment-sheet";
 import { useCommentSheetReveal } from "./comment-sheet-reveal";
 import { $rangeOf } from "./marks";
 import { blockElement } from "./scroll";
-import { COARSE_POINTER_QUERY, PRIMARY_COARSE_POINTER_QUERY } from "./pointer";
+import { PRIMARY_COARSE_POINTER_QUERY } from "./pointer";
 import { useThreads } from "./threads";
 import { useTransitionPresence } from "./transition-presence";
 import { widgets$ } from "./widget-options";
@@ -247,7 +247,6 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 	let [preview, setPreview] = useState<string>();
 	let [previewMeasurement, setPreviewMeasurement] = useState<PreviewMeasurement>();
 	let [pinned, setPinned] = useState<string>();
-	let [coarse, setCoarse] = useState(false);
 	let [primaryCoarse, setPrimaryCoarse] = useState(false);
 	let [cardHeights, setCardHeights] = useState<{ [id: string]: number }>({});
 	let root = useRef<HTMLDivElement>(null);
@@ -291,17 +290,13 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 	}, [editor]);
 
 	useEffect(() => {
-		let query = matchMedia(COARSE_POINTER_QUERY);
 		let primary = matchMedia(PRIMARY_COARSE_POINTER_QUERY);
 		let update = () => {
-			setCoarse(query.matches);
 			setPrimaryCoarse(primary.matches);
 		};
 		update();
-		query.addEventListener("change", update);
 		primary.addEventListener("change", update);
 		return () => {
-			query.removeEventListener("change", update);
 			primary.removeEventListener("change", update);
 		};
 	}, []);
@@ -344,7 +339,7 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 		if (!host) return;
 		let page = rect(host.getBoundingClientRect());
 		let measured: MeasuredThread[] = [];
-		let size = coarse ? 44 : 24;
+		let size = primaryCoarse ? 44 : 18;
 
 		for (let view of state.threads) {
 			if (view.thread.status !== "open") continue;
@@ -392,7 +387,7 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 
 	useLayoutEffect(() => {
 		measure();
-	}, [host, state.threads, coarse]);
+	}, [host, state.threads, primaryCoarse]);
 
 	useEffect(() => {
 		if (!host) return;
@@ -406,7 +401,7 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 			host.removeEventListener("scroll", update, true);
 			observer.disconnect();
 		};
-	}, [editor, host, state.threads, coarse]);
+	}, [editor, host, state.threads, primaryCoarse]);
 
 	useEffect(() => () => clearTimeout(close.current), []);
 
@@ -612,7 +607,7 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 			button: previewEntry.button,
 			id: `plan-comment-preview-${previewEntry.view.thread.id}`,
 			page: rect(page),
-			size: coarse ? 44 : 24,
+			size: primaryCoarse ? 44 : 18,
 			view: previewEntry.view,
 			width: previewWidth,
 		}
@@ -661,7 +656,7 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 			{placed.map(({ button, hits, view }) => {
 				let shown = pinned === view.thread.id;
 				let previewId = `plan-comment-preview-${view.thread.id}`;
-				let anchor = markerRect(button, page, coarse ? 44 : 24);
+				let anchor = markerRect(button, page, primaryCoarse ? 44 : 18);
 				let cardPoint = edgePanelPoint(
 					anchor,
 					page,
@@ -703,7 +698,7 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 							style={button}
 							type="button"
 						>
-							<MessageIcon aria-hidden="true" size={14} />
+							<MessageIcon aria-hidden="true" />
 						</button>
 						<CommentSurface
 							compact={false}
