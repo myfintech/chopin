@@ -1,0 +1,114 @@
+# MANTL: deploys main to GCP after CI passes on it. Infrastructure lives in
+# myfintech/ai (infra/chopin); this mirrors its scripts/deploy.sh.
+#
+# Needs two repository variables (not secrets; from `tofu output` there):
+#   GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_DEPLOY_SERVICE_ACCOUNT
+name: deploy
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  # Redeploy or roll back by running this from main with a commit SHA.
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full commit SHA to deploy (default: head of main)
+        required: false
+
+# Chopin allows one writer per database and every deploy restarts it, so
+# deploys queue rather than cancel one another.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT: origination-internal-devex
+  REGION: us-central1
+  ZONE: us-central1-a
+  NAME: chopin
+  URL: https://chopin.mantl.engineering
+
+jobs:
+  deploy:
+    name: build and roll the VM
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    steps:
+      - name: Resolve commit
+        id: ref
+        env:
+          SHA: ${{ inputs.sha || github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "not a full commit SHA: $SHA" >&2; exit 1; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.ref.outputs.sha }}
+
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - run: gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
+
+      - name: Check for an existing image
+        id: image
+        run: |
+          image="$REGION-docker.pkg.dev/$PROJECT/$NAME/chopin:${{ steps.ref.outputs.sha }}"
+          echo "name=$image" >> "$GITHUB_OUTPUT"
+          if gcloud artifacts docker images describe "$image" --project "$PROJECT" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.image.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - if: steps.image.outputs.exists != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.image.outputs.name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Migrations are forward-only: rolling back means restoring this backup
+      # and deploying the old SHA.
+      - name: Back up the database
+        run: |
+          gcloud sql backups create --instance "$NAME-pg" --project "$PROJECT" \
+            --description "pre-deploy ${{ steps.ref.outputs.sha }}"
+
+      # chopin-image-watch on the VM restarts Chopin within ~15s of this changing.
+      - name: Roll the VM
+        run: |
+          gcloud compute instances add-metadata "$NAME" --project "$PROJECT" --zone "$ZONE" \
+            --metadata "chopin-image=${{ steps.image.outputs.name }}"
+
+      # The load balancer's health check URL is public. The VM stops and starts
+      # Chopin, so allow several minutes for migrations and the first probe.
+      - name: Wait for Chopin to serve
+        run: |
+          sleep 30
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null "$URL/api/session"; then
+              echo "Chopin is serving ${{ steps.ref.outputs.sha }}"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Chopin did not become healthy; see the logs commands in myfintech/ai infra/chopin/README.md" >&2
+          exit 1
