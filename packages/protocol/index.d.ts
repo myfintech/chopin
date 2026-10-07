@@ -114,6 +114,7 @@ export type { Comment } from "./comment";
 export type { ConversationPlan } from "./conversation-plan";
 export type { Job } from "./job";
 export type { Plan } from "./plan";
+export type { Provenance } from "./provenance";
 export type { Question } from "./question";
 export type { Research } from "./research";
 
@@ -125,6 +126,7 @@ export type Incoming =
 	| import("./conversation-plan").ConversationPlan.Incoming
 	| import("./job").Job.Incoming
 	| import("./plan").Plan.Incoming
+	| import("./provenance").Provenance.Incoming
 	| import("./question").Question.Incoming;
 
 /** Everything a client may receive. */
@@ -135,5 +137,6 @@ export type Outgoing =
 	| import("./conversation-plan").ConversationPlan.Outgoing
 	| import("./job").Job.Outgoing
 	| import("./plan").Plan.Outgoing
+	| import("./provenance").Provenance.Outgoing
 	| import("./question").Question.Outgoing
 	| import("./research").Research.Outgoing;

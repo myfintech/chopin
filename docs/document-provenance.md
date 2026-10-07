@@ -5,7 +5,7 @@ whether that author was a person, an agent, or the system. It is recorded beside
 the document and never enters the MDX, so exporting a document produces the same
 bytes whether provenance is on or off.
 
-This change only records the data. Nothing in the browser shows it yet.
+The [authorship margin](#authorship-margin) shows it in the document.
 
 ## Enabling
 
@@ -92,6 +92,13 @@ entry points:
 The rule is that an agent edit is never credited to a person. A mistake in the
 other direction labels a person's change as `system`, not `agent`.
 
+### Telling agents apart
+
+Agent actors take an optional `id` and `name`. Today there is one Planner per
+deployment, and coding agents are told apart by their MCP client name, so
+neither is set. A second agent of the same kind must set `id`, or its work is
+attributed to the first. When set, `id` is part of the coalescing key.
+
 ## Coalescing
 
 Typing produces many small commits. A commit joins the actor's latest entry when
@@ -134,4 +141,66 @@ without provenance and a warning is logged. Attribution never blocks an edit.
 ## Reading
 
 `storage.provenance.list(channelId, limit, after?)` returns entries ordered by
-start time, with a `next` cursor. No HTTP or WebSocket route exposes it yet.
+start time, with a `next` cursor.
+
+## Authorship margin
+
+An **Authorship** button in the document header shows who last wrote each
+block. It appears only when provenance is on, and whether it is showing is
+remembered per browser.
+
+- **Who:** the author's face at the start of each run of blocks they wrote,
+  and a bar in their colour beside every block. A person's colour is their
+  cursor colour. The Planner keeps the brand colour, and any other agent takes
+  a colour from its name.
+- **Person or agent:** a person has a square face and a solid bar. An agent
+  has a round face and a dashed bar. Text from before recording, or written by
+  the system, has a faint bar and no face.
+- **Who asked:** an agent is one author whoever asked it. The person who asked
+  the Planner, or whose token a coding agent used, is a small badge on its face
+  and is named in the card.
+- **Several authors:** a dot on top of the bar means more than one author has
+  changed the block.
+- **Card:** hovering or focusing the margin opens a card with the latest
+  change word by word, the block's history, and **Restore**, which puts back
+  the text from before the latest change.
+- **Contributors:** a strip above the document lists each author's share of the
+  current text, plus all agents together. Choosing one dims every other block
+  and offers buttons to step through theirs.
+
+### How it is read
+
+The browser sends `provenance:authorship`. Any repository reader may ask. The
+server reads the whole channel history, then inside the plan queue splits the
+committed document into blocks and follows each block back:
+
+1. The block's author is the newest change whose `after.digest` matches it,
+   preferring the nearest position when two blocks share a digest.
+2. Its history continues through the change whose `after.digest` matches that
+   change's `before.digest`, no later than where that change began.
+3. A move continues the chain but does not change the author.
+
+Each block is sent with an anchor for the current epoch, so the browser places
+the margin the same way it places decision and comment chrome. The browser asks
+again 700 ms after the document settles, while the margin is showing.
+
+### Restore
+
+`provenance:restore` takes a block's index and current digest, and requires
+write access. The server checks the digest, recomputes the block's history, and
+applies the text from before its latest change with the same structural edit the
+Planner uses. That edit is persisted before it is published and recorded as the
+requesting person's change. Restore is refused for dialect components, such as
+decision cards, because their records are the authority, and while
+implementation is active.
+
+Like `edit_plan`, a restore rebases decision and comment anchors after the edit
+rather than before it.
+
+### Limits
+
+- History is read in full on every request. A very long-lived document makes
+  this slower; there is no cache yet.
+- Times are when the change's burst last changed, not the block's own edit.
+- The browser suite does not cover the margin, because its servers run without
+  `DOCUMENT_PROVENANCE`.

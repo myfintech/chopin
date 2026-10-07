@@ -1,3 +1,5 @@
+export { AuthorshipStore, AuthorshipToggle } from "./authorship";
+export type { AuthorshipView } from "./authorship";
 export { SidecarCard } from "./card";
 export type { SidecarCardProps } from "./card";
 export { CardMetaStore, useCardMeta } from "./card-meta";

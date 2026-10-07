@@ -15,15 +15,24 @@ export type Via = (typeof VIAS)[number];
 
 export type Person = { id?: string; handle: string };
 
+/**
+ * Which agent acted, when more than one of a kind can.
+ *
+ * Optional because today there is one Planner per deployment and a coding
+ * agent is told apart by its MCP client. A second agent of the same kind must
+ * set `id`, or its work is attributed to the first.
+ */
+export type AgentIdentity = { id?: string; name?: string };
+
 export type Actor =
 	| { type: "human"; kind: "user"; id: string; handle: string }
-	| { type: "agent"; kind: "planner"; requestedBy?: Person; job?: string }
-	| {
+	| ({ type: "agent"; kind: "planner"; requestedBy?: Person; job?: string } & AgentIdentity)
+	| ({
 		type: "agent";
 		kind: "coding-agent";
 		user: Person;
 		client?: { name: string; version: string };
-	}
+	} & AgentIdentity)
 	| { type: "system"; kind: "server" };
 
 /** One top-level block as it stood at a revision. `source` is its canonical MDX. */
