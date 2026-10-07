@@ -3,6 +3,8 @@ import { documentPath } from "@chopin/protocol/document-url";
 import { ChevronIcon, DocumentIcon } from "@chopin/icons";
 import {
 	advanceDecisionView,
+	AuthorshipStore,
+	AuthorshipToggle,
 	CardMetaStore,
 	countUnanswered,
 	cursor,
@@ -45,6 +47,7 @@ import { initialDocumentView, presentWorkspace, workspaceProfile } from "./works
 
 import type { ConversationPlan, Research, Session } from "@chopin/protocol";
 import type { DecisionView, DecisionViewState } from "@chopin/editor";
+import type { ReactNode } from "react";
 import type { DocumentMetadata } from "./document-actions";
 import type { DocumentAction } from "./document-actions-menu";
 import type { HostedWorkspaceProps } from "./hosted";
@@ -75,6 +78,7 @@ export function Header(
 		label,
 		onAction,
 		presentation,
+		tools,
 	}: {
 		archivedAt?: string;
 		canManage: boolean;
@@ -82,6 +86,8 @@ export function Header(
 		label: string;
 		onAction: (action: DocumentAction) => void;
 		presentation: WorkspacePresentation;
+		/** Document view controls beside the people here. */
+		tools?: ReactNode;
 	},
 ) {
 	let people = peopleHere(members);
@@ -136,6 +142,7 @@ export function Header(
 					</span>
 				)}
 			</div>
+			{tools}
 			<div
 				aria-label={`People here: ${people.join(", ")}`}
 				className="room-members ml-auto flex shrink-0 items-center"
@@ -236,6 +243,7 @@ export function RoomWorkspace(
 	let [questions] = useState(() => new QuestionnaireStore());
 	let [cardMeta] = useState(() => new CardMetaStore());
 	let [threads] = useState(() => new ThreadStore());
+	let [authorship] = useState(() => new AuthorshipStore());
 	let research = useMemo(
 		() =>
 			new ResearchRequestStore({
@@ -766,6 +774,7 @@ export function RoomWorkspace(
 						label={metadata.title}
 						onAction={action => onDocumentAction(room, action)}
 						presentation={presentation}
+						tools={<AuthorshipToggle store={authorship} />}
 					/>
 				}
 				controls={
@@ -813,6 +822,7 @@ export function RoomWorkspace(
 						research={profile.research ? research : undefined}
 						scrollTop={planScrollTop}
 						threads={threads}
+						authorship={authorship}
 						user={user}
 						wire={wire}
 					/>

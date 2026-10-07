@@ -15,6 +15,7 @@ import "./styles.css";
 import "./feedback.css";
 import { plugins as dialectPlugins } from "@chopin/dialect";
 
+import { AuthorshipLayer, authorshipPlugin, AuthorshipStrip } from "./authorship";
 import { ChangeStore } from "./changes";
 import { PlanChanges } from "./changes-chip";
 import { collaborationPlugin } from "./collaboration";
@@ -25,6 +26,7 @@ import { register } from "./widgets";
 import { widgetsPlugin } from "./widgets-plugin";
 
 import type { ReactNode } from "react";
+import type { AuthorshipStore } from "./authorship";
 import type { CardMetaStore } from "./card-meta";
 import type { Binding } from "@lexical/yjs";
 import type { MDXEditorMethods } from "@mdxeditor/editor";
@@ -80,6 +82,8 @@ export type PlanEditorProps = {
 	research?: ResearchStore;
 	/** The same arrangement for comment threads. */
 	threads?: ThreadStore;
+	/** Who wrote each block, when the deployment records provenance. */
+	authorship?: AuthorshipStore;
 	/** Remembered by the document host while this surface is hidden. */
 	scrollTop?: number;
 	/** The document host owns persisted view position, not the editor. */
@@ -98,6 +102,7 @@ export type PlanState = {
 
 export function PlanEditor(
 	{
+		authorship,
 		busy,
 		className,
 		commentPresentation = "popover",
@@ -149,7 +154,8 @@ export function PlanEditor(
 		questions?.bind(value);
 		threads?.bind(value);
 		changes.bind(value);
-	}, [questions, threads, changes]);
+		authorship?.bind(value);
+	}, [questions, threads, changes, authorship]);
 
 	let onAnchors = useCallback(
 		(snapshot: {
@@ -225,6 +231,13 @@ export function PlanEditor(
 	let offline = connection !== undefined && connection !== "connected";
 	let locked = offline || !!busy || !!readOnly || !state.synced;
 
+	useEffect(() => authorship?.connect(wire, state.synced && !offline), [
+		authorship,
+		wire,
+		state.synced,
+		offline,
+	]);
+
 	// Empty without a connection, and never used: the editor is not rendered
 	// at all until there is one, so there is nothing to configure.
 	let plugins = useMemo(
@@ -282,6 +295,7 @@ export function PlanEditor(
 						canEdit: !readOnly,
 						synced: state.synced,
 					}),
+					...(authorship ? [authorshipPlugin({ store: authorship })] : []),
 				]
 				: [],
 		[
@@ -307,6 +321,7 @@ export function PlanEditor(
 			offline,
 			readOnly,
 			state.synced,
+			authorship,
 		],
 	);
 
@@ -333,6 +348,7 @@ export function PlanEditor(
 		<div className={`plan flex h-full w-full flex-col ${className ?? ""}`}>
 			<div className="plan-workspace">
 				<div className="plan-document">
+					{authorship && <AuthorshipStrip store={authorship} />}
 					<div
 						ref={scroller}
 						className="h-full min-h-0 overflow-auto"
@@ -358,6 +374,7 @@ export function PlanEditor(
 							suppressHtmlProcessing
 						/>
 					</div>
+					{authorship && <AuthorshipLayer canEdit={!readOnly && !offline} store={authorship} />}
 					{/* In the document column, so they track the prose, not the pane. */}
 					<PlanChanges motionImmediately={motionImmediately} store={changes} />
 					<PlanStatus

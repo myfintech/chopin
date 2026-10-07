@@ -15,9 +15,11 @@ export function actorKey(actor: Actor): string {
 		case "planner":
 			return `agent:planner:${actor.requestedBy?.id ?? actor.requestedBy?.handle ?? ""}:${
 				actor.job ?? ""
-			}`;
+			}${actor.id ? `:${actor.id}` : ""}`;
 		case "coding-agent":
-			return `agent:coding-agent:${actor.user.id ?? actor.user.handle}:${actor.client?.name ?? ""}`;
+			return `agent:coding-agent:${actor.user.id ?? actor.user.handle}:${actor.client?.name ?? ""}${
+				actor.id ? `:${actor.id}` : ""
+			}`;
 		case "server":
 			return "system";
 	}

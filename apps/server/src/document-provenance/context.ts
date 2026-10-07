@@ -59,6 +59,11 @@ export function browser<A extends unknown[], R>(
 	return (...args) => within(user(ws.data), "browser", () => run(...args));
 }
 
+/** Run a person's own server-applied edit, such as a restore, in their scope. */
+export function person<R>(ws: Socket, run: () => R): R {
+	return within(user(ws.data), "server", run);
+}
+
 /** Run one socket frame, in a lapsing human scope when the frame is a person's decision. */
 export function receive(
 	ws: Socket,

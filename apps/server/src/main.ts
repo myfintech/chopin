@@ -46,6 +46,7 @@ import { registerNavigationRoutes } from "./navigation/routes";
 import { registerPreferenceRoutes } from "./user-preferences/routes";
 import * as Service from "./plan/service";
 import * as DocumentProvenance from "./document-provenance";
+import * as ProvenanceSocket from "./document-provenance/socket";
 import * as Inject from "./questions/inject";
 import * as Marks from "./comments/inject";
 import * as Questions from "./questions/service";
@@ -570,6 +571,12 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 			if (room.plan) await Comments.dismiss(chat(room, ws), ws, frame);
 			return;
 
+		case "provenance:authorship":
+			return ProvenanceSocket.authorship(room, ws, frame);
+
+		case "provenance:restore":
+			return ProvenanceSocket.restore(room, ws, frame);
+
 		case "job:list":
 			try {
 				if (!config.backgroundJobs) throw new Error("background jobs are disabled");
@@ -614,6 +621,7 @@ const VIEWER_ALLOWED = new Set([
 	"job:list",
 	"job:get",
 	"conversation-plan:research-link",
+	"provenance:authorship",
 ]);
 
 async function refreshAccess(ws: Socket, forceGitHub = false): Promise<AuthorizationResult> {

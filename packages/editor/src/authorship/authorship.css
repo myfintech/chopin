@@ -1,0 +1,407 @@
+/*
+ * The authorship margin.
+ *
+ * The lane sits further from the prose than the decision marker, so the two
+ * can both be shown: faces about 60px out, bars about 34px out, and the
+ * decision disc in the 28px nearest the text. The leading gutter grows to
+ * hold the lane only while it is showing.
+ */
+.plan .plan-document[data-authorship] .plan-content {
+	--plan-leading-gutter: max(var(--plan-gutter), 4rem);
+}
+
+/* The strip takes its row above the scroller rather than covering the first line. */
+.plan-document:has(> .authorship-strip) {
+	display: flex;
+	flex-direction: column;
+}
+
+.plan-document:has(> .authorship-strip) > [data-plan-scroll] {
+	flex: 1;
+	height: auto;
+	min-height: 0;
+}
+
+.authorship-layer {
+	pointer-events: none;
+	position: absolute;
+	inset-inline: 0;
+	overflow: hidden;
+	z-index: 2;
+}
+
+.authorship-layer [data-dimmed] {
+	opacity: 0.3;
+}
+
+/* The block a step through one contributor's blocks just landed on. */
+.plan .plan-content [data-authorship-reached] {
+	border-radius: var(--radius-sm);
+	background: color-mix(in oklch, var(--color-brand) 12%, transparent);
+	outline: 0.375rem solid color-mix(in oklch, var(--color-brand) 12%, transparent);
+}
+
+/* The block an open card describes. The outline widens the tint past the text. */
+.plan .plan-content [data-authorship-active] {
+	border-radius: var(--radius-sm);
+	background: color-mix(in oklch, var(--color-brand) 12%, transparent);
+	outline: 0.375rem solid color-mix(in oklch, var(--color-brand) 12%, transparent);
+}
+
+.plan .plan-content [data-authorship-dimmed] {
+	opacity: 0.32;
+	transition: opacity var(--duration-base) var(--ease-out);
+}
+
+.authorship-bar {
+	position: absolute;
+	width: 4px;
+	border-radius: var(--radius-sm);
+	background: currentcolor;
+}
+
+.authorship-bar[data-texture="dashed"] {
+	background: linear-gradient(currentcolor 62.5%, transparent 62.5%);
+	background-size: 100% 8px;
+}
+
+.authorship-bar[data-texture="faint"] {
+	width: 2px;
+	margin-inline-start: 0.5px;
+	background: currentcolor;
+	opacity: 0.45;
+}
+
+.authorship-multi {
+	position: absolute;
+	width: 6px;
+	height: 6px;
+	border-radius: var(--radius-full);
+	background: var(--color-text-quaternary);
+}
+
+.authorship-face {
+	position: absolute;
+	display: block;
+}
+
+.authorship-agent-face {
+	position: relative;
+	display: block;
+	flex-shrink: 0;
+	border-radius: var(--radius-full);
+}
+
+.authorship-system-face {
+	display: block;
+	flex-shrink: 0;
+	border: 1.5px dotted var(--color-text-quaternary);
+	border-radius: var(--radius-full);
+}
+
+.authorship-badge {
+	position: absolute;
+	right: -4px;
+	bottom: -4px;
+	display: block;
+	border-radius: var(--radius-sm);
+	outline: 1.5px solid var(--color-page);
+}
+
+.authorship-lane {
+	pointer-events: auto;
+	position: absolute;
+	padding: 0;
+	border: 0;
+	border-radius: var(--radius-sm);
+	background: transparent;
+	cursor: pointer;
+}
+
+.authorship-lane:hover,
+.authorship-lane[aria-expanded="true"] {
+	background: color-mix(in oklch, var(--color-text-quaternary) 8%, transparent);
+}
+
+.authorship-card {
+	pointer-events: auto;
+	position: absolute;
+	display: flex;
+	flex-direction: column;
+	max-height: 312px;
+	overflow: auto;
+	border: var(--edge-width) solid var(--color-control-edge);
+	border-radius: var(--radius-lg);
+	background: var(--color-page);
+	box-shadow: var(--shadow-overlay);
+	color: var(--color-text-primary);
+	font-size: var(--text-sm);
+	line-height: 1.45;
+}
+
+.authorship-card p {
+	margin: 0;
+}
+
+.authorship-card-head {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	padding: 0.625rem 0.75rem;
+	border-bottom: var(--edge-width) solid var(--color-edge);
+}
+
+.authorship-card-head strong {
+	font-weight: 600;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.authorship-pill {
+	flex-shrink: 0;
+	padding: 0 0.4375rem;
+	border-radius: var(--radius-full);
+	background: var(--color-neutral-surface);
+	color: var(--color-neutral-text);
+	font-size: var(--text-xs);
+	font-weight: 600;
+}
+
+.authorship-pill[data-type="agent"] {
+	background: var(--color-brand-wash);
+	color: var(--color-brand-ink);
+}
+
+.authorship-when {
+	margin-inline-start: auto;
+	flex-shrink: 0;
+	color: var(--color-text-tertiary);
+	font-size: var(--text-xs);
+	white-space: nowrap;
+}
+
+.authorship-card-body {
+	display: flex;
+	flex-direction: column;
+	gap: 0.375rem;
+	padding: 0.625rem 0.75rem;
+}
+
+.authorship-detail {
+	color: var(--color-text-tertiary);
+	font-size: var(--text-xs);
+}
+
+.authorship-words {
+	padding: 0.5rem 0.625rem;
+	border: var(--edge-width) solid var(--color-edge);
+	border-radius: var(--radius-md);
+	background: var(--color-inset);
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+.authorship-words ins {
+	padding-inline: 0.125rem;
+	border-radius: var(--radius-sm);
+	background: var(--color-success-wash);
+	color: var(--color-success-ink);
+	text-decoration: none;
+}
+
+.authorship-words del {
+	padding-inline: 0.125rem;
+	border-radius: var(--radius-sm);
+	background: var(--color-destructive-wash);
+	color: var(--color-destructive-ink);
+}
+
+.authorship-history {
+	padding: 0.5rem 0.75rem 0.625rem;
+	border-top: var(--edge-width) solid var(--color-edge);
+}
+
+.authorship-heading {
+	margin-block-end: 0.375rem !important;
+	color: var(--color-text-tertiary);
+	font-size: var(--text-xs);
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+}
+
+.authorship-history ol {
+	display: flex;
+	flex-direction: column;
+	gap: 0.3125rem;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+.authorship-history li {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	font-size: var(--text-xs);
+}
+
+.authorship-history li > span:not(.authorship-agent-face, .authorship-system-face) {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.authorship-history time {
+	margin-inline-start: auto;
+	flex-shrink: 0;
+	color: var(--color-text-tertiary);
+	font-variant-numeric: tabular-nums;
+}
+
+.authorship-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.375rem;
+	padding: 0.5rem 0.75rem 0.625rem;
+	border-top: var(--edge-width) solid var(--color-edge);
+}
+
+/* Contributors ------------------------------------------------------------ */
+
+.authorship-strip {
+	display: flex;
+	flex-shrink: 0;
+	flex-wrap: nowrap;
+	overflow-x: auto;
+	scrollbar-width: none;
+	align-items: center;
+	gap: 0.375rem;
+	padding: 0.5rem 1rem;
+	border-bottom: var(--edge-width) solid var(--color-edge);
+	background: var(--color-page);
+	font-size: var(--text-xs);
+}
+
+.authorship-strip-label {
+	margin-inline-end: 0.25rem;
+	color: var(--color-text-tertiary);
+	font-weight: 600;
+	letter-spacing: 0.05em;
+	text-transform: uppercase;
+}
+
+.authorship-strip-note {
+	color: var(--color-text-tertiary);
+}
+
+.authorship-chip {
+	display: inline-flex;
+	flex-shrink: 0;
+	align-items: center;
+	gap: 0.375rem;
+	height: 1.75rem;
+	padding-inline: 0.25rem 0.5rem;
+	border: var(--edge-width) solid var(--color-edge);
+	border-radius: var(--radius-md);
+	background: var(--color-page);
+	color: var(--color-text-primary);
+	font: inherit;
+	font-weight: 500;
+	white-space: nowrap;
+}
+
+button.authorship-chip {
+	cursor: pointer;
+}
+
+button.authorship-chip:hover {
+	border-color: var(--color-control-edge);
+}
+
+.authorship-chip[aria-pressed="true"] {
+	border-color: var(--color-brand);
+	background: var(--color-brand-wash);
+}
+
+.authorship-chip[data-dimmed] {
+	opacity: 0.55;
+}
+
+.authorship-chip-static {
+	padding-inline-start: 0.5rem;
+	color: var(--color-text-tertiary);
+}
+
+.authorship-share {
+	color: var(--color-text-tertiary);
+	font-variant-numeric: tabular-nums;
+	font-weight: 400;
+}
+
+.authorship-strip-rule {
+	width: 1px;
+	height: 1.125rem;
+	margin-inline: 0.25rem;
+	background: var(--color-control-edge);
+}
+
+.authorship-agents-mark {
+	width: 18px;
+	height: 18px;
+	border: 1.5px dashed var(--color-text-tertiary);
+	border-radius: var(--radius-full);
+}
+
+.authorship-focus {
+	display: inline-flex;
+	flex-shrink: 0;
+	align-items: center;
+	gap: 0.125rem;
+	margin-inline-start: auto;
+	color: var(--color-text-secondary);
+}
+
+.authorship-focus > span {
+	margin-inline-end: 0.25rem;
+	font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.plan .plan-content [data-authorship-dimmed] {
+		transition: none;
+	}
+}
+
+/* Header toggle ------------------------------------------------------------ */
+
+/* Drawn inside a button the header may grow to a 44px touch target. */
+.authorship-toggle-pill {
+	display: inline-flex;
+	align-items: center;
+	height: 1.5rem;
+	padding-inline: 0.5rem;
+	border: var(--edge-width) solid var(--color-control-edge);
+	border-radius: var(--radius-md);
+	color: var(--color-text-secondary);
+	font-size: var(--text-sm);
+	font-weight: 500;
+	white-space: nowrap;
+	transition:
+		background-color var(--duration-base) var(--ease-out),
+		border-color var(--duration-base) var(--ease-out),
+		color var(--duration-base) var(--ease-out);
+}
+
+button:hover > .authorship-toggle-pill {
+	background: var(--color-hover);
+}
+
+button[aria-pressed="true"] > .authorship-toggle-pill {
+	border-color: var(--color-brand);
+	background: var(--color-brand-wash);
+	color: var(--color-brand-ink);
+}

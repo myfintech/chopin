@@ -25,7 +25,7 @@ function iconButton(target: EventTarget | null): HTMLElement | null {
 	if (
 		!button || button.disabled || button.closest("[inert]")
 		|| button.matches(
-			".sr-only, .navigation-drawer-backdrop, .navigation-modal-backdrop, .plan-comment-button, .plan-decision-marker",
+			".sr-only, .navigation-drawer-backdrop, .navigation-modal-backdrop, .plan-comment-button, .plan-decision-marker, .authorship-lane",
 		)
 	) {
 		return null;

@@ -1,0 +1,30 @@
+[
+	{
+		"file": "packages/editor/src/authorship/layer.tsx",
+		"reason": "An authorship bar takes its author's identity colour: a person's cursor colour from their handle, or the brand colour for the Planner. Identity, not a semantic interface colour, as for presence faces.",
+		"cases": [
+			[
+				"color",
+				"color",
+				"mark.color",
+				"style object > AuthorshipLayer > <span>",
+				1
+			]
+		],
+		"sourceHash": "bdbab9e8f41175657c78d58809d8152708f8b489140c23421e76cf704a6006e7"
+	},
+	{
+		"file": "packages/editor/src/authorship/faces.tsx",
+		"reason": "An agent's face takes its identity colour so agents other than the Planner can be told apart, matching the per-handle colour of a person's face.",
+		"cases": [
+			[
+				"color",
+				"background",
+				"authorColor(author)",
+				"style object > AuthorFace > <span>",
+				1
+			]
+		],
+		"sourceHash": "79adc0ad87cee78d9c56c7e1b96b3f4bb4ec87773c554268dc4ee948d5043385"
+	}
+]
