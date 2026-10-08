@@ -161,6 +161,9 @@ remembered per browser.
   and is named in the card.
 - **Several authors:** a dot on top of the bar means more than one author has
   changed the block.
+- **Wide blocks:** a diagram or image that extends past the prose into the
+  gutter keeps its width. Its face and bar move out to the block's own edge,
+  so the margin never covers the block.
 - **Card:** hovering or focusing the margin opens a card with the latest
   change word by word, the block's history, and **Restore**, which puts back
   the text from before the latest change.

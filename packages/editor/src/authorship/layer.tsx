@@ -44,10 +44,13 @@ const HOVER_MS = 120;
 const DIMMED = "data-authorship-dimmed";
 const ACTIVE = "data-authorship-active";
 
-type Placed = { mark: Mark; top: number; height: number; element: HTMLElement };
+/**
+ * `start` is the edge the margin is drawn left of: the prose's, or a wide block's
+ * own when it extends past the prose into the gutter, so the margin never covers it.
+ */
+type Placed = { mark: Mark; top: number; height: number; start: number; element: HTMLElement };
 type Frame = {
-	/** Left and right edges of the prose column, relative to the scroller. */
-	prose: number;
+	/** Right edge of the prose column, relative to the scroller. */
 	proseEnd: number;
 	width: number;
 	height: number;
@@ -55,7 +58,7 @@ type Frame = {
 	placed: Placed[];
 };
 
-const EMPTY: Frame = { prose: 0, proseEnd: 0, width: 0, height: 0, top: 0, placed: [] };
+const EMPTY: Frame = { proseEnd: 0, width: 0, height: 0, top: 0, placed: [] };
 
 function useView(store: AuthorshipStore): AuthorshipView {
 	return useSyncExternalStore(store.subscribe, store.snapshot);
@@ -150,7 +153,14 @@ export function AuthorshipLayer({ store, canEdit }: { store: AuthorshipStore; ca
 			if (!element) continue;
 			let rect = element.getBoundingClientRect();
 			if (rect.height === 0) continue;
-			placed.push({ mark, element, top: rect.top - bounds.top, height: rect.height });
+			placed.push({
+				mark,
+				element,
+				top: rect.top - bounds.top,
+				height: rect.height,
+				// Never so far out that the face is clipped; a scrollbar can take the gutter's last pixels.
+				start: Math.min(prose, Math.max(FACE, rect.left - bounds.left)),
+			});
 			if (mark.dimmed) {
 				element.setAttribute(DIMMED, "");
 				next.add(element);
@@ -159,7 +169,6 @@ export function AuthorshipLayer({ store, canEdit }: { store: AuthorshipStore; ca
 		for (let element of painted.current) if (!next.has(element)) element.removeAttribute(DIMMED);
 		painted.current = next;
 		setFrame({
-			prose,
 			proseEnd,
 			width: scroller.clientWidth,
 			height: scroller.clientHeight,
@@ -271,7 +280,7 @@ export function AuthorshipLayer({ store, canEdit }: { store: AuthorshipStore; ca
 			className="authorship-layer"
 			style={{ top: frame.top, height: frame.height }}
 		>
-			{visible.map(({ mark, top, height }) => {
+			{visible.map(({ mark, top, height, start }) => {
 				let { block } = mark;
 				let digest = block.anchor.digest;
 				let expanded = open?.digest === digest;
@@ -285,7 +294,7 @@ export function AuthorshipLayer({ store, canEdit }: { store: AuthorshipStore; ca
 							className="authorship-bar"
 							data-texture={mark.texture}
 							style={{
-								left: frame.prose - BAR,
+								left: start - BAR,
 								top: top + 3,
 								height: Math.max(6, height - 6),
 								color: mark.color,
@@ -295,7 +304,7 @@ export function AuthorshipLayer({ store, canEdit }: { store: AuthorshipStore; ca
 							<span
 								aria-hidden="true"
 								className="authorship-multi"
-								style={{ left: frame.prose - BAR - 10, top: top + 9 }}
+								style={{ left: start - BAR - 10, top: top + 9 }}
 							/>
 						)}
 						{mark.face && (
@@ -303,7 +312,7 @@ export function AuthorshipLayer({ store, canEdit }: { store: AuthorshipStore; ca
 								aria-hidden="true"
 								className="authorship-face"
 								style={{
-									left: frame.prose - FACE,
+									left: start - FACE,
 									top: top + Math.max(0, Math.min(height, 26) / 2 - 10),
 								}}
 							>
@@ -323,7 +332,7 @@ export function AuthorshipLayer({ store, canEdit }: { store: AuthorshipStore; ca
 								hover.current = setTimeout(() => show(digest), HOVER_MS);
 							}}
 							onPointerLeave={hide}
-							style={{ left: Math.max(0, frame.prose - LANE), top, height, width: LANE_WIDTH }}
+							style={{ left: Math.max(0, start - LANE), top, height, width: LANE_WIDTH }}
 							type="button"
 						/>
 					</div>
