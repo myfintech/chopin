@@ -160,7 +160,7 @@ test("Save requires a choice while an existing custom draft remains readable", a
 test("Related preserves separate heading and counted name and forwards parent-section events", async ({ page }) => {
 	let errors = await load(page, "linked");
 	let related = page.getByRole("button", {
-		name: "What auth system should we use? — show in plan, 2 places",
+		name: "What auth system should we use? — show in document, 2 places",
 		exact: true,
 	});
 	await expect(related).toBeVisible();
@@ -193,7 +193,7 @@ test("Related preserves separate heading and counted name and forwards parent-se
 
 test("an unlinked prompt remains inert prose with no advertised Related destination", async ({ page }) => {
 	let errors = await load(page, "unlinked");
-	await expect(page.getByRole("button", { name: /show in plan/ })).toHaveCount(0);
+	await expect(page.getByRole("button", { name: /show in document/ })).toHaveCount(0);
 	let prompt = page.getByRole("heading", { name: "What auth system should we use?", exact: true });
 	expect(
 		await prompt.evaluate(element => ({
@@ -266,9 +266,9 @@ for (let surface of ["chat", "sidebar"] as const) {
 		await expect(card.getByRole("radio", { name: "GitHub Apps from chat", exact: true }))
 			.toBeChecked();
 		await expect(card.getByRole("button", { name: "Save", exact: true })).toHaveCount(0);
-		await expect(card.getByRole("button", { name: "Add an option", exact: true })).toBeDisabled();
+		await expect(card.getByRole("button", { name: "Add an option", exact: true })).toHaveCount(0);
 		if (surface === "chat") {
-			await expect(page.getByRole("button", { name: "Save decision", exact: true })).toBeDisabled();
+			await expect(page.getByRole("button", { name: "Save decision", exact: true })).toHaveCount(0);
 			await expect(page.getByText("Suggested: GitHub Apps", { exact: true })).toBeVisible();
 		} else {
 			let sidebar = page.getByRole("region", { name: "Decisions", exact: true });

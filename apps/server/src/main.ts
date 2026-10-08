@@ -237,8 +237,8 @@ async function plan(room: Rooms.Room, server: Server<SocketData>): Promise<Servi
 		);
 		if (!channel?.archivedAt) {
 			if (summaryCoordinator) void summaryCoordinator.ensure(room.id).catch(() => {});
-			if (Inject.enabled()) Inject.ask(opened, server, room.id);
-			if (Marks.enabled()) await Marks.mark(opened);
+			if (Inject.enabled(opened)) Inject.ask(opened, server, room.id);
+			if (Marks.enabled(opened)) await Marks.mark(opened);
 		}
 		return opened;
 	});
@@ -1491,7 +1491,7 @@ try {
 		LEASE_TTL_MS,
 	);
 	if (!heldLease) throw new Error("another Chopin instance owns the database");
-	let reset = await storage.sessions.deleteAll(new Date(), heldLease, LEASE_TTL_MS);
+	let reset = await storage.sessions.reset(new Date(), heldLease, LEASE_TTL_MS);
 	heldLease = reset.lease;
 } catch (err) {
 	await shutdownHarnesses();

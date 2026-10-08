@@ -50,6 +50,14 @@ const PLAIN = "text";
  */
 const THEME = { dark: "pierre-dark", light: "pierre-light" } as const;
 
+/**
+ * Keeps the first file's change counts clear of the block's own controls,
+ * which float over the top-end corner of the box this header sits in.
+ */
+function chromeRoom() {
+	return <span aria-hidden="true" className="plan-diff-chrome-room" />;
+}
+
 let loading: Promise<Renderer> | undefined;
 
 function load(): Promise<Renderer> {
@@ -247,6 +255,7 @@ function View({ kind, source, language, meta }: CodeViewProps) {
 						key={index}
 						fileDiff={fileDiff}
 						options={diffOptions}
+						renderHeaderMetadata={index === 0 ? chromeRoom : undefined}
 					/>
 				))
 				: <File file={file} options={options} />}

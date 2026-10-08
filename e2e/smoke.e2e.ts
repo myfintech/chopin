@@ -414,9 +414,11 @@ test("chat keeps both ends of a tall transcript clear across layouts", async ({ 
 	expect(position.messageBottom).toBeLessThanOrEqual(position.scrollerBottom);
 });
 
-test("chat disables Send when its socket disconnects", async ({ join, page }) => {
+test("chat disables Send once a lost socket outlasts a blip", async ({ join, page }) => {
 	let sockets: WebSocketRoute[] = [];
+	let offline = false;
 	await page.routeWebSocket("**/ws?**", route => {
+		if (offline) return route.close();
 		route.connectToServer();
 		sockets.push(route);
 	});
@@ -427,8 +429,13 @@ test("chat disables Send when its socket disconnects", async ({ join, page }) =>
 	await draft.fill("A draft left during reconnect.");
 	await expect(send).toBeEnabled();
 
+	offline = true;
 	await sockets.at(-1)!.close();
+	// Inside the grace period nothing changes; after it, Send waits and the
+	// draft stays.
+	await expect(send).toBeEnabled();
 	await expect(send).toBeDisabled();
+	await expectChatValue(draft, "A draft left during reconnect.");
 });
 
 test("chat routes one Send action by @chopin without blocking room messages or its queue", async ({ join, page }) => {
@@ -884,7 +891,9 @@ test(
 		await expect(chat.getByText("Edit plan", { exact: true })).toHaveCount(0);
 		await expect(chat.getByRole("button", { name: "Stop Chopin" })).toHaveCount(0);
 
-		let mine = chat.locator("[data-chat-entry]").filter({ hasText: "Ask Chopin" });
+		let mine = chat.locator("[data-chat-entry]").filter({
+			has: page.getByText("Ana", { exact: true }),
+		});
 		let theirs = chat.locator("[data-chat-entry]").filter({
 			hasText: "Check the rollback path too.",
 		});
@@ -1073,7 +1082,7 @@ test(
 test("an empty room settles rather than loading forever", async ({ join }) => {
 	let page = await join("ana");
 
-	await expect(page.locator('[aria-live="polite"][data-level]')).toHaveAttribute(
+	await expect(page.locator(".plan-status")).toHaveAttribute(
 		"data-level",
 		"hidden",
 	);

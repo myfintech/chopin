@@ -18,6 +18,8 @@ export type ReferenceTarget = {
 	channelId: string;
 	title: string;
 	slug?: string;
+	child?: boolean;
+	parentTitle?: string;
 	description?: string;
 };
 
@@ -319,6 +321,23 @@ export function chatSendPayload(
 		to: plannerEnabled && addressedOutsideReferences(value, requests) ? "planner" : "room",
 		...(requests.length > 0 ? { references: requests } : {}),
 	};
+}
+
+export const PLANNER_UNAVAILABLE_NOTICE =
+	"Chopin is off on this server. Your message went to the room only.";
+
+/** Whether a payload names the Planner, even though it was routed to the room. */
+export function addressesPlanner(payload: ChatSendPayload): boolean {
+	return addressedOutsideReferences(payload.text, payload.references ?? []);
+}
+
+/** Put each local notice directly under the message it answers; unknown messages are skipped. */
+export function withNoticesAfter(
+	entries: Chat.Entry[],
+	notices: Readonly<Record<string, Chat.Entry>>,
+): Chat.Entry[] {
+	if (Object.keys(notices).length === 0) return entries;
+	return entries.flatMap(entry => notices[entry.id] ? [entry, notices[entry.id]!] : [entry]);
 }
 
 /**

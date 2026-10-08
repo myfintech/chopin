@@ -5,6 +5,8 @@ export type { SidecarCardProps } from "./card";
 export { CardMetaStore, useCardMeta } from "./card-meta";
 export { collaborationPlugin } from "./collaboration";
 export type { CollaborationOptions } from "./collaboration";
+export { CONNECTION_GRACE, CONNECTION_STALL, useConnectionNotice } from "./connection-notice";
+export type { ConnectionNotice } from "./connection-notice";
 export { ContentSwapLayer } from "./content-swap";
 export type { ContentSwapLayerProps, ContentSwapMotion } from "./content-swap";
 export { Count } from "./count";
@@ -30,9 +32,11 @@ export type { MotionDisclosureContract } from "./disclosure-motion";
 export { displayName } from "./display-name";
 export { AgentFace, Face } from "./face";
 export type { FaceProps } from "./face";
+export type { Refusal } from "./history";
 export { PlanEditor } from "./plan-editor";
 export type { PlanEditorProps, PlanState } from "./plan-editor";
 export { usePointerCapabilities } from "./pointer";
+export { usePopoverDismissal } from "./popover-dismissal";
 export { PlanProvider } from "./provider";
 export type { PlanProviderOptions } from "./provider";
 export {
@@ -42,11 +46,19 @@ export {
 	useQuestionnaires,
 } from "./questionnaires";
 export type { PlanQuestionnaireState, QuestionnaireEntry } from "./questionnaires";
+export { MAX_RESEARCH_BRIEF, ResearchLauncher } from "./research-launcher";
+export type { ResearchLaunchBlock, ResearchLaunchResult } from "./research-launcher";
 export { SendAction } from "./send-action";
 export { PlanStatus } from "./status";
 export type { PlanStatusProps } from "./status";
 export { ThreadObserver, ThreadStore, useThreads } from "./threads";
 export type { Draft, ThreadState, ThreadView } from "./threads";
+export {
+	MENU_SURFACE,
+	ROW as MENU_ROW,
+	ROW_OFF as MENU_ROW_OFF,
+	ROW_ON as MENU_ROW_ON,
+} from "./toolbar/surface";
 export { presenceClass, transitionPresence, useTransitionPresence } from "./transition-presence";
 export type { PresenceAction, PresencePhase, TransitionPresence } from "./transition-presence";
 export type { Connection, Transport, Unsubscribe } from "./transport";
@@ -59,6 +71,7 @@ export type {
 export {
 	QuestionnaireCard,
 	register as registerPlanWidgets,
+	ResearchBrief,
 	ResearchCard,
 	ResearchComposer,
 	ResearchReference,

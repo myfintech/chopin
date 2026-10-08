@@ -61,7 +61,7 @@ export type CompareNavigationResult = {
 	updated: boolean;
 };
 
-/** Process-lifetime registry row used only by durable agent ownership. */
+/** Public session metadata, also referenced by durable agent ownership. */
 export type WebSession = {
 	id: string;
 	userId: string;
@@ -69,7 +69,15 @@ export type WebSession = {
 	createdAt: Date;
 };
 
-export type CreateWebSession = WebSession;
+/** Opaque authenticated ciphertext; storage never receives plaintext GitHub credentials. */
+export type SessionCredentials = {
+	secretHash: Uint8Array;
+	ciphertext: Uint8Array;
+	revision: number;
+};
+
+export type StoredWebSession = WebSession & { credentials?: SessionCredentials };
+export type CreateWebSession = StoredWebSession;
 
 export type ChannelDescription = {
 	value: string;

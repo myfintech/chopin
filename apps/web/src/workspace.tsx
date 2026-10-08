@@ -1,13 +1,16 @@
 /** Three panes on one ground, with the document as the only raised surface. */
 
 import { useEffect, useId, useLayoutEffect, useReducer, useRef, useState } from "react";
+import { Count } from "@chopin/editor/count";
 import { ContentSwapLayer } from "@chopin/editor/content-swap";
 import { useTransitionPresence } from "@chopin/editor/transition-presence";
 import { CloseIcon } from "@chopin/icons";
 
 import {
+	CHAT_CHOICE_STORAGE_KEY,
 	initialWorkspaceState,
 	presentWorkspace,
+	storedDesktopChat,
 	transitionWorkspace,
 	workspaceDestinations,
 	workspaceHeadingId,
@@ -20,8 +23,13 @@ import { workspaceSizing } from "./workspace-sizing";
 import "./workspace-sizing.css";
 import { motionContract } from "./motion-contract";
 import { motionImmediately } from "./motion-input";
+import { sidebarMoving, usePaneMotion, usePaneSettledWidth } from "./pane-motion";
+import { listenForShortcuts } from "./global-shortcuts";
+import { currentShortcutPlatform, shortcutLabel } from "./shortcuts";
+import { DocumentActivityDot, documentActivityLabel } from "./document-activity";
 
-import type { Dispatch, ReactNode, RefObject } from "react";
+import type { CSSProperties, Dispatch, ReactNode, RefObject } from "react";
+import type { DocumentActivity } from "./document-activity";
 import type {
 	WorkspaceDestination,
 	WorkspaceEvent,
@@ -63,11 +71,19 @@ export function useWorkspaceLayout() {
 	useLayoutEffect(() => {
 		let element = frame.current;
 		if (!element) return;
-		let measure = () => setAvailable(element.clientWidth);
+		let measure = () => {
+			if (!sidebarMoving()) setAvailable(element.clientWidth);
+		};
 		measure();
 		let observer = new ResizeObserver(measure);
 		observer.observe(element);
-		return () => observer.disconnect();
+		document.addEventListener("transitionend", measure);
+		document.addEventListener("transitioncancel", measure);
+		return () => {
+			observer.disconnect();
+			document.removeEventListener("transitionend", measure);
+			document.removeEventListener("transitioncancel", measure);
+		};
 	}, []);
 	return { available, frame, mode: workspaceSizing(available, 500).mode };
 }
@@ -79,17 +95,17 @@ export function useWorkspaceState(
 	let [state, dispatch] = useReducer(
 		transitionWorkspace,
 		undefined,
+		// A child opens with its parent's saved Chat preference but never saves its own.
 		() =>
 			initialWorkspaceState(
-				profile,
-				localStorage.getItem("chopin:pane:chat:open") !== "false",
+				storedDesktopChat(localStorage.getItem(CHAT_CHOICE_STORAGE_KEY)),
 			),
 	);
 
 	useEffect(() => {
-		if (!profile.persistChat) return;
+		if (!profile.persistChat || state.desktopChatOpen === undefined) return;
 		localStorage.setItem(
-			"chopin:pane:chat:open",
+			CHAT_CHOICE_STORAGE_KEY,
 			String(state.desktopChatOpen),
 		);
 	}, [profile.persistChat, state.desktopChatOpen]);
@@ -105,6 +121,8 @@ export type WorkspaceProps = {
 	plan: ReactNode;
 	decisions: ReactNode;
 	controls: ReactNode;
+	/** Connection and document status, right-aligned in the document header. */
+	status?: ReactNode;
 	ids: WorkspaceIds;
 	mode: WorkspaceMode;
 	state: WorkspaceState;
@@ -114,6 +132,7 @@ export type WorkspaceProps = {
 	onDestination: (destination: "plan" | "decisions") => void;
 	unanswered: number;
 	chatActivity: { unread: number; busy: boolean };
+	documentActivity?: DocumentActivity;
 	identity?: string;
 	presentation: WorkspacePresentation;
 };
@@ -148,9 +167,10 @@ export function ChatToggle(
 			aria-controls={controls}
 			aria-description={open ? status : undefined}
 			aria-expanded={open}
-			aria-label={open ? "Close sidebar" : `Show chat pane${status ? `, ${status}` : ""}`}
+			aria-label={open ? "Hide chat" : `Show chat${status ? `, ${status}` : ""}`}
 			className={`chat-toggle btn btn-icon btn-ghost relative shrink-0 ${className ?? ""}`}
-			data-tooltip={open ? "Close sidebar" : "Show chat"}
+			data-tooltip={open ? "Hide chat" : "Show chat"}
+			data-tooltip-shortcut={shortcutLabel("toggle-chat", currentShortcutPlatform())}
 			data-tooltip-verbatim={open ? "" : undefined}
 			data-activity={activity.busy ? "busy" : activity.unread > 0 ? "unread" : undefined}
 			onClick={onToggle}
@@ -201,7 +221,9 @@ function destinationLabel(
 	destination: WorkspaceDestination,
 	unanswered: number,
 	activity: WorkspaceProps["chatActivity"],
+	document: DocumentActivity,
 ): string {
+	if (destination === "plan") return documentActivityLabel(document);
 	if (destination === "decisions" && unanswered > 0) {
 		return `Decisions, ${unanswered} unanswered`;
 	}
@@ -226,6 +248,7 @@ export function Workspace(
 		ids,
 		chatActivity,
 		decisions,
+		documentActivity,
 		header,
 		identity,
 		mode,
@@ -235,6 +258,7 @@ export function Workspace(
 		plan,
 		presentation: workspacePresentation,
 		state,
+		status,
 		unanswered,
 		view,
 	}: WorkspaceProps,
@@ -263,6 +287,26 @@ export function Workspace(
 		220,
 		immediately,
 	);
+	let chatTrack = usePaneMotion(chatPresence.phase);
+	let documentSwap = useRef<HTMLDivElement>(null);
+	usePaneSettledWidth(documentSwap);
+	// The outgoing document stays under Chat until Chat has faded in over it.
+	let documentPresence = useTransitionPresence(
+		presentation.documentVisible ? true : undefined,
+		contentSwapMotion.closeDuration,
+		immediately,
+	);
+	let destination: WorkspaceDestination = mode !== "split" && presentation.chatVisible
+		? "chat"
+		: view;
+	let [travel, setTravel] = useState({ destination, back: false });
+	if (travel.destination !== destination) {
+		let order = workspaceDestinations();
+		setTravel({
+			back: order.indexOf(destination) < order.indexOf(travel.destination),
+			destination,
+		});
+	}
 	let opener = useRef<HTMLElement | undefined>(undefined);
 	let edgeTab = useRef<HTMLButtonElement>(null);
 	let previousChatOpen = useRef(state.chatOpen);
@@ -283,6 +327,15 @@ export function Workspace(
 		}
 		previousChatOpen.current = state.chatOpen;
 	}, [mode, state.chatOpen]);
+
+	let previousMode = useRef(mode);
+	useLayoutEffect(() => {
+		if (previousMode.current === mode) return;
+		previousMode.current = mode;
+		if (document.activeElement?.closest("[hidden], [inert]")) {
+			focusDestination(presentation.documentVisible ? view : "chat");
+		}
+	}, [mode]);
 
 	let navigate = (destination: WorkspaceDestination, source?: HTMLElement) => {
 		if (destination === "chat" && source) opener.current = source;
@@ -310,12 +363,31 @@ export function Workspace(
 		});
 	};
 
+	let toggleChat = useRef(() => {});
+	toggleChat.current = () => {
+		if (!presentation.chatVisible) {
+			if (mode === "split") showDesktopChat();
+			else navigate("chat");
+			return;
+		}
+		let pane = root.current?.querySelector(`#${CSS.escape(ids.pane.chat)}`);
+		// Keep focus where it was unless closing the pane would strand it.
+		if (mode !== "split" || pane?.contains(document.activeElement)) dismissChat();
+		else onDesktopChatOpen(false);
+	};
+	let chatShortcutEnabled = !!chat && !paperObscured;
+	useEffect(() => {
+		if (!chatShortcutEnabled) return;
+		return listenForShortcuts(() => ({ "toggle-chat": () => toggleChat.current() }));
+	}, [chatShortcutEnabled]);
+
 	return (
 		<div
 			className="workspace-root flex h-full flex-col overflow-hidden bg-ground"
 			data-workspace-mode={mode}
 			data-workspace-room={identity}
 			data-workspace-surface={profile.surface}
+			data-workspace-travel={travel.back ? "back" : undefined}
 			ref={root}
 		>
 			{header}
@@ -333,6 +405,7 @@ export function Workspace(
 							destination,
 							unanswered,
 							chatActivity,
+							active ? undefined : documentActivity,
 						);
 						return (
 							<button
@@ -349,25 +422,20 @@ export function Workspace(
 									: destination === "decisions"
 									? "Decisions"
 									: "Document"}
+								{destination === "plan" && !active && (
+									<DocumentActivityDot activity={documentActivity} />
+								)}
 								{destination === "decisions" && unanswered > 0 && (
-									<span
-										aria-hidden="true"
-										className={`${motionContract("feedback").className} ml-1`}
-										data-motion-feedback="count"
-									>
-										{unanswered}
+									<span aria-hidden="true" className="ml-1" data-plan-decision-count>
+										<Count motion>{unanswered}</Count>
 									</span>
 								)}
 								{destination === "chat" && chatActivity.busy && (
 									<span aria-hidden="true" className="workspace-working-indicator ml-1 shrink-0" />
 								)}
 								{destination === "chat" && chatActivity.unread > 0 && (
-									<span
-										aria-hidden="true"
-										className={`${motionContract("feedback").className} ml-1`}
-										data-motion-feedback="count"
-									>
-										{chatActivity.unread}
+									<span aria-hidden="true" className="ml-1">
+										<Count motion>{chatActivity.unread}</Count>
 									</span>
 								)}
 							</button>
@@ -395,6 +463,7 @@ export function Workspace(
 						className={`workspace-chat-panel motion-panel ${chatPresence.className} relative flex min-w-0 flex-col overflow-hidden bg-chat-pane ${
 							mode === "split" ? "hairline-l hairline-r hairline-b" : ""
 						}`}
+						data-pane-moving={chatTrack.moving || undefined}
 						hidden={chatPresence.phase === "closed"}
 						id={ids.pane.chat}
 						inert={chatInactive}
@@ -405,8 +474,9 @@ export function Workspace(
 								dismissChat();
 							}
 						}}
+						onTransitionEnd={chatTrack.onTransitionEnd}
 						style={mode === "split"
-							? { width: chatWidth }
+							? { "--chat-width": `${chatWidth}px` } as CSSProperties
 							: { width: "100%" }}
 					>
 						{mode === "split"
@@ -467,7 +537,7 @@ export function Workspace(
 					className={`workspace-document-panel order-1 relative min-w-0 w-full flex-1 ${
 						mode === "split" ? "hairline-l hairline-b" : ""
 					}`}
-					hidden={!presentation.documentVisible}
+					hidden={documentPresence.phase === "closed"}
 					inert={!presentation.documentVisible}
 				>
 					<div className="relative flex h-full flex-col overflow-hidden">
@@ -498,6 +568,9 @@ export function Workspace(
 									/>
 								)}
 								{controls}
+								<div className="ml-auto flex shrink-0 items-center gap-2 pl-2">
+									{status}
+								</div>
 								{childPresentation && (
 									<div className="ml-auto flex shrink-0 items-center">
 										<button
@@ -514,9 +587,11 @@ export function Workspace(
 								)}
 							</div>
 						)}
+						{mode !== "split" && status && <div className="workspace-status-row">{status}</div>}
 						<div
 							className="workspace-document-swap content-swap-stack relative min-h-0 flex-1"
 							data-workspace-document-swap
+							ref={documentSwap}
 						>
 							<ContentSwapLayer
 								active={presentation.documentVisible && presentation.documentView === "plan"}

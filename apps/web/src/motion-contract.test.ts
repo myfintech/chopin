@@ -17,13 +17,18 @@ describe("motion contracts", () => {
 		});
 		expect(motionContract("collapse")).toEqual({
 			className: "motion-collapse",
-			closeDuration: 250,
+			closeDuration: 200,
 			contentClassName: "motion-collapse-content",
 			states: MOTION_STATES,
 		});
 		expect(motionContract("content-swap")).toEqual({
 			className: "motion-content-swap",
 			closeDuration: 250,
+			states: MOTION_STATES,
+		});
+		expect(motionContract("route-swap")).toEqual({
+			className: "motion-route-swap",
+			closeDuration: 30,
 			states: MOTION_STATES,
 		});
 		expect(motionContract("feedback")).toEqual({

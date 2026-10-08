@@ -1,10 +1,12 @@
 import { Cell } from "@mdxeditor/gurx";
 
+import type { ResearchLauncher } from "./research-launcher";
 import type { ReactNode } from "react";
 import type { CardMetaStore } from "./card-meta";
 import type { Binding } from "@lexical/yjs";
 import type { ChangeStore } from "./changes";
 import type { ContentSwapMotion } from "./content-swap";
+import type { MotionDisclosureContract } from "./disclosure-motion";
 import type { Research } from "@chopin/protocol";
 import type { ResearchDraftStore } from "./research-draft";
 import type { QuestionnaireStore } from "./questionnaires";
@@ -38,19 +40,27 @@ export type WidgetOptions = {
 	binding?: Binding;
 	commentPresentation?: CommentPresentation;
 	motionImmediately?: () => boolean;
+	disclosureMotion?: MotionDisclosureContract;
 	questionMotion?: QuestionStepMotion;
 	questions?: QuestionnaireStore;
 	cardMeta?: CardMetaStore;
 	onCardSource?: (questionnaireId: string) => void;
+	/** Whether a card has a Chat message to go back to. */
+	hasCardSource?: (questionnaireId: string) => boolean;
+	/** False when no Planner will review where decisions live. */
+	planner?: boolean;
 	evidence?: (questionnaireId: string) => ReactNode | null;
 	research?: ResearchStore;
 	researchDrafts?: ResearchDraftStore;
+	researchLauncher?: ResearchLauncher;
 	threads?: ThreadStore;
 	changes?: ChangeStore;
 	wire?: Transport;
 	connected?: boolean;
 	synced?: boolean;
 	canEdit?: boolean;
+	/** The viewer's own handle. */
+	self?: string;
 };
 
 export const widgets$ = Cell<WidgetOptions>({});

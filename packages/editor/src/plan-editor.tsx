@@ -11,6 +11,7 @@ import { markdownShortcutPlugin, MDXEditor } from "@mdxeditor/editor";
 
 // Structural editor CSS, then our retheme over the top.
 import "@mdxeditor/editor/style.css";
+import "@chopin/diagrams/styles.css";
 import "./styles.css";
 import "./feedback.css";
 import { plugins as dialectPlugins } from "@chopin/dialect";
@@ -19,7 +20,7 @@ import { AuthorshipLayer, authorshipPlugin, AuthorshipStrip } from "./authorship
 import { ChangeStore } from "./changes";
 import { PlanChanges } from "./changes-chip";
 import { collaborationPlugin } from "./collaboration";
-import { PlanStatus } from "./status";
+import { useConnectionNotice } from "./connection-notice";
 import { PLAN_LEXICAL_THEME } from "./plan-theme";
 import { ResearchDraftStore } from "./research-draft";
 import { register } from "./widgets";
@@ -28,6 +29,7 @@ import { widgetsPlugin } from "./widgets-plugin";
 import type { ReactNode } from "react";
 import type { AuthorshipStore } from "./authorship";
 import type { CardMetaStore } from "./card-meta";
+import type { MotionDisclosureContract } from "./disclosure-motion";
 import type { Binding } from "@lexical/yjs";
 import type { MDXEditorMethods } from "@mdxeditor/editor";
 import type { Plan } from "@chopin/protocol";
@@ -36,6 +38,8 @@ import type { QuestionnaireStore } from "./questionnaires";
 import type { ThreadStore } from "./threads";
 import type { Connection, Transport } from "./transport";
 import type { CommentPresentation, QuestionStepMotion, ResearchStore } from "./widget-options";
+import type { Refusal } from "./history";
+import type { ResearchLauncher } from "./research-launcher";
 
 /**
  * Lexical paints remote cursors with inline styles unless the theme names a
@@ -65,6 +69,7 @@ export type PlanEditorProps = {
 	commentPresentation?: CommentPresentation;
 	/** App-owned input policy for interactions that should settle without motion. */
 	motionImmediately?: () => boolean;
+	disclosureMotion?: MotionDisclosureContract;
 	/** Host presentation for moving between bounded questionnaire steps. */
 	questionMotion?: QuestionStepMotion;
 	/** Identity for this client's remote cursor. */
@@ -83,9 +88,15 @@ export type PlanEditorProps = {
 	cardMeta?: CardMetaStore;
 	/** Open the chat message that started a conversation decision. */
 	onCardSource?: (questionnaireId: string) => void;
+	/** Whether a card has a Chat message to go back to; without one it offers no jump. */
+	hasCardSource?: (questionnaireId: string) => boolean;
+	/** False when no Planner will review where decisions live. */
+	planner?: boolean;
 	evidence?: (questionnaireId: string) => ReactNode | null;
 	/** Durable Research Workspace state and actions supplied by the host app. */
 	research?: ResearchStore;
+	/** Lets the host open the research composer at the end of the document. */
+	researchLauncher?: ResearchLauncher;
 	/** The same arrangement for comment threads. */
 	threads?: ThreadStore;
 	/** Who wrote each block, when the deployment records provenance. */
@@ -94,6 +105,10 @@ export type PlanEditorProps = {
 	scrollTop?: number;
 	/** The document host owns persisted view position, not the editor. */
 	onScrollTop?: (top: number) => void;
+	/** Whether the document has opened, for status chrome the host renders. */
+	onState?: (state: PlanState) => void;
+	/** Host-owned context shown above the document, in the prose column. */
+	preface?: ReactNode;
 	className?: string;
 };
 
@@ -102,9 +117,22 @@ export type PlanState = {
 	synced: boolean;
 	/** Why the document was last replaced, if it was. */
 	reset?: Plan.Reset["reason"];
+	/**
+	 * Counts replacements that dropped edits the server never acknowledged,
+	 * so the host can say so once for each, until it is dismissed.
+	 */
+	lost?: number;
 	/** Why it could not be opened at all, if it could not. */
 	failed?: string;
+	/**
+	 * An undo or redo this person just asked for that could not be applied
+	 * safely, for the host to mention briefly. A new object for each refusal.
+	 */
+	refused?: { reason: Refusal };
 };
+
+/** How long a refused undo stays in the state, long enough to read and no longer. */
+const UNDO_NOTICE = 3000;
 
 export function PlanEditor(
 	{
@@ -113,15 +141,21 @@ export function PlanEditor(
 		className,
 		commentPresentation = "popover",
 		connection,
+		disclosureMotion,
 		motionImmediately,
 		onScrollTop,
+		onState,
+		preface,
 		questionMotion,
 		questions,
 		cardMeta,
 		onCardSource,
+		hasCardSource,
 		evidence,
+		planner,
 		readOnly,
 		research,
+		researchLauncher,
 		scrollTop,
 		threads,
 		user,
@@ -147,10 +181,16 @@ export function PlanEditor(
 	// A rotated epoch invalidates the whole local document, so the editor is
 	// rebuilt rather than reconciled — that is what "reset" means. The marks
 	// describe a history that no longer exists, so they go with it.
-	let onReset = useCallback((reason: Plan.Reset["reason"]) => {
+	let onReset = useCallback((reason: Plan.Reset["reason"], lost: boolean) => {
 		changes.clear();
 		questions?.resetDocument();
-		setState(prev => ({ ...prev, synced: false, reset: reason, failed: undefined }));
+		setState(prev => ({
+			...prev,
+			synced: false,
+			reset: reason,
+			failed: undefined,
+			lost: lost ? (prev.lost ?? 0) + 1 : prev.lost,
+		}));
 		setGeneration(value => value + 1);
 	}, [changes, questions]);
 
@@ -177,8 +217,24 @@ export function PlanEditor(
 		[questions, threads],
 	);
 
+	let onUndoRefused = useCallback((reason: Refusal) => {
+		setState(prev => ({ ...prev, refused: { reason } }));
+	}, []);
+	useEffect(() => {
+		let refused = state.refused;
+		if (!refused) return;
+		let timer = setTimeout(() => {
+			setState(prev => prev.refused === refused ? { ...prev, refused: undefined } : prev);
+		}, UNDO_NOTICE);
+		return () => clearTimeout(timer);
+	}, [state.refused]);
+
 	let onChanges = useCallback((found: Plan.Change[]) => {
 		changes.mark(found);
+	}, [changes]);
+
+	let onRemoteUpdate = useCallback((agent: boolean) => {
+		changes.authored(agent);
 	}, [changes]);
 
 	// The scroll container is what "in view" is measured against, and it only
@@ -195,12 +251,32 @@ export function PlanEditor(
 		return () => element.removeEventListener("scroll", onScroll);
 	}, [changes, generation, onScrollTop, wire]);
 
+	// Restore only when the scroller is (re)created. Echoing every reported
+	// position back cancels smooth scrolls and rewinds to a stale offset.
+	let restoreTop = useRef(scrollTop);
+	restoreTop.current = scrollTop;
 	useEffect(() => {
 		let element = scroller.current;
-		if (element && scrollTop !== undefined) element.scrollTop = scrollTop;
-	}, [generation, scrollTop]);
+		if (element && restoreTop.current !== undefined) element.scrollTop = restoreTop.current;
+	}, [generation]);
+
+	// A preface that changes height moves the document without resizing or scrolling it; overlays
+	// that track the prose (comment markers, rails) re-measure on scroll, so announce one.
+	let hasPreface = !!preface;
+	useEffect(() => {
+		let element = scroller.current;
+		let content = element?.querySelector(":scope > .plan-preface");
+		if (!element || !content) return;
+		let observer = new ResizeObserver(() => element.dispatchEvent(new Event("scroll")));
+		observer.observe(content);
+		return () => observer.disconnect();
+	}, [generation, hasPreface, wire]);
 
 	useEffect(() => () => changes.dispose(), [changes]);
+
+	useEffect(() => {
+		onState?.(state);
+	}, [onState, state]);
 
 	let onProvider = useCallback((value: PlanProvider | undefined) => {
 		provider.current = value;
@@ -247,7 +323,9 @@ export function PlanEditor(
 		if (presence) resume(presence);
 	}, [presence, connection]);
 
-	let offline = connection !== undefined && connection !== "connected";
+	// Locking waits out a blip, and edits made meanwhile wait in the outbox.
+	let offline = useConnectionNotice(connection !== undefined && connection !== "connected")
+		!== "none";
 	let locked = offline || !!busy || !!readOnly || !state.synced;
 
 	useEffect(() => authorship?.connect(wire, state.synced && !offline), [
@@ -295,23 +373,30 @@ export function PlanEditor(
 						onBinding,
 						onAnchors,
 						onChanges,
+						onUndoRefused,
+						onRemoteUpdate,
 					}),
 					widgetsPlugin({
 						binding,
 						commentPresentation,
+						disclosureMotion,
 						motionImmediately,
 						questionMotion,
 						questions,
 						cardMeta,
 						onCardSource,
+						hasCardSource,
 						evidence,
+						planner,
 						research,
 						researchDrafts,
+						researchLauncher,
 						threads,
 						changes,
 						wire,
 						connected: !offline,
 						canEdit: !readOnly,
+						self: user.name,
 						synced: state.synced,
 					}),
 					...(authorship ? [authorshipPlugin({ store: authorship })] : []),
@@ -325,14 +410,20 @@ export function PlanEditor(
 			onBinding,
 			onAnchors,
 			onChanges,
+			onUndoRefused,
+			onRemoteUpdate,
 			binding,
 			questions,
 			cardMeta,
 			onCardSource,
+			hasCardSource,
 			evidence,
+			planner,
 			research,
 			researchDrafts,
+			researchLauncher,
 			commentPresentation,
+			disclosureMotion,
 			motionImmediately,
 			questionMotion,
 			threads,
@@ -364,7 +455,10 @@ export function PlanEditor(
 	}
 
 	return (
-		<div className={`plan flex h-full w-full flex-col ${className ?? ""}`}>
+		<div
+			className={`plan flex h-full w-full flex-col ${className ?? ""}`}
+			data-plan-offline={offline || undefined}
+		>
 			<div className="plan-workspace">
 				<div className="plan-document">
 					{authorship && <AuthorshipStrip store={authorship} />}
@@ -373,7 +467,9 @@ export function PlanEditor(
 						className="h-full min-h-0 overflow-auto"
 						data-focus-boundary=""
 						data-plan-scroll=""
+						data-plan-synced={state.synced || undefined}
 					>
+						{hasPreface && <div className="plan-preface">{preface}</div>}
 						<MDXEditor
 							// Remounting on epoch rotation is deliberate: the previous
 							// document no longer exists, so there is nothing to reconcile.
@@ -398,12 +494,6 @@ export function PlanEditor(
 					{authorship && <AuthorshipLayer canEdit={!readOnly && !offline} store={authorship} />}
 					{/* In the document column, so they track the prose, not the pane. */}
 					<PlanChanges motionImmediately={motionImmediately} store={changes} />
-					<PlanStatus
-						connection={connection}
-						synced={state.synced}
-						failed={state.failed}
-						busy={busy}
-					/>
 				</div>
 			</div>
 		</div>

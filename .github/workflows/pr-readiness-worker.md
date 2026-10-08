@@ -101,7 +101,7 @@ safe-outputs:
           type: choice
           options: [proposal, human, infrastructure]
         review:
-          description: Exact binary Git diff from captured head to proposal; omit for a report
+          description: Exact bounded binary Git diff of the proposed repair; omit for a report
           required: false
           type: string
         reason:
@@ -172,27 +172,59 @@ job owns publication; a proposal is not proof of publication or passing CI.
    Do not add a separate CI repair commit during a rebase: publish the replay
    first, then the coordinator will schedule repair if current-head CI fails.
    Never flatten a stack or guess its replay boundary.
-3. If `operation` is `fix`, run `bun install --frozen-lockfile` inside the sandbox
+3. If `operation` is `merge`, merge the exact captured base into the captured
+   head with Git hooks disabled. If Git finds no conflict despite the dispatched
+   conflict action, report `infrastructure` with the stale GitHub observation
+   and request a fresh scan; do not create a merge proposal. Resolve only
+   conflicts whose intentions are clear from both sides' changes. Create exactly
+   one merge commit with the captured head as first parent and captured base as
+   second parent. Preserve earlier merge commits. Run
+   `bun install --frozen-lockfile` and relevant verification on the merged tree.
+   Do not add a separate CI repair commit:
+   the coordinator will schedule one if current-head CI fails afterward.
+   Report a human blocker for competing intentions, an ambiguous merge base,
+   or a protected-path conflict outside an existing design-contract exception
+   JSON file. For that exception-only case, compare the merge-base, captured
+   head, and captured base JSON: every field, entry, order, reason, and case
+   must be identical except `sourceHash` values. Preserve those fields and
+   the file mode in the proposal.
+   Renew each hash from the proposed source bytes and record a rationale review
+   for every hash changed relative to either parent. If the shapes differ,
+   report a human blocker. Run `bun run ci` on a merge that renews design hashes
+   and record its actual result in `checks`. A conflicted file cannot retain the
+   exact captured-head blob because that would discard the base change. If the
+   base changed a `sourceHash` since the merge-base and the head
+   has a different value, the proposal cannot keep the head's value for that
+   field, even when another hash changes. Report a human blocker when that is
+   the only valid resolution.
+   Do not silently edit nonconflicting files.
+4. If `operation` is `fix`, run `bun install --frozen-lockfile` inside the sandbox
    against the captured working head, then reproduce its actual CI failure first.
    Make the smallest correction preserving intended behavior, then create exactly
    one nonempty commit. Run the failing check and the narrowest useful regression.
    Run `bun run fix`, inspect its changes, and run `bun run ci`; run `bun run types`
    for TypeScript edits. Browser, PostgreSQL, and container failures require real
    prerequisites. Report unavailable infrastructure instead of a speculative fix.
-4. Do not weaken tests, assertions, design rules, or checks. Do not change workflow
+   A mergeable PR may receive this fix while its branch is behind the base.
+5. Do not weaken tests, assertions, design rules, or checks. Do not change workflow
    files, manifests, lockfiles, agent instructions, maintenance scripts, or other
    protected paths. Existing design-contract exception `sourceHash` fields may
    be renewed only after checking the new source preserves that exact documented
-   exception. Preserve all other JSON fields and entries. Record each renewal as
-   `{file, sourceHash, rationale}` in `hashReviews`; hash actual source bytes with
-   SHA-256. Changed expectations or a broader exception need a human decision.
-5. When intent is ambiguous or protected edits are needed, call `finish_attempt`
+   exception. Preserve all other JSON fields and entries. Changed expectations
+   or a broader exception need a human decision. For each renewed exception
+   record, add `{file, sourceHash, rationale}` to `hashReviews`: set `file` to that record's
+   `file` source path (for example `apps/web/src/workspace.tsx`), not the exception
+   JSON path; set `sourceHash` to the SHA-256 of that source blob in the proposed
+   tree; explain the renewed exception in `rationale`.
+   The merge exception above permits only those reviewed hash renewals in a
+   protected conflict.
+6. When intent is ambiguous or protected edits are needed, call `finish_attempt`
    once with kind `human`, the exact attempt, and a nonempty concise reason:
    conflicting files, both competing intentions, the precise decision needed,
    and a suggested resolution. Infrastructure blockers use kind `infrastructure`
    with the failed prerequisite and concrete retry action. Omit `review` for
    these reports. Do not create a proposal for these reports.
-6. For a verified proposal, place only `proposal.json` and `proposal.bundle` in
+7. For a verified proposal, place only `proposal.json` and `proposal.bundle` in
    `/tmp/gh-aw/proposal/`. Set ref `refs/pr-maintenance/proposal` to the proposal
    commit and bundle that ref, excluding captured head and base prerequisites.
    The bundle must list exactly that one ref. The manifest has exactly these keys:
@@ -201,11 +233,17 @@ job owns publication; a proposal is not proof of publication or passing CI.
    `oldReplayBoundary: null`, `checks` (nonempty array of `{command, result}`),
    and `hashReviews` (array, empty when none). Identities come from the attempt
    JSON; record actual verification results rather than claimed success.
-7. Obtain the exact `git --no-replace-objects diff --binary --no-ext-diff
-   --no-textconv HEAD_SHA PROPOSAL_SHA`. If larger than 200 KiB, report a human
-   blocker for reviewing the larger change. Otherwise call `finish_attempt`
-   exactly once with kind `proposal`, the exact attempt, that entire diff as
-   `review`; omit `reason`. The detector must inspect the actual proposed change.
+8. For a merge, obtain the synthetic tree SHA (the first NUL-delimited field)
+   from `git --no-replace-objects -c merge.conflictStyle=merge merge-tree
+   --write-tree -z --name-only --no-messages HEAD_SHA BASE_SHA`. This is the
+   review base: the trusted application verifies that all cleanly merged paths
+   match this tree. For a fix or rebase, use `HEAD_SHA` as the review base.
+   Obtain the exact `git --no-replace-objects diff --binary --no-ext-diff
+   --no-textconv REVIEW_BASE PROPOSAL_SHA`. If larger than 10,240 bytes, report
+   a human blocker for reviewing the larger change. Otherwise call
+   `finish_attempt` exactly once with kind `proposal`, the exact attempt, and
+   that entire diff as `review`; omit `reason`. The detector must inspect the
+   actual proposed resolution or fix.
 
 ## Usage
 
@@ -219,7 +257,9 @@ and a repository write credential locally, run
 verified and never reset. Drain any running old writers before enabling the new
 coordinator. Select main-based canaries with
 `PR_READINESS_PRS` before expanding to `all`. The existing write secret is named
-`PR_MAITENANCE_TOKEN`. Non-main bases require a recorded stack replay boundary
+`PR_MAITENANCE_TOKEN`; it needs Contents and Pull requests write to publish
+guarded repairs. The coordinator dispatches workers and CI with its built-in
+`GITHUB_TOKEN`. Non-main bases require a recorded stack replay boundary
 and currently receive a human blocker. Enabling the coordinator disables the old
 rebase and CI-fixer writers. Manual coordinator dispatch with a PR number retries
 that PR only for a repository writer.

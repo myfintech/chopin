@@ -56,17 +56,18 @@ import type {
 	ResetInitialResearchAttemptResult,
 	ResumeBackgroundJob,
 	SaveCheckpoint,
+	SessionCredentials,
 	SettleBackgroundJob,
 	StartResearchWorkspace,
 	StartResearchWorkspaceResult,
 	StoredChannel,
+	StoredWebSession,
 	SupersedeBackgroundJob,
 	UpdateAgentContext,
 	UserNavigation,
 	UserNavigationSnapshot,
 	UserProject,
 	UserRecord,
-	WebSession,
 } from "./model";
 import type { PreferenceStore } from "../user-preferences/model";
 import type { ProvenanceStore } from "../document-provenance/model";
@@ -78,10 +79,12 @@ export interface UserStore {
 
 export interface SessionStore {
 	create(session: CreateWebSession): Promise<void>;
-	get(id: string, now: Date): Promise<WebSession | undefined>;
+	get(id: string, now: Date): Promise<StoredWebSession | undefined>;
+	rotate(id: string, expectedRevision: number, credentials: SessionCredentials): Promise<boolean>;
 	delete(id: string): Promise<boolean>;
 	deleteExpired(now: Date): Promise<number>;
-	deleteAll(
+	/** Release all Planner owners; retain only unexpired sessions with encrypted credentials. */
+	reset(
 		now: Date,
 		lease: Lease,
 		leaseTtlMs: number,
@@ -223,6 +226,11 @@ export interface ResearchWorkspaceStore {
 	findByIdempotencyKey(
 		channelId: string,
 		idempotencyKey: string,
+	): Promise<ResearchWorkspaceDetail | undefined>;
+	/** The workspace in `channelId` whose report became the child document `publishedChannelId`. */
+	findPublished(
+		channelId: string,
+		publishedChannelId: string,
 	): Promise<ResearchWorkspaceDetail | undefined>;
 	findTurnByJob(channelId: string, jobId: string): Promise<ResearchTurn | undefined>;
 }
