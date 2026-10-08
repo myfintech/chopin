@@ -1,8 +1,8 @@
 # Working on Chopin
 
 > **MANTL notice:** This is `myfintech/chopin`, MANTL's downstream copy of `githubnext/chopin`
-> that we regularly rebase onto upstream. Read [MANTL.md](MANTL.md) before making changes. Every change must stay
-> rebase-friendly: add instead of modifying, and keep edits to upstream files minimal.
+> that we regularly merge upstream into. Read [MANTL.md](MANTL.md) before making changes. Every change must stay
+> merge-friendly: add instead of modifying, and keep edits to upstream files minimal.
 
 Chopin is an experimental collaborative authoring system: several people and a
 hosted agent share one rich, repository-connected document. Plans are one
