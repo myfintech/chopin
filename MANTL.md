@@ -81,9 +81,9 @@ pull requests and every clone build on its history.
 morning and on demand. It merges `upstream/main` into the `upstream-sync` branch and opens a
 pull request against `main`. If an earlier sync pull request is still open, it merges into that
 branch again and comments on the pull request instead of replacing it. `bun.lock` is always
-regenerated, never merged. When the merge conflicts, or `bun run ci`, `bun run types`, or
-`bun test` fail after it, Claude, running through the MANTL LLM gateway, resolves them under
-this file's rules. It commits conflict resolutions in the merge commit and follow-up fixes as
+regenerated, never merged. The workflow then runs the same checks as CI, including the
+browser suite. When the merge conflicts or a check fails, Claude, running through the MANTL
+LLM gateway, resolves it under this file's rules and reruns the checks until they pass. It commits conflict resolutions in the merge commit and follow-up fixes as
 separate commits, then writes a summary into the pull request. When a resolution needs a product, schema, or protocol decision, Claude
 stops and the workflow opens an issue titled `Upstream sync needs attention` instead.
 
