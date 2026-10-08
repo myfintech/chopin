@@ -37,10 +37,25 @@ jobs:
     name: merge upstream
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     permissions:
       contents: read
       pull-requests: read
+    # Matches ci.yml, so `bun run test:postgres` runs here as it does in CI.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: chopin
+          POSTGRES_USER: chopin
+          POSTGRES_PASSWORD: chopin
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U chopin -d chopin"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
     outputs:
       status: ${{ steps.merge.outputs.status }}
       pr: ${{ steps.base.outputs.pr }}
@@ -65,6 +80,7 @@ jobs:
           fetch-depth: 0
 
       - uses: oven-sh/setup-bun@v2
+        id: bun
         with:
           bun-version: ${{ env.BUN_VERSION }}
 
@@ -113,8 +129,8 @@ jobs:
             echo "Conflicts:"; cat "$RUNNER_TEMP/sync/conflicts.txt"
           fi
 
-      # Cheap feedback for the agent. The pull request's own CI, including
-      # PostgreSQL and the browser suite, remains the gate.
+      # The same checks as ci.yml, browser suite included, so a clean merge that
+      # only breaks e2e still reaches the agent instead of the pull request.
       - name: Regenerate the lockfile and run checks
         id: checks
         if: steps.merge.outputs.status == 'merged'
@@ -123,14 +139,30 @@ jobs:
           if ! git diff --quiet bun.lock; then
             git commit -m "Regenerate bun.lock after the upstream merge" bun.lock
           fi
-          if { bun run ci && bun run types && bun test; } > "$RUNNER_TEMP/checks.log" 2>&1; then
-            echo "passed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "passed=false" >> "$GITHUB_OUTPUT"
-            tail -n 200 "$RUNNER_TEMP/checks.log"
-          fi
+          bun run e2e:browsers
+
+          log="$RUNNER_TEMP/checks.log"
+          passed=true
+          check() {
+            echo "=== $*" >> "$log"
+            if ! "$@" >> "$log" 2>&1; then
+              echo "FAILED: $*" | tee -a "$log"
+              passed=false
+            fi
+          }
+          check bun run ci
+          check bun run types
+          check bun test
+          check bun run test:postgres
+          check bun run design:behavior
+          check bun run e2e
+          echo "passed=$passed" >> "$GITHUB_OUTPUT"
 
       # `[1m]` tells Claude Code the gateway serves Opus's full context window.
+      # The action installs its own Bun and puts it first on PATH for the
+      # agent's shell; passing ours keeps the agent on the repository's pin.
+      # The e2e suite runs for about ten minutes, past Claude Code's default
+      # ten-minute command limit.
       - name: Resolve with Claude
         if: steps.merge.outputs.status == 'conflicted' || steps.checks.outputs.passed == 'false'
         uses: anthropics/claude-code-action@v1
@@ -139,11 +171,14 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.UPSTREAM_SYNC_GATEWAY_KEY }}
           github_token: ${{ github.token }}
+          path_to_bun_executable: ${{ steps.bun.outputs.bun-path }}
           settings: |
             {
               "env": {
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-5-5",
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                "BASH_DEFAULT_TIMEOUT_MS": "1800000",
+                "BASH_MAX_TIMEOUT_MS": "1800000"
               }
             }
           claude_args: >-
@@ -161,8 +196,11 @@ jobs:
             - `conflicted`: `git merge upstream/main` stopped on the files that
               `git diff --name-only --diff-filter=U` lists. bun.lock has already been taken from
               upstream.
-            - `merged`: the merge is committed but `bun run ci`, `bun run types`, or `bun test`
-              failed. Their output is in ${{ runner.temp }}/checks.log.
+            - `merged`: the merge is committed but at least one CI check failed. The output is in
+              ${{ runner.temp }}/checks.log; each failed command has a `FAILED:` line.
+
+            Bun ${{ env.BUN_VERSION }} (the repository's pin), Node, Docker, and a PostgreSQL
+            service on 127.0.0.1:5432 are available, matching CI.
 
             Work through this:
             1. Resolve each conflict by starting from upstream's version and reapplying MANTL's
@@ -173,8 +211,14 @@ jobs:
             2. Run `bun install` so bun.lock matches the merged package.json files. Never
                hand-edit bun.lock.
             3. MANTL migrations stay last in `MIGRATIONS`. Never edit an upstream migration.
-            4. Run `bun run ci`, `bun run types`, and `bun test`, and fix failures the merge
-               caused. For `reviewed dynamic owner changed`, follow Pinned design exceptions in
+            4. Run every check in .github/workflows/ci.yml's `checks` and `browser` jobs, and fix
+               failures the merge caused. That is currently `bun run ci`, `bun run types`,
+               `bun test`, `bun run test:postgres`, `bun run e2e:browsers` once, then
+               `bun run design:behavior` and `bun run e2e`; follow ci.yml if it lists more. The
+               e2e suite takes about ten minutes, so while fixing a failure rerun only the
+               affected spec, for example `bun run e2e e2e/shell.e2e.ts`, then run the full suite
+               once at the end. Treat a test Playwright reports as flaky as a failure unless it
+               is also flaky on `origin/main`. Do not finish while a check fails. For `reviewed dynamic owner changed`, follow Pinned design exceptions in
                MANTL.md: confirm the dynamic value still comes from where the exception's reason
                says before renewing its hash.
             5. Update the Upstream divergences table for every seam that moved, changed, was
