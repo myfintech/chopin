@@ -600,8 +600,10 @@ test("the language menu takes focus before the next animation frame", async ({ j
 	let trigger = content(page).getByRole("button", { name: "Code language: TypeScript" });
 	let list = page.getByRole("listbox", { name: "Code language" });
 
-	await page.clock.install();
-	await page.clock.pauseAt(new Date());
+	// Pausing at the runner's "now" races the browser's running clock into the past.
+	let now = Date.now();
+	await page.clock.install({ time: now });
+	await page.clock.pauseAt(now + 1_000);
 	await trigger.focus();
 	await page.keyboard.press("ArrowDown");
 	await expect(list).toBeFocused();
