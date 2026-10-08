@@ -98,7 +98,10 @@ function harnessServer(port: number, database: string) {
 
 export default defineConfig({
 	testDir: ".",
-	testIgnore: join(ROOT, "e2e/design/*.e2e.ts"),
+	testIgnore: [
+		join(ROOT, "e2e/design/*.e2e.ts"),
+		join(ROOT, "e2e/diagram-gallery/*.e2e.ts"),
+	],
 
 	/*
 	 * Bun's test runner claims `*.test.*` and `*.spec.*`. A Playwright file
@@ -133,6 +136,8 @@ export default defineConfig({
 			name: "chromium",
 			testIgnore: [
 				join(ROOT, "e2e/design/*.e2e.ts"),
+				// Project settings override the top-level list; keep dev-only gallery tests excluded.
+				join(ROOT, "e2e/diagram-gallery/*.e2e.ts"),
 				join(ROOT, "e2e/conversation-plan-heading.e2e.ts"),
 				join(ROOT, "e2e/conversation-plan-jobs.e2e.ts"),
 				join(ROOT, "e2e/decision-prose.e2e.ts"),
@@ -159,7 +164,7 @@ export default defineConfig({
 				"**/responsive*.e2e.ts",
 				"**/sidecar.e2e.ts",
 				"**/harness.e2e.ts",
-				"**/local-auth.e2e.ts",
+				"**/auth-lifecycle.e2e.ts",
 			],
 			use: { ...devices["Desktop Chrome"], baseURL: `http://${HOST}:${PLAIN}` },
 		},
@@ -186,8 +191,8 @@ export default defineConfig({
 			use: { ...devices["Desktop Chrome"], baseURL: `http://${HOST}:${HARNESS}` },
 		},
 		{
-			name: "local",
-			testMatch: "**/local-auth.e2e.ts",
+			name: "auth",
+			testMatch: "**/auth-lifecycle.e2e.ts",
 			use: { ...devices["Desktop Chrome"], baseURL: "http://127.0.0.1:8791" },
 		},
 	],

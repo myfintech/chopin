@@ -20,6 +20,7 @@ test("a single decision renders as a saveable card without a stepper", () => {
 		createElement(QuestionView, {
 			definition: SINGLE,
 			drafts: {},
+			onAddOption: async () => ({ ok: true as const }),
 			onSubmit() {},
 		}),
 	);
@@ -150,7 +151,7 @@ test("a read-only decision remains linked but has no answer actions", () => {
 		}),
 	);
 
-	expect(markup).toContain("show in plan");
+	expect(markup).toContain("show in document");
 	expect(markup).toContain("disabled");
 	expect(markup).not.toContain(">Save<");
 	expect(markup).not.toContain("Discard");

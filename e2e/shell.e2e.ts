@@ -25,7 +25,7 @@ test("an icon button shows its label on keyboard focus", async ({ join }) => {
 	await expect(tooltip).toHaveText("New document");
 	await page.getByRole("button", { name: "Hide sidebar" }).focus();
 	await expect(tooltip).toHaveText("Hide sidebar");
-	await page.keyboard.press("Tab");
+	await page.keyboard.press("Shift+Tab");
 	await expect(tooltip).toBeHidden();
 });
 
@@ -38,6 +38,48 @@ test("an icon tooltip remains visible while its button is focused", async ({ joi
 	await expect(tooltip).toBeVisible();
 	await page.mouse.move(0, 0);
 	await expect(tooltip).toBeVisible();
+});
+
+test("an icon tooltip stays hidden after its button is pressed until the pointer returns", async ({ join, page }) => {
+	await join("ana");
+	let mention = page.getByRole("button", { exact: true, name: "Mention docs" });
+	let tooltip = page.locator("[data-icon-tooltip]");
+	await mention.hover();
+	await expect(tooltip).toBeVisible();
+	await mention.click();
+	await expect(tooltip).toBeHidden();
+	await page.waitForTimeout(600);
+	await expect(tooltip).toBeHidden();
+	await page.mouse.move(0, 0);
+	await mention.hover();
+	await expect(tooltip).toBeVisible();
+	await expect(tooltip).toHaveText("Mention docs");
+});
+
+test("an icon tooltip shows on keyboard focus and hides when its trigger opens a popup", async ({ join, page }) => {
+	await join("ana");
+	let addProject = page.getByRole("button", { exact: true, name: "Add project" });
+	let tooltip = page.locator("[data-icon-tooltip]");
+	await addProject.focus();
+	await page.keyboard.press("Shift+Tab");
+	await page.keyboard.press("Tab");
+	await expect(addProject).toBeFocused();
+	await expect(tooltip).toBeVisible();
+	await addProject.evaluate(button => {
+		button.setAttribute("aria-haspopup", "menu");
+		button.setAttribute("aria-expanded", "true");
+	});
+	await expect(tooltip).toBeHidden();
+});
+
+test("a second icon tooltip opens without the delay once one has shown", async ({ join, page }) => {
+	await join("ana");
+	let tooltip = page.locator("[data-icon-tooltip]");
+	await page.getByRole("button", { exact: true, name: "Add project" }).hover();
+	await expect(tooltip).toHaveText("Add project");
+	await page.getByRole("button", { name: /^New document in / }).first().hover();
+	await expect(tooltip).toHaveText("New document", { timeout: 200 });
+	await expect(tooltip).toHaveAttribute("data-instant", "");
 });
 
 test("an icon tooltip preserves a title updated during hover", async ({ join, page }) => {
@@ -133,7 +175,7 @@ test("split Chat owns its controls and keeps its draft while hidden", async ({ j
 	let draft = chatInput(pane);
 	let header = page.getByRole("banner");
 	let heading = page.getByRole("heading", { name: "Chat" });
-	let close = page.getByRole("button", { name: "Close sidebar" });
+	let close = page.getByRole("button", { name: "Hide chat" });
 	let chatHeader = pane.locator("[data-chat-header]");
 	let identity = chatHeader.locator("[data-chat-identity]");
 
@@ -157,12 +199,12 @@ test("split Chat owns its controls and keeps its draft while hidden", async ({ j
 	await heading.hover();
 	await expect(close).toHaveCSS("opacity", "1");
 	await close.hover();
-	await expect(page.locator("[data-icon-tooltip]")).toHaveText("Close sidebar");
+	await expect(page.locator("[data-icon-tooltip]")).toHaveText("Hide chat");
 	await expect(page.locator("[data-icon-tooltip]")).toBeVisible();
 	await expect(close).toHaveAttribute("aria-controls", paneId!);
 	await expect(close).toHaveAttribute("aria-expanded", "true");
 	await close.click();
-	let opener = page.getByRole("button", { name: "Show chat pane" });
+	let opener = page.getByRole("button", { name: "Show chat" });
 	let toolbar = page.locator("[data-document-toolbar]");
 	let documentTab = toolbar.getByRole("button", { name: "Document", exact: true });
 	await expect(pane).toBeHidden();
@@ -186,12 +228,12 @@ test("split Chat owns its controls and keeps its draft while hidden", async ({ j
 test("split Chat controls remain available to touch", async ({ join }) => {
 	let page = await join("ana", { hasTouch: true, viewport: { width: 1280, height: 800 } });
 	let pane = chatPane(page);
-	let close = pane.getByRole("button", { name: "Close sidebar" });
+	let close = pane.getByRole("button", { name: "Hide chat" });
 	expect(await page.evaluate(() => matchMedia("(any-pointer: coarse)").matches)).toBe(true);
 	await expect(close).toHaveCSS("opacity", "1");
 	await close.tap();
 	await expect(pane).toBeHidden();
-	let opener = page.getByRole("button", { name: "Show chat pane" });
+	let opener = page.getByRole("button", { name: "Show chat" });
 	await opener.tap();
 	await expect(pane).toBeVisible();
 });
@@ -205,14 +247,14 @@ test("the chat rail remembers its width and visibility", async ({ join, page }) 
 	let paneId = await pane.getAttribute("id");
 	expect(paneId).toBeTruthy();
 	let rememberedWidth = (await box(pane)).width;
-	let toggle = page.getByRole("button", { name: "Close sidebar" });
+	let toggle = page.getByRole("button", { name: "Hide chat" });
 	await expect(toggle).toHaveAttribute("aria-controls", paneId!);
 	await toggle.click();
 	await expect(pane).toBeHidden();
 
 	await page.reload();
 	await ready(page);
-	await page.getByRole("button", { name: "Show chat pane" }).click();
+	await page.getByRole("button", { name: "Show chat" }).click();
 	await expect.poll(async () => (await box(chatPane(page))).width)
 		.toBeCloseTo(rememberedWidth, 0);
 });

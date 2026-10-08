@@ -61,6 +61,9 @@ const MIGRATIONS = [{
 	id: "015_planner_inline_reference",
 	path: join(import.meta.dir, "migrations/015_planner_inline_reference.sql"),
 }, {
+	id: "016_persistent_sessions",
+	path: join(import.meta.dir, "migrations/016_persistent_sessions.sql"),
+}, {
 	id: "mantl_user_preferences",
 	path: join(import.meta.dir, "migrations/mantl_user_preferences.sql"),
 }, {

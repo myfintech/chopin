@@ -22,7 +22,7 @@ async function expectOpenCardReadOnly(card: ReturnType<typeof decisionCard>) {
 	await expect(card.getByRole("button", { name: "Save", exact: true })).toHaveCount(0);
 	await expect(card.getByRole("button", { name: "Discard", exact: true })).toHaveCount(0);
 	let add = card.getByRole("button", { name: "Add an option", exact: true });
-	await expect(add).toBeDisabled();
+	await expect(add).toHaveCount(0);
 }
 
 test("Chat analysis diagnostics float without moving a bottom message", async ({ join, room }) => {
@@ -268,7 +268,7 @@ test("mounted parent and child transcripts keep their own source ranges", async 
 	await expect.poll(highlightedRooms).toEqual([]);
 	let parentMessage = parent.locator(`[data-chat-message-id="${parentMessageId}"]`);
 	await expect(parentMessage).not.toHaveAttribute("data-source-exact", "true");
-	await expect(parentMessage.locator("[data-source-preview]")).toHaveCount(0);
+	await expect(parentMessage).not.toHaveAttribute("data-chat-source", "true");
 });
 
 test("an inline card arriving keeps the typist's caret", async ({ join, room }) => {
@@ -441,8 +441,8 @@ test("failed analysis retries in Chat while editor selection survives hiding Cha
 	await page.keyboard.press("ControlOrMeta+A");
 	let selected = await page.evaluate(() => window.getSelection()?.toString() ?? "");
 	expect(selected).toContain("selected sentence");
-	await page.getByRole("button", { name: /Close sidebar/ }).click();
-	await page.getByRole("button", { name: /Show chat pane/ }).click();
+	await page.getByRole("button", { name: /Hide chat/ }).click();
+	await page.getByRole("button", { name: /Show chat/ }).click();
 	await expect(editor).toBeVisible();
 	await expect.poll(() => page.evaluate(() => window.getSelection()?.toString() ?? ""))
 		.toContain("selected sentence");

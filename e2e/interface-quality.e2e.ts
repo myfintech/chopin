@@ -53,11 +53,16 @@ for (let width of [1280, 390]) {
 		let actions = page.getByRole("banner").getByRole("button", { name: /^Actions for / });
 		await actions.click();
 		await page.getByRole("menuitem", { name: "Rename", exact: true }).click();
-		let rename = page.getByRole("dialog", { name: "Rename document", exact: true });
+		let rename = page.getByRole("textbox", { name: "Document title" });
 		let title = `${"ReleaseHandoff".repeat(8)}${room.slice(0, 8)}`;
-		await rename.getByRole("textbox", { name: "Document title" }).fill(title);
-		await rename.getByRole("button", { name: "Save", exact: true }).click();
+		await rename.fill(title);
+		await rename.press("Enter");
 		await expect(rename).toBeHidden();
+		await expect.poll(() =>
+			page.getByRole("banner").locator("svg").evaluateAll(icons =>
+				Math.min(...icons.map(icon => icon.getBoundingClientRect().width))
+			)
+		).toBeGreaterThanOrEqual(14);
 		await actions.click();
 		await page.getByRole("menuitem", { name: "Archive", exact: true }).click();
 		await actions.click();

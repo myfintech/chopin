@@ -32,7 +32,7 @@
 				1
 			]
 		],
-		"sourceHash": "5db9f37e2663a774eeb11cfde3a2fcf93dd06dc0ed6f077af42b5f8bc9e9b431"
+		"sourceHash": "f8782df8726829978d4c4da7a3ab75c25bef7f0c5ebb1d8f387b636013ea0f44"
 	},
 	{
 		"file": "packages/question/src/react/resolved-actions.tsx",
@@ -46,7 +46,7 @@
 				1
 			]
 		],
-		"sourceHash": "e73b8467dde57d40dbd6f9944640601586cf4601b35c02ee7dde248da405af59"
+		"sourceHash": "bd0b6b0b4e5b16f71f129dd4a840314d64268da7f640105563c50417a1248df2"
 	},
 	{
 		"file": "packages/icons/src/icon.tsx",
@@ -254,9 +254,65 @@
 				"props",
 				"unresolved JSX props > CircleCloseIcon > <LineIcon>",
 				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > TableIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > LinkIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > DiagramIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > FormulaIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > TabsIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > MagnifierIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > DiffIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > PencilIcon > <LineIcon>",
+				1
 			]
 		],
-		"sourceHash": "c20b4df1238227b0508167fb7d7ac86ceb30fc30c846777c5af11831f5d6ee7f"
+		"sourceHash": "464a7ac73e3c46a69f97381648ad09a66a71f896abcfc30394a8266a63d64f6d"
 	},
 	{
 		"file": "packages/visuals/src/ui/mini-bars.tsx",
@@ -690,6 +746,6 @@
 				1
 			]
 		],
-		"sourceHash": "b6454ae171e15bf7a00d5cfc6ca34141ea34f87484d16dead55c6ae9dfc3ea09"
+		"sourceHash": "5c9709fd97d4f6777205da118ce8b24123537b0ae7e56d3fa4490db8538081bf"
 	}
 ]

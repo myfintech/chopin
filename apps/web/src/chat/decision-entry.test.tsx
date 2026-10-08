@@ -80,7 +80,7 @@ test("the current prompt generation stays live across a same-second reopen", () 
 	let reopened = { ...saved, status: "reopened" as const };
 
 	expect(promptView({ entry: promptEntry(0), latest: true, meta: saved, value: savedValue }))
-		.toEqual({ state: "collapsed", text: "Decided: GitHub Apps · mina" });
+		.toEqual({ state: "collapsed", text: "Decided: GitHub Apps · @mina" });
 	expect(promptView({ entry: promptEntry(0), latest: true, meta: reopened, value: savedValue }))
 		.toEqual({ state: "collapsed", text: "Reopened" });
 	expect(promptView({ entry: promptEntry(0), latest: false, meta: reopened, value: savedValue }))
@@ -113,10 +113,10 @@ test("a decision without labels uses its saved-answer fallback and owner", () =>
 	};
 	let meta = openMeta({ status: "decided", owner: "jules" });
 	expect(promptView({ entry: promptEntry(0), latest: true, meta, value: custom }))
-		.toEqual({ state: "collapsed", text: "Decided: Use the hosted provider · jules" });
+		.toEqual({ state: "collapsed", text: "Decided: Use the hosted provider · @jules" });
 	let unanswered = { ...custom, questions: [{ ...custom.questions[0]!, answer: undefined }] };
 	expect(promptView({ entry: promptEntry(0), latest: true, meta, value: unanswered }))
-		.toEqual({ state: "collapsed", text: "Decided: Saved decision · jules" });
+		.toEqual({ state: "collapsed", text: "Decided: Saved decision · @jules" });
 });
 
 test("prompt selection shares the card projection and exact suggestion snapshot", () => {
@@ -185,12 +185,27 @@ test("a missing suggestion leaves Save disabled until a human chooses an option"
 		value: VALUE,
 		meta: openMeta(),
 		connected: false,
-		canEdit: false,
+		canEdit: true,
 		onOpenCard() {},
 	}));
 
 	expect(markup).toContain("Choose an option on the card");
 	expect(markup).toMatch(/<button[^>]*disabled=""[^>]*>Save decision<\/button>/);
+});
+
+test("a viewer who cannot edit sees no Save action on a prompt", () => {
+	let markup = renderToStaticMarkup(createElement(DecisionPrompt, {
+		entry: promptEntry(0),
+		latest: true,
+		value: VALUE,
+		meta: openMeta(),
+		connected: true,
+		canEdit: false,
+		onOpenCard() {},
+	}));
+
+	expect(markup).not.toContain("Save decision");
+	expect(markup).not.toContain("Choose an option on the card");
 });
 
 test("activity labels remain text for the document sentinel and link card activities", () => {

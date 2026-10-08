@@ -41,8 +41,10 @@ export function nextAction(snapshot) {
 	if (snapshot.optedOut) return "opted-out";
 	if (snapshot.parentReady === false) return "waiting-parent";
 	if (snapshot.mergeable === false) return "conflict";
-	if (snapshot.behind > 0) return "rebase";
-	if (snapshot.behind !== 0 || snapshot.mergeable !== true) return "verify";
+	if (
+		!Number.isSafeInteger(snapshot.behind) || snapshot.behind < 0
+		|| snapshot.mergeable !== true
+	) return "verify";
 	if (snapshot.rebaseRequired === null) return "verify";
 	if (snapshot.rebaseRequired === true && snapshot.rebaseable !== true) {
 		return snapshot.rebaseable === false ? "rebase" : "verify";
@@ -66,18 +68,48 @@ function optedOut(pr) {
 	return pr.labels.some((label) => label.name === "no-babysit");
 }
 
-export function inventory(repository, gh = github) {
+export function inventory(repository, gh = github, selected = () => true, target = null) {
+	if (typeof selected !== "function") throw new TypeError("Invalid PR selection");
 	let listed = gh([
 		"api",
 		`repos/${repository}/pulls?state=open&sort=updated&direction=asc&per_page=100`,
 		"--paginate",
 		"--slurp",
 	]).flat();
+	let focused = null;
+	if (target !== null) {
+		let candidates = listed.filter(pr => included(pr, repository));
+		let seeds = target.kind === "prs"
+			? candidates.filter(pr => target.numbers.includes(pr.number))
+			: target.kind === "branch"
+			? candidates.filter(pr => pr.head.ref === target.branch)
+			: [];
+		// A branch name must identify exactly one open PR. Ambiguity is retried by the sweep.
+		if (target.kind === "branch" && seeds.length !== 1) return [];
+		focused = new Set(seeds.map(pr => pr.number));
+		let branches = new Set(seeds.map(pr => pr.head.ref));
+		let bases = new Set(seeds.map(pr => pr.base.ref));
+		let changed = true;
+		while (changed) {
+			changed = false;
+			for (let pr of candidates) {
+				if (focused.has(pr.number)) continue;
+				if (!branches.has(pr.base.ref) && !bases.has(pr.head.ref)) continue;
+				focused.add(pr.number);
+				branches.add(pr.head.ref);
+				bases.add(pr.base.ref);
+				changed = true;
+			}
+		}
+	}
 	let snapshots = new Map();
 	let mergePolicies = new Map();
 	let settings;
 	for (let candidate of listed) {
-		if (!included(candidate, repository)) continue;
+		if (
+			!included(candidate, repository) || !selected(candidate.number)
+			|| (focused !== null && !focused.has(candidate.number))
+		) continue;
 		let pr = optedOut(candidate)
 			? candidate
 			: gh(["api", `repos/${repository}/pulls/${candidate.number}`]);
@@ -170,10 +202,18 @@ export function inventory(repository, gh = github) {
 	let pending = new Map(snapshots);
 	let rows = [];
 	for (let entry of pending.values()) {
-		let parents = [...snapshots.values()].filter((parent) =>
-			parent.row.number !== entry.row.number && parent.row.branch === entry.row.base
+		let parents = [...snapshots.values()]
+			.filter(parent =>
+				parent.row.number !== entry.row.number && parent.row.branch === entry.row.base
+			)
+			.map(parent => parent.row.number);
+		parents.push(
+			...listed.filter(candidate =>
+				!snapshots.has(candidate.number) && included(candidate, repository)
+				&& candidate.head.ref === entry.row.base
+			).map(candidate => candidate.number),
 		);
-		entry.row.parent = parents.length === 1 ? parents[0].row.number : null;
+		entry.row.parent = parents.length === 1 ? parents[0] : null;
 		entry.changed ||= parents.length > 1;
 	}
 	while (pending.size) {
@@ -187,7 +227,9 @@ export function inventory(repository, gh = github) {
 				? "verify"
 				: nextAction({
 					...entry.snapshot,
-					parentReady: parent ? parent.row.action === "ready" : undefined,
+					parentReady: entry.row.parent === null
+						? undefined
+						: parent?.row.action === "ready",
 				});
 			rows.push(entry.row);
 			pending.delete(number);

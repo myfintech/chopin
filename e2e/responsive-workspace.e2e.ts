@@ -141,9 +141,9 @@ test(
 				let views = page.getByRole("group", { name: "Document view" });
 				await expect(views).toBeVisible();
 				if (width === 724 && fromCompactChat) {
-					await page.getByRole("button", { name: "Close sidebar" }).click();
+					await page.getByRole("button", { name: "Hide chat" }).click();
 					await expect(chat).toBeHidden();
-					let showChat = page.getByRole("button", { name: "Show chat pane" });
+					let showChat = page.getByRole("button", { name: "Show chat" });
 					await expect(showChat).toBeFocused();
 					await showChat.click();
 					await expect(chat).toBeVisible();
@@ -416,7 +416,7 @@ test("landscape split controls respect inline safe areas", async ({ join, page, 
 	await expect(page.getByRole("navigation", { name: "Workspace view" })).toHaveCount(0);
 	let header = page.getByRole("banner");
 	let headerControls = header.getByRole("button");
-	let chatToggle = page.getByRole("button", { name: "Close sidebar" });
+	let chatToggle = page.getByRole("button", { name: "Hide chat" });
 	let viewControls = page.getByRole("group", { name: "Document view" }).getByRole("button");
 	let [headerFirst, headerLast, chatButton, viewFirst, viewLast] = await Promise.all([
 		headerControls.first().boundingBox(),
@@ -454,8 +454,8 @@ test("an 844px landscape viewport keeps the split workspace", async ({ join, see
 	await expectNoHorizontalOverflow(page);
 });
 
-test("the Projects drawer below 1024px keeps the split workspace", async ({ join, seed }) => {
-	let viewport = { width: 1023, height: 964 };
+test("the Projects drawer below 1198px keeps the split workspace", async ({ join, seed }) => {
+	let viewport = { width: 1197, height: 964 };
 	await seed(RESPONSIVE_SOURCE);
 	let page = await join("ana", { viewport });
 	await expect(page.getByRole("navigation", { name: "Workspace view" })).toHaveCount(0);
@@ -473,9 +473,9 @@ test("the Projects drawer below 1024px keeps the split workspace", async ({ join
 	await expect(page.getByRole("dialog", { name: "Chat" })).toHaveCount(0);
 	await expect(content(page)).toBeEditable();
 	await expect(page.getByRole("separator", { name: "Resize chat" })).toBeVisible();
-	await page.getByRole("button", { name: "Close sidebar" }).click();
+	await page.getByRole("button", { name: "Hide chat" }).click();
 	await expect(chat).toBeHidden();
-	let opener = page.getByRole("button", { name: "Show chat pane" });
+	let opener = page.getByRole("button", { name: "Show chat" });
 	await expect(opener).toBeFocused();
 	await opener.click();
 	await expect(chat).toBeVisible();
@@ -487,7 +487,7 @@ test("the Projects drawer below 1024px keeps the split workspace", async ({ join
 
 test("the wide Projects sidebar leaves the workspace unobstructed", async ({ join, seed }) => {
 	await seed(RESPONSIVE_SOURCE);
-	let page = await join("ana", { viewport: { width: 1024, height: 768 } });
+	let page = await join("ana", { viewport: { width: 1198, height: 768 } });
 	let projects = page.getByRole("complementary", { includeHidden: true, name: "Projects" });
 	let opener = page.getByRole("button", { name: "Show sidebar" });
 	let track = projects.locator("../..");
@@ -532,9 +532,25 @@ test("a representative desktop retains the split Chat layout", async ({ join, se
 	await expect(chatPane(page)).toBeVisible();
 	await expect(page.getByRole("separator", { name: "Resize chat" })).toBeVisible();
 	await expect(page.getByRole("navigation", { name: "Workspace view" })).toHaveCount(0);
-	await expect(page.getByRole("button", { name: "Close sidebar" })).toBeVisible();
+	await expect(page.getByRole("button", { name: "Hide chat" })).toBeVisible();
 	await expect(page.getByRole("group", { name: "Document view" })).toBeVisible();
 	await expect(content(page)).toBeEditable();
+});
+
+test("a pinch zoom magnifies the desktop layout instead of reflowing it", async ({ join, seed }) => {
+	await seed(RESPONSIVE_SOURCE);
+	let page = await join("ana", { viewport: { width: 1440, height: 900 } });
+	await expect(page.getByRole("separator", { name: "Resize chat" })).toBeVisible();
+	let cdp = await page.context().newCDPSession(page);
+	await cdp.send("Emulation.setPageScaleFactor", { pageScaleFactor: 2 });
+	await expect.poll(() => page.evaluate(() => window.visualViewport!.scale)).toBeGreaterThan(1.5);
+	let root = await page.evaluate(() => {
+		let box = document.getElementById("root")!.getBoundingClientRect();
+		return { height: box.height, left: box.left, top: box.top, width: box.width };
+	});
+	expect(root).toEqual({ height: 900, left: 0, top: 0, width: 1440 });
+	await expect(page.getByRole("separator", { name: "Resize chat" })).toBeVisible();
+	await expect(page.getByRole("navigation", { name: "Workspace view" })).toHaveCount(0);
 });
 
 test("200% zoom at 640 CSS pixels uses compact controls without clipping", async ({ join, seed }) => {
@@ -616,4 +632,30 @@ test("a touch comment sheet keeps its composer above the visual keyboard", async
 	} finally {
 		await emulation.close();
 	}
+});
+
+test("layout resize moves focus out of a hidden Chat pane", async ({ join, seed }) => {
+	await seed(RESPONSIVE_SOURCE);
+	let page = await join("ana", { viewport: { width: 960, height: 850 } });
+	await chatInput(chatPane(page)).focus();
+	await page.setViewportSize({ width: 640, height: 850 });
+	await expect(chatPane(page)).toBeHidden();
+	await expect.poll(() =>
+		page.evaluate(() => {
+			let active = document.activeElement;
+			return active !== document.body && !active?.closest("[hidden], [inert]");
+		})
+	).toBe(true);
+});
+
+test("the obsolete auto-saved Chat key does not hide Chat or persist a new choice", async ({ join, seed, page }) => {
+	await seed(RESPONSIVE_SOURCE);
+	await page.setViewportSize({ width: 960, height: 850 });
+	await page.addInitScript(() => localStorage.setItem("chopin:pane:chat:open", "false"));
+	await join("ana");
+	await expect(chatPane(page)).toBeVisible();
+	expect(await page.evaluate(() => localStorage.getItem("chopin:pane:chat:choice"))).toBeNull();
+	await page.getByRole("button", { name: "Hide chat" }).click();
+	await expect.poll(() => page.evaluate(() => localStorage.getItem("chopin:pane:chat:choice")))
+		.toBe("false");
 });

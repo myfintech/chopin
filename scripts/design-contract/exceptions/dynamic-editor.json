@@ -46,7 +46,7 @@
 				1
 			]
 		],
-		"sourceHash": "f285810ba8efe65355adea1f208e7d03c51d27ef66ab8da3579eff60cfaf3da3"
+		"sourceHash": "099ee516920e9e9f999b28cc1f8dd0b3b2a853697aa1b07429d0ffadb229cc64"
 	},
 	{
 		"file": "packages/editor/src/content-swap.tsx",
@@ -60,7 +60,7 @@
 				1
 			]
 		],
-		"sourceHash": "f285810ba8efe65355adea1f208e7d03c51d27ef66ab8da3579eff60cfaf3da3"
+		"sourceHash": "099ee516920e9e9f999b28cc1f8dd0b3b2a853697aa1b07429d0ffadb229cc64"
 	},
 	{
 		"file": "packages/editor/src/static-plan-editor.tsx",
@@ -74,7 +74,7 @@
 				1
 			]
 		],
-		"sourceHash": "8c19c2628572bd604d4a20ace72e65d6f13713dc06871b349aec883b42ff4092"
+		"sourceHash": "5a578d3960aca2da3da87c7c80757b338402221713687734a4249d53eb7e2529"
 	},
 	{
 		"file": "packages/editor/src/toolbar/slash.tsx",
@@ -102,7 +102,7 @@
 				1
 			]
 		],
-		"sourceHash": "93562ee92ff04a87622d531fb413cf3f7734e2830658e069706ce69ec25623c9"
+		"sourceHash": "e2bcd44481a8df91f73ffcbb0bef8ccc93a7dd64addd9ea4b874755c19afd09f"
 	},
 	{
 		"file": "packages/editor/src/toolbar/bubble.tsx",
@@ -120,21 +120,35 @@
 				"class",
 				"CELL",
 				"class > SelectionBubble > <button>",
-				5
+				3
 			],
 			[
 				"dynamic",
 				"class",
 				"CELL_ON",
 				"class > SelectionBubble > <button>",
-				2
+				3
 			],
 			[
 				"dynamic",
 				"class",
 				"CELL_OFF",
 				"class > SelectionBubble > <button>",
-				5
+				6
+			],
+			[
+				"dynamic",
+				"class",
+				"ROW",
+				"class > SelectionBubble > <button>",
+				2
+			],
+			[
+				"dynamic",
+				"class",
+				"DIVIDER",
+				"class > SelectionBubble > <span>",
+				1
 			],
 			[
 				"dynamic",
@@ -144,7 +158,7 @@
 				3
 			]
 		],
-		"sourceHash": "01db79e7bf938cd5b01b3f3a446415cb88ca6e42100908d890b087b0b593d192"
+		"sourceHash": "0c55d7382e99b0fc885a47a127dd8f59bf9f50a49261ce7f14fcb0bdf78aff5d"
 	},
 	{
 		"file": "packages/editor/src/toolbar/research.tsx",
@@ -158,7 +172,7 @@
 				1
 			]
 		],
-		"sourceHash": "adbf5fed0ed7f56653ce5b496714a92b640bcd2a3fce4a681f12ea1167887590"
+		"sourceHash": "9efb66508a77c1cce3bf057c61f62f50db047ab318b9928238aefc922a5afa4c"
 	},
 	{
 		"file": "packages/editor/src/widgets/research-motion.tsx",
@@ -200,7 +214,7 @@
 				1
 			]
 		],
-		"sourceHash": "db127842206a29d6eb733356a77095b22ac618f648e01dcd72955f134a46a25d"
+		"sourceHash": "42d324e8f0d6553de93211b3e56e98026bb90f33e4a6f4b0b735bc9af4dbbbfb"
 	},
 	{
 		"file": "packages/editor/src/comment-layer.tsx",
@@ -228,11 +242,11 @@
 				1
 			]
 		],
-		"sourceHash": "db127842206a29d6eb733356a77095b22ac618f648e01dcd72955f134a46a25d"
+		"sourceHash": "42d324e8f0d6553de93211b3e56e98026bb90f33e4a6f4b0b735bc9af4dbbbfb"
 	},
 	{
 		"file": "packages/editor/src/table/rails.tsx",
-		"reason": "Table rail style is computed viewport geometry (position, size, transform); token policy deliberately does not ban measured dimensions.",
+		"reason": "Table rails and seam lines use measured viewport position and size, clipped to the document scroller; no semantic paint or typography values enter these styles.",
 		"cases": [
 			[
 				"dynamic",
@@ -275,9 +289,16 @@
 				"seamBox(axis, lines[at] ?? 0, origin, GRIP, 2, gripLane)",
 				"unresolved style > Rail > <div>",
 				1
+			],
+			[
+				"dynamic",
+				"*",
+				"seamLine(aim.axis, line, metrics)",
+				"unresolved style > TableRails > <div>",
+				1
 			]
 		],
-		"sourceHash": "7f56a600045b818225aa9752cdb32f174792dfe3269637cf6e6cea0e956f0bfc"
+		"sourceHash": "fadeb29730d5f0d73a55912d6f82d1e91cedab3675ec341f9320849e4702b184"
 	},
 	{
 		"file": "packages/editor/src/disclosure-motion.tsx",
@@ -340,7 +361,7 @@
 				2
 			]
 		],
-		"sourceHash": "a5d52c78cf96c9318b0d9a94c73af58ad678a8623263b9759449e329cac6f1eb"
+		"sourceHash": "9d4004592b45a77cdf21a669a49e86c0c0bfeba1728288ae084406678498688b"
 	},
 	{
 		"file": "packages/editor/src/collaboration.tsx",
@@ -361,7 +382,7 @@
 				1
 			]
 		],
-		"sourceHash": "d210230ab09b8560bb9e17286af0df2648beff3891e183eb8c87a46f390185f2"
+		"sourceHash": "22c33a6f68fa66902159bda6643bc6d81acfa36107e722e428580d970f60e142"
 	},
 	{
 		"file": "packages/editor/src/widgets/questionnaire.tsx",
@@ -382,7 +403,7 @@
 				1
 			]
 		],
-		"sourceHash": "190cce4ad05296adc8c945d21755b3b26804b7542b7b30cda9667ba1e77e98cb"
+		"sourceHash": "49ccb021fb60c45cdbe234241549e468ba556277d74d824145ca8707ff2bc908"
 	},
 	{
 		"file": "packages/editor/src/widgets/code-view.tsx",
@@ -396,7 +417,7 @@
 				1
 			]
 		],
-		"sourceHash": "14a4fa0dc3588db62d80c31b718311645d26d070e014c87be28a53a7d2a308b8"
+		"sourceHash": "ee8ce4efba7e1ca187de661019e7da027433292f305e0142aedbfba1bbee9b49"
 	},
 	{
 		"file": "packages/editor/src/changes.ts",
@@ -410,7 +431,7 @@
 				1
 			]
 		],
-		"sourceHash": "e14622f16d62dca66486a913fec462b1d5380c732c6f04b63e713c877302ded9"
+		"sourceHash": "a31a505282b9cbd25a0b3ebae1862d61b971aea30b40ec20462b9c3c84aef466"
 	},
 	{
 		"file": "packages/editor/src/widgets/language-menu.tsx",
@@ -431,7 +452,7 @@
 				1
 			]
 		],
-		"sourceHash": "ed1b5eb9ac3c88e823d46d5af6a43c5d21acffe81577e07f739a4a5701c81f73"
+		"sourceHash": "b66eda9493a332f0c5d39b5fc2c07df09de7d45457d7ac45c2a839d1651e1f86"
 	},
 	{
 		"file": "packages/editor/src/widgets/questionnaire.tsx",
@@ -445,7 +466,7 @@
 				1
 			]
 		],
-		"sourceHash": "190cce4ad05296adc8c945d21755b3b26804b7542b7b30cda9667ba1e77e98cb"
+		"sourceHash": "49ccb021fb60c45cdbe234241549e468ba556277d74d824145ca8707ff2bc908"
 	},
 	{
 		"file": "packages/editor/src/resolved-layer.tsx",
@@ -461,12 +482,12 @@
 			[
 				"dynamic",
 				"*",
-				"markerStyle(marker, lineHeight, hit, inset)",
+				"markerStyle(marker, lineHeight, prose, vertical[index]!)",
 				"unresolved style > ResolvedLayer > <button>",
 				1
 			]
 		],
-		"sourceHash": "d6976f81401b6563b3b68c38364b94bab169b30eed0038ed1f788f4025488260"
+		"sourceHash": "74045d002ca932fa97d57774c0d4c4e36b19bb30daa92703a322595de22e37f5"
 	},
 	{
 		"file": "packages/editor/src/resolved-layer.tsx",
@@ -480,6 +501,6 @@
 				1
 			]
 		],
-		"sourceHash": "d6976f81401b6563b3b68c38364b94bab169b30eed0038ed1f788f4025488260"
+		"sourceHash": "74045d002ca932fa97d57774c0d4c4e36b19bb30daa92703a322595de22e37f5"
 	}
 ]
