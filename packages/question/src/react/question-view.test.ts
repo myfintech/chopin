@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import { currentQuestion, QuestionView } from "./question-view";
+import { currentQuestion, duplicateOf, QuestionView } from "./question-view";
 import { create, limits, normalize, read } from "../index";
 
 test("a replacement definition falls back before rendering when its active question disappears", () => {
@@ -94,6 +94,7 @@ test("options carry letter tiles and the last row offers to add one", () => {
 	let markup = renderToStaticMarkup(createElement(QuestionView, {
 		definition: { questions: [ROLLOUT] },
 		drafts: {},
+		onAddOption: async () => ({ ok: true as const }),
 		onCancel() {},
 		onSubmit() {},
 	}));
@@ -121,7 +122,7 @@ test("an existing custom answer still renders, as a selected row before the add 
 	expect(markup).toContain('checked=""');
 });
 
-test("the add row is disabled without a handler and hidden at the option limit", () => {
+test("the add row is hidden without a handler and at the option limit", () => {
 	let view = (options: typeof ROLLOUT.options, onAddOption?: () => Promise<{ ok: true }>) =>
 		renderToStaticMarkup(createElement(QuestionView, {
 			definition: { questions: [{ ...ROLLOUT, options }] },
@@ -129,7 +130,7 @@ test("the add row is disabled without a handler and hidden at the option limit",
 			onAddOption,
 		}));
 
-	expect(view(ROLLOUT.options)).toMatch(/question-add"[^>]*disabled/);
+	expect(view(ROLLOUT.options)).not.toContain("Add an option");
 	expect(view(ROLLOUT.options, async () => ({ ok: true }))).not.toMatch(
 		/question-add"[^>]*disabled/,
 	);
@@ -275,4 +276,16 @@ test("an expired card keeps its question and says the Planner will proceed; a wi
 	let withdrawn = render("cancelled");
 	expect(withdrawn).toContain("Cancelled by @chopin");
 	expect(withdrawn).not.toContain("Nobody answered");
+});
+
+test("a typed label repeats an option regardless of case or padding", () => {
+	let question = {
+		id: "q",
+		header: "Q",
+		question: "Where?",
+		multiple: false,
+		options: [{ id: "a", label: " In SQLite ", description: "" }],
+	};
+	expect(duplicateOf(question, "in sqlite")?.id).toBe("a");
+	expect(duplicateOf(question, "In files")).toBeUndefined();
 });

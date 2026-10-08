@@ -7,7 +7,12 @@ import { join } from "node:path";
 import { applyProposal } from "./application.mjs";
 import { begin, initialState } from "./state.mjs";
 
-function fixture(protectedChange = false, contents = "repair") {
+function fixture(
+	protectedChange = false,
+	contents = "repair",
+	operation = "fix",
+	baseExtraBytes = 0,
+) {
 	let source = mkdtempSync(join(tmpdir(), "application-source-"));
 	let directory = mkdtempSync(join(tmpdir(), "application-trusted-"));
 	let artifactDirectory = mkdtempSync(join(tmpdir(), "application-artifact-"));
@@ -28,12 +33,53 @@ function fixture(protectedChange = false, contents = "repair") {
 	writeFileSync(join(source, "apps/a.ts"), "initial");
 	git("add", ".");
 	git("commit", "-qm", "base");
-	let head = git("rev-parse", "HEAD");
+	let root = git("rev-parse", "HEAD");
+	let head = root;
+	let expectedBase = root;
+	if (operation === "merge") {
+		git("checkout", "-qb", "feature");
+		writeFileSync(join(source, "apps/a.ts"), "feature");
+		git("add", ".");
+		git("commit", "-qm", "feature");
+		head = git("rev-parse", "HEAD");
+		git("checkout", "-qb", "main", root);
+		writeFileSync(join(source, "apps/a.ts"), "base update");
+		if (baseExtraBytes > 0) {
+			writeFileSync(join(source, "apps/base-extra.ts"), "x".repeat(baseExtraBytes));
+		}
+		git("add", ".");
+		git("commit", "-qm", "base update");
+		expectedBase = git("rev-parse", "HEAD");
+		git("checkout", "-q", "feature");
+	}
 	execFileSync("git", ["clone", "-q", source, directory]);
+	if (operation === "merge") {
+		expect(() => git("merge", "--no-ff", "--no-commit", "main")).toThrow();
+	}
 	writeFileSync(join(source, protectedChange ? "package.json" : "apps/a.ts"), contents);
 	git("add", ".");
 	git("commit", "-qm", "proposal");
 	let proposalHead = git("rev-parse", "HEAD");
+	let reviewBase = head;
+	if (operation === "merge") {
+		let output: string;
+		try {
+			output = execFileSync("git", [
+				"merge-tree",
+				"--write-tree",
+				"-z",
+				"--name-only",
+				"--no-messages",
+				head,
+				expectedBase,
+			], { cwd: source, encoding: "utf8" });
+		} catch (error) {
+			let failed = error as { status?: number; stdout?: string };
+			if (failed.status !== 1 || typeof failed.stdout !== "string") throw error;
+			output = failed.stdout;
+		}
+		reviewBase = output.split("\0")[0];
+	}
 	git("update-ref", "refs/pr-maintenance/proposal", proposalHead);
 	git(
 		"bundle",
@@ -41,14 +87,15 @@ function fixture(protectedChange = false, contents = "repair") {
 		join(artifactDirectory, "proposal.bundle"),
 		"refs/pr-maintenance/proposal",
 		`^${head}`,
+		...(operation === "merge" ? [`^${expectedBase}`] : []),
 	);
 	let manifest = {
 		schemaVersion: 1,
 		attempt: "attempt",
-		operation: "fix",
+		operation,
 		pr: 1,
 		expectedHead: head,
-		expectedBase: head,
+		expectedBase,
 		proposalHead,
 		oldReplayBoundary: null,
 		bundleSha256: createHash("sha256").update(
@@ -66,7 +113,12 @@ function fixture(protectedChange = false, contents = "repair") {
 			revision: 0,
 			prs: {
 				"1": begin(
-					initialState({ number: 1, head, baseHead: head, action: "repair" }, 1),
+					initialState({
+						number: 1,
+						head,
+						baseHead: expectedBase,
+						action: operation === "merge" ? "conflict" : "repair",
+					}, 1),
 					"attempt",
 					2,
 				),
@@ -80,7 +132,7 @@ function fixture(protectedChange = false, contents = "repair") {
 		base: { ref: "main", repo: { full_name: "owner/repo" } },
 	};
 	let calls: string[] = [];
-	let baseHead = head;
+	let baseHead = expectedBase;
 	let store = {
 		async load() {
 			calls.push("load");
@@ -106,7 +158,7 @@ function fixture(protectedChange = false, contents = "repair") {
 			"--no-ext-diff",
 			"--no-textconv",
 			"--binary",
-			head,
+			reviewBase,
 			proposalHead,
 		], { cwd: source, encoding: "utf8" }),
 		now: 3,
@@ -126,6 +178,7 @@ function fixture(protectedChange = false, contents = "repair") {
 		options,
 		calls,
 		pr,
+		source,
 		head,
 		proposalHead,
 		record: () => record,
@@ -161,7 +214,51 @@ test("registers using CAS before guarded push and verifies published head", asyn
 		},
 	});
 	expect(f.calls.filter((call) => call === "push")).toHaveLength(1);
-});
+}, 15_000);
+
+test("guarded publication accepts one reviewed conflict merge and rejects stale base", async () => {
+	let f = fixture(false, "combined", "merge");
+	expect(await applyProposal(f.options)).toEqual({
+		kind: "applied",
+		head: f.proposalHead,
+		verification: {
+			head: f.proposalHead,
+			operation: "merge",
+			paths: ["apps/a.ts"],
+			checks: [{ command: "bun test", result: "passed" }],
+			hashReviews: [],
+		},
+	});
+	expect(f.calls.indexOf("save")).toBeLessThan(f.calls.indexOf("push"));
+	f = fixture(false, "combined", "merge");
+	f.setBase("c".repeat(40));
+	expect(await applyProposal(f.options)).toEqual({ kind: "superseded" });
+	expect(f.calls).not.toContain("push");
+	f = fixture(false, "combined", "merge");
+	f.pr.head.sha = "c".repeat(40);
+	expect(await applyProposal(f.options)).toEqual({ kind: "superseded" });
+	expect(f.calls).not.toContain("push");
+}, 15_000);
+
+test("merge detector reviews only resolution over the synthetic merge tree", async () => {
+	let f = fixture(false, "combined", "merge", 20 * 1024);
+	let headDiff = execFileSync("git", ["diff", "--binary", f.head, f.proposalHead], {
+		cwd: f.source,
+	});
+	expect(headDiff.length).toBeGreaterThan(10 * 1024);
+	expect(Buffer.byteLength(f.options.review)).toBeLessThanOrEqual(10 * 1024);
+	expect((await applyProposal(f.options)).kind).toBe("applied");
+	let mismatch = fixture(false, "combined", "merge");
+	mismatch.options.review = execFileSync("git", [
+		"diff",
+		"--binary",
+		mismatch.head,
+		mismatch.proposalHead,
+	], { cwd: mismatch.source, encoding: "utf8" });
+	expect((await applyProposal(mismatch.options)).kind).toBe("blocked");
+	expect(mismatch.calls).not.toContain("save");
+	expect(mismatch.calls).not.toContain("push");
+}, 15_000);
 
 test("head/base drift and opt-out supersede without publication", async () => {
 	for (let drift of ["head", "base", "opt-out"]) {
@@ -320,8 +417,10 @@ test("missing captured object is a trusted repository infrastructure failure", a
 	expect(f.calls).not.toContain("push");
 });
 
-test("compressible oversized proposal diff is a policy blocker before state writes", async () => {
-	let f = fixture(false, "x".repeat(512 * 1024));
+test("review over the safe-output limit blocks before state writes", async () => {
+	let f = fixture(false, "x".repeat(10 * 1024));
+	expect(Buffer.byteLength(f.options.review)).toBeGreaterThan(10 * 1024);
+	expect(Buffer.byteLength(f.options.review)).toBeLessThan(11 * 1024);
 	expect(await applyProposal(f.options)).toEqual({
 		kind: "blocked",
 		reason: "Detector review must exactly match the bounded proposal diff",

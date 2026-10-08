@@ -12,9 +12,11 @@
  * was here, but the block itself is gone and cannot be asked what it was.
  */
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useRef, useState, useSyncExternalStore } from "react";
+import { ArrowUpIcon, ChevronIcon } from "@chopin/icons";
 
 import { MotionDisclosureIcon } from "./disclosure-motion";
+import { usePopoverDismissal } from "./popover-dismissal";
 
 import type { ChangeStore, Entry, Snapshot } from "./changes";
 
@@ -38,6 +40,27 @@ function label(entry: Entry): string {
 		case "removed":
 			return entry.blocks.length > 1 ? `Removed ${entry.blocks.length} blocks` : "Removed";
 	}
+}
+
+/**
+ * Who wrote it: the verified caller first, then the client they used. The
+ * client names itself and could claim to be anyone, so it never stands alone;
+ * one that gave no name is reported by the server as `unknown`.
+ */
+export function author(entry: Entry): string | undefined {
+	let attribution = entry.attribution;
+	if (!attribution) return undefined;
+	let user = `@${attribution.user}`;
+	return attribution.client.name === "unknown" ? user : `${user} via ${attribution.client.name}`;
+}
+
+function provenance(entry: Entry): string | undefined {
+	let attribution = entry.attribution;
+	if (!attribution) return undefined;
+	let client = attribution.client.name === "unknown"
+		? "An unnamed MCP client"
+		: `${attribution.client.name} ${attribution.client.version}`;
+	return `${client}, revisions ${attribution.fromRevision} to ${attribution.revision}`;
 }
 
 function describe(entry: Entry): string {
@@ -65,14 +88,9 @@ function List({ entries }: { entries: Entry[] }) {
 					// between this list and a plain history of the turn.
 					data-unread={entry.seen ? undefined : ""}
 				>
-					<span
-						className="plan-changes-kind"
-						title={entry.attribution
-							? `${entry.attribution.client.name} ${entry.attribution.client.version}, revisions ${entry.attribution.fromRevision} to ${entry.attribution.revision}`
-							: undefined}
-					>
+					<span className="plan-changes-kind" title={provenance(entry)}>
 						{label(entry)}
-						{entry.attribution ? ` by ${entry.attribution.client.name}` : ""}
+						{author(entry) ? ` by ${author(entry)}` : ""}
 					</span>
 					<span className="plan-changes-text">{describe(entry)}</span>
 				</li>
@@ -93,6 +111,7 @@ function Chip(
 	let [open, setOpen] = useState(false);
 	let [iconMotionOwner, setIconMotionOwner] = useState<"immediate" | "pointer">();
 	let box = useRef<HTMLDivElement>(null);
+	let more = useRef<HTMLButtonElement>(null);
 
 	// Once every change in this direction is read, the list has nothing left
 	// to show. Adjusting state during render (rather than in an Effect that
@@ -107,21 +126,17 @@ function Chip(
 		}
 	}
 
-	// Closing on an outside click rather than on blur: the list is inside the
-	// same box as the button, so blur fires on the way to clicking it.
-	useEffect(() => {
-		if (!open) return;
-		let close = (event: MouseEvent) => {
-			if (!box.current?.contains(event.target as Node)) {
-				setIconMotionOwner("pointer");
-				setOpen(false);
-			}
-		};
-		document.addEventListener("mousedown", close);
-		return () => document.removeEventListener("mousedown", close);
-	}, [open]);
+	// Outside the whole box rather than blur: the list is inside the same box
+	// as the button, so blur fires on the way to clicking it.
+	usePopoverDismissal(open, target => box.current?.contains(target), restoreFocus => {
+		setIconMotionOwner(restoreFocus ? "immediate" : "pointer");
+		setOpen(false);
+		if (restoreFocus) more.current?.focus();
+	});
 
 	if (waiting === 0) return null;
+
+	let summary = `${count(waiting)} ${waiting === 1 ? "change" : "changes"} ${side}`;
 
 	return (
 		<div ref={box} className="plan-changes" data-side={side}>
@@ -134,14 +149,19 @@ function Chip(
 					type="button"
 					className="plan-changes-go"
 					onClick={onGo}
-					title={`Go to the nearest change ${side}`}
+					aria-label={summary}
+					data-tooltip={summary}
 				>
-					<span aria-hidden="true">{side === "above" ? "↑" : "↓"}</span>
-					{`${count(waiting)} ${waiting === 1 ? "change" : "changes"} ${side}`}
+					<ArrowUpIcon
+						className={side === "below" ? "rotate-180" : undefined}
+						size={14}
+					/>
+					<span className="tabular-nums" aria-hidden="true">{count(waiting)}</span>
 				</button>
 				<button
 					type="button"
 					className="plan-changes-more"
+					ref={more}
 					data-tooltip="View changes"
 					aria-expanded={open}
 					onClick={() => {
@@ -150,14 +170,15 @@ function Chip(
 						);
 						setOpen(value => !value);
 					}}
-					title="What the agent changed"
 				>
 					<MotionDisclosureIcon
 						className="editor-motion-feedback"
-						closed="▸"
+						closed={<ChevronIcon size={14} />}
 						motionOwner={iconMotionOwner}
 						open={open}
-						opened="▾"
+						opened={
+							<ChevronIcon className={side === "below" ? "-rotate-90" : "rotate-90"} size={14} />
+						}
 					/>
 					<span className="sr-only">What the agent changed</span>
 				</button>

@@ -14,15 +14,19 @@ import {
 	Face,
 	firstOpenDecision,
 	PlanEditor,
+	PlanStatus,
 	QuestionnaireStore,
+	ResearchLauncher,
 	selectDecisionView,
 	ThreadStore,
+	useConnectionNotice,
 	useHasPlanContent,
 	useQuestionnaires,
 	visibleDecisionView,
 } from "@chopin/editor";
 
 import { Chat } from "./chat/chat";
+import { ChildProvenance } from "./child-provenance";
 import { shouldShowResearchActionError, useResearchOfferLinks } from "./chat/research-offer";
 import type { ResearchDraftController } from "./chat/research-draft-controller";
 import { advanceConversationAnnouncement } from "./conversation-plan/announcements";
@@ -35,22 +39,37 @@ import type { ExcerptCorrectionAction } from "./conversation-plan/analysis-overv
 import { ConversationPlanStore, useConversationPlan } from "./conversation-plan/store";
 import { rememberChannel } from "./channel-recovery";
 import { decisionAttention, DecisionViewControl } from "./decision-view-control";
+import {
+	advanceDocumentActivity,
+	ANSWER_FOLLOW_MS,
+	documentActivity,
+	QUIET_DOCUMENT,
+} from "./document-activity";
 import { newestDocumentMetadata } from "./document-actions";
 import { DocumentActionsMenu } from "./document-actions-menu";
+import { DocumentRename } from "./document-rename";
 import { motionContract } from "./motion-contract";
 import { motionImmediately } from "./motion-input";
 import { useNavigationDocument } from "./navigation-shell";
+import { titleEdits } from "./title-edit";
 import { peopleHere } from "./presence";
 import { ResearchRequestStore } from "./research-requests";
 import { Wire } from "./wire";
 import { useWorkspaceIds, useWorkspaceLayout, useWorkspaceState, Workspace } from "./workspace";
 import { initialDocumentView, presentWorkspace, workspaceProfile } from "./workspace-model";
 
-import type { ConversationPlan, Research, Session } from "@chopin/protocol";
-import type { DecisionView, DecisionViewState } from "@chopin/editor";
+import type { ConversationPlan, Plan, Question, Research, Session } from "@chopin/protocol";
+import type {
+	DecisionView,
+	DecisionViewState,
+	PlanState,
+	Refusal,
+	ResearchLaunchResult,
+} from "@chopin/editor";
 import type { ReactNode } from "react";
 import type { DocumentMetadata } from "./document-actions";
 import type { DocumentAction } from "./document-actions-menu";
+import type { TitleEdit } from "./title-edit";
 import type { HostedWorkspaceProps } from "./hosted";
 import type { Status } from "./wire";
 import type { ChatDestination } from "./conversation-plan/source";
@@ -61,6 +80,14 @@ type ManagedHello = Session.Hello & { archivedAt?: string; canManage: boolean };
 type ManagedChannel = Session.Channel & { archivedAt?: string; canManage: boolean };
 type ManagedAccess = Session.Access & { canManage: boolean };
 type WorkspaceMetadata = DocumentMetadata;
+
+// Lives here rather than in `title-edit.ts` to keep it out of the initial bundle.
+function claimTitleEdit(id: string): TitleEdit | undefined {
+	let edit = titleEdits.get(id);
+	// StrictMode renders twice in one task, and both renders must see the claim.
+	if (edit) queueMicrotask(() => titleEdits.delete(id));
+	return edit;
+}
 
 function settleMotionImmediately(): boolean {
 	return motionImmediately();
@@ -75,30 +102,75 @@ export function Header(
 	{
 		archivedAt,
 		canManage,
+		editing,
 		members,
 		label,
 		onAction,
+		onEditingChange,
+		onRenamed,
 		presentation,
+		project,
+		room,
 		tools,
 	}: {
 		archivedAt?: string;
 		canManage: boolean;
+		editing?: TitleEdit;
 		members: Session.Member[];
 		label: string;
 		onAction: (action: DocumentAction) => void;
+		onEditingChange: (editing?: TitleEdit) => void;
+		onRenamed: (channel: DocumentMetadata) => void;
 		presentation: WorkspacePresentation;
+		project?: { id: string; name: string };
+		room: string;
 		/** Document view controls beside the people here. */
 		tools?: ReactNode;
 	},
 ) {
+	let { onProjectReveal } = useNavigationDocument();
 	let people = peopleHere(members);
+	let header = useRef<HTMLElement>(null);
+	let title = useRef<HTMLButtonElement>(null);
+	let previousEdit = useRef(editing);
+	useEffect(() => {
+		let previous = previousEdit.current;
+		previousEdit.current = editing;
+		// Hand the caret back only when the field took it with it, not after a blur commit.
+		if (!editing && previous && document.activeElement === document.body) title.current?.focus();
+	}, [editing]);
+	let finishEdit = () => {
+		// Naming a new document leads into writing it, unless the user already clicked elsewhere.
+		if (editing === "new" && header.current?.contains(document.activeElement)) {
+			header.current.closest(".workspace-root")
+				?.querySelector<HTMLElement>(".plan-content[contenteditable='true']")
+				?.focus();
+		}
+		onEditingChange();
+	};
 	return (
-		<header className="room-header relative flex shrink-0 flex-nowrap items-center px-2 py-2 sm:px-5 sm:py-0">
+		<header
+			className="room-header relative flex shrink-0 flex-nowrap items-center px-2 py-2 sm:px-5 sm:py-0"
+			ref={header}
+		>
 			<div
 				aria-label={`Document: ${label}`}
 				className="flex min-w-0 flex-1 items-center gap-0.5"
 			>
-				<DocumentIcon />
+				<DocumentIcon className="shrink-0" />
+				{project && presentation.type !== "parent-with-child" && (
+					<>
+						<button
+							aria-label={`Show ${project.name} in the sidebar`}
+							className="document-project-prefix"
+							onClick={() => onProjectReveal(project.id)}
+							type="button"
+						>
+							<span className="truncate">{project.name}</span>
+						</button>
+						<span aria-hidden="true" className="document-project-separator">/</span>
+					</>
+				)}
 				{presentation.type === "parent-with-child"
 					? (
 						<>
@@ -122,22 +194,46 @@ export function Header(
 							</span>
 						</>
 					)
-					: canManage
+					: editing && canManage && !archivedAt
 					? (
-						<DocumentActionsMenu
-							align="start"
-							channel={{ archivedAt, title: label }}
-							className="document-title-trigger"
-							onAction={onAction}
-							trigger={
-								<>
-									<span className="truncate">{label}</span>
-									<ChevronIcon aria-hidden="true" className="rotate-90" />
-								</>
-							}
+						<DocumentRename
+							channel={{ id: room, title: label }}
+							inline
+							onCancel={finishEdit}
+							replay={editing === "new"}
+							onRenamed={detail => {
+								onRenamed(detail.channel);
+								finishEdit();
+							}}
 						/>
 					)
+					: canManage && !archivedAt
+					? (
+						<button
+							aria-label={`Rename ${label}`}
+							className="document-title-trigger"
+							onClick={() => onEditingChange("rename")}
+							onKeyDown={event => {
+								if (event.key !== "F2") return;
+								event.preventDefault();
+								onEditingChange("rename");
+							}}
+							ref={title}
+							type="button"
+						>
+							<span className="truncate">{label}</span>
+						</button>
+					)
 					: <span className="document-title-label truncate">{label}</span>}
+				{canManage && presentation.type !== "parent-with-child" && (
+					<DocumentActionsMenu
+						align="start"
+						channel={{ archivedAt, title: label }}
+						className="document-title-menu"
+						onAction={action => action === "rename" ? onEditingChange("rename") : onAction(action)}
+						trigger={<ChevronIcon aria-hidden="true" className="rotate-90" />}
+					/>
+				)}
 				{archivedAt && (
 					<span className="document-archived-status">
 						<Badge icon={ArchiveIcon} label="Archived" size="sm" />
@@ -182,6 +278,17 @@ export function Header(
 	);
 }
 
+const LOST_EDITS =
+	"Your last edits couldn't be saved because the document changed while you were offline.";
+
+const UNDO_REFUSALS: Record<Refusal, string> = {
+	others: "Others have edited this since.",
+	change: "This change can't be reversed here.",
+};
+
+/** Reconnect attempts a person can make in one outage before Reload is offered. */
+const RECONNECTS_BEFORE_RELOAD = 3;
+
 export function RoomWorkspace(
 	{
 		agent = true,
@@ -224,6 +331,26 @@ export function RoomWorkspace(
 		onResearchChildPublished,
 	} = useNavigationDocument();
 	let [status, setStatus] = useState<Status>("connecting");
+	let [planState, setPlanState] = useState<PlanState>({ synced: false });
+	// Claimed while rendering, so a new document's title takes focus as soon as it mounts.
+	let [titleEdit, setTitleEdit] = useState(() => claimTitleEdit(room));
+	useEffect(() => {
+		let listen = (event: Event) => {
+			if ((event as CustomEvent<string>).detail !== room) return;
+			let edit = claimTitleEdit(room);
+			if (edit) setTitleEdit(edit);
+		};
+		addEventListener("title-edit", listen);
+		return () => removeEventListener("title-edit", listen);
+	}, [room]);
+	// Controls dim only once a loss outlasts a blip; actions still read `status`.
+	let treatAsConnected = useConnectionNotice(status !== "connected") === "none";
+	// Reconnecting in place keeps unsent work, so it is offered first. A reload
+	// is the fallback once it has failed this often in one outage.
+	let [reconnects, setReconnects] = useState(0);
+	// The last loss of unsent edits this person has dismissed.
+	let [lostSeen, setLostSeen] = useState(0);
+	if (status === "connected" && reconnects) setReconnects(0);
 	let [members, setMembers] = useState<Session.Member[]>([]);
 	let [effectiveCanEdit, setEffectiveCanEdit] = useState(canEdit && !archivedAt);
 	let [effectiveCanManage, setEffectiveCanManage] = useState(canManage);
@@ -255,6 +382,7 @@ export function RoomWorkspace(
 	let [cardMeta] = useState(() => new CardMetaStore());
 	let [threads] = useState(() => new ThreadStore());
 	let [authorship] = useState(() => new AuthorshipStore());
+	let [researchLauncher] = useState(() => new ResearchLauncher());
 	let research = useMemo(
 		() =>
 			new ResearchRequestStore({
@@ -327,6 +455,12 @@ export function RoomWorkspace(
 		},
 		[chatActive],
 	);
+	let planVisible = workspacePresentation.documentVisible && view === "plan";
+	let latestPlanVisible = useRef(planVisible);
+	latestPlanVisible.current = planVisible;
+	let latestBusy = useRef(chatActivity.busy);
+	latestBusy.current = chatActivity.busy;
+	let [documentWatch, setDocumentWatch] = useState(QUIET_DOCUMENT);
 	let updateMetadata = useCallback((next: WorkspaceMetadata) => {
 		let previous = metadataRef.current;
 		let metadata = newestDocumentMetadata(previous, next);
@@ -364,6 +498,48 @@ export function RoomWorkspace(
 		if (!chatActive) return;
 		setChatActivity(current => current.unread === 0 ? current : { ...current, unread: 0 });
 	}, [chatActive]);
+
+	useEffect(() => {
+		if (planVisible) setDocumentWatch(state => advanceDocumentActivity(state, { type: "seen" }));
+	}, [planVisible]);
+
+	useEffect(() => {
+		setDocumentWatch(state =>
+			advanceDocumentActivity(state, { type: chatActivity.busy ? "started" : "idle" })
+		);
+	}, [chatActivity.busy]);
+
+	useEffect(() => {
+		if (documentWatch.following !== "awaiting") return;
+		let timer = window.setTimeout(
+			() => setDocumentWatch(state => advanceDocumentActivity(state, { type: "expired" })),
+			ANSWER_FOLLOW_MS,
+		);
+		return () => window.clearTimeout(timer);
+	}, [documentWatch.following]);
+
+	useEffect(() => {
+		if (!wire) return;
+		let offChanges = wire.on<Plan.Changes>("plan:changes", () => {
+			if (latestPlanVisible.current) return;
+			setDocumentWatch(state =>
+				advanceDocumentActivity(state, { type: "changes", busy: latestBusy.current })
+			);
+		});
+		// Only this viewer's own answer resumes a turn worth following; a discard
+		// or someone else's answer may start nothing.
+		let offResolved = wire.on<Question.Resolved>("question:resolved", event => {
+			if (event.status !== "answered" || event.resolver !== handle) return;
+			if (latestPlanVisible.current) return;
+			setDocumentWatch(state =>
+				advanceDocumentActivity(state, { type: "answered", busy: latestBusy.current })
+			);
+		});
+		return () => {
+			offChanges();
+			offResolved();
+		};
+	}, [wire, handle]);
 
 	useEffect(() => {
 		let previous = previousUnanswered.current;
@@ -439,6 +615,10 @@ export function RoomWorkspace(
 		if (mode === "split") setDesktopChatOpen(true);
 		else dispatch({ type: "set-chat", open: true });
 	}, [dispatch, mode, setDesktopChatOpen]);
+	let hasCardSource = useCallback((questionnaireId: string) => {
+		let thread = conversation.state && threadForCard(conversation.state, questionnaireId);
+		return !!thread?.questionSources[0];
+	}, [conversation.state]);
 	let showCardSource = useCallback((questionnaireId: string) => {
 		let thread = conversation.state && threadForCard(conversation.state, questionnaireId);
 		let source = thread?.questionSources[0];
@@ -531,6 +711,19 @@ export function RoomWorkspace(
 			card.tabIndex = -1;
 			card.focus();
 		});
+	};
+
+	let startResearch = async (brief: string): Promise<ResearchLaunchResult> => {
+		let checked = researchLauncher.check(brief);
+		if (!checked.ok) return checked;
+		selectDestination("plan");
+		// The document may have been hidden; open once it has laid out.
+		await new Promise(resolve => requestAnimationFrame(resolve));
+		return researchLauncher.open(brief);
+	};
+	let showResearchDraft = () => {
+		selectDestination("plan");
+		requestAnimationFrame(() => researchLauncher.reveal());
 	};
 
 	useEffect(() => {
@@ -746,7 +939,12 @@ export function RoomWorkspace(
 							: !workspaceCanEdit
 							? "You have read-only access to this document."
 							: undefined}
+						emptyNotice={presentation.type === "child"
+							? "Discuss this report here. Messages stay with the report."
+							: undefined}
 						onShowDecisions={() => selectDestination("decisions")}
+						onResearch={researchEnabled ? startResearch : undefined}
+						onShowResearch={showResearchDraft}
 						people={peopleHere(members)}
 						conversationPlan={conversation.state}
 						conversationPlanJobs={conversation.jobs}
@@ -765,6 +963,7 @@ export function RoomWorkspace(
 								canExecute: researchExecution,
 								wire,
 								controllers: researchDrafts,
+								handle,
 								onSource: source =>
 									showSource({ source: { ...source, role: "support" }, itemId: source.messageId }),
 								store: research,
@@ -776,7 +975,7 @@ export function RoomWorkspace(
 							questions,
 							meta: cardMeta,
 							wire,
-							connected: status === "connected",
+							connected: treatAsConnected,
 							canEdit: workspaceCanEdit,
 							onOpenCard: showDecisionCard,
 						}}
@@ -788,24 +987,91 @@ export function RoomWorkspace(
 					/>
 				}
 				chatActivity={chatActivity}
+				documentActivity={documentActivity(documentWatch, chatActivity.busy)}
 				header={
 					<Header
 						archivedAt={workspaceArchivedAt}
 						canManage={effectiveCanManage}
+						editing={titleEdit}
 						members={members}
 						label={metadata.title}
 						onAction={action => onDocumentAction(room, action)}
+						onEditingChange={setTitleEdit}
+						onRenamed={updateMetadata}
 						presentation={presentation}
+						project={{ id: repository.id, name: repository.name }}
+						room={room}
 						tools={<AuthorshipToggle store={authorship} />}
 					/>
 				}
 				controls={
 					<DecisionViewControl
 						attention={attention}
+						documentActivity={documentActivity(documentWatch, chatActivity.busy)}
 						onView={selectDestination}
 						unanswered={unanswered}
 						view={view}
 					/>
+				}
+				status={
+					<>
+						{!!planState.lost && planState.lost !== lostSeen && (
+							<div className="plan-status" data-level="alert" role="alert">
+								<span className="plan-status-text">
+									<span
+										aria-hidden="true"
+										className="plan-status-label"
+										data-tooltip={LOST_EDITS}
+										data-tooltip-verbatim=""
+									>
+										Edits not saved
+									</span>
+									<span aria-hidden="true" className="plan-status-detail">{LOST_EDITS}</span>
+									<span className="sr-only">{LOST_EDITS}</span>
+								</span>
+								<button
+									className="btn btn-sm btn-ghost"
+									onClick={() =>
+										setLostSeen(planState.lost ?? 0)}
+									type="button"
+								>
+									Dismiss
+								</button>
+							</div>
+						)}
+						{/* Apart from PlanStatus, which would announce its end as "Reconnected". */}
+						{planState.refused && (
+							<div className="plan-status" data-level="notice">
+								<span aria-hidden="true" className="plan-status-dot" />
+								<span aria-hidden="true" className="plan-status-text">
+									<span
+										className="plan-status-label"
+										data-tooltip={UNDO_REFUSALS[planState.refused.reason]}
+										data-tooltip-verbatim=""
+									>
+										Can't undo
+									</span>
+									<span className="plan-status-detail">
+										{UNDO_REFUSALS[planState.refused.reason]}
+									</span>
+								</span>
+							</div>
+						)}
+						<span aria-atomic="true" aria-live="polite" className="sr-only" role="status">
+							{planState.refused && `Can't undo. ${UNDO_REFUSALS[planState.refused.reason]}`}
+						</span>
+						<PlanStatus
+							connection={status === "deleted" ? "closed" : treatAsConnected ? undefined : status}
+							failed={planState.failed}
+							onReconnect={wire && reconnects < RECONNECTS_BEFORE_RELOAD
+								? () => {
+									setReconnects(count => count + 1);
+									wire.reconnect();
+								}
+								: undefined}
+							synced={planState.synced}
+						/>
+					</>
 				}
 				ids={workspaceIds}
 				identity={room}
@@ -817,13 +1083,15 @@ export function RoomWorkspace(
 					<Decisions
 						cardMeta={cardMeta}
 						canEdit={workspaceCanEdit}
-						connected={status === "connected" && workspaceCanEdit}
+						connected={treatAsConnected && workspaceCanEdit}
 						headingId={workspaceIds.heading.decisions}
 						motion={motionContract("collapse")}
 						motionImmediately={settleMotionImmediately}
 						onShowPlan={showPlan}
+						planner={agent}
 						questionMotion={QUESTION_MOTION}
 						reveal={reveal}
+						self={handle}
 						store={questions}
 						wire={wire}
 					/>
@@ -833,15 +1101,23 @@ export function RoomWorkspace(
 						cardMeta={cardMeta}
 						evidence={showEvidence}
 						onCardSource={showCardSource}
+						hasCardSource={hasCardSource}
+						planner={agent}
 						commentPresentation={mode === "split" ? "popover" : "sheet"}
 						connection={status === "deleted" ? "closed" : status}
 						key={workspaceArchivedAt ? "archived" : "active"}
+						disclosureMotion={motionContract("collapse")}
 						motionImmediately={settleMotionImmediately}
 						onScrollTop={setPlanScrollTop}
+						onState={setPlanState}
+						preface={presentation.type === "child" && presentation.parent
+							? <ChildProvenance channelId={room} parent={presentation.parent} />
+							: undefined}
 						questionMotion={QUESTION_MOTION}
 						questions={questions}
 						readOnly={!workspaceCanEdit}
 						research={profile.research ? research : undefined}
+						researchLauncher={researchLauncher}
 						scrollTop={planScrollTop}
 						threads={threads}
 						authorship={authorship}

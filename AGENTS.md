@@ -70,6 +70,7 @@ image build. A documentation-only change should still pass `bun run ci`.
 | `packages/question` | Questionnaire definitions and shared drafts            | `protocol`                                           |
 | `packages/draft`    | Bounded collaborative plain-text drafts                | none                                                 |
 | `packages/viewport` | Browser geometry and subscriptions                     | none                                                 |
+| `packages/diagrams` | Bounded diagram rendering and scoped React viewing     | none (React peer)                                    |
 | `packages/editor`   | Collaborative editor, decisions, comments, and widgets | `dialect`, `question`, `protocol`, `viewport`        |
 | `apps/server`       | Auth, channels, rooms, storage, Planner, MCP, tasks    | `dialect`, `draft`, `question`, `protocol`           |
 | `apps/web`          | Repository picker, navigation, conversation, workspace | `dialect`, `draft`, `editor`, `protocol`, `viewport` |
@@ -99,9 +100,10 @@ MDAST object identity preserves existing Lexical nodes, selections, and undo
 history.
 
 PostgreSQL is the only runtime storage adapter. One renewable `chopin:writer`
-lease permits one application process per database. Process-local browser
-sessions and GitHub credentials are cleared on startup; collaborative state and
-external implementation runs are durable.
+lease permits one application process per database. Hosted browser sessions use
+encrypted credentials in PostgreSQL and restore on presentation of the browser
+cookie. Startup clears Planner ownership and metadata-only local sessions;
+collaborative state and external implementation runs are durable.
 
 ## Authority and security
 
@@ -392,7 +394,7 @@ ordering. Extract pure state machines for unit coverage and use `*.e2e.ts` for
 the browser adapter.
 
 The E2E fake GitHub replaces GitHub's network responses only. OAuth state,
-process-local sessions, admission, repository checks, channel routes,
+session persistence, admission, repository checks, channel routes,
 WebSockets, storage, and the web application are production implementations.
 
 Prefer role and accessible-name selectors. Avoid classes, generated Lexical

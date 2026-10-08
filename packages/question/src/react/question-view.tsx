@@ -14,11 +14,13 @@ import { CheckIcon, ChevronIcon, DecisionIcon, PlusIcon, WarningIcon } from "@ch
 
 import { INPUT_EXPIRY_MS, MAX_LABEL, MAX_SHARED_OPTIONS } from "../limits";
 import { answered } from "../draft";
-import { InlineCode, InlineCodeList } from "./inline-code";
+import { InlineCode } from "./inline-code";
 import { plainInlineList, plainInlineText } from "./inline-segments";
 import { projectSuggestion, reduceSuggestionEditState } from "./project-suggestion";
+import { cardRelation, RelationNote } from "./relation-note";
 import { ResolvedActions } from "./resolved-actions";
 import type { VisibleSuggestion } from "./project-suggestion";
+import type { Relation } from "../relation";
 
 import type { ReactNode } from "react";
 import type { Question } from "@chopin/protocol";
@@ -79,6 +81,10 @@ export type QuestionViewProps = {
 	 * rather than advertising a jump that would do nothing.
 	 */
 	places?: Record<string, number>;
+	/** Whether each answered decision is linked, pending, deliberately empty or orphaned. */
+	relations?: Record<string, Relation>;
+	/** What a pending relationship is waiting on, when the host knows better than "Linking…". */
+	pendingRelation?: string;
 	collaborators?: Collaborator[];
 	/**
 	 * Replaces the `@handle` pills for people on the current question. The view
@@ -89,7 +95,7 @@ export type QuestionViewProps = {
 	error?: string;
 	/** Host-owned presentation class for an error entering the view. */
 	errorClassName?: string;
-	/** Rendered beside the heading; hosts use it for counts and provenance. */
+	/** Host metadata, shown before an open question or below answered choices. */
 	aside?: ReactNode;
 	/** Controls in the trailing header, beside question-specific presence. */
 	headerActions?: ReactNode;
@@ -251,6 +257,12 @@ function LegacyCustom(
 	);
 }
 
+/** The existing option a typed label would repeat, matched like the server does. */
+export function duplicateOf(question: Item, label: string) {
+	let key = label.toLowerCase();
+	return question.options.find(option => option.label.trim().toLowerCase() === key);
+}
+
 /**
  * The last row: a prompt to add an option, which becomes the field for it.
  *
@@ -273,11 +285,13 @@ function AddOption(
 ) {
 	let [text, setText] = useState<string | null>(null);
 	let [pending, setPending] = useState<string | null>(null);
+	let hintId = useId();
 	let input = useRef<HTMLInputElement>(null);
 	let trigger = useRef<HTMLButtonElement>(null);
 	let focus = useRef<"field" | "trigger">(undefined);
 	let edit = useRef(0);
 	let letterIndex = question.options.length + offset;
+	let duplicate = text ? duplicateOf(question, text.trim()) : undefined;
 	useEffect(() => () => {
 		edit.current++;
 	}, []);
@@ -311,7 +325,7 @@ function AddOption(
 
 	let add = async () => {
 		let label = text?.trim();
-		if (!label || !onAdd || pending !== null) return;
+		if (!label || !onAdd || pending !== null || duplicateOf(question, label)) return;
 		let submittedEdit = edit.current;
 		setPending(label);
 		onFailed(undefined);
@@ -357,52 +371,63 @@ function AddOption(
 	}
 
 	return (
-		<div
-			aria-busy={pending !== null || undefined}
-			className="question-choice-row question-option question-adding"
-		>
-			<Key>{letter(letterIndex)}</Key>
-			<input
-				aria-disabled={pending !== null || undefined}
-				aria-label="New option"
-				autoComplete="off"
-				className="question-field"
-				disabled={disabled}
-				maxLength={MAX_LABEL}
-				onBlur={() => {
-					// Only an empty field collapses by itself. Typed text is kept, because
-					// adding an option is visible to everyone and should be deliberate.
-					if (!text.trim() && pending === null) {
-						edit.current++;
-						onCancelEdit?.();
-						setText(null);
-					}
-				}}
-				onChange={event => {
-					onEdit?.();
-					setText(event.currentTarget.value);
-					onFailed(undefined);
-				}}
-				onKeyDown={event => {
-					if (event.key === "Escape") {
-						event.preventDefault();
-						event.stopPropagation();
-						edit.current++;
-						onCancelEdit?.();
-						setText(null);
+		<div className="question-adding-group">
+			<div
+				aria-busy={pending !== null || undefined}
+				className="question-choice-row question-option question-adding"
+			>
+				<Key>{letter(letterIndex)}</Key>
+				<input
+					aria-disabled={pending !== null || undefined}
+					aria-describedby={hintId}
+					aria-invalid={duplicate ? true : undefined}
+					aria-label="New option"
+					autoComplete="off"
+					className="question-field"
+					disabled={disabled}
+					maxLength={MAX_LABEL}
+					onBlur={() => {
+						// Only an empty field collapses by itself. Typed text is kept, because
+						// adding an option is visible to everyone and should be deliberate.
+						if (!text.trim() && pending === null) {
+							edit.current++;
+							onCancelEdit?.();
+							setText(null);
+						}
+					}}
+					onChange={event => {
+						onEdit?.();
+						setText(event.currentTarget.value);
 						onFailed(undefined);
-						focus.current = "trigger";
-					} else if (event.key === "Enter" && !event.nativeEvent.isComposing) {
-						event.preventDefault();
-						void add();
-					}
-				}}
-				placeholder="Add an option"
-				readOnly={pending !== null}
-				ref={input}
-				value={text}
-			/>
-			{pending !== null && <span className="sr-only" role="status">Adding option</span>}
+					}}
+					onKeyDown={event => {
+						if (event.key === "Escape") {
+							event.preventDefault();
+							event.stopPropagation();
+							edit.current++;
+							onCancelEdit?.();
+							setText(null);
+							onFailed(undefined);
+							focus.current = "trigger";
+						} else if (event.key === "Enter" && !event.nativeEvent.isComposing) {
+							event.preventDefault();
+							void add();
+						}
+					}}
+					placeholder="Add an option"
+					readOnly={pending !== null}
+					ref={input}
+					value={text}
+				/>
+				{pending !== null && <span className="sr-only" role="status">Adding option</span>}
+			</div>
+			<p
+				className="question-add-hint"
+				id={hintId}
+				role="status"
+			>
+				{duplicate ? `Already an option: ${duplicate.label}` : ""}
+			</p>
 		</div>
 	);
 }
@@ -417,11 +442,8 @@ const LINK = "flex w-full cursor-pointer items-start justify-between gap-2 round
  * to be one. Unlinked, it takes no tab stop and offers no focus ring it could
  * never show.
  *
- * Wraps whatever it is given rather than being a paragraph itself, because on a
- * resolved card what points into the plan is the question *and* its answer
- * together. Those used to be two adjacent, identically-labelled buttons — one
- * for what the question was about, one for what the answer produced — which the
- * agent anchored to overlapping prose, so the two led to the same block.
+ * On resolved cards, only the heading is linked. Static answer rows stay
+ * outside the button, leaving one destination per question.
  *
  * `label` is the plain-text reading of the children. It is composed into the
  * accessible name rather than replacing it: the decision is what the button is
@@ -454,8 +476,8 @@ function Related(
 			data-ace-question-id={id}
 			data-press="wide"
 			aria-label={count > 1
-				? `${label} — show in plan, ${count} places`
-				: `${label} — show in plan`}
+				? `${label} — show in document, ${count} places`
+				: `${label} — show in document`}
 			onClick={() => onSelect?.(id)}
 			onMouseEnter={() => onEnter?.(id)}
 			onMouseLeave={event => event.currentTarget !== document.activeElement && onLeave?.(id)}
@@ -476,6 +498,7 @@ function Related(
 function Resolved(
 	{
 		answers,
+		aside,
 		definition,
 		resolver,
 		places,
@@ -484,6 +507,7 @@ function Resolved(
 		onQuestionSelect,
 	}: {
 		answers: Answer[];
+		aside?: ReactNode;
 		definition: Definition;
 		resolver?: string;
 		places?: QuestionViewProps["places"];
@@ -493,35 +517,97 @@ function Resolved(
 	},
 ) {
 	return (
-		<div className="space-y-2 px-3 py-2.5">
-			{answers.map((answer, index) => {
-				let id = definition.questions[index]?.id;
-				let chosen = answer.custom === undefined ? (answer.choices ?? []) : [answer.custom];
-				return (
-					<Related
-						key={id ?? index}
-						id={id}
-						count={(id ? places?.[id] : undefined) ?? 0}
-						label={`${plainInlineText(answer.question)} — ${plainInlineList(chosen)}`}
-						className=""
-						onEnter={onQuestionEnter}
-						onLeave={onQuestionLeave}
-						onSelect={onQuestionSelect}
-					>
-						{
-							/* The question and what was chosen are one decision, so they are
-						    one target: two stacked buttons led to the same prose. */
-						}
-						<p className="m-0 text-sm text-text-secondary">
-							<InlineCode text={answer.question} />
-						</p>
-						<p className="m-0 text-sm font-medium text-text-primary">
-							<InlineCodeList items={chosen} />
-						</p>
-					</Related>
-				);
-			})}
-			{resolver && <p className="m-0 text-sm text-text-tertiary">Answered by @{resolver}</p>}
+		<div>
+			<div className="space-y-4">
+				{answers.map((answer, index) => {
+					let question = definition.questions[index];
+					let id = question?.id;
+					let options = question?.options ?? [];
+					let chosenIds = answer.optionIds === undefined ? undefined : new Set(answer.optionIds);
+					let chosenLabels = new Set(answer.choices ?? []);
+					let selected = options.filter(option =>
+						chosenIds ? chosenIds.has(option.id) : chosenLabels.has(option.label)
+					);
+					let matchedLabels = new Set(selected.map(option => option.label));
+					let unmatched = answer.custom
+						? [answer.custom]
+						: (answer.choices ?? []).filter(label => !matchedLabels.has(label));
+					return (
+						<section className="question-resolved-section" key={id ?? index}>
+							<header className="question-head">
+								<span className="question-mark" title="Decision">
+									<DecisionIcon />
+								</span>
+								<div className="question-head-text">
+									<h4 className="question-title">
+										<Related
+											id={id}
+											count={(id ? places?.[id] : undefined) ?? 0}
+											label={answer.question}
+											className="question-title-link"
+											inline
+											onEnter={onQuestionEnter}
+											onLeave={onQuestionLeave}
+											onSelect={onQuestionSelect}
+										>
+											<InlineCode text={answer.question} />
+										</Related>
+									</h4>
+								</div>
+							</header>
+							<div className="question-options">
+								{options.map((option, optionIndex) => {
+									let isSelected = selected.includes(option);
+									return (
+										<div
+											className="question-choice-row question-option"
+											data-selected={isSelected ? "" : undefined}
+											key={option.id}
+										>
+											<Key>{letter(optionIndex)}</Key>
+											<span className="question-text">
+												<span className="question-label">
+													{isSelected && <span className="sr-only">{"Selected: "}</span>}
+													<InlineCode text={option.label} />
+												</span>
+												{option.description && (
+													<span className="question-desc">
+														<InlineCode text={option.description} />
+													</span>
+												)}
+											</span>
+											<span aria-hidden="true" className="question-check">
+												<CheckIcon />
+											</span>
+										</div>
+									);
+								})}
+								{unmatched.map((label, unmatchedIndex) => (
+									<div
+										className="question-choice-row question-option"
+										data-selected=""
+										key={`${label}-${unmatchedIndex}`}
+									>
+										<Key>{letter(options.length + unmatchedIndex)}</Key>
+										<span className="question-text">
+											<span className="question-label">
+												<span className="sr-only">{"Selected: "}</span>
+												<InlineCode text={label} />
+											</span>
+										</span>
+										<span aria-hidden="true" className="question-check">
+											<CheckIcon />
+										</span>
+									</div>
+								))}
+							</div>
+						</section>
+					);
+				})}
+			</div>
+			{aside
+				? <div className="question-resolved-meta">{aside}</div>
+				: resolver && <p className="question-resolved-meta">Answered by @{resolver}</p>}
 		</div>
 	);
 }
@@ -619,6 +705,8 @@ export function QuestionView(props: QuestionViewProps) {
 		aside,
 		headerActions,
 		places,
+		relations,
+		pendingRelation,
 		onQuestionEnter,
 		onQuestionLeave,
 		onQuestionFocus,
@@ -711,23 +799,42 @@ export function QuestionView(props: QuestionViewProps) {
 	}
 
 	if (status !== "open") {
+		let related = answers
+			? cardRelation(relations, definition.questions.map(question => question.id))
+			: undefined;
+		let relationNote = related && (
+			<RelationNote
+				count={places?.[related.question]}
+				onEnter={onQuestionEnter}
+				onLeave={onQuestionLeave}
+				onSelect={onQuestionSelect}
+				pending={pendingRelation}
+				question={related.question}
+				relation={related.relation}
+			/>
+		);
 		return (
-			<div>
-				{single && <DecisionHeading />}
-				{aside}
+			<div className="question-card">
 				{answers
 					? (
 						<Resolved
 							answers={answers}
+							aside={aside}
 							definition={definition}
 							resolver={resolver}
-							places={places}
+							// One control per destination: a linked note takes over the jump.
+							places={related?.relation === "linked" ? undefined : places}
 							onQuestionEnter={onQuestionEnter}
 							onQuestionLeave={onQuestionLeave}
 							onQuestionSelect={onQuestionSelect}
 						/>
 					)
-					: <p className="m-0 px-3 py-2.5 text-sm text-text-secondary">Saved decision</p>}
+					: (
+						<div>
+							<p className="m-0 px-2 text-sm text-text-secondary">Saved decision</p>
+							{aside && <div className="question-resolved-meta">{aside}</div>}
+						</div>
+					)}
 				{error && <Callout feedback={errorClassName} title="Couldn’t save" message={error} />}
 				<ResolvedActions
 					className="question-actions"
@@ -735,6 +842,7 @@ export function QuestionView(props: QuestionViewProps) {
 					onDiscard={onDiscard}
 					onReopen={onReopen}
 					submitting={submitting}
+					note={relationNote}
 				/>
 			</div>
 		);
@@ -815,13 +923,13 @@ export function QuestionView(props: QuestionViewProps) {
 								{refining && <p className="question-hint" role="status">Chopin is refining…</p>}
 							</div>
 							<span className="flex shrink-0 items-center gap-2">
-								{headerActions}
 								<Presence
 									people={collaborators.filter(person =>
 										person.question === current.id
 									)}
 									render={renderPeople}
 								/>
+								{headerActions}
 							</span>
 						</header>
 
@@ -845,7 +953,7 @@ export function QuestionView(props: QuestionViewProps) {
 									name={`${base}-${current.id}`}
 								/>
 							)}
-							{current.options.length < MAX_SHARED_OPTIONS && (
+							{onAddOption && current.options.length < MAX_SHARED_OPTIONS && (
 								<AddOption
 									key={current.id}
 									question={current}
@@ -853,9 +961,7 @@ export function QuestionView(props: QuestionViewProps) {
 										? 1
 										: 0}
 									disabled={disabled}
-									onAdd={onAddOption
-										? label => onAddOption(current.id, label)
-										: undefined}
+									onAdd={label => onAddOption(current.id, label)}
 									onFailed={setAddError}
 									onEdit={markComposerEdit}
 									onCancelEdit={cancelComposerEdit}

@@ -1,7 +1,17 @@
 import { describe, expect, it } from "bun:test";
 
 import { carriedByMarkers } from "./widgets/questionnaire";
-import { keyOf, markerPoint, point, popoverBelow, prune, shown, unchosen } from "./resolved";
+import {
+	keyOf,
+	markerPoint,
+	markerReach,
+	point,
+	popoverBelow,
+	prune,
+	shown,
+	unchosen,
+	verticalReach,
+} from "./resolved";
 
 import type { Question, Questionnaire } from "@chopin/dialect";
 import type { Rect } from "./comment-geometry";
@@ -75,14 +85,13 @@ describe("hover and pin", () => {
 		expect(shown(state)).toEqual({ key: a, pinned: true });
 	});
 
-	it("toggles off from the marker but not from the prose", () => {
+	it("toggles off from the marker", () => {
 		let pinned = point({}, { type: "toggle", key: a });
 		expect(point(pinned, { type: "toggle", key: a }).pinned).toBeUndefined();
-		expect(point(pinned, { type: "pin", key: a }).pinned).toBe(a);
 	});
 
 	it("holds one pin: pinning another replaces it", () => {
-		let state = point(point({}, { type: "pin", key: a }), { type: "pin", key: b });
+		let state = point(point({}, { type: "toggle", key: a }), { type: "toggle", key: b });
 		expect(state.pinned).toBe(b);
 	});
 
@@ -130,6 +139,24 @@ describe("marker and popover placement", () => {
 	it("never leaves the host", () => {
 		expect(markerPoint(box(1000, 50, 100, 20), 20, host).left).toBeLessThanOrEqual(780);
 		expect(markerPoint(box(2, 50, 100, 20), 20, host).left).toBeGreaterThanOrEqual(0);
+	});
+
+	it("reaches 12px past the marker but stops at the page edge and the prose", () => {
+		expect(markerReach(72, 20, 100)).toEqual({ start: 12, end: 8 });
+		expect(markerReach(100, 20, 200)).toEqual({ start: 12, end: 12 });
+		expect(markerReach(4, 12, 16)).toEqual({ start: 4, end: 0 });
+		expect(markerReach(0, 12, 8)).toEqual({ start: 0, end: 0 });
+	});
+
+	it("splits the gap between markers closer than their reach", () => {
+		expect(verticalReach([{ top: 0, height: 20 }, { top: 36, height: 20 }])).toEqual([
+			{ top: 12, bottom: 8 },
+			{ top: 8, bottom: 12 },
+		]);
+		expect(verticalReach([{ top: 0, height: 20 }, { top: 100, height: 20 }])).toEqual([
+			{ top: 12, bottom: 12 },
+			{ top: 12, bottom: 12 },
+		]);
 	});
 
 	it("opens under the block, aligned to its start, and flips at the bottom", () => {

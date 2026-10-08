@@ -12,7 +12,8 @@ import {
 	childPresentation,
 	rebaseChildHistoryState,
 } from "./anchored-child-surface";
-import { githubLoginHref, hostedRoute, retryableChannelFailure } from "./hosted";
+import { hostedRoute, retryableChannelFailure } from "./hosted";
+import { githubLoginHref } from "./hosted-login";
 import { prepareDocumentLoad, validatedChildPath } from "./document-loader";
 import { Workspace } from "./workspace";
 
@@ -335,11 +336,11 @@ describe("anchored child lifecycle", () => {
 		);
 
 		expect(markup).toContain("Child chat");
-		expect(markup).toContain('aria-label="Show chat pane, Planner working"');
+		expect(markup).toContain('aria-label="Show chat, Planner working"');
 		expect(markup).toContain('aria-label="Close Source review"');
-		expect(toolbar).toContain('aria-label="Show chat pane, Planner working"');
+		expect(toolbar).toContain('aria-label="Show chat, Planner working"');
 		expect(toolbar).toContain('aria-label="Close Source review"');
-		expect(toolbar.indexOf("Show chat pane")).toBeLessThan(
+		expect(toolbar.indexOf("Show chat")).toBeLessThan(
 			toolbar.indexOf("Close Source review"),
 		);
 	});

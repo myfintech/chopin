@@ -15,6 +15,7 @@ import { addComposerChild$, realmPlugin } from "@mdxeditor/editor";
 
 import { ChangeObserver } from "./changes-observer";
 import { CommentLayer } from "./comment-layer";
+import { MarkdownPastePlugin } from "./markdown-paste";
 import { QuestionnaireObserver } from "./questionnaires";
 import { ResolvedLayer } from "./resolved-layer";
 import { TableChrome } from "./table/chrome";
@@ -29,6 +30,7 @@ import {
 	EnterPlugin,
 	PreviewPlugin,
 	ResearchDeletionPlugin,
+	TabKeyPlugin,
 	TabsPlugin,
 } from "./widgets";
 import { widgets$ } from "./widget-options";
@@ -63,9 +65,11 @@ export const widgetsPlugin = realmPlugin<WidgetOptions>({
 		realm.pub(addComposerChild$, PreviewPlugin);
 		realm.pub(addComposerChild$, CalloutPlugin);
 		realm.pub(addComposerChild$, EnterPlugin);
+		realm.pub(addComposerChild$, TabKeyPlugin);
 		realm.pub(addComposerChild$, DecoratorSelectionPlugin);
 		realm.pub(addComposerChild$, ResearchDeletionPlugin);
 		realm.pub(addComposerChild$, DecisionDeletionPlugin);
+		realm.pub(addComposerChild$, MarkdownPastePlugin);
 		// Also where `@lexical/table`'s own plugins are registered, which the
 		// editor otherwise runs without.
 		realm.pub(addComposerChild$, TableChrome);

@@ -1,9 +1,11 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 
 import * as Api from "./api";
-import { HostedApp, HostedFailure, HostedLoading, HostedLogin } from "./hosted";
+import { HostedApp, HostedFailure, HostedLoading } from "./hosted";
 import { clearRepositoryCache } from "./repository-cache";
 
+let loadHostedLogin = () => import("./hosted-login");
+let HostedLogin = lazy(() => loadHostedLogin().then(module => ({ default: module.HostedLogin })));
 let LocalLogin = lazy(() =>
 	import("./local-login").then(module => ({ default: module.LocalLogin }))
 );
@@ -15,6 +17,9 @@ export function App() {
 
 	useEffect(() => {
 		let active = true;
+		// Fetch the sign-in page beside the session so a signed-out visit does not wait on
+		// a second round trip; it stays out of the initial bundle.
+		void loadHostedLogin().catch(() => {});
 		Api.session().then(value => {
 			if (active) setSession(value);
 		}, reason => {
@@ -46,13 +51,11 @@ export function App() {
 	if (error) return <HostedFailure error={error} />;
 	if (!session || !repositoryCacheReady) return <HostedLoading />;
 	if (!session.user) {
-		return session.auth === "local"
-			? (
-				<Suspense fallback={<HostedLoading />}>
-					<LocalLogin />
-				</Suspense>
-			)
-			: <HostedLogin />;
+		return (
+			<Suspense fallback={<HostedLoading />}>
+				{session.auth === "local" ? <LocalLogin /> : <HostedLogin />}
+			</Suspense>
+		);
 	}
 	return <HostedApp agent={session.agent} user={session.user} />;
 }

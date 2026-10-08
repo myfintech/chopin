@@ -446,6 +446,8 @@ describe("consumer roles", () => {
 		let offenders: string[] = [];
 		for (let file of [...sources(join(ROOT, "apps")), ...sources(join(ROOT, "packages"))]) {
 			if (file.startsWith(join(ROOT, "packages/icons/"))) continue;
+			// The diagram viewer owns an SVG canvas, not interface icon artwork.
+			if (file === join(ROOT, "packages/diagrams/src/diagram.tsx")) continue;
 			let content = withoutComments(readFileSync(file, "utf8"));
 			if (/<svg\b/.test(content) || /[\u{1F300}-\u{1FAFF}]/u.test(content)) {
 				offenders.push(relative(ROOT, file));
@@ -723,13 +725,13 @@ describe("migration", () => {
 			}],
 			["apps/web/src/chat/chat.tsx", {
 				action: "Stop Chopin",
-				marker: 'wire?.send("chat:abort")',
+				marker: 'control("chat:abort")',
 				size: "btn-icon",
 				tiers: ["btn-secondary"],
 			}],
 			["apps/web/src/chat/chat.tsx", {
 				action: "Resume Planner",
-				marker: 'wire?.send("chat:resume")',
+				marker: 'control("chat:resume")',
 				size: "btn-icon",
 				tiers: ["btn-secondary"],
 			}],

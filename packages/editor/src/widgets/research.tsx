@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import {
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useRef,
+	useState,
+	useSyncExternalStore,
+} from "react";
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
 import { useCellValue } from "@mdxeditor/gurx";
 import {
@@ -54,6 +61,8 @@ export type ResearchComposerProps = {
 	cancelLabel?: string;
 	dismissible?: boolean;
 	error?: string;
+	/** Quiet context that does not block submission. */
+	notice?: string;
 	onCancel: () => void;
 	onChange: (value: string) => void;
 	onEscape?: () => void;
@@ -137,6 +146,7 @@ export function ResearchComposer(
 		cancelLabel,
 		dismissible = true,
 		error,
+		notice,
 		onCancel,
 		onChange,
 		onEscape,
@@ -151,62 +161,63 @@ export function ResearchComposer(
 		event.preventDefault();
 		onSubmit();
 	};
+	let message = error ?? blocked ?? notice;
 	return (
 		<form className="plan-research-composer" onSubmit={submit}>
-			<div className="plan-research-field">
-				<textarea
-					aria-label="Research question"
-					autoFocus
-					className="field"
-					disabled={submitting}
-					maxLength={4096}
-					onChange={event => onChange(event.target.value)}
-					onKeyDown={event =>
-						handleResearchComposerKey(event, {
-							dismissible,
-							onChange,
-							onDismiss: onEscape ?? onCancel,
-							onSubmit,
-						})}
-					placeholder="What should Chopin research?"
-					readOnly={questionLocked}
-					rows={3}
-					value={question}
-				/>
-				{dismissible && !submitting && (
+			<textarea
+				aria-label="Research question"
+				autoFocus
+				disabled={submitting}
+				maxLength={4096}
+				onChange={event => onChange(event.target.value)}
+				onKeyDown={event =>
+					handleResearchComposerKey(event, {
+						dismissible,
+						onChange,
+						onDismiss: onEscape ?? onCancel,
+						onSubmit,
+					})}
+				placeholder="What should Chopin research?"
+				readOnly={questionLocked}
+				rows={3}
+				value={question}
+			/>
+			{dismissible && !submitting && (
+				<button
+					aria-label="Discard research question"
+					className="plan-research-dismiss btn btn-icon btn-ghost"
+					data-tooltip="Discard research"
+					onClick={onCancel}
+					type="button"
+				>
+					<CloseIcon aria-hidden="true" size={14} />
+				</button>
+			)}
+			<div className="plan-research-composer-footer">
+				<p
+					className="plan-research-message"
+					data-tone={error ? "error" : undefined}
+					role={error ? "alert" : "status"}
+				>
+					{message}
+				</p>
+				{cancelLabel && (
 					<button
-						aria-label="Discard research question"
-						className="plan-research-dismiss btn btn-icon btn-ghost"
-						data-tooltip="Discard research"
-						onClick={onCancel}
-						type="button"
-					>
-						<CloseIcon aria-hidden="true" size={14} />
-					</button>
-				)}
-				<div className="plan-research-send">
-					<SendAction
-						busy={submitting}
-						disabled={submitting || !!blocked || !question.trim()}
-						label={submitLabel}
-						onClick={onSubmit}
-					/>
-				</div>
-			</div>
-			{blocked && <p role="status">{blocked}</p>}
-			{error && <p role="alert">{error}</p>}
-			{cancelLabel && (
-				<div className="plan-research-actions">
-					<button
-						className="btn btn-sm btn-secondary"
+						className="btn btn-sm btn-ghost"
 						disabled={submitting || cancelDisabled}
 						onClick={onCancel}
 						type="button"
 					>
 						{cancelLabel}
 					</button>
-				</div>
-			)}
+				)}
+				<SendAction
+					busy={submitting}
+					disabled={submitting || !!blocked || !question.trim()}
+					label={submitLabel}
+					onClick={onSubmit}
+				/>
+			</div>
 		</form>
 	);
 }
@@ -244,6 +255,39 @@ function Indicator({ stage }: { stage: Research.RequestStage }) {
 			className="plan-research-dot"
 			data-idle={stage === "cancelled" ? "" : undefined}
 		/>
+	);
+}
+
+/** A question is context, not a heading: two quiet lines that open on request. */
+export function ResearchBrief({ text }: { text: string }) {
+	let [open, setOpen] = useState(false);
+	let [long, setLong] = useState(false);
+	let ref = useRef<HTMLSpanElement>(null);
+	useLayoutEffect(() => {
+		let element = ref.current;
+		if (!element || open) return;
+		let measure = () => setLong(element.scrollHeight > element.clientHeight + 1);
+		measure();
+		let observer = new ResizeObserver(measure);
+		observer.observe(element);
+		return () => observer.disconnect();
+	}, [text, open]);
+	return (
+		<>
+			<span className="plan-research-brief" data-open={open ? "" : undefined} ref={ref}>
+				{text}
+			</span>
+			{(long || open) && (
+				<button
+					aria-expanded={open}
+					className="plan-research-more"
+					onClick={() => setOpen(!open)}
+					type="button"
+				>
+					{open ? "Show less" : "Show more"}
+				</button>
+			)}
+		</>
 	);
 }
 
@@ -300,6 +344,7 @@ export function ResearchCard(
 			<SidecarCard
 				className={`plan-research-card${ready ? " relative" : ""}`}
 				data-research-ready={ready ? "" : undefined}
+				data-research-request={request.id}
 				data-stage={stage}
 				label="Research"
 				tabIndex={-1}
@@ -339,7 +384,7 @@ export function ResearchCard(
 					</div>
 				</div>
 				<Swap className="plan-research-title" id={ready ? "report" : "question"}>
-					{ready ? ready.title : request.question}
+					{ready ? ready.title : <ResearchBrief text={request.question} />}
 				</Swap>
 				<Fold open={!!ready}>
 					{shownSummary !== undefined && <p className="plan-research-summary">{shownSummary}</p>}

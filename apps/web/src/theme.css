@@ -439,6 +439,20 @@ body {
 	}
 }
 
+/* Live Chat arrivals only; `data-chat-enter` is never set on history. */
+[data-chat-enter] {
+	transition:
+		opacity var(--duration-base) var(--motion-smooth-out),
+		transform var(--duration-base) var(--motion-smooth-out);
+}
+
+@starting-style {
+	[data-chat-enter] {
+		opacity: 0;
+		transform: translateY(4px);
+	}
+}
+
 .chat-toggle-icon-sidebar {
 	opacity: 0;
 }
@@ -476,6 +490,54 @@ body {
 	transition:
 		background-color var(--duration-fast) var(--ease-out),
 		scale var(--duration-fast) var(--ease-out);
+}
+
+/*
+ * The shared menu recipe. Items mark the keyboard or pointer row with
+ * `data-active`; `aria-selected` stays free for a chosen value.
+ */
+.menu-surface {
+	border-radius: var(--radius-md);
+	background: var(--color-page);
+	padding: var(--menu-padding);
+	outline: var(--edge-width) solid var(--color-edge);
+	outline-offset: calc(-1 * var(--edge-width));
+	box-shadow: var(--shadow-overlay);
+	font-size: var(--text-sm);
+}
+
+.menu-item {
+	display: flex;
+	min-height: var(--menu-item-height);
+	width: 100%;
+	align-items: center;
+	gap: calc(var(--spacing) * 2);
+	border-radius: var(--radius-sm);
+	padding: 0 calc(var(--spacing) * 2);
+	text-align: left;
+	font-size: var(--text-sm);
+	color: var(--color-text-primary);
+}
+
+.menu-item:hover {
+	background: var(--color-hover);
+}
+
+.menu-item[data-active] {
+	background: var(--color-selected);
+}
+
+/* Surfaces that mount already open (no presence class) ease in the same way. */
+.menu-surface[data-menu-enter] {
+	transform-origin: bottom left;
+	transition:
+		opacity var(--dropdown-open-dur) var(--dropdown-ease),
+		transform var(--dropdown-open-dur) var(--dropdown-ease);
+
+	@starting-style {
+		opacity: 0;
+		transform: scale(var(--dropdown-pre-scale));
+	}
 }
 
 body {
@@ -558,18 +620,57 @@ body {
 	transition-duration: var(--panel-close-dur);
 }
 
+/* Split Chat is a track: its width moves the document, and Chat slides under its clip. */
+.workspace-root[data-workspace-mode="split"] .workspace-chat-panel {
+	width: 0;
+	align-items: flex-end;
+	opacity: 1;
+	transform: none;
+}
+
+.workspace-root[data-workspace-mode="split"] .workspace-chat-panel > * {
+	width: var(--chat-width, 0px);
+}
+
+.workspace-root[data-workspace-mode="split"] .workspace-chat-panel.is-open {
+	width: var(--chat-width, 0px);
+}
+
+.workspace-root[data-workspace-mode="split"] .workspace-chat-panel:not(.is-open) {
+	border-inline-width: 0;
+}
+
+.workspace-root[data-workspace-mode="split"] .workspace-chat-panel[data-pane-moving] {
+	transition: width var(--panel-open-dur) var(--motion-move);
+}
+
+.workspace-root[data-workspace-mode="split"] .workspace-chat-panel.is-closing[data-pane-moving] {
+	transition-duration: var(--panel-close-dur);
+}
+
+/* Compact views are sibling tabs: Chat sits leftmost, so it enters from the left. */
+.workspace-root:not([data-workspace-mode="split"]) .workspace-chat-panel {
+	--panel-direction: -1;
+	--panel-distance: var(--page-slide-distance);
+	transition-duration: var(--page-slide-dur);
+}
+
+.workspace-root[data-workspace-travel="back"] {
+	--swap-direction: -1;
+}
+
 .content-swap-stack {
 	display: grid;
 }
 
-.content-swap-stack > .motion-content-swap {
+.content-swap-stack > :is(.motion-content-swap, .motion-route-swap) {
 	grid-area: 1 / 1;
 	min-width: 0;
 }
 
 .motion-content-swap {
 	opacity: 0;
-	transform: translateX(var(--page-slide-distance));
+	transform: translateX(calc(var(--page-slide-distance) * var(--swap-direction, 1)));
 	transition:
 		opacity var(--page-slide-dur) var(--motion-smooth-out),
 		transform var(--page-slide-dur) var(--motion-smooth-out);
@@ -585,13 +686,105 @@ body {
 .motion-content-swap.is-closing {
 	pointer-events: none;
 	opacity: 0;
-	transform: translateX(calc(var(--page-slide-distance) * -1));
+	transform: translateX(calc(var(--page-slide-distance) * var(--swap-direction, 1) * -1));
+}
+
+/*
+ * Switching documents keeps the header, tabs and Chat frame still. Only the
+ * document body and transcript change: out, then in, never both at once. A
+ * staged route is laid out but unseen while its document syncs.
+ */
+.motion-route-swap[data-content-swap-state="staged"] {
+	visibility: hidden;
+}
+
+.motion-route-swap :is([data-workspace-document-swap], [data-chat-stack]) {
+	opacity: 0;
+	transition: opacity var(--route-swap-in-dur) var(--ease-out);
+}
+
+.motion-route-swap.is-open :is([data-workspace-document-swap], [data-chat-stack]) {
+	opacity: 1;
+}
+
+.motion-route-swap.is-closing :is([data-workspace-document-swap], [data-chat-stack]) {
+	transition-duration: var(--route-swap-out-dur);
 }
 
 .workspace-root:not([data-workspace-mode="split"]) .workspace-chat-panel {
 	position: absolute;
 	inset: 0;
 	z-index: 10;
+}
+
+/*
+ * Without the split header row, status lies over the top of the document, and
+ * only while it has something to say. Overlaid rather than inserted, so a
+ * short blip does not push the prose down and back. A quiet dot alone is not
+ * worth a row.
+ */
+.workspace-status-row {
+	position: absolute;
+	z-index: 3;
+	inset-block-start: 0;
+	inset-inline: 0;
+}
+
+.workspace-status-row:has(.plan-status:is([data-level="notice"], [data-level="alert"])) {
+	display: flex;
+	min-height: calc(var(--spacing) * 9);
+	align-items: center;
+	padding: calc(var(--spacing) * 1.5) calc(var(--spacing) * 4);
+	border-bottom: var(--edge-width) solid var(--color-edge);
+	background: var(--color-page);
+}
+
+.workspace-status-row .plan-status {
+	flex: 1;
+}
+
+.workspace-status-row .plan-status .btn {
+	margin-inline-start: auto;
+}
+
+.workspace-status-row .plan-status[data-level="quiet"] .plan-status-dot {
+	display: none;
+}
+
+/* Touch has no hover, so the detail a tooltip would carry is written out. */
+@media (pointer: coarse) {
+	.workspace-status-row .plan-status-detail {
+		display: block;
+	}
+}
+
+/* Jump-to-source: a tint behind the message that fades; the message itself never moves. */
+.chat-message-body[data-chat-source] {
+	isolation: isolate;
+}
+
+.chat-message-body:not(:first-child) > .chat-message-to {
+	margin-top: 4px;
+}
+
+.chat-source-tint {
+	position: absolute;
+	inset: -2px -6px;
+	z-index: -1;
+	border-radius: var(--radius-md);
+	background: var(--color-brand-wash);
+	pointer-events: none;
+	animation: chat-source-tint calc(var(--duration-linger) * 2) var(--ease-out) forwards;
+}
+
+@keyframes chat-source-tint {
+	0%,
+	40% {
+		opacity: 1;
+	}
+	100% {
+		opacity: 0;
+	}
 }
 
 .chat-message-body:has([data-analysis-trigger]) {
@@ -723,10 +916,6 @@ button.chat-tool-call-toggle {
 	display: grid;
 	gap: 7px;
 	margin: 0 0 7px 20px;
-}
-
-.chat-tool-call-details[hidden] {
-	display: none;
 }
 
 .chat-tool-data-label {
@@ -865,6 +1054,31 @@ button.chat-tool-call-toggle {
 	}
 }
 
+/* Small controls keep their look; an invisible 44px target grows around them. */
+/* In the components layer so utilities such as `absolute` still win. */
+@layer components {
+	:root[data-plan-coarse-pointer]
+		:where(.btn-icon, .btn-sm, .project-sidebar-action, .project-sidebar-document-action) {
+		position: relative;
+	}
+
+	:root[data-plan-coarse-pointer]
+		:where(.btn-icon, .btn-sm, .project-sidebar-action, .project-sidebar-document-action)::after {
+		content: "";
+		position: absolute;
+		top: 50%;
+		left: 50%;
+		width: max(100%, 44px);
+		height: max(100%, 44px);
+		transform: translate(-50%, -50%);
+	}
+
+	/* Beside a comment marker: grow vertically only so the marker keeps its taps. */
+	:root[data-plan-coarse-pointer] .plan-code-toggle::after {
+		width: 100%;
+	}
+}
+
 .question-field {
 	scroll-margin-block-end: calc(var(--keyboard-inset, 0px) + 1rem);
 }
@@ -972,7 +1186,8 @@ label.question-option:has(.question-input:not(:disabled)) {
 }
 
 .question-option:has(.question-input:checked),
-.question-option:has(.question-input:checked:not(:disabled)):hover {
+.question-option:has(.question-input:checked:not(:disabled)):hover,
+.question-option[data-selected] {
 	background: var(--color-brand-wash);
 }
 
@@ -1001,7 +1216,8 @@ label.question-option:has(.question-input:not(:disabled)) {
 		color var(--duration-fast) var(--ease-out);
 }
 
-.question-option:has(.question-input:checked) .question-key > span {
+.question-option:has(.question-input:checked) .question-key > span,
+.question-option[data-selected] .question-key > span {
 	background: var(--color-brand);
 	color: var(--color-white);
 }
@@ -1046,8 +1262,15 @@ label.question-option:has(.question-input:not(:disabled)) {
 	transition: opacity var(--duration-fast) var(--ease-out);
 }
 
-.question-option:has(.question-input:checked) .question-check {
+.question-option:has(.question-input:checked) .question-check,
+.question-option[data-selected] .question-check {
 	opacity: 1;
+}
+
+.question-resolved-meta {
+	margin: 0.75rem 0.5rem 0;
+	font-size: var(--text-xs);
+	color: var(--color-text-tertiary);
 }
 
 .question-add,
@@ -1103,6 +1326,21 @@ button.question-add:disabled {
 
 .question-adding:focus-within {
 	outline-color: var(--color-brand);
+}
+
+/* The hint's line is always reserved while the field is open, so a duplicate never moves the card. */
+.question-add-hint {
+	margin: 0;
+	min-block-size: 1.25rem;
+	padding-inline: 0.75rem;
+	font-size: var(--text-xs);
+	line-height: 1.25rem;
+	color: var(--color-danger-text);
+}
+
+.question-add-hint:not(:empty) {
+	border-radius: var(--radius-sm);
+	background: var(--color-danger-surface);
 }
 
 .question-field {
@@ -1168,6 +1406,22 @@ button.question-add:disabled {
 	}
 }
 
+/* Resolved cards have no padded body, so their footer needs its own floor. */
+.question-actions[data-resolved-actions] {
+	padding-block-end: calc(var(--spacing) * 2.5);
+}
+
+/* A decision whose prose has not been reviewed yet: a calm pulse, not a spinner. */
+.question-relation-dot {
+	background: var(--color-text-tertiary);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	.question-relation-dot:not([data-idle]) {
+		animation: chat-work-dot calc(var(--duration-base) * 8) var(--motion-move) infinite;
+	}
+}
+
 /* Discard confirm: the footer swaps in place and fades in. */
 .question-confirm {
 	margin-inline-end: auto;
@@ -1227,6 +1481,35 @@ button.question-add:disabled {
 	outline-offset: var(--focus-ring-offset);
 }
 
+/* MDXEditor paints task-list checkboxes on the focused list item's pseudo-element. */
+.plan-content
+	:is([class*="_listItemUnchecked"], [class*="_listItemChecked"]):focus-visible::before {
+	outline: var(--focus-ring-width) solid var(--focus-ring-color);
+	outline-offset: var(--focus-ring-offset);
+}
+
+/* The research composer is one field; its textarea hands the ring to the outer card. */
+.plan-research-composer:focus-within {
+	outline: 2px solid var(--color-brand);
+	outline-offset: 2px;
+}
+
+.plan-research-composer textarea:focus {
+	outline: none;
+}
+
+/* A rendered block clips its preview's ring, so show the same ring on the outer block. */
+.plan-content .planCode :is(.plan-code-view, .plan-diagram):focus-visible {
+	outline: none;
+}
+
+:root:not([data-focus-input="pointer"])
+	.plan-content
+	.planCode:has(> [data-plan-preview] :is(.plan-code-view, .plan-diagram):focus-visible) {
+	outline: var(--focus-ring-width) solid var(--focus-ring-color);
+	outline-offset: 0;
+}
+
 /*
  * The ring answers "where am I?" for keyboard users, so it hides after a pointer
  * press. Text fields keep theirs: a caret alone is easy to lose.
@@ -1234,6 +1517,12 @@ button.question-add:disabled {
 :root[data-focus-input="pointer"]
 	:where(button, select, summary, [role="button"], [role="listbox"], [role="option"], [tabindex]:not(input, textarea)):focus-visible {
 	outline: none;
+}
+
+/* The header title edits like a heading, not a form: beside its wash, a hairline is enough. */
+:where(.document-title-input):focus-visible {
+	outline-width: calc(var(--focus-ring-width) / 2);
+	outline-offset: calc(var(--focus-ring-width) / -2);
 }
 
 /* A listbox holds the keyboard's place on its highlighted option instead. */
@@ -1261,9 +1550,16 @@ button.question-add:disabled {
 	border-right-color: transparent;
 	border-radius: var(--radius-full);
 }
+
+@media (prefers-reduced-motion: no-preference) {
+	.document-activity-dot[data-document-activity="writing"] {
+		animation: chat-work-dot calc(var(--duration-base) * 8) var(--motion-move) infinite;
+	}
+}
 @media (prefers-reduced-motion: reduce) {
 	.chat-work-lattice > span,
-	.chat-work-headline-motion {
+	.chat-work-headline-motion,
+	.chat-source-tint {
 		animation: none;
 	}
 
@@ -1271,16 +1567,26 @@ button.question-add:disabled {
 		animation: none;
 	}
 
+	.menu-surface[data-menu-enter],
 	.motion-dropdown,
 	.motion-popover,
 	.motion-panel,
 	.motion-content-swap,
+	.motion-route-swap :is([data-workspace-document-swap], [data-chat-stack]),
 	.motion-collapse,
 	.motion-collapse-content {
 		transition: none;
 	}
 
+	.workspace-root[data-workspace-mode="split"] .workspace-chat-panel[data-pane-moving] {
+		transition: none;
+	}
+
 	:root[data-motion-input="pointer"] .chat-toggle-icon {
+		transition: none;
+	}
+
+	[data-chat-enter] {
 		transition: none;
 	}
 

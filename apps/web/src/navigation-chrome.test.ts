@@ -3,7 +3,12 @@ import { ChevronIcon, DocumentIcon, SearchIcon } from "@chopin/icons";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import { NavigationIcon, ProjectSidebar, toggleCollapsedProjectIds } from "./project-sidebar";
+import {
+	menuItemTarget,
+	NavigationIcon,
+	ProjectSidebar,
+	toggleCollapsedProjectIds,
+} from "./project-sidebar";
 import { ProjectSidebarExpandButton } from "./project-sidebar-chrome";
 import { Header } from "./room-workspace";
 
@@ -78,7 +83,9 @@ describe("the Figma navigation chrome", () => {
 		expect(markup).toMatch(
 			/aria-label="New document in testing-sql-transcripts"[^>]*>.*?new-document\.svg/s,
 		);
-		expect(markup).toContain(renderToStaticMarkup(createElement(DocumentIcon)));
+		expect(markup).toContain(
+			renderToStaticMarkup(createElement(DocumentIcon)),
+		);
 		expect(markup).not.toContain('src="/repository.png"');
 		expect(markup).toMatch(
 			/aria-label="Add project"[^>]*>.*?class="size-3\.5"[^>]*add-project\.svg/s,
@@ -102,6 +109,14 @@ describe("the Figma navigation chrome", () => {
 		);
 	});
 
+	test("steps through account menu items and wraps", () => {
+		expect(menuItemTarget("ArrowDown", 0, 3)).toBe(1);
+		expect(menuItemTarget("ArrowDown", 2, 3)).toBe(0);
+		expect(menuItemTarget("ArrowUp", 0, 3)).toBe(2);
+		expect(menuItemTarget("Home", 2, 3)).toBe(0);
+		expect(menuItemTarget("End", 0, 3)).toBe(2);
+	});
+
 	test("exposes whether the account menu is open", () => {
 		let props = {
 			canCreateDocument: false,
@@ -122,11 +137,18 @@ describe("the Figma navigation chrome", () => {
 		let closed = renderToStaticMarkup(createElement(ProjectSidebar, props));
 		let open = renderToStaticMarkup(createElement(ProjectSidebar, {
 			...props,
-			accountMenu: createElement("div", { role: "menu" }),
+			accountMenu: {
+				className: "",
+				closing: false,
+				onDismiss() {},
+				onShortcuts() {},
+				onSignOut() {},
+			},
 		}));
 
 		expect(closed).toMatch(/class="project-sidebar-account" aria-expanded="false"/);
 		expect(open).toMatch(/class="project-sidebar-account" aria-expanded="true"/);
+		expect(open).toContain("Keyboard shortcuts");
 	});
 
 	test("offers explicit pagination when a Project has more documents", () => {
@@ -166,21 +188,47 @@ describe("the Figma navigation chrome", () => {
 			label: "Hushed mountain",
 			members: [{ handle: "MaggieAppleton", client: "tab-one" }],
 			onAction: () => {},
+			onEditingChange: () => {},
+			onRenamed: () => {},
 			presentation: { type: "document" as const },
+			room: "room-one",
 		};
 		let markup = renderToStaticMarkup(createElement(Header, props));
 
-		expect(markup.split(renderToStaticMarkup(createElement(DocumentIcon)))).toHaveLength(2);
+		expect(
+			markup.split(renderToStaticMarkup(createElement(DocumentIcon, { className: "shrink-0" }))),
+		).toHaveLength(2);
 		expect(markup).not.toContain('src="/repository.png"');
 		expect(markup).toContain('aria-label="Document: Hushed mountain"');
 		expect(markup).toContain('aria-label="Actions for Hushed mountain"');
+		expect(markup).toContain('aria-label="Rename Hushed mountain"');
 		expect(markup).toContain("gap-0.5");
 		expect(markup).not.toContain("safe-area-inset-top");
-		expect(markup).toContain('style="width:24px;height:24px"');
+		expect(markup).toContain('style="width:24px;height:24px;');
 		expect(markup).not.toContain('aria-label="Show sidebar"');
 		expect(markup).not.toContain('aria-label="Repository:');
 		expect(markup).not.toContain('href="/"');
 		expect(markup).not.toContain("hairline-b");
+	});
+
+	test("swaps the title for an inline field while renaming", () => {
+		let markup = renderToStaticMarkup(createElement(Header, {
+			canManage: true,
+			editing: "rename",
+			label: "Hushed mountain",
+			members: [],
+			onAction() {},
+			onEditingChange() {},
+			onRenamed() {},
+			presentation: { type: "document" },
+			room: "room-one",
+		}));
+
+		expect(markup).toContain(">Document title</label>");
+		expect(markup).toContain('value="Hushed mountain"');
+		expect(markup).toContain('placeholder="Untitled"');
+		expect(markup).not.toContain('aria-label="Rename Hushed mountain"');
+		expect(markup).not.toContain(">Save</button>");
 	});
 
 	test("turns the parent title into a child-document breadcrumb", () => {
@@ -189,6 +237,9 @@ describe("the Figma navigation chrome", () => {
 			label: "Release plan",
 			members: [{ handle: "MaggieAppleton", client: "tab-one" }],
 			onAction() {},
+			onEditingChange() {},
+			onRenamed() {},
+			room: "room-one",
 			presentation: {
 				childLabel: "Source review",
 				onChildClose() {},
@@ -214,7 +265,10 @@ describe("the Figma navigation chrome", () => {
 			label: "Archived brief",
 			members: [],
 			onAction: () => {},
+			onEditingChange: () => {},
+			onRenamed: () => {},
 			presentation: { type: "document" as const },
+			room: "room-one",
 		};
 		let manager = renderToStaticMarkup(createElement(Header, { ...props, canManage: true }));
 		let viewer = renderToStaticMarkup(createElement(Header, { ...props, canManage: false }));
@@ -222,8 +276,10 @@ describe("the Figma navigation chrome", () => {
 		expect(manager).toContain(">Archived</span>");
 		expect(manager).toContain('aria-label="Actions for Archived brief"');
 		expect(manager).toContain(">Restore</button>");
+		expect(manager).not.toContain('aria-label="Rename Archived brief"');
 		expect(viewer).toContain(">Archived</span>");
 		expect(viewer).not.toContain('aria-label="Actions for Archived brief"');
 		expect(viewer).not.toContain(">Restore</button>");
+		expect(viewer).not.toContain('aria-label="Rename Archived brief"');
 	});
 });
