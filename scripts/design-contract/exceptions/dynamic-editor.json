@@ -361,7 +361,7 @@
 				2
 			]
 		],
-		"sourceHash": "51ac54fbe62946cfd9225c1658537cfdb43432b6f380e187b126b8eff31a043d"
+		"sourceHash": "afc7307a0824afbb9f7fa208ac4ce082cea96be7d70b969a39d3842e38a88ef7"
 	},
 	{
 		"file": "packages/editor/src/collaboration.tsx",
@@ -417,7 +417,7 @@
 				1
 			]
 		],
-		"sourceHash": "01110b02afe3ac02bea7998cac3ade4c0cdf4b0948204190d4b773aafeeaa4f5"
+		"sourceHash": "ee8ce4efba7e1ca187de661019e7da027433292f305e0142aedbfba1bbee9b49"
 	},
 	{
 		"file": "packages/editor/src/changes.ts",
