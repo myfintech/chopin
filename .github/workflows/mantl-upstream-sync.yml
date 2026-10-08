@@ -1,0 +1,369 @@
+# MANTL: merges githubnext/chopin into a pull request against main, using
+# Claude through the MANTL LLM gateway to resolve conflicts and failed checks.
+# See "Syncing with upstream" in MANTL.md for setup and the review rules.
+#
+# `resolve` runs upstream's code (dependency scripts, checks, the agent's
+# shell), so it holds only a read-only GITHUB_TOKEN and a budget-capped gateway
+# key. `publish` holds the GitHub App token and never runs repository code: it
+# receives the result as a git bundle.
+#
+#   vars.UPSTREAM_SYNC_APP_ID, secrets.UPSTREAM_SYNC_APP_PRIVATE_KEY,
+#   secrets.UPSTREAM_SYNC_GATEWAY_KEY
+name: upstream sync
+
+on:
+  schedule:
+    - cron: '17 9 * * 1-5'
+  workflow_dispatch:
+  # Disables workflows that a merge brings in; see disable-new-workflows.
+  push:
+    branches: [main]
+    paths: ['.github/workflows/**']
+
+permissions:
+  contents: read
+
+env:
+  BUN_VERSION: 1.4.2
+  BRANCH: upstream-sync
+
+# A second run would merge into the same branch.
+concurrency:
+  group: upstream-sync-${{ github.event_name == 'push' }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: merge upstream
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      status: ${{ steps.merge.outputs.status }}
+      pr: ${{ steps.base.outputs.pr }}
+      before: ${{ steps.merge.outputs.before }}
+      after: ${{ steps.merge.outputs.after }}
+    steps:
+      # An open sync pull request is merged into again, never replaced, so a
+      # reviewer's fixups on the branch survive the next run.
+      - name: Find an open sync pull request
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          pr=$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "ref=${pr:+$BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.base.outputs.ref || 'main' }}
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      # The pinned Impeccable CLI behind `bun run ci` requires Node 22.18 or newer.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$BRANCH"
+          mkdir -p "$RUNNER_TEMP/sync"
+
+          git remote add upstream https://github.com/githubnext/chopin.git
+          git fetch --no-tags upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already contains upstream/main."
+            echo "status=current" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          before=$(git merge-base HEAD upstream/main)
+          after=$(git rev-parse upstream/main)
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          echo "after=$after" >> "$GITHUB_OUTPUT"
+
+          if git merge --no-ff --no-edit -m "Merge upstream githubnext/chopin at ${after:0:12}" upstream/main; then
+            echo "status=merged" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git diff --name-only --diff-filter=U > "$RUNNER_TEMP/sync/conflicts.txt"
+          # bun.lock is regenerated after the merge, never hand-merged.
+          if grep -qx bun.lock "$RUNNER_TEMP/sync/conflicts.txt"; then
+            git checkout upstream/main -- bun.lock
+          fi
+          if [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+            git commit --no-edit
+            echo "status=merged" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=conflicted" >> "$GITHUB_OUTPUT"
+            echo "Conflicts:"; cat "$RUNNER_TEMP/sync/conflicts.txt"
+          fi
+
+      # Cheap feedback for the agent. The pull request's own CI, including
+      # PostgreSQL and the browser suite, remains the gate.
+      - name: Regenerate the lockfile and run checks
+        id: checks
+        if: steps.merge.outputs.status == 'merged'
+        run: |
+          bun install
+          if ! git diff --quiet bun.lock; then
+            git commit -m "Regenerate bun.lock after the upstream merge" bun.lock
+          fi
+          if { bun run ci && bun run types && bun test; } > "$RUNNER_TEMP/checks.log" 2>&1; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            tail -n 200 "$RUNNER_TEMP/checks.log"
+          fi
+
+      # `[1m]` tells Claude Code the gateway serves Opus's full context window.
+      - name: Resolve with Claude
+        if: steps.merge.outputs.status == 'conflicted' || steps.checks.outputs.passed == 'false'
+        uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: https://llm-gateway.mantl.engineering
+        with:
+          anthropic_api_key: ${{ secrets.UPSTREAM_SYNC_GATEWAY_KEY }}
+          github_token: ${{ github.token }}
+          settings: |
+            {
+              "env": {
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-5-5",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+              }
+            }
+          claude_args: >-
+            --model "claude-opus-5-5[1m]"
+            --max-turns 300
+            --allowedTools Bash,Read,Edit,Write,Glob,Grep
+            --disallowedTools "Bash(git push:*)"
+          prompt: |
+            You are merging upstream githubnext/chopin into myfintech/chopin, MANTL's downstream
+            copy. Read MANTL.md before anything else. Its rules override AGENTS.md.
+
+            The checkout is on branch `${{ env.BRANCH }}`. `upstream/main` is
+            ${{ steps.merge.outputs.after }}; the previous merge base was
+            ${{ steps.merge.outputs.before }}. Merge status: ${{ steps.merge.outputs.status }}.
+            - `conflicted`: `git merge upstream/main` stopped on the files that
+              `git diff --name-only --diff-filter=U` lists. bun.lock has already been taken from
+              upstream.
+            - `merged`: the merge is committed but `bun run ci`, `bun run types`, or `bun test`
+              failed. Their output is in ${{ runner.temp }}/checks.log.
+
+            Work through this:
+            1. Resolve each conflict by starting from upstream's version and reapplying MANTL's
+               intent. Use the Upstream divergences table in MANTL.md and
+               `git log origin/main --not upstream/main -- <path>` to learn what MANTL's hunk is
+               for. Do not restore the old MANTL hunk wholesale. If upstream now does what a MANTL
+               change did, remove the MANTL change, its files, and its divergence row.
+            2. Run `bun install` so bun.lock matches the merged package.json files. Never
+               hand-edit bun.lock.
+            3. MANTL migrations stay last in `MIGRATIONS`. Never edit an upstream migration.
+            4. Run `bun run ci`, `bun run types`, and `bun test`, and fix failures the merge
+               caused. For `reviewed dynamic owner changed`, follow Pinned design exceptions in
+               MANTL.md: confirm the dynamic value still comes from where the exception's reason
+               says before renewing its hash.
+            5. Update the Upstream divergences table for every seam that moved, changed, was
+               added, or was removed.
+            6. If the merge is still in progress, conclude it with `git commit --no-edit` once
+               every conflict is resolved, so resolutions live in the merge commit. Put
+               follow-up work (lockfile, hashes, divergence table, fixes) in separate commits that
+               follow the commit rules in MANTL.md. Leave the working tree clean.
+
+            Do not push, rebase, reset, amend, or rewrite any existing commit. Do not edit files
+            under .github/workflows that came from upstream.
+
+            Stop and leave the merge unfinished, rather than guess, when a resolution needs a
+            product decision, a schema or migration change, a protocol change, or reworking a
+            MANTL feature beyond its seam. Also stop if a design exception's dynamic value no
+            longer comes from where its reason says.
+
+            Whether you finish or stop, write a summary for the reviewer to
+            ${{ runner.temp }}/sync/summary.md with a shell heredoc. Cover: each conflicted file
+            and how you resolved it; each renewed design-contract hash and what you checked; MANTL
+            changes you removed because upstream covered them; the final check results; and
+            anything a reviewer should look at closely. If you stopped, say why first.
+
+      - name: Verify the merge and bundle it
+        if: steps.merge.outputs.status != 'current'
+        run: |
+          if [ -f .git/MERGE_HEAD ]; then
+            echo "The merge was not concluded." >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor upstream/main HEAD
+          if git grep -nE '^(<<<<<<<|>>>>>>>)( |$)'; then
+            echo "Conflict markers remain." >&2
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --short
+            echo "The working tree is not clean." >&2
+            exit 1
+          fi
+          git bundle create "$RUNNER_TEMP/sync/sync.bundle" HEAD --not origin/main
+
+      - uses: actions/upload-artifact@v7
+        if: always() && steps.merge.outputs.status != 'current'
+        with:
+          name: upstream-sync
+          path: ${{ runner.temp }}/sync
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    name: open the pull request
+    needs: resolve
+    if: >-
+      !cancelled() && github.event_name != 'push' &&
+      needs.resolve.outputs.status != 'current'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/create-github-app-token@v3
+        id: app
+        with:
+          app-id: ${{ vars.UPSTREAM_SYNC_APP_ID }}
+          private-key: ${{ secrets.UPSTREAM_SYNC_APP_PRIVATE_KEY }}
+
+      # Nothing from the merged tree is installed or run in this job.
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v7
+        continue-on-error: true
+        with:
+          name: upstream-sync
+          path: ${{ runner.temp }}/sync
+
+      - name: Push and open the pull request
+        if: needs.resolve.result == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PR: ${{ needs.resolve.outputs.pr }}
+          BEFORE: ${{ needs.resolve.outputs.before }}
+          AFTER: ${{ needs.resolve.outputs.after }}
+          STATUS: ${{ needs.resolve.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          git -c core.hooksPath=/dev/null fetch --no-tags "$RUNNER_TEMP/sync/sync.bundle" HEAD
+          git merge-base --is-ancestor "$AFTER" FETCH_HEAD
+
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if [ -n "$PR" ]; then
+            git -c core.hooksPath=/dev/null push "$remote" "FETCH_HEAD:refs/heads/$BRANCH"
+          else
+            # A leftover branch from a closed pull request is replaced.
+            git -c core.hooksPath=/dev/null push --force "$remote" "FETCH_HEAD:refs/heads/$BRANCH"
+          fi
+
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo "Merges [githubnext/chopin@${AFTER:0:12}](https://github.com/githubnext/chopin/commit/$AFTER):"
+            echo "$(git rev-list --count --no-merges "$BEFORE..$AFTER") upstream commits," \
+              "[compare](https://github.com/githubnext/chopin/compare/$BEFORE...$AFTER)."
+            echo
+            echo "> [!IMPORTANT]"
+            echo "> Merge with **Create a merge commit**. Squash or rebase drops upstream's history,"
+            echo "> and the next sync conflicts on everything since."
+            echo
+            if [ "$STATUS" = conflicted ]; then
+              echo "### Conflicts Claude resolved"
+              echo
+              sed 's/.*/- `&`/' "$RUNNER_TEMP/sync/conflicts.txt"
+              echo
+            fi
+            added=$(git diff --name-only --diff-filter=A "$BEFORE" "$AFTER" -- .github/workflows)
+            if [ -n "$added" ]; then
+              echo "### New upstream workflows"
+              echo
+              echo "These are disabled automatically once this merges. Re-enable any MANTL wants."
+              echo
+              echo "$added" | sed 's/.*/- `&`/'
+              echo
+            fi
+            if [ -f "$RUNNER_TEMP/sync/summary.md" ]; then
+              echo "### Claude's summary"
+              echo
+              cat "$RUNNER_TEMP/sync/summary.md"
+              echo
+            fi
+            echo "Run: $RUN_URL"
+            echo
+            echo "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+          } > "$body"
+
+          if [ -n "$PR" ]; then
+            gh pr comment "$PR" --body-file "$body"
+          else
+            gh pr create --base main --head "$BRANCH" \
+              --title "Merge upstream changes" --body-file "$body"
+          fi
+
+      - name: Report a failed sync
+        if: failure() || needs.resolve.result != 'success'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Upstream sync needs attention"
+          body="$RUNNER_TEMP/failure.md"
+          {
+            echo "The upstream sync could not finish on its own: $RUN_URL"
+            echo
+            echo "Merge \`upstream/main\` by hand as described in MANTL.md."
+            if [ -f "$RUNNER_TEMP/sync/summary.md" ]; then
+              echo
+              echo "### Claude's summary"
+              echo
+              cat "$RUNNER_TEMP/sync/summary.md"
+            fi
+          } > "$body"
+          issue=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body-file "$body"
+          else
+            gh issue create --title "$title" --body-file "$body"
+          fi
+
+  # Upstream workflows need secrets this repository does not have. Anything
+  # that is not CI or MANTL's own is disabled as soon as it reaches main.
+  disable-new-workflows:
+    name: disable new upstream workflows
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh workflow list --all --json path,state \
+            --jq '.[] | select(.state == "active") | .path' |
+            while read -r path; do
+              case "$path" in
+                .github/workflows/ci.yml | .github/workflows/mantl-*) continue ;;
+                .github/workflows/*) ;;
+                *) continue ;;
+              esac
+              echo "Disabling $path"
+              gh workflow disable "$(basename "$path")"
+            done
