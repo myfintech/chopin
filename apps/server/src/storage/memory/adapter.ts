@@ -1,6 +1,7 @@
 import { conflict, missing } from "../errors";
 import { documentSlug, documentSlugCandidate } from "../../channels/slug";
 import { availableChannelTitle } from "../../channels/title";
+import { sidecarUnansweredDecisions } from "../../questions/unanswered";
 import { MemoryBackgroundJobStore } from "./jobs";
 import { MemoryResearchWorkspaceStore } from "./research";
 import { MemoryPreferenceStore } from "../../user-preferences/memory";
@@ -14,6 +15,7 @@ import type {
 	ChannelArchiveInput,
 	ChannelArchiveResult,
 	ChannelCursor,
+	ChannelDecisionCount,
 	ChannelPage,
 	ChannelRecord,
 	ChannelScanCursor,
@@ -283,6 +285,9 @@ export class MemoryStorage implements StorageAdapter {
 			this.#listChannels(repositoryId, limit, after, query, includeArchived),
 		scan: (repositoryId, limit, after, includeArchived) =>
 			this.#scanChannels(repositoryId, limit, after, includeArchived),
+		unansweredDecisions: repositoryId => Promise.resolve(this.#unansweredDecisions(repositoryId)),
+		unansweredDecisionCounts: (repositoryId, channelIds) =>
+			Promise.resolve(this.#unansweredDecisionCounts(repositoryId, channelIds)),
 		claimAgentOwner: (channelId, sessionId, now) =>
 			this.#claimAgentOwner(channelId, sessionId, now),
 		clearAgentOwner: (channelId, expectedSessionId, expectedGeneration, now) =>
@@ -450,6 +455,7 @@ export class MemoryStorage implements StorageAdapter {
 			revision: 0,
 			createdAt: now,
 			updatedAt: now,
+			unansweredDecisions: sidecarUnansweredDecisions(initial?.sidecar),
 		};
 		this.#channels.set(saved.id, saved);
 		this.#sequences.set(saved.id, 1);
@@ -602,15 +608,7 @@ export class MemoryStorage implements StorageAdapter {
 		includeArchived = false,
 	): Promise<ChannelPage> {
 		let count = Math.min(100, Math.max(1, limit));
-		let ordered = [...this.#channels.values()]
-			.filter(value => value.repositoryId === repositoryId)
-			.filter(value => {
-				if (!value.parentChannelId) return includeArchived || !value.archivedAt;
-				let parent = this.#channels.get(value.parentChannelId);
-				return parent?.repositoryId === repositoryId
-					&& !parent.parentChannelId
-					&& (includeArchived || !parent.archivedAt);
-			})
+		let ordered = this.#catalogue(repositoryId, includeArchived)
 			.filter(value =>
 				!query
 				|| value.title.toLowerCase().includes(query.toLowerCase())
@@ -632,6 +630,36 @@ export class MemoryStorage implements StorageAdapter {
 			next: ordered.length > page.length && last
 				? { updatedAt: new Date(last.updatedAt), id: last.id }
 				: undefined,
+		});
+	}
+
+	#catalogue(repositoryId: string, includeArchived: boolean): ChannelRecord[] {
+		return [...this.#channels.values()]
+			.filter(value => value.repositoryId === repositoryId)
+			.filter(value => {
+				if (!value.parentChannelId) return includeArchived || !value.archivedAt;
+				let parent = this.#channels.get(value.parentChannelId);
+				return parent?.repositoryId === repositoryId
+					&& !parent.parentChannelId
+					&& (includeArchived || !parent.archivedAt);
+			});
+	}
+
+	#unansweredDecisions(repositoryId: string): number {
+		return this.#catalogue(repositoryId, false)
+			.reduce((total, value) => total + value.unansweredDecisions, 0);
+	}
+
+	#unansweredDecisionCounts(repositoryId: string, channelIds: string[]): ChannelDecisionCount[] {
+		return channelIds.flatMap(channelId => {
+			let found = this.#channels.get(channelId);
+			return found?.repositoryId === repositoryId
+				? [{
+					channelId,
+					revision: found.revision,
+					unansweredDecisions: found.unansweredDecisions,
+				}]
+				: [];
 		});
 	}
 
@@ -843,6 +871,9 @@ export class MemoryStorage implements StorageAdapter {
 			...found,
 			revision,
 			updatedAt: new Date(Math.max(found.updatedAt.getTime(), input.now.getTime())),
+			...(input.sidecar !== undefined
+				? { unansweredDecisions: sidecarUnansweredDecisions(input.sidecar) }
+				: {}),
 		});
 		this.#sequences.set(input.channelId, sequence + 1);
 		if (input.provenance) this.provenance.record(input.channelId, input.provenance, input.now);
@@ -910,6 +941,7 @@ export class MemoryStorage implements StorageAdapter {
 			...found,
 			revision,
 			updatedAt: new Date(Math.max(found.updatedAt.getTime(), input.now.getTime())),
+			unansweredDecisions: sidecarUnansweredDecisions(input.sidecar),
 		});
 		this.#sequences.set(input.channelId, sequence + 1);
 		let result = { revision, sequence, repeated: false };

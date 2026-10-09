@@ -103,6 +103,11 @@ export type ChannelRecord = {
 	updatedAt: Date;
 	archivedAt?: Date;
 	description?: ChannelDescription;
+	unansweredDecisions: number;
+};
+
+export type ChannelDecisionCount = Pick<ChannelRecord, "revision" | "unansweredDecisions"> & {
+	channelId: string;
 };
 
 export type InitialChannel =
@@ -115,7 +120,13 @@ export type InitialChannel =
 export type CreateChannel =
 	& Omit<
 		ChannelRecord,
-		"slug" | "revision" | "createdAt" | "updatedAt" | "archivedAt" | "description"
+		| "slug"
+		| "revision"
+		| "createdAt"
+		| "updatedAt"
+		| "archivedAt"
+		| "description"
+		| "unansweredDecisions"
 	>
 	& {
 		now: Date;
