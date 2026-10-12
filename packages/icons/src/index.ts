@@ -61,5 +61,5 @@ export {
 } from "./line";
 export { ListIcon } from "./list";
 export { ArchiveIcon, DocumentIcon, LoaderIcon, SearchIcon } from "./system";
-export { WarningIcon } from "./warning";
 export { MonitorIcon, MoonIcon, SunIcon } from "./theme";
+export { WarningIcon } from "./warning";
