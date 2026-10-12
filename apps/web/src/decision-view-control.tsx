@@ -1,9 +1,9 @@
 import { Count } from "@chopin/editor";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import { DocumentActivityDot, documentActivityLabel } from "./document-activity";
 
-import type { DecisionView } from "@chopin/editor";
+import type { WorkspaceDocumentView } from "./workspace-model";
 import type { DocumentActivity } from "./document-activity";
 
 export function decisionAttention(previous: number, current: number): boolean {
@@ -29,19 +29,24 @@ export function unansweredDecisionsLabel(label: string, unanswered: number): str
 	return `${label}, ${unanswered} unanswered ${unanswered === 1 ? "decision" : "decisions"}`;
 }
 
+/** Why Build cannot open yet, for its tooltip and accessible description. */
+export const BUILD_UNAVAILABLE = "Write the document before building it";
+
 export function DecisionViewControl(
 	{
 		attention,
+		buildEnabled,
 		documentActivity,
 		onView,
 		unanswered,
 		view,
 	}: {
 		attention?: boolean;
+		buildEnabled?: boolean;
 		documentActivity?: DocumentActivity;
-		onView: (view: DecisionView) => void;
+		onView: (view: WorkspaceDocumentView) => void;
 		unanswered: number;
-		view: DecisionView;
+		view: WorkspaceDocumentView;
 	},
 ) {
 	return (
@@ -71,6 +76,8 @@ export function DecisionViewControl(
 				aria-label={unanswered > 0 ? `Decisions, ${unanswered} unanswered` : "Decisions"}
 				aria-pressed={view === "decisions"}
 				className={`btn btn-sm gap-1 transition-[background-color,box-shadow,color] ${
+					unanswered > 0 ? "btn-with-count" : ""
+				} ${
 					view === "decisions"
 						? "bg-ground font-medium text-gray-800"
 						: "text-text-tertiary hover:bg-hover"
@@ -83,18 +90,63 @@ export function DecisionViewControl(
 				{unanswered > 0 && (
 					<span
 						aria-hidden="true"
+						className="flex"
 						data-plan-decision-count
 					>
 						<Count
-							appearance="quiet"
+							appearance="control"
 							key={attention ? `attention-${unanswered}` : "settled"}
 							motion={attention}
+							selected={view === "decisions"}
 						>
 							{unanswered}
 						</Count>
 					</span>
 				)}
 			</button>
+			{buildEnabled !== undefined && (
+				<BuildSegment ready={buildEnabled} selected={view === "build"} onView={onView} />
+			)}
 		</div>
+	);
+}
+
+/**
+ * Build stays focusable while the document is empty, so its reason can be read;
+ * `disabled` would hide both the tooltip and the description.
+ */
+function BuildSegment(
+	{ onView, ready, selected }: {
+		onView: (view: WorkspaceDocumentView) => void;
+		ready: boolean;
+		selected: boolean;
+	},
+) {
+	let reason = useId();
+	return (
+		<>
+			<button
+				aria-current={selected ? "page" : undefined}
+				aria-describedby={ready ? undefined : reason}
+				aria-disabled={ready ? undefined : true}
+				aria-pressed={selected}
+				className={`btn btn-sm transition-[background-color,box-shadow,color] ${
+					selected
+						? "bg-ground font-medium text-gray-800"
+						: ready
+						? "text-text-tertiary hover:bg-hover"
+						: "cursor-default text-text-tertiary opacity-40"
+				}`}
+				data-tooltip={ready ? undefined : BUILD_UNAVAILABLE}
+				data-tooltip-detail={ready ? undefined : ""}
+				onClick={() => {
+					if (ready) onView("build");
+				}}
+				type="button"
+			>
+				Build
+			</button>
+			{!ready && <span className="sr-only" id={reason}>{BUILD_UNAVAILABLE}</span>}
+		</>
 	);
 }

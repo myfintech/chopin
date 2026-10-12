@@ -3,6 +3,7 @@ import * as Comments from "../comments/service";
 import * as Service from "../plan/service";
 import * as Questions from "../questions/service";
 import { tell } from "../wire";
+import { initialState } from "./domain";
 
 import type { Plan as Wire, Request } from "@chopin/protocol";
 import type { Socket } from "../wire";
@@ -78,19 +79,23 @@ export function greetJoinedPlan(
 	frame: Request<Wire.Open.Ask>,
 	conversationPlan: boolean,
 	current: () => boolean,
+	root?: Pick<Chat.RootChat, "working">,
 ): Promise<void> {
 	return Service.exclusive(opened, async () => {
 		if (!current()) throw new Error("document is unavailable");
 		Service.greet(opened, ws, frame);
 		Questions.greet(opened, ws);
-		Comments.greet(opened, ws);
-		Chat.greet(opened.chat, ws);
+		Comments.greet(opened, ws, root);
+		// A child's Chat is its root's. A kept child may still hold what its old
+		// Chat derived, so it is shown an empty Conversation instead.
+		let child = !!opened.parentChannelId;
+		if (!child) Chat.greet(opened.chat, ws);
 		if (conversationPlan) {
 			tell(ws, {
 				kind: "conversation-plan:snapshot",
 				ts: 0,
-				state: opened.conversationPlan,
-				jobs: opened.conversationPlanJobs,
+				state: child ? initialState() : opened.conversationPlan,
+				jobs: child ? [] : opened.conversationPlanJobs,
 			});
 		}
 	});

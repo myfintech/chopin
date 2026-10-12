@@ -1,13 +1,17 @@
 import { Cell } from "@mdxeditor/gurx";
 
 import type { ResearchLauncher } from "./research-launcher";
+import type { PublishedInvestigation } from "@chopin/experiment/records";
+import type { SelectionPatch } from "@chopin/experiment";
 import type { ReactNode } from "react";
 import type { CardMetaStore } from "./card-meta";
 import type { Binding } from "@lexical/yjs";
 import type { ChangeStore } from "./changes";
 import type { ContentSwapMotion } from "./content-swap";
+import type { EditMode } from "./edit-mode";
 import type { MotionDisclosureContract } from "./disclosure-motion";
 import type { Research } from "@chopin/protocol";
+import type { GitHubReference, GitHubReferenceResult } from "@chopin/protocol/github-reference";
 import type { ResearchDraftStore } from "./research-draft";
 import type { QuestionnaireStore } from "./questionnaires";
 import type { ThreadStore } from "./threads";
@@ -36,7 +40,25 @@ export type ResearchStore = {
 	open(child: Research.ReadyChild, opener: ResearchOpener): void;
 };
 
+/** A GitHub reference's summary as the host last saw it, or that one is on its way. */
+export type GitHubReferenceEntry = { status: "loading" } | GitHubReferenceResult;
+
+/**
+ * App-owned summaries for GitHub pull request and issue links.
+ *
+ * Reading is cheap and may happen on every editor update: `get` answers from
+ * memory and asks the host to fetch (batched) when it has nothing or what it
+ * has is stale, notifying subscribers when the answer changes.
+ */
+export type GitHubReferenceStore = {
+	subscribe(listener: () => void): () => void;
+	get(reference: GitHubReference): GitHubReferenceEntry;
+	/** Settles with a fresh answer, for a paste that wants a title. */
+	load(reference: GitHubReference): Promise<GitHubReferenceResult>;
+};
+
 export type WidgetOptions = {
+	experiments?: ExperimentResources;
 	binding?: Binding;
 	commentPresentation?: CommentPresentation;
 	motionImmediately?: () => boolean;
@@ -47,6 +69,8 @@ export type WidgetOptions = {
 	onCardSource?: (questionnaireId: string) => void;
 	/** Whether a card has a Chat message to go back to. */
 	hasCardSource?: (questionnaireId: string) => boolean;
+	/** Open a decision in the Decisions pane; phones show open decisions there only. */
+	onShowDecision?: (questionnaireId: string) => void;
 	/** False when no Planner will review where decisions live. */
 	planner?: boolean;
 	evidence?: (questionnaireId: string) => ReactNode | null;
@@ -59,8 +83,23 @@ export type WidgetOptions = {
 	connected?: boolean;
 	synced?: boolean;
 	canEdit?: boolean;
+	/** This client's reading or editing mode on a phone; see `edit-mode.ts`. */
+	editMode?: EditMode;
+	/** Locked for any reason other than reading mode, so a reader's selection can still comment. */
+	blocked?: boolean;
+	/** Where the host docks formatting while editing on a phone, replacing the selection bubble. */
+	formatDock?: HTMLElement | null;
 	/** The viewer's own handle. */
 	self?: string;
+};
+
+export type ExperimentResources = {
+	subscribe(listener: () => void): () => void;
+	snapshot(): number;
+	get(id: string): PublishedInvestigation | undefined;
+	load(id: string): Promise<void>;
+	change(id: string, view: string, patch: SelectionPatch): Promise<void>;
+	place(id: string, view: string, decision?: string, remove?: boolean): Promise<void>;
 };
 
 export const widgets$ = Cell<WidgetOptions>({});

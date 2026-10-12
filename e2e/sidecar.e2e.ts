@@ -12,7 +12,8 @@ import { chatInput, expectChatValue } from "./chat-input";
  * test here writes the plan before anybody opens it.
  */
 
-import { authenticate, content, expect, ready, roomPath, test } from "./room";
+import { authenticate, content, edit, expect, ready, roomPath, test } from "./room";
+import { bringForward, deckSeed, deckSlot } from "./decision-deck-fixtures";
 import { storedQuestion } from "../apps/server/src/testing/plan";
 
 import type { Locator, Page } from "@playwright/test";
@@ -40,9 +41,15 @@ const ANCHORED_DEFINITION = {
 };
 
 function editorIsModalBackground(page: Page): Promise<boolean> {
-	return page.locator('[aria-label="editable markdown"]').evaluate(element =>
-		!!element.closest('[inert], [aria-hidden="true"]')
-	);
+	// A modal keeps live regions and their ancestors un-inerted so announcements
+	// still reach readers; everything else in the editor must be outside the modal.
+	return page.locator('[aria-label="editable markdown"]').evaluate(element => {
+		// oxlint-disable-next-line unicorn(consistent-function-scoping) -- The callback executes in the browser realm.
+		let covered = (node: Element): boolean =>
+			!!node.closest('[inert], [aria-hidden="true"]') || node.hasAttribute("aria-live")
+			|| (node.children.length > 0 && [...node.children].every(covered));
+		return covered(element);
+	});
 }
 const ANCHORED = `Anchored paragraph.
 
@@ -192,7 +199,7 @@ async function secondThread(page: import("@playwright/test").Page) {
 	await content(page).locator("p").nth(1).selectText();
 	await page.getByRole("button", { name: "Comment on this passage", exact: true }).click();
 	let draft = page.getByRole("dialog", { name: "New comment" });
-	await draft.getByPlaceholder("Comment on this passage…").fill("Keep this block as well.");
+	await draft.getByPlaceholder("Add a comment").fill("Keep this block as well.");
 	await draft.getByRole("button", { name: /^(Comment|Post comment)$/ }).click();
 	await expect.poll(() => commentButton(page).count()).toBe(2);
 	await page.keyboard.press("Escape");
@@ -203,7 +210,7 @@ test("a wide desktop comment sits in the gutter beside its passage", async ({ jo
 	await seed(PROSE);
 	let page = await join("ana");
 	await page.setViewportSize({ width: 1_440, height: 900 });
-	await page.getByRole("button", { name: "Hide chat" }).click();
+	await page.getByRole("button", { name: "Expand document" }).click();
 	await page.getByRole("button", { name: "Hide sidebar" }).click();
 	let card = await thread(page);
 	let paragraph = content(page).locator("p").first();
@@ -229,7 +236,7 @@ test("a narrow split document keeps the desktop comment popover", async ({ join,
 	let paragraph = content(page).locator("p").first();
 
 	await expect(card).not.toHaveAttribute("aria-modal", "true");
-	await expect(page.getByRole("button", { name: "Resize comment sheet" })).toHaveCount(0);
+	await expect(page.locator("[data-plan-comment-sheet]")).toHaveCount(0);
 	// No gutter is wide enough here, so the card sits below the passage inside its column.
 	await expect.poll(async () => {
 		let cardBox = await card.boundingBox();
@@ -279,28 +286,43 @@ test(
 );
 
 test(
-	"an unseeded document keeps linked questions inline and reveals them in Decisions",
+	"an unseeded document opens its Planner questions in Decisions",
 	async ({ baseURL, page, room }) => {
 		await authenticate(page, "ana", baseURL!);
 		await page.goto(roomPath(room));
-		await ready(page);
 		let decisions = page.getByRole("button", { name: /^Decisions/ });
-		await expect(decisions).toHaveAttribute("aria-pressed", "false");
-		await expect(page.getByRole("button", { name: "Document", exact: true }))
-			.toHaveAttribute("aria-pressed", "true");
-		await expect(content(page).locator("article[data-plan-sidecar-questionnaire]"))
-			.toHaveCount(2);
-		await decisions.click();
 		await expect(decisions).toHaveAttribute("aria-pressed", "true");
-		let card = questionnaire(page);
-		await expect(card).toHaveCount(2);
-		await expect(card.getByRole("heading", { name: "Where should room state live?" }))
-			.toBeVisible();
-		await expect(card.getByRole("heading", { name: "Which of these belong in the first cut?" }))
-			.toBeVisible();
-		await expect(card.getByRole("tablist")).toHaveCount(0);
+		await expect(page.getByRole("status").filter({ hasText: "Showing Decisions: 2 to answer" }))
+			.toHaveCount(1);
+		await expect(page.locator('[data-document-view="decisions"] [data-deck]'))
+			.toHaveAttribute("aria-label", "2 open decisions");
+		await page.getByRole("button", { name: "Document", exact: true }).click();
+		await ready(page);
+		await expect(decisions).toHaveAttribute("aria-pressed", "false");
+		await expect(content(page).locator("[data-deck]")).toHaveCount(1);
 	},
 );
+
+test("the Decisions deck label counts only decisions still open", async ({ join, seed }) => {
+	let fixture = deckSeed({ before: "Decisions for the rollout." }, 3);
+	await seed(fixture.source, fixture.state);
+	let page = await join("ana");
+	await page.getByRole("button", { name: /^Decisions/ }).click();
+	let deck = page.locator('[data-document-view="decisions"] [data-deck]');
+	let top = deck.locator("[data-deck-top]");
+	let answerTop = async () => {
+		await top.getByRole("radio").first().check();
+		await top.getByRole("button", { name: "Save", exact: true }).click();
+	};
+	await expect(deck).toHaveAttribute("aria-label", "3 open decisions");
+
+	// An answered card waits at the back of the deck but is no longer open.
+	await answerTop();
+	await expect(deck).toHaveAttribute("aria-label", "2 open decisions");
+	await answerTop();
+	await expect(deck).toHaveAttribute("aria-label", "1 open decision");
+	await expect(deck.locator("[data-deck-slot]")).toHaveCount(3);
+});
 
 test("questions leave the chat pane free of a waiting row", async ({ join, seed }) => {
 	await seed(PROSE);
@@ -425,10 +447,12 @@ test("compact Chat returns to the document after a collaborator adds prose", asy
 		{ timeout: 20_000 },
 	);
 	let nav = ana.getByRole("navigation", { name: "Workspace view" });
+	// A blank document opens in Decisions; choosing Document keeps the reader there.
+	await expect(nav.getByRole("button", { name: "Decisions, 2 unanswered", exact: true }))
+		.toHaveAttribute("aria-current", "page");
+	await nav.getByRole("button", { name: "Document", exact: true }).click();
 	await expect(nav.getByRole("button", { name: "Document", exact: true }))
 		.toHaveAttribute("aria-current", "page");
-	await expect(nav.getByRole("button", { name: "Decisions, 2 unanswered", exact: true }))
-		.toBeVisible();
 	await nav.getByRole("button", { name: /Chat/ }).click();
 
 	let boContext = await browser.newContext({ baseURL, viewport: { width: 1280, height: 800 } });
@@ -491,7 +515,8 @@ for (
 		let decisions = page.getByRole("button", { name: /^Decisions/ });
 		let plan = page.getByRole("button", { name: "Document", exact: true });
 		let stack = page.locator("[data-plan-decisions-scroll]");
-		let first = questionnaire(page).first();
+		// Desktop opens open decisions as a deck; choosing the tab focuses its top.
+		let first = page.locator('[data-document-view="decisions"] [data-deck-top]');
 
 		await decisions.click();
 		if (example.compact) {
@@ -583,13 +608,45 @@ test("decision cards save independently with progressive custom answers", async 
 
 	await storage.getByRole("radio", { name: /On disk as MDX/ }).check();
 	await saveStorage.click();
+	// The answered card waits behind the deck's next open decision.
 	await expect(scope).toBeVisible();
-	await expect(scope).toBeFocused();
+	await expect(deckSlot(page, "Which of these belong in the first cut?")).toBeFocused();
+	await expect(deckSlot(page, "Where should room state live?")).toContainText("Answered by @ana");
 	await expect(scope.getByRole("button", { name: "Save", exact: true })).toBeVisible();
 	await expect(scope).not.toContainText("Answered by");
 	await expect(scope.getByRole("checkbox", { name: "Anchors" })).not.toBeChecked();
+	await expect(page.getByRole("button", { name: /resolved$/ })).toHaveCount(0);
 
-	let history = page.getByRole("button", { name: "1 resolved" });
+	let addRow = scope.getByRole("button", { name: "Add an option" });
+	await addRow.focus();
+	await page.keyboard.press("Enter");
+	let field = scope.getByRole("textbox", { name: "New option" });
+	await expect(field).toBeFocused();
+	let saveScope = scope.getByRole("button", { name: "Save", exact: true });
+	await expect(saveScope).toBeDisabled();
+	await field.press("Escape");
+	await expect(field).toHaveCount(0);
+	await expect(addRow).toBeFocused();
+	await addRow.click();
+	field = scope.getByRole("textbox", { name: "New option" });
+	await field.fill("Only collaborative anchors");
+	await field.press("Enter");
+	// It joins everyone's list as the next lettered row and is not chosen for anyone.
+	let added = scope.getByRole("checkbox", { name: "Only collaborative anchors" });
+	await expect(added).toBeVisible();
+	await expect(added).not.toBeChecked();
+	await expect(scope.locator("label", { hasText: "Only collaborative anchors" })).toContainText(
+		"D",
+	);
+	await expect(addRow).toBeFocused();
+	await expect(saveScope).toBeDisabled();
+	await added.check();
+	await scope.getByRole("checkbox", { name: /^Anchors/ }).check();
+	await saveScope.click();
+
+	// With nothing left open, the deck gives way to resolved history.
+	let history = page.getByRole("button", { name: "2 resolved" });
+	await expect(history).toBeVisible();
 	let historyIcon = history.locator("[data-feedback-icon]");
 	await history.hover();
 	await page.evaluate(() => {
@@ -627,6 +684,11 @@ test("decision cards save independently with progressive custom answers", async 
 	await expect(resolved).toContainText("On disk as MDX");
 	await expect(resolved).toContainText("Answered by @ana");
 	await expect(resolved.getByRole("button", { name: "Save", exact: true })).toHaveCount(0);
+	let resolvedScope = questionnaire(page).filter({
+		hasText: "Which of these belong in the first cut?",
+	});
+	await expect(resolvedScope).toContainText("Only collaborative anchors");
+	await expect(resolvedScope).toContainText("Answered by @ana");
 	let iconStarts = await page.evaluate(() => {
 		let record = Reflect.get(window, "__feedbackIconTransitions") as { starts: number };
 		return record.starts;
@@ -660,47 +722,13 @@ test("decision cards save independently with progressive custom answers", async 
 	).toBe(iconStarts);
 	await expect(history).not.toHaveAttribute("aria-controls");
 	await expect(historyContent).toHaveCount(0);
-
-	let addRow = scope.getByRole("button", { name: "Add an option" });
-	await addRow.focus();
-	await page.keyboard.press("Enter");
-	let field = scope.getByRole("textbox", { name: "New option" });
-	await expect(field).toBeFocused();
-	let saveScope = scope.getByRole("button", { name: "Save", exact: true });
-	await expect(saveScope).toBeDisabled();
-	await field.press("Escape");
-	await expect(field).toHaveCount(0);
-	await expect(addRow).toBeFocused();
-	await addRow.click();
-	field = scope.getByRole("textbox", { name: "New option" });
-	await field.fill("Only collaborative anchors");
-	await field.press("Enter");
-	// It joins everyone's list as the next lettered row and is not chosen for anyone.
-	let added = scope.getByRole("checkbox", { name: "Only collaborative anchors" });
-	await expect(added).toBeVisible();
-	await expect(added).not.toBeChecked();
-	await expect(scope.locator("label", { hasText: "Only collaborative anchors" })).toContainText(
-		"D",
-	);
-	await expect(addRow).toBeFocused();
-	await expect(saveScope).toBeDisabled();
-	await added.check();
-	await scope.getByRole("checkbox", { name: /^Anchors/ }).check();
-	await saveScope.click();
-	let allResolved = page.getByRole("button", { name: "2 resolved" });
-	await expect(allResolved).toBeVisible();
-	await allResolved.click();
-	let resolvedScope = questionnaire(page).filter({
-		hasText: "Which of these belong in the first cut?",
-	});
-	await expect(resolvedScope).toContainText("Only collaborative anchors");
-	await expect(resolvedScope).toContainText("Answered by @ana");
 });
 
 test("Save and Next wait for a chosen answer", async ({ join, seed }) => {
 	await seed(PROSE);
 	let page = await join("ana");
 	await page.getByRole("button", { name: /^Decisions/ }).click();
+	await bringForward(page, "Which of these belong in the first cut?");
 	let card = questionnaire(page).filter({
 		has: page.getByRole("heading", { name: "Which of these belong in the first cut?" }),
 	});
@@ -735,6 +763,7 @@ test("a rejected save is announced as an alert with motion feedback", async ({ j
 	await seed(PROSE);
 	await join("ana");
 	await page.getByRole("button", { name: /^Decisions/ }).click();
+	await bringForward(page, "Which of these belong in the first cut?");
 	let card = questionnaire(page).filter({
 		has: page.getByRole("heading", { name: "Which of these belong in the first cut?" }),
 	});
@@ -877,10 +906,10 @@ test("an option one member adds is shared, durable, and choosable by another", a
 	await chosen.check();
 	await storage(bo).getByRole("button", { name: "Save", exact: true }).click();
 
+	// Each reader saw it open, so the answered card waits behind the open deck.
 	for (let page of [ana, bo]) {
-		await page.getByRole("button", { name: "1 resolved" }).click();
-		await expect(questionnaire(page).filter({ hasText: "Where should room state live?" }))
-			.toContainText("In PostgreSQL");
+		await expect(deckSlot(page, "Where should room state live?")).toContainText("Answered by @bo");
+		await expect(deckSlot(page, "Where should room state live?")).toContainText("In PostgreSQL");
 	}
 });
 
@@ -953,6 +982,7 @@ test("discarding asks first", async ({ join, seed }) => {
 	await seed(PROSE);
 	let page = await join("ana");
 	await page.getByRole("button", { name: /^Decisions/ }).click();
+	await bringForward(page, "Which of these belong in the first cut?");
 	let card = questionnaire(page).filter({
 		has: page.getByRole("heading", { name: "Which of these belong in the first cut?" }),
 	});
@@ -992,6 +1022,7 @@ test("a compact new-comment sheet blocks navigation and restores editor focus", 
 		isMobile: true,
 		viewport: { width: 390, height: 844 },
 	});
+	await edit(page);
 	let editor = content(page);
 	let plan = page.getByRole("button", {
 		name: "Document",
@@ -1005,7 +1036,7 @@ test("a compact new-comment sheet blocks navigation and restores editor focus", 
 		await page.getByRole("button", { name: "Comment on this passage", exact: true }).click();
 		let sheet = page.getByRole("dialog", { name: "New comment" });
 		await expect(sheet).toHaveAttribute("aria-modal", "true");
-		await expect(sheet.getByPlaceholder("Comment on this passage…")).toBeFocused();
+		await expect(sheet.getByPlaceholder("Add a comment")).toBeFocused();
 		return sheet;
 	};
 
@@ -1025,7 +1056,7 @@ test("a compact new-comment sheet blocks navigation and restores editor focus", 
 	).toBe(true);
 	await page.mouse.click(destinationPoint.x, destinationPoint.y);
 	await expect(sheet).toHaveCount(0);
-	await expect(plan).toHaveAttribute("aria-pressed", "true");
+	await expect(plan).toHaveAttribute("aria-current", "page");
 	await expect(editor).toBeFocused();
 	sheet = await openDraft();
 	await page.locator("[data-plan-comment-sheet-backdrop]").click({
@@ -1047,39 +1078,33 @@ test("submitting a compact new comment restores editor focus", async ({ join, se
 		isMobile: true,
 		viewport: { width: 390, height: 844 },
 	});
+	await edit(page);
 	let editor = content(page);
 	await editor.locator("p").nth(1).selectText();
 	await page.getByRole("button", { name: "Comment on this passage", exact: true }).click();
 	let sheet = page.getByRole("dialog", { name: "New comment" });
-	await sheet.getByPlaceholder("Comment on this passage…").fill("Keep this block as well.");
+	await sheet.getByPlaceholder("Add a comment").fill("Keep this block as well.");
 	await sheet.getByRole("button", { name: "Post comment", exact: true }).click();
 
 	await expect(sheet).toHaveCount(0);
 	await expect(editor).toBeFocused();
 });
 
-for (
-	let resolution of [
-		{ action: "Apply feedback", confirmation: "Apply feedback", verb: "applying" },
-		{ action: "Dismiss", confirmation: "Dismiss", verb: "dismissing" },
-	] as const
-) {
-	test(`${resolution.verb} a compact comment restores editor focus`, async ({ join, seed }) => {
-		await seed(PROSE);
-		let page = await join("ana", {
-			hasTouch: true,
-			isMobile: true,
-			viewport: { width: 390, height: 844 },
-		});
-		let editor = content(page);
-		let sheet = await thread(page);
-		await sheet.getByRole("button", { name: resolution.action }).click();
-		await sheet.getByRole("button", { name: resolution.confirmation }).click();
-
-		await expect(sheet).toHaveCount(0);
-		await expect(editor).toBeFocused();
+test("resolving a compact comment restores editor focus", async ({ join, seed }) => {
+	await seed(PROSE);
+	let page = await join("ana", {
+		hasTouch: true,
+		isMobile: true,
+		viewport: { width: 390, height: 844 },
 	});
-}
+	await edit(page);
+	let editor = content(page);
+	let sheet = await thread(page);
+	await sheet.getByRole("button", { name: "Resolve", exact: true }).click();
+
+	await expect(sheet).toHaveCount(0);
+	await expect(editor).toBeFocused();
+});
 
 test("an unavailable comment position keeps its compact sheet mounted until geometry recovers", async ({ join, seed }) => {
 	await seed(TALL_PASSAGE);
@@ -1105,7 +1130,7 @@ test("an unavailable comment position keeps its compact sheet mounted until geom
 	});
 	await page.getByRole("button", { name: "Comment on this passage", exact: true }).click();
 	let draft = page.getByRole("dialog", { name: "New comment" });
-	await draft.getByPlaceholder("Comment on this passage…").fill("Keep the whole passage.");
+	await draft.getByPlaceholder("Add a comment").fill("Keep the whole passage.");
 	await draft.getByRole("button", { name: "Post comment", exact: true }).click();
 
 	// Both threads mark the one block, so they share its marker.
@@ -1192,7 +1217,7 @@ test("a touch comment opens as a modal sheet and restores its marker", async ({ 
 	await marker.tap();
 	let sheet = page.getByRole("dialog", { name: "Comment thread" });
 	await expect(sheet).toBeVisible();
-	await expect(sheet.getByRole("button", { name: "Resize comment sheet" })).toBeFocused();
+	await expect(sheet.getByRole("button", { name: "Close comment" })).toBeFocused();
 	await expect.poll(() => editorIsModalBackground(page)).toBe(true);
 	await page.keyboard.press("Escape");
 	await expect(sheet).toHaveCount(0);
@@ -1259,18 +1284,20 @@ test("clicking a comment button pins its document card and preserves the related
 	await seed(PROSE);
 	let page = await join("ana");
 	await page.setViewportSize({ width: 1_440, height: 900 });
-	await page.getByRole("button", { name: "Hide chat" }).click();
+	await page.getByRole("button", { name: "Expand document" }).click();
 	await page.getByRole("button", { name: "Hide sidebar" }).click();
 	let card = await thread(page);
 	await expect(card).toContainText("@dev");
-	await expect(card.getByPlaceholder("Reply…")).toBeVisible();
+	await expect(card.getByPlaceholder("Reply", { exact: true })).toBeVisible();
 	await page.keyboard.press("Escape");
 	await expect(page.getByRole("dialog", { name: "Comment thread" })).toHaveCount(0);
 	card = await thread(page);
 
-	await expect.poll(() => washed(page)).toBeGreaterThan(0);
+	// The pinned card underlines its passage, and keeps it while the pointer is elsewhere.
+	await expect.poll(() => washed(page, ["plan-comment-open"])).toBe(1);
 	await content(page).hover();
-	await expect.poll(() => washed(page)).toBeGreaterThan(0);
+	await expect.poll(() => washed(page, ["plan-comment-open"])).toBe(1);
+	await expect.poll(() => washed(page, ["plan-comment"])).toBe(0);
 });
 
 test("a live text edit preserves its document comment", async ({ join, seed }) => {
@@ -1305,6 +1332,7 @@ test("a compact orphan sheet owns focus and restores its opener", async ({ join,
 		isMobile: true,
 		viewport: { width: 390, height: 844 },
 	});
+	await edit(page);
 	let first = content(page).locator("p").first();
 	await first.selectText();
 	await page.keyboard.press("Backspace");
@@ -1314,10 +1342,10 @@ test("a compact orphan sheet owns focus and restores its opener", async ({ join,
 	await opener.tap();
 	let sheet = page.getByRole("dialog", { name: "Orphaned comments" });
 	await expect(sheet).toHaveAttribute("aria-modal", "true");
-	await expect(sheet.getByRole("button", { name: "Resize comment sheet" })).toBeFocused();
+	await expect(sheet.getByRole("button", { name: "Close comment" })).toBeFocused();
 	await expect.poll(() => editorIsModalBackground(page)).toBe(true);
 	await page.keyboard.press("Shift+Tab");
-	await expect(sheet.getByRole("button", { name: "Apply feedback" })).toBeFocused();
+	await expect(sheet.getByRole("textbox", { name: "Reply", exact: true })).toBeFocused();
 	await page.keyboard.press("Escape");
 	await expect(sheet).toHaveCount(0);
 	await expect(opener).toBeFocused();
@@ -1331,9 +1359,10 @@ test("a remotely orphaned compact comment closes its sheet and restores editor f
 		isMobile: true,
 		viewport: { width: 390, height: 844 },
 	});
+	await edit(page);
 	let editor = content(page);
 	let sheet = await thread(page);
-	await expect(sheet.getByRole("button", { name: "Resize comment sheet" })).toBeFocused();
+	await expect(sheet.getByRole("button", { name: "Close comment" })).toBeFocused();
 
 	let collaborator = await join("bo");
 	let subject = content(collaborator).locator("p").first();
@@ -1347,58 +1376,53 @@ test("a remotely orphaned compact comment closes its sheet and restores editor f
 	await expect(page.getByRole("button", { name: "1 orphaned comments" })).toBeVisible();
 });
 
-function washed(page: import("@playwright/test").Page): Promise<number> {
-	return page.evaluate(() => CSS.highlights.get("plan-related")?.size ?? 0);
+/** Commented passages washed in any tone, or only in the named ones. */
+function washed(
+	page: import("@playwright/test").Page,
+	names = ["plan-comment", "plan-comment-hover", "plan-comment-open"],
+): Promise<number> {
+	return page.evaluate(
+		names => names.reduce((total, name) => total + (CSS.highlights.get(name)?.size ?? 0), 0),
+		names,
+	);
 }
 
-test("the reply composer grows and keeps one inset send action", async ({ join, seed }) => {
+test("the reply field is one line until focused, then grows and reveals Send to Chopin and its send", async ({ join, seed }) => {
 	await seed(PROSE);
 	let page = await join("ana");
 	let card = await thread(page);
-	let composer = card.getByPlaceholder("Reply…");
+	let composer = card.getByRole("textbox", { name: "Reply", exact: true });
+	let frame = composer.locator("xpath=ancestor::*[@data-mode][1]");
+	let send = card.getByRole("button", { name: "Send reply" });
+	let address = card.getByRole("checkbox", { name: "Send to Chopin" });
 	let initial = await composer.evaluate(element => ({
 		height: element.clientHeight,
 		resize: getComputedStyle(element).resize,
 	}));
 
 	expect(initial.resize).toBe("none");
+	await expect(frame).not.toHaveAttribute("data-open");
+	await composer.focus();
+	await expect(frame).toHaveAttribute("data-open", "true");
+	await expect(send).toBeVisible();
+	await expect(send).toBeDisabled();
+	await expect(address).toBeVisible();
+	await expect(address).not.toBeChecked();
+
 	await composer.fill("First line\nSecond line\nThird line\nFourth line\nFifth line");
 	await expect.poll(() => composer.evaluate(element => element.clientHeight)).toBeGreaterThan(
 		initial.height,
 	);
-	let send = card.getByRole("button", { name: "Send reply" });
-	await expect(send).toBeVisible();
-	let geometry = await Promise.all([composer.boundingBox(), send.boundingBox()]).then(
-		([field, button]) =>
-			field && button
-				? {
-					bottom: field.y + field.height - button.y - button.height,
-					contained: button.x >= field.x
-						&& button.y >= field.y
-						&& button.x + button.width <= field.x + field.width
-						&& button.y + button.height <= field.y + field.height,
-					right: field.x + field.width - button.x - button.width,
-				}
-				: undefined,
-	);
-	expect(geometry?.contained).toBe(true);
-	expect(Math.abs((geometry?.right ?? 0) - (geometry?.bottom ?? 0))).toBeLessThan(0.5);
-
-	let apply = card.getByRole("button", { name: "Apply feedback" });
-	let dismiss = card.getByRole("button", { name: "Dismiss" });
-	let actionStyles = await Promise.all([apply, dismiss].map(button =>
-		button.evaluate(element => {
-			let style = getComputedStyle(element);
-			return {
-				background: style.backgroundColor,
-				paddingLeft: style.paddingLeft,
-				paddingRight: style.paddingRight,
-			};
-		})
-	));
-	expect(actionStyles[0].background).not.toBe(actionStyles[1].background);
-	expect(actionStyles[0].paddingLeft).toBe("12px");
-	expect(actionStyles[0].paddingRight).toBe("12px");
+	await expect(send).toBeEnabled();
+	// The frame grows with the field; measure once it has caught up.
+	await expect.poll(() =>
+		Promise.all([frame.boundingBox(), send.boundingBox()]).then(
+			([outer, button]) =>
+				!!outer && !!button && button.x >= outer.x && button.y >= outer.y
+				&& button.x + button.width <= outer.x + outer.width
+				&& button.y + button.height <= outer.y + outer.height,
+		)
+	).toBe(true);
 });
 
 test("a reply joins the thread without a duplicate reply count", async ({ join, seed }) => {
@@ -1407,7 +1431,7 @@ test("a reply joins the thread without a duplicate reply count", async ({ join, 
 	let card = await thread(page);
 
 	await expect(card.getByText(/repl(y|ies)$/)).toHaveCount(0);
-	await card.getByPlaceholder("Reply…").fill("Still right, but say why.");
+	await card.getByPlaceholder("Reply", { exact: true }).fill("Still right, but say why.");
 	await card.getByRole("button", { name: "Send reply" }).click();
 	await expect(card).toContainText("Still right, but say why.");
 	await expect(card).toContainText("@ana");
@@ -1415,42 +1439,67 @@ test("a reply joins the thread without a duplicate reply count", async ({ join, 
 	await expect(commentButton(page)).toHaveAccessibleDescription("1 reply waiting.");
 });
 
-test("a comment confirmation remains until the reader chooses", async ({ join, seed }) => {
+test("resolving hides the thread at once, and Undo brings it back for everyone", async ({ join, seed }) => {
 	await seed(PROSE);
 	let page = await join("ana");
+	let other = await join("bo");
+	await expect(commentButton(other)).toHaveCount(1);
 	let card = await thread(page);
+	let source = await content(page).textContent();
 
-	await card.getByRole("button", { name: "Dismiss" }).click();
-	await expect(card).toContainText("This closes the thread without changing the document.");
-	await page.waitForTimeout(4_100);
-	await expect(card.getByRole("button", { name: "Dismiss" })).toBeVisible();
-	await expect(card.getByRole("button", { name: "Cancel" })).toBeVisible();
-});
-
-test("accepting explains its consequence before changing the document", async ({ join, seed }) => {
-	await seed(PROSE);
-	let page = await join("ana");
-	let card = await thread(page);
-
-	await card.getByRole("button", { name: "Apply feedback" }).click();
-	await expect(card).toContainText("Planner will use this feedback to update the document.");
-	await card.getByRole("button", { name: "Apply feedback" }).click();
-	await expect(page.getByText(/accepted a comment on/)).toBeVisible();
-	await expect(
-		page.getByText("The agent is not running, so the plan has not been revised."),
-	).toBeVisible();
+	await card.hover();
+	await card.getByRole("button", { name: "Resolve", exact: true }).click();
 	await expect(page.getByRole("dialog", { name: "Comment thread" })).toHaveCount(0);
 	await expect(commentButton(page)).toHaveCount(0);
-	await expect(content(page).locator("article").filter({ hasText: QUOTED })).toContainText(QUOTED);
+	await expect(commentButton(other)).toHaveCount(0);
+	await expect(page.getByRole("status").filter({ hasText: "Comment resolved" })).toBeAttached();
+	let undo = page.getByRole("button", { name: "Undo", exact: true });
+	await expect(undo).toBeVisible();
+	expect(await content(page).textContent()).toBe(source);
+
+	// Pointing at the toast holds it past its usual window.
+	await undo.hover();
+	await page.waitForTimeout(6_500);
+	await expect(undo).toBeVisible();
+	await undo.click();
+	await expect(undo).toHaveCount(0);
+	let reopened = page.getByRole("dialog", { name: "Comment thread" });
+	await expect(reopened).toContainText("@dev");
+	await expect(commentButton(other)).toHaveCount(1);
+	await expect.poll(() => washed(other)).toBeGreaterThan(0);
+
+	// The reopened thread takes replies again.
+	await reopened.getByRole("textbox", { name: "Reply", exact: true }).fill("Back again.");
+	await reopened.getByRole("button", { name: "Send reply" }).click();
+	await expect(reopened).toContainText("Back again.");
+	await commentButton(other).click();
+	await expect(other.getByRole("dialog", { name: "Comment thread" })).toContainText("Back again.");
 });
 
-test("a dismissed thread removes its document button", async ({ join, seed }) => {
+test("Mod+Z outside the editor undoes a resolve while its toast shows", async ({ join, seed }) => {
 	await seed(PROSE);
 	let page = await join("ana");
 	let card = await thread(page);
+	await card.hover();
+	await card.getByRole("button", { name: "Resolve", exact: true }).click();
+	await expect(commentButton(page)).toHaveCount(0);
 
-	await card.getByRole("button", { name: "Dismiss" }).click();
-	await expect(card).toContainText("This closes the thread without changing the document.");
-	await card.getByRole("button", { name: "Dismiss" }).click();
+	// Inside the editor Mod+Z is the document's own undo, so focus something else first.
+	await page.getByRole("button", { name: "Document", exact: true }).focus();
+	await page.keyboard.press("ControlOrMeta+z");
+	await expect(page.getByRole("dialog", { name: "Comment thread" })).toContainText("@dev");
+	await expect(page.getByRole("button", { name: "Undo", exact: true })).toHaveCount(0);
+});
+
+test("a resolved thread stays hidden after a reload", async ({ join, seed }) => {
+	await seed(PROSE);
+	let page = await join("ana");
+	let card = await thread(page);
+	await card.hover();
+	await card.getByRole("button", { name: "Resolve", exact: true }).click();
+	await expect(commentButton(page)).toHaveCount(0);
+
+	await page.reload();
+	await expect(content(page)).toContainText(QUOTED);
 	await expect(commentButton(page)).toHaveCount(0);
 });

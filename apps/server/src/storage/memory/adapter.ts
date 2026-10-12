@@ -2,7 +2,10 @@ import { conflict, missing } from "../errors";
 import { documentSlug, documentSlugCandidate } from "../../channels/slug";
 import { availableChannelTitle } from "../../channels/title";
 import { sidecarUnansweredDecisions } from "../../questions/unanswered";
+import { childSidecarWithoutConversation } from "../child-conversation";
 import { MemoryBackgroundJobStore } from "./jobs";
+import { MemoryExperimentStore } from "./experiments";
+import { MemoryImageStore } from "./images";
 import { MemoryResearchWorkspaceStore } from "./research";
 import { MemoryPreferenceStore } from "../../user-preferences/memory";
 import { MemoryProvenanceStore } from "../../document-provenance/memory";
@@ -46,6 +49,7 @@ import type {
 	BackgroundJobStore,
 	ChannelStore,
 	CollaborationStore,
+	ImageStore,
 	LeaseStore,
 	NavigationStore,
 	ResearchWorkspaceStore,
@@ -127,6 +131,11 @@ type Operation = CommitResult;
 /** A strict in-memory adapter used by domain tests, not a production fallback. */
 export class MemoryStorage implements StorageAdapter {
 	readonly driver = "memory";
+	readonly experiments = new MemoryExperimentStore({
+		exists: id => this.#channels.has(id),
+		active: id => !this.#channels.get(id)?.archivedAt,
+		fence: lease => this.#assertLease(lease),
+	});
 
 	#users = new Map<string, UserRecord>();
 	#sessions = new Map<string, StoredWebSession>();
@@ -142,6 +151,11 @@ export class MemoryStorage implements StorageAdapter {
 	#operations = new Map<string, Map<string, Operation>>();
 	#agents = new Map<string, AgentState>();
 	#leases = new Map<string, Lease>();
+	readonly #images = new MemoryImageStore({
+		channelExists: id => this.#channels.has(id),
+		userExists: id => this.#users.has(id),
+	});
+	readonly images: ImageStore = this.#images;
 
 	readonly users: UserStore = {
 		put: input => {
@@ -271,6 +285,17 @@ export class MemoryStorage implements StorageAdapter {
 	readonly channels: ChannelStore = {
 		create: async input => this.#createChannel(input),
 		get: id => Promise.resolve(this.#channels.get(id)).then(value => value && channel(value)),
+		children: (parentId, limit) =>
+			Promise.resolve(
+				[...this.#channels.values()]
+					.filter(value => value.parentChannelId === parentId && !value.archivedAt)
+					.sort((left, right) =>
+						left.createdAt.getTime() - right.createdAt.getTime()
+						|| left.id.localeCompare(right.id)
+					)
+					.slice(0, limit)
+					.map(value => channel(value)),
+			),
 		resolve: (repositoryId, slug) => {
 			let id = this.#channelSlugs.get(repositoryId)?.get(slug);
 			let found = id ? this.#channels.get(id) : undefined;
@@ -301,6 +326,7 @@ export class MemoryStorage implements StorageAdapter {
 		commit: input => this.#commit(input),
 		replace: input => this.#replace(input),
 		checkpoint: input => this.#checkpoint(input),
+		dropChildConversations: lease => this.#dropChildConversations(lease),
 	};
 
 	readonly #jobs = new MemoryBackgroundJobStore({
@@ -533,6 +559,7 @@ export class MemoryStorage implements StorageAdapter {
 		this.#channels.delete(id);
 		await this.#research.deleteChannel(id);
 		this.#jobs.deleteChannel(id);
+		this.#images.deleteChannel(id);
 		this.#snapshots.delete(id);
 		this.#sequences.delete(id);
 		this.#updates.delete(id);
@@ -988,6 +1015,34 @@ export class MemoryStorage implements StorageAdapter {
 		}
 		this.#leases.set(held.name, { ...existing, expiresAt: new Date(0) });
 		return Promise.resolve(true);
+	}
+
+	async #dropChildConversations(lease: Lease): Promise<{ cleared: string[]; kept: string[] }> {
+		this.#assertLease(lease);
+		let cleared: string[] = [];
+		let kept: string[] = [];
+		let children = [...this.#channels.values()]
+			.filter(channel => channel.parentChannelId)
+			.map(channel => channel.id)
+			.sort();
+		for (let channelId of children) {
+			let stored = this.#snapshots.get(channelId);
+			let current = childSidecarWithoutConversation(this.#sidecars.get(channelId) ?? null);
+			let checkpointed = childSidecarWithoutConversation(stored?.sidecar ?? null);
+			if (current === "kept" || checkpointed === "kept") {
+				kept.push(channelId);
+				continue;
+			}
+			if (current === "unchanged" && checkpointed === "unchanged") continue;
+			if (current !== "unchanged") this.#sidecars.set(channelId, json(current));
+			if (stored && checkpointed !== "unchanged") {
+				this.#snapshots.set(channelId, { ...stored, sidecar: json(checkpointed) });
+			}
+			let agent = this.#agents.get(channelId);
+			if (agent) this.#agents.set(channelId, { ...agent, summary: "", transcriptCursor: 0 });
+			cleared.push(channelId);
+		}
+		return { cleared, kept };
 	}
 
 	#assertLease(held: Lease): void {

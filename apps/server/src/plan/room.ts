@@ -19,15 +19,18 @@ import * as Y from "yjs";
 
 import {
 	$createDecisionNode,
+	$createExperimentNode,
 	$createPlanNodes,
 	$createResearchNode,
 	$exportPlanTree,
 	$importPlan,
 	assert,
 	assertIntroducedUrls,
+	ExperimentNode,
 	exportPlan,
 	limits,
 	parse,
+	PlanParseError,
 	PlanValidationError,
 	questionnaireElement,
 	QuestionnaireNode,
@@ -360,7 +363,12 @@ export async function apply(
 	let before = parse(project(target)).children;
 	let researchProjections: ResearchProjectionChange[] = [];
 	let held = open > 0 ? Buffer.byteLength(project(target)) : 0;
-	for (let update of updates) Y.applyUpdate(target.doc, update, REMOTE);
+	try {
+		for (let update of updates) Y.applyUpdate(target.doc, update, REMOTE);
+	} catch {
+		// Earlier updates in the batch, or part of this one, may already be in.
+		return { ok: false, issues: ["malformed-update"] };
+	}
 	await settle();
 
 	try {
@@ -394,8 +402,15 @@ export async function apply(
 			return { ok: false, issues: ["source-too-large"] };
 		}
 	} catch (err) {
-		if (!(err instanceof PlanValidationError)) throw err;
-		return { ok: false, issues: err.issues.map(issue => issue.code) };
+		// The batch is already applied and cannot be undone, so every failure here
+		// must refuse it and let the caller rebuild. A throw runs out of the plan
+		// queue as an unhandled rejection, which exits the server.
+		if (err instanceof PlanValidationError) {
+			return { ok: false, issues: err.issues.map(issue => issue.code) };
+		}
+		if (err instanceof PlanParseError) return { ok: false, issues: ["unparseable"] };
+		console.error("[plan] could not project a client batch:", err);
+		return { ok: false, issues: ["unprojectable"] };
 	}
 
 	target.seq += updates.length;
@@ -1243,6 +1258,29 @@ export function insertResearch(target: Document, id: string): Mutation | undefin
 	return mutate(target, () => {
 		if ($nodesOfType(ResearchNode).some(node => node.getId() === id)) return false;
 		$getRoot().append($createResearchNode(id));
+		return true;
+	});
+}
+
+export function placeExperiment(
+	target: Document,
+	experiment: string,
+	view: string,
+	decision: string,
+	remove = false,
+): Mutation | undefined {
+	return mutate(target, () => {
+		let existing = $nodesOfType(ExperimentNode).find(node =>
+			node.getExperiment() === experiment && node.getView() === view
+			&& node.getDecision() === decision
+		);
+		if (remove) {
+			if (!existing) return false;
+			existing.remove();
+			return true;
+		}
+		if (existing) return false;
+		$getRoot().append($createExperimentNode(ulid(), experiment, view, decision));
 		return true;
 	});
 }

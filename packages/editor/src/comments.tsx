@@ -1,108 +1,249 @@
 /**
- * A comment thread, as a card in the sidecar.
+ * A comment thread, as a card beside its passage.
  *
- * Four states, and the difference between them is who can still act. A draft
- * has a passage but no thread yet. An open thread takes replies from anyone.
- * An accepted one is frozen — that is what accepting means — and reads as a
- * decision. A dismissed one is not rendered at all.
+ * Two shapes. A draft has a passage but no thread yet, so it is only a
+ * composer. An open thread lists its notes and takes replies from anyone; its
+ * header actions copy a link to it or resolve it. Resolving hides the thread
+ * at once and is undone from a toast, so it needs no confirmation.
  *
- * Accept and dismiss both confirm on a second click, because neither can be
- * undone: accepting freezes the thread, puts a decision in the document and starts
- * a turn. That is the same two-click shape `QuestionView` uses for cancelling,
- * so it is an interaction people have already met here.
+ * Accepted and dismissed threads come only from the earlier lifecycle and are
+ * never shown here: an accepted one renders through its `<Decision>`.
  */
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowUpIcon, CheckIcon, ChevronIcon, CloseIcon, MessageIcon } from "@chopin/icons";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { ArrowUpIcon, CheckIcon, ChevronIcon, EllipsisIcon, LinkIcon } from "@chopin/icons";
 
 import { limits } from "@chopin/dialect";
 
-import { Provenance, SidecarCard, when } from "./card";
+import { ChopinMark } from "./chopin-mark";
 import { displayName } from "./display-name";
 import { Face } from "./face";
 import { PRIMARY_COARSE_POINTER_QUERY } from "./pointer";
 
 import type { KeyboardEvent, ReactNode } from "react";
 import type { Comment } from "@chopin/protocol";
-import type { ThreadView } from "./threads";
+import type { Sent, ThreadView } from "./threads";
+
+/** Notes past which the middle of a thread folds behind "Show N replies". */
+const FOLD_AFTER = 3;
+
+/** A time today, or a date otherwise: the shortest stamp that is still unambiguous. */
+export function stamp(ts: number, now = new Date()): string {
+	let date = new Date(ts * 1_000);
+	if (Number.isNaN(date.getTime())) return "";
+	let today = date.toDateString() === now.toDateString();
+	return date.toLocaleString(
+		undefined,
+		today
+			? { hour: "numeric", minute: "2-digit" }
+			: {
+				month: "short",
+				day: "numeric",
+				...(date.getFullYear() === now.getFullYear() ? {} : { year: "numeric" }),
+			},
+	);
+}
 
 /** Chat's author row: face, display name, quiet timestamp. The handle stays in the name. */
-export function Author({ handle, ts }: { handle: string; ts?: number }) {
+export function Author(
+	{ handle, textSize = "sm", ts }: {
+		handle: string;
+		textSize?: "xs" | "sm";
+		ts?: number;
+	},
+) {
 	return (
-		<span className="flex min-w-0 items-center gap-2 text-sm">
+		<span
+			className={`flex min-w-0 items-center gap-2 ${textSize === "xs" ? "text-xs" : "text-sm"}`}
+		>
 			<Face decorative handle={handle} size={20} titled={false} />
-			<span className="min-w-0 truncate font-semibold" title={`@${handle}`}>
+			<span className="min-w-0 truncate font-semibold text-text-primary" title={`@${handle}`}>
 				{displayName(handle)}
 				<span className="sr-only">(@{handle})</span>
 			</span>
 			{ts !== undefined && (
-				<span className="shrink-0 text-text-quaternary tabular-nums">{when(ts)}</span>
+				<time
+					className="shrink-0 text-xs text-text-quaternary tabular-nums"
+					dateTime={new Date(ts * 1_000).toISOString()}
+				>
+					{stamp(ts)}
+				</time>
 			)}
 		</span>
 	);
 }
 
-function Note({
-	action,
-	note,
-	opening,
-}: {
-	action?: ReactNode;
-	note: Comment.Note;
-	opening?: boolean;
-}) {
+/** Chopin's author row: Chat's mark at the note-avatar size, its name, the time. */
+function ChopinAuthor({ textSize = "sm", ts }: { textSize?: "xs" | "sm"; ts?: number }) {
 	return (
-		<li
-			className="flex flex-col gap-0.5"
-			data-plan-comment-opening-note={opening || undefined}
+		<span
+			className={`flex min-w-0 items-center gap-2 ${textSize === "xs" ? "text-xs" : "text-sm"}`}
 		>
-			<div className="flex min-h-7 items-center justify-between gap-2">
-				<Author handle={note.handle} ts={note.ts} />
-				{action}
+			<span aria-hidden="true" className="plan-comment-agent">
+				<ChopinMark circle />
+			</span>
+			<span className="min-w-0 truncate font-semibold text-text-primary">Chopin</span>
+			{ts !== undefined && (
+				<time
+					className="shrink-0 text-xs text-text-quaternary tabular-nums"
+					dateTime={new Date(ts * 1_000).toISOString()}
+				>
+					{stamp(ts)}
+				</time>
+			)}
+		</span>
+	);
+}
+
+/** Whoever wrote a note: a member by their face and name, or Chopin by its mark. */
+export function NoteAuthor(
+	{ note, textSize, ts }: { note: Comment.Note; textSize?: "xs" | "sm"; ts?: number },
+) {
+	return note.author === "planner"
+		? <ChopinAuthor textSize={textSize} ts={ts} />
+		: <Author handle={note.handle} textSize={textSize} ts={ts} />;
+}
+
+/** The address a note was sent with, drawn from `to` because the text never carries it. */
+function Mention() {
+	return <span className="plan-comment-mention">@Chopin</span>;
+}
+
+/** One note: its author row and body. Also read back, without actions, in a resolved thread. */
+export function Note({ actions, note }: { actions?: ReactNode; note: Comment.Note }) {
+	return (
+		<li className="plan-comment-note" data-planner={note.author === "planner" || undefined}>
+			<div className="plan-comment-note-head">
+				<NoteAuthor note={note} ts={note.ts} />
+				{actions}
 			</div>
-			<p className="m-0 pl-7 text-sm whitespace-pre-wrap text-text-primary">{note.text}</p>
+			<p className="plan-comment-note-body">
+				{note.to === "planner" && (
+					<>
+						<Mention />
+						{" "}
+					</>
+				)}
+				{note.text}
+			</p>
 		</li>
 	);
 }
 
-function CloseButton({ onClose }: { onClose: () => void }) {
+/** Three dots that rise in turn; still under reduced motion. */
+function Dots() {
 	return (
-		<button
-			aria-label="Close comment"
-			className="plan-comment-close btn btn-icon btn-ghost"
-			data-plan-comment-close
-			onClick={onClose}
-			title="Close comment"
-			type="button"
-		>
-			<CloseIcon aria-hidden="true" size={14} />
-		</button>
+		<span aria-hidden="true" className="plan-comment-dots">
+			<i />
+			<i />
+			<i />
+		</span>
 	);
 }
 
-function DraftHeader({ onClose }: { onClose: () => void }) {
+/** What the reader is told about Chopin's turn on this thread, while it runs or once it stopped. */
+const OUTCOME: Record<NonNullable<ThreadView["planner"]>, string> = {
+	working: "Chopin is working on it",
+	stopped: "Chopin stopped",
+	failed: "Chopin couldn't reply",
+	off: "Chopin isn't running",
+};
+
+function PlannerStatus({ state }: { state: NonNullable<ThreadView["planner"]> }) {
 	return (
-		<header
-			className="flex min-h-7 items-center justify-between text-text-tertiary"
-			data-plan-comment-draft-header
+		<div
+			aria-live="polite"
+			className="plan-comment-planner"
+			data-plan-comment-planner={state}
+			role="status"
 		>
-			<MessageIcon aria-hidden="true" size={14} />
-			<CloseButton onClose={onClose} />
-		</header>
+			{state === "working" && <Dots />}
+			<span>{OUTCOME[state]}</span>
+		</div>
 	);
 }
 
-/** Context is repeated only when its source passage can no longer be reached. */
-function Quote({ drifted, text }: { drifted?: boolean; text: string }) {
+/** The `…` menu and the resolve check, revealed on hover or focus and always shown on touch. */
+function Actions({ link, onResolve }: { link?: string; onResolve?: () => void }) {
+	let [menu, setMenu] = useState(false);
+	let trigger = useRef<HTMLButtonElement>(null);
+	let list = useRef<HTMLDivElement>(null);
+
+	useEffect(() => {
+		if (!menu) return;
+		list.current?.querySelector<HTMLElement>("[role=menuitem]")?.focus();
+		let outside = (event: PointerEvent) => {
+			let target = event.target as Node;
+			if (!list.current?.contains(target) && !trigger.current?.contains(target)) setMenu(false);
+		};
+		document.addEventListener("pointerdown", outside);
+		return () => document.removeEventListener("pointerdown", outside);
+	}, [menu]);
+
+	let close = () => {
+		setMenu(false);
+		trigger.current?.focus();
+	};
+
 	return (
-		<div className="plan-comment-context flex flex-col gap-1" data-plan-comment-context>
-			<blockquote className="plan-comment-context-copy m-0 text-sm text-text-secondary">
-				{text}
-			</blockquote>
-			{drifted && (
-				<p className="m-0 text-sm text-warning-ink">
-					This passage has changed since the comment was added.
-				</p>
+		<div className="plan-comment-actions" data-open={menu || undefined}>
+			{link && (
+				<span className="plan-comment-menu-anchor">
+					<button
+						aria-expanded={menu}
+						aria-haspopup="menu"
+						aria-label="More actions"
+						className="plan-comment-action btn btn-icon btn-ghost"
+						data-press="small"
+						onClick={() => setMenu(open => !open)}
+						ref={trigger}
+						type="button"
+					>
+						<EllipsisIcon aria-hidden="true" size={14} />
+					</button>
+					{menu && (
+						<div
+							aria-label="Comment actions"
+							className="plan-comment-menu"
+							onKeyDown={event => {
+								if (event.key !== "Escape" && event.key !== "Tab") return;
+								// The card's own Escape would close it; this only closes the menu.
+								if (event.key === "Escape") {
+									event.preventDefault();
+									event.stopPropagation();
+								}
+								close();
+							}}
+							ref={list}
+							role="menu"
+						>
+							<button
+								className="plan-comment-menu-item"
+								onClick={() => {
+									void navigator.clipboard?.writeText(link).catch(() => {});
+									close();
+								}}
+								role="menuitem"
+								type="button"
+							>
+								<LinkIcon aria-hidden="true" size={14} />
+								Copy link
+							</button>
+						</div>
+					)}
+				</span>
+			)}
+			{onResolve && (
+				<button
+					aria-label="Resolve"
+					className="plan-comment-action btn btn-icon btn-ghost"
+					data-press="small"
+					data-tooltip="Resolve"
+					onClick={onResolve}
+					type="button"
+				>
+					<CheckIcon aria-hidden="true" size={14} />
+				</button>
 			)}
 		</div>
 	);
@@ -126,32 +267,74 @@ export function composerKey(
 	return "send";
 }
 
-/** A textarea with its send button inside, shared by new comments and replies. */
+/**
+ * Whether the text just typed addresses Chopin: `@chopin` as a word of its own,
+ * once the next character ends it. Returns the text without the mention, and
+ * where the caret belongs afterwards, or nothing when there is no mention.
+ */
+export function mention(
+	value: string,
+	caret: number,
+	final = false,
+): { text: string; caret: number } | undefined {
+	// While typing, the word must be ended, or `@chopinesque` could never be
+	// written. At send it may end the text.
+	let match = (final ? /(^|\s)@chopin(?=[\s,.;:!?]|$)/i : /(^|\s)@chopin(?=[\s,.;:!?])/i)
+		.exec(value);
+	if (!match) return undefined;
+	let start = match.index + match[1]!.length;
+	let end = start + "@chopin".length;
+	// The chip carries its own gap, so the space that ended the mention goes too.
+	if (/\s/.test(value[end] ?? "")) end += 1;
+	let text = (value.slice(0, start) + value.slice(end)).replace(/^\s+/, "");
+	let removed = value.length - text.length;
+	return { text, caret: Math.max(0, Math.min(text.length, caret - removed)) };
+}
+
+/**
+ * The field and its send, shared by new comments and replies.
+ *
+ * Its footer holds Send to Chopin and the send. A new comment shows the footer
+ * always; a reply is one quiet line until it is focused or holds something,
+ * then grows to reveal it. Addressing Chopin — the checkbox, or `@chopin` typed
+ * as a word — puts an `@Chopin` chip at the start of the text. The chip is not
+ * text and is never sent: the destination is.
+ */
 function Composer({
 	autoFocus,
-	busy,
-	label,
+	expanded,
+	mode,
 	onCancel,
 	onSend,
 	onTyping,
-	placeholder,
-	sendLabel,
 }: {
 	autoFocus?: boolean;
-	busy?: boolean;
-	label: string;
+	/** Keep Send to Chopin showing, as a sheet's pinned composer does. */
+	expanded?: boolean;
+	mode: "new" | "reply";
 	onCancel?: () => void;
-	onSend: (text: string) => void;
+	onSend: (text: string, to?: "planner") => void | Promise<Sent>;
 	onTyping?: (writing: boolean) => void;
-	placeholder: string;
-	sendLabel?: string;
 }) {
 	let [text, setText] = useState("");
+	let [to, setTo] = useState(false);
+	let [focused, setFocused] = useState(false);
+	let [coarse, setCoarse] = useState(false);
+	let [indent, setIndent] = useState(0);
+	let [refusal, setRefusal] = useState<string>();
 	let ref = useRef<HTMLTextAreaElement>(null);
+	let chip = useRef<HTMLSpanElement>(null);
+	let caret = useRef<number | undefined>(undefined);
+	let checkbox = useId();
 
 	useEffect(() => {
-		if (autoFocus) ref.current?.focus();
+		setCoarse(matchMedia(PRIMARY_COARSE_POINTER_QUERY).matches);
+		if (autoFocus) ref.current?.focus({ preventScroll: true });
 	}, [autoFocus]);
+
+	useLayoutEffect(() => {
+		setIndent(to && chip.current ? chip.current.offsetWidth : 0);
+	}, [to]);
 
 	useLayoutEffect(() => {
 		let field = ref.current;
@@ -160,21 +343,68 @@ function Composer({
 		let height = Math.min(field.scrollHeight, 160);
 		field.style.height = `${height}px`;
 		field.style.overflowY = field.scrollHeight > height ? "auto" : "hidden";
-	}, [text]);
+		if (caret.current !== undefined) {
+			field.setSelectionRange(caret.current, caret.current);
+			caret.current = undefined;
+		}
+	}, [text, indent]);
 
 	// Whoever is typing stops being told about the moment this goes away, so
-	// an unmount does not leave a caret blinking in somebody else's sidecar.
+	// an unmount does not leave a caret blinking in somebody else's card.
 	useEffect(() => () => onTyping?.(false), [onTyping]);
 
+	let change = (value: string, at: number) => {
+		let found = mention(value, at);
+		if (found) {
+			caret.current = found.caret;
+			setTo(true);
+			value = found.text;
+		} else if (to) {
+			value = value.replace(/^\s+/, "");
+		}
+		setText(value);
+		setRefusal(undefined);
+		onTyping?.(value.length > 0);
+	};
+
 	let send = () => {
-		let value = text.trim();
-		if (!value || busy) return;
+		let typed = text.trim();
+		if (!typed) return;
+		// A mention that ends the text has nothing after it to end the word while typing.
+		let found = mention(typed, typed.length, true);
+		let value = (found?.text ?? typed).trim();
+		let addressed = to || !!found;
+		if (!value) {
+			setText("");
+			setTo(addressed);
+			return;
+		}
 		setText("");
+		setTo(false);
+		setRefusal(undefined);
 		onTyping?.(false);
-		onSend(value);
+		let sent = onSend(value, addressed ? "planner" : undefined);
+		// Refused: put the words back, unless something new was typed meanwhile, and say why.
+		void sent?.then(result => {
+			if (result.ok) return;
+			setRefusal(result.message);
+			setText(current => current ? current : value);
+			setTo(current => current || addressed);
+		});
+		// A clicked send disables itself and drops focus without a blur, which would leave
+		// the field believing it still had focus; the field takes it back instead.
+		ref.current?.focus({ preventScroll: true });
 	};
 
 	let key = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+		let field = event.currentTarget;
+		if (
+			event.key === "Backspace" && to && field.selectionStart === 0 && field.selectionEnd === 0
+		) {
+			event.preventDefault();
+			setTo(false);
+			return;
+		}
 		let action = composerKey(
 			{
 				key: event.key,
@@ -182,7 +412,7 @@ function Composer({
 				isComposing: event.nativeEvent.isComposing,
 				keyCode: event.keyCode,
 			},
-			matchMedia(PRIMARY_COARSE_POINTER_QUERY).matches,
+			coarse,
 		);
 		if (action === "cancel" && onCancel) {
 			event.preventDefault();
@@ -193,35 +423,68 @@ function Composer({
 		}
 	};
 
+	let open = expanded || mode === "new" || focused || text.length > 0 || to;
+	let label = mode === "new" ? "Post comment" : "Send reply";
+
 	return (
 		<div
-			className="plan-comment-composer relative"
-			data-inset-send
-			data-plan-comment-composer-shell
+			className="plan-comment-composer field"
+			data-mode={mode}
+			data-open={open || undefined}
+			onBlur={event => {
+				if (!event.currentTarget.contains(event.relatedTarget)) setFocused(false);
+			}}
+			onFocus={() => setFocused(true)}
 		>
-			<textarea
-				ref={ref}
-				className="plan-comment-composer-field field block min-h-16 w-full resize-none px-2 py-1.5 text-sm"
-				disabled={busy}
-				maxLength={limits.MAX_NOTE}
-				onChange={event => {
-					setText(event.target.value);
-					onTyping?.(event.target.value.length > 0);
-				}}
-				onKeyDown={key}
-				placeholder={placeholder}
-				value={text}
-			/>
-			<button
-				aria-label={sendLabel ?? `Send ${label.toLowerCase()}`}
-				className="plan-comment-send btn btn-icon btn-primary absolute right-2 bottom-2 rounded-full"
-				disabled={!text.trim() || busy}
-				onClick={send}
-				title={sendLabel ?? `Send ${label.toLowerCase()}`}
-				type="button"
-			>
-				<ArrowUpIcon aria-hidden="true" size={14} />
-			</button>
+			<div className="plan-comment-composer-input">
+				{to && (
+					<span aria-hidden="true" className="plan-comment-address-chip" ref={chip}>
+						@Chopin
+					</span>
+				)}
+				<textarea
+					aria-label={mode === "new" ? "Comment" : "Reply"}
+					className="plan-comment-composer-field"
+					maxLength={limits.MAX_NOTE}
+					onChange={event => change(event.target.value, event.target.selectionStart)}
+					onKeyDown={key}
+					placeholder={mode === "new" ? "Add a comment" : "Reply"}
+					ref={ref}
+					rows={1}
+					style={indent ? { textIndent: `calc(${indent}px + 0.25rem)` } : undefined}
+					value={text}
+				/>
+			</div>
+			{refusal && <p className="plan-comment-refusal" role="alert">{refusal}</p>}
+			<div className="plan-comment-composer-fold">
+				<div className="plan-comment-composer-footer" inert={!open || undefined}>
+					<label className="plan-comment-address" htmlFor={checkbox}>
+						<input
+							checked={to}
+							className="plan-comment-address-box choice-control"
+							id={checkbox}
+							onChange={event => {
+								setTo(event.target.checked);
+								ref.current?.focus({ preventScroll: true });
+							}}
+							type="checkbox"
+						/>
+						Send to Chopin
+					</label>
+					<button
+						aria-label={label}
+						className="plan-comment-send btn btn-icon btn-primary rounded-full"
+						data-press="small"
+						data-tooltip="Send"
+						data-tooltip-shortcut={coarse ? undefined : "↵"}
+						disabled={!text.trim()}
+						onClick={send}
+						type="button"
+					>
+						<ArrowUpIcon aria-hidden="true" size={14} />
+					</button>
+				</div>
+			</div>
 		</div>
 	);
 }
@@ -230,102 +493,60 @@ export type ThreadCardProps = {
 	view: ThreadView;
 	quote: string;
 	writing?: string[];
-	focused?: boolean;
-	busy?: boolean;
 	/** Whether durable thread actions are available to this viewer. */
 	canEdit?: boolean;
-	/** True once the agent has said what an accepted thread produced. */
-	applied?: boolean;
-	onReply: (text: string) => void;
-	onAccept: () => void;
-	onDismiss: () => void;
-	onRetry: () => void;
+	/** An address that opens this thread, for Copy link. */
+	link?: string;
+	onReply: (text: string, to?: "planner") => void | Promise<Sent>;
+	onResolve: () => void;
 	onTyping: (writing: boolean) => void;
 	onFocus: () => void;
 	onBlur: () => void;
-	/** Dismiss a document dialog without changing the durable thread. */
-	onClose?: () => void;
-	/** Desktop owns visible close chrome; a compact sheet owns dismissal itself. */
-	showClose?: boolean;
-	/** The overlay is document chrome rather than an item in the decisions rail. */
-	inDocument?: boolean;
 	/** Return to the list of a block's threads this one was opened from. */
 	onBack?: () => void;
 	backLabel?: string;
+	/** In a sheet the notes scroll and the composer stays pinned beneath them. */
+	sheet?: boolean;
 };
 
 export function ThreadCard({
-	applied,
-	busy,
+	backLabel,
 	canEdit = true,
-	focused,
-	onAccept,
+	link,
+	onBack,
 	onBlur,
-	onClose,
-	onDismiss,
 	onFocus,
 	onReply,
-	onRetry,
+	onResolve,
 	onTyping,
 	quote,
-	inDocument,
-	onBack,
-	backLabel,
-	showClose = true,
+	sheet,
 	view,
 	writing,
 }: ThreadCardProps) {
 	let { thread } = view;
-	let open = thread.status === "open";
-	let [confirming, setConfirming] = useState<"accept" | "dismiss">();
-
-	let confirmation = confirming === "accept"
-		? {
-			action: "Apply feedback",
-			message: "Planner will use this feedback to update the document.",
-			onConfirm: onAccept,
-		}
-		: confirming === "dismiss"
-		? {
-			action: "Dismiss",
-			message: "This closes the thread without changing the document.",
-			onConfirm: onDismiss,
-		}
-		: undefined;
+	let [unfolded, setUnfolded] = useState(false);
+	let notes = thread.notes;
+	let first = notes[0];
+	let folded = notes.length > FOLD_AFTER && !unfolded;
+	let rest = folded ? notes.slice(-1) : notes.slice(1);
+	let hidden = notes.length - 2;
 
 	return (
-		<SidecarCard
+		<article
+			aria-label="Comment"
+			className="plan-comment-thread"
+			data-focus-boundary=""
 			data-plan-comment-card
-			{...(inDocument
-				? { "data-plan-comment-thread": thread.id }
-				: { "data-plan-sidecar-thread": thread.id })}
-			focused={focused}
-			footer={!open && !applied && (
-				<>
-					<span className="text-sm text-warning-ink">Not yet applied</span>
-					{canEdit && (
-						<button
-							className="btn btn-sm btn-ghost"
-							disabled={busy}
-							onClick={onRetry}
-							type="button"
-						>
-							Ask again
-						</button>
-					)}
-				</>
-			)}
-			label="Comment"
+			data-plan-comment-thread={thread.id}
 			onBlur={onBlur}
 			onFocus={onFocus}
 			onMouseEnter={onFocus}
 			onMouseLeave={onBlur}
-			settled={!open}
-			status={!open && <Provenance at={thread.at} by={thread.resolver} verb="Accepted" />}
 		>
 			{onBack && (
 				<button
-					className="plan-comment-back btn btn-sm btn-ghost gap-1 self-start"
+					className="plan-comment-back btn btn-sm btn-ghost gap-1"
 					data-plan-comment-back
 					onClick={onBack}
 					type="button"
@@ -335,111 +556,86 @@ export function ThreadCard({
 				</button>
 			)}
 
-			<ul className="m-0 flex list-none flex-col gap-2 p-0">
-				{thread.notes.map((note, index) => (
-					<Note
-						action={index === 0 && showClose && onClose
-							? <CloseButton onClose={onClose} />
-							: undefined}
-						key={note.id}
-						note={note}
-						opening={index === 0}
-					/>
-				))}
-			</ul>
+			<Scroll sheet={sheet}>
+				<ol className="plan-comment-notes">
+					{first && (
+						<Note
+							actions={canEdit || link
+								? <Actions link={link} onResolve={canEdit ? onResolve : undefined} />
+								: undefined}
+							note={first}
+						/>
+					)}
+					{folded && (
+						<li>
+							<button
+								className="plan-comment-more"
+								onClick={() => setUnfolded(true)}
+								type="button"
+							>
+								<span aria-hidden="true" className="plan-comment-more-rule" />
+								Show {hidden} {hidden === 1 ? "reply" : "replies"}
+								<span aria-hidden="true" className="plan-comment-more-rule" />
+							</button>
+						</li>
+					)}
+					{rest.map(note => <Note key={note.id} note={note} />)}
+				</ol>
 
-			{view.orphaned && <Quote drifted={view.drifted} text={quote} />}
-			{view.drifted && !view.orphaned && (
-				<p className="m-0 text-sm text-warning-ink">
-					This passage has changed since the comment was added.
-				</p>
-			)}
-
-			{writing && writing.length > 0 && (
-				<p className="m-0 text-sm text-text-secondary">
-					{writing.join(", ")} {writing.length === 1 ? "is" : "are"} writing…
-				</p>
-			)}
-
-			{open && canEdit && (
-				<>
-					<Composer
-						busy={busy}
-						label="Reply"
-						onSend={onReply}
-						onTyping={onTyping}
-						placeholder="Reply…"
-					/>
-					{confirmation
-						? (
-							<div className="plan-comment-confirm flex flex-col gap-2 pt-2">
-								<p aria-live="polite" className="m-0 text-sm text-text-secondary">
-									{confirmation.message}
-								</p>
-								<div className="flex items-center justify-between gap-2">
-									<button
-										className="btn btn-sm btn-ghost"
-										onClick={() => setConfirming(undefined)}
-										type="button"
-									>
-										Cancel
-									</button>
-									<button
-										className="btn btn-sm btn-secondary"
-										disabled={busy}
-										onClick={() => {
-											setConfirming(undefined);
-											confirmation.onConfirm();
-										}}
-										type="button"
-									>
-										{confirmation.action}
-									</button>
-								</div>
-							</div>
-						)
-						: (
-							<div className="flex items-center justify-between gap-2 pt-2">
-								<button
-									className="btn btn-sm btn-ghost gap-1"
-									disabled={busy}
-									onClick={() => setConfirming("dismiss")}
-									type="button"
-								>
-									<CloseIcon aria-hidden="true" size={14} />
-									Dismiss
-								</button>
-								<button
-									className="btn btn-md btn-primary gap-1"
-									disabled={busy}
-									onClick={() => setConfirming("accept")}
-									type="button"
-								>
-									<CheckIcon aria-hidden="true" size={14} />
-									Apply feedback
-								</button>
-							</div>
+				{(view.orphaned || view.drifted) && (
+					<div className="plan-comment-context" data-plan-comment-context>
+						{view.orphaned && (
+							<blockquote className="plan-comment-context-copy m-0 text-sm text-text-secondary">
+								{quote}
+							</blockquote>
 						)}
-				</>
+						<p className="m-0 text-sm text-warning-ink">
+							This passage has changed since the comment was added.
+						</p>
+					</div>
+				)}
+
+				{view.planner && <PlannerStatus state={view.planner} />}
+
+				{writing && writing.length > 0 && (
+					<p className="m-0 text-sm text-text-secondary">
+						{writing.join(", ")} {writing.length === 1 ? "is" : "are"} writing…
+					</p>
+				)}
+			</Scroll>
+
+			{canEdit && (
+				<Pinned sheet={sheet}>
+					<Composer expanded={sheet} mode="reply" onSend={onReply} onTyping={onTyping} />
+				</Pinned>
 			)}
-		</SidecarCard>
+		</article>
 	);
+}
+
+/** A sheet scrolls the notes on their own, beneath a fixed header and above a pinned composer. */
+function Scroll({ children, sheet }: { children: ReactNode; sheet?: boolean }) {
+	return sheet ? <div className="plan-comment-thread-scroll">{children}</div> : <>{children}</>;
+}
+
+function Pinned({ children, sheet }: { children: ReactNode; sheet?: boolean }) {
+	return sheet ? <div className="plan-comment-thread-compose">{children}</div> : <>{children}</>;
 }
 
 export type ThreadListProps = {
 	views: ThreadView[];
+	/** A sheet counts the threads in its own header row. */
+	heading?: boolean;
 	/** A compact sheet focuses its own grabber instead. */
 	autoFocus?: boolean;
 	/** The thread just left with Back; its item takes focus, even in a sheet. */
 	returnTo?: string;
 	onSelect: (id: string) => void;
-	onClose?: () => void;
-	showClose?: boolean;
 };
 
 /** Several threads on one block, as one stop that opens into each of them. */
 export function ThreadList(
-	{ autoFocus = true, onClose, onSelect, returnTo, showClose = true, views }: ThreadListProps,
+	{ autoFocus = true, heading = true, onSelect, returnTo, views }: ThreadListProps,
 ) {
 	let list = useRef<HTMLUListElement>(null);
 
@@ -476,14 +672,15 @@ export function ThreadList(
 	};
 
 	return (
-		<SidecarCard data-plan-comment-card data-plan-comment-group label="Comments" padded={false}>
-			<header className="flex min-h-7 items-center justify-between px-3 pt-2.5">
-				<span className="text-sm text-text-tertiary tabular-nums">
-					{views.length} comments
-				</span>
-				{showClose && onClose && <CloseButton onClose={onClose} />}
-			</header>
-			<ul className="m-0 flex list-none flex-col p-1.5 pt-1" onKeyDown={move} ref={list}>
+		<article
+			aria-label="Comments"
+			className="plan-comment-thread plan-comment-list"
+			data-focus-boundary=""
+			data-plan-comment-card
+			data-plan-comment-group
+		>
+			{heading && <header className="plan-comment-list-head">{views.length} comments</header>}
+			<ul className="plan-comment-list-items" onKeyDown={move} ref={list}>
 				{views.map(view => {
 					let opening = view.thread.notes[0];
 					let replies = Math.max(0, view.thread.notes.length - 1);
@@ -495,47 +692,43 @@ export function ThreadList(
 								onClick={() => onSelect(view.thread.id)}
 								type="button"
 							>
-								<span className="flex min-w-0 items-baseline justify-between gap-2">
-									{opening && <Author handle={opening.handle} />}
+								<span className="plan-comment-note-head">
+									{opening && <NoteAuthor note={opening} ts={opening.ts} />}
 									{replies > 0 && (
-										<span className="text-xs text-text-tertiary tabular-nums">
+										<span className="plan-comment-group-replies">
 											{replies} {replies === 1 ? "reply" : "replies"}
 										</span>
 									)}
 								</span>
-								<span className="plan-comment-group-note pl-7 text-sm text-text-secondary">
-									{opening?.text.split("\n")[0]}
-								</span>
+								<span className="plan-comment-group-note">{opening?.text}</span>
 							</button>
 						</li>
 					);
 				})}
 			</ul>
-		</SidecarCard>
+		</article>
 	);
 }
 
 export type DraftCardProps = {
-	busy?: boolean;
-	onSend: (text: string) => void;
+	onSend: (text: string, to?: "planner") => void | Promise<Sent>;
 	onCancel: () => void;
-	showClose?: boolean;
+	sheet?: boolean;
 };
 
-/** A compact sheet shows its own close beside the grabber, so its draft has no header row. */
-export function DraftCard({ busy, onCancel, onSend, showClose = true }: DraftCardProps) {
+/** A new comment: only the composer, with no header to say what the card already shows. */
+export function DraftCard({ onCancel, onSend, sheet }: DraftCardProps) {
 	return (
-		<SidecarCard data-plan-comment-card focused label="Comment">
-			{showClose && <DraftHeader onClose={onCancel} />}
-			<Composer
-				autoFocus
-				busy={busy}
-				label="Comment"
-				onCancel={onCancel}
-				onSend={onSend}
-				placeholder="Comment on this passage…"
-				sendLabel="Post comment"
-			/>
-		</SidecarCard>
+		<article
+			aria-label="New comment"
+			className="plan-comment-thread"
+			data-focus-boundary=""
+			data-plan-comment-card
+			data-plan-comment-draft
+		>
+			<Pinned sheet={sheet}>
+				<Composer autoFocus mode="new" onCancel={onCancel} onSend={onSend} />
+			</Pinned>
+		</article>
 	);
 }

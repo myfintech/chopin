@@ -47,6 +47,7 @@ export declare namespace Session {
 		| Access
 		| Channel
 		| Deleted
+		| Planner
 		| Failure
 		| Ping;
 
@@ -102,6 +103,24 @@ export declare namespace Session {
 		channelId: string;
 	};
 
+	/**
+	 * Who holds this document's remote Planner. `held` is a client that detached or
+	 * dropped and keeps the document until `until` (ISO 8601) unless it reattaches.
+	 * Only the holder's GitHub login is named, never its machine or checkout.
+	 */
+	export type PlannerAttachment =
+		| { state: "attached"; login: string }
+		| { state: "held"; login: string; until: string }
+		| { state: "none" };
+
+	/**
+	 * Sent only under `HARNESS=remote`: once after `Hello`, then to the whole room
+	 * whenever a client attaches, detaches, its grace period ends, or its ownership
+	 * is released by a sign-out, a Planner reset or the server closing its link.
+	 * Other harnesses never send it.
+	 */
+	export type Planner = KIND<"session:planner"> & { planner: PlannerAttachment };
+
 	/** Broadcast whenever the membership of the room changes. */
 	export type Presence = KIND<"session:presence"> & {
 		members: Member[];
@@ -110,6 +129,12 @@ export declare namespace Session {
 	/** A request could not be served. Carries the `rid` it answers. */
 	export type Failure = KIND<"session:error"> & {
 		message: string;
+		/**
+		 * Set for a refusal the client presents in full rather than as a generic
+		 * failure. `planner-not-attached`: a Planner request under `HARNESS=remote`
+		 * to a document no client is attached to; `message` says how to attach one.
+		 */
+		code?: "planner-not-attached";
 	};
 
 	/** Liveness, and the smallest thing that proves request correlation works. */
@@ -204,6 +229,7 @@ export declare namespace Sidebar {
 export type { Chat } from "./chat";
 export type { Comment } from "./comment";
 export type { ConversationPlan } from "./conversation-plan";
+export type { Experiment } from "./experiment";
 export type { Job } from "./job";
 export type { Plan } from "./plan";
 export type { Provenance } from "./provenance";
@@ -216,6 +242,7 @@ export type Incoming =
 	| import("./chat").Chat.Incoming
 	| import("./comment").Comment.Incoming
 	| import("./conversation-plan").ConversationPlan.Incoming
+	| import("./implementation").Implementation.Incoming
 	| import("./job").Job.Incoming
 	| import("./plan").Plan.Incoming
 	| import("./provenance").Provenance.Incoming
@@ -223,11 +250,13 @@ export type Incoming =
 
 /** Everything a client may receive, on a room socket or the sidebar socket. */
 export type Outgoing =
+	| import("./experiment").Experiment.Changed
 	| Session.Outgoing
 	| Sidebar.Outgoing
 	| import("./chat").Chat.Outgoing
 	| import("./comment").Comment.Outgoing
 	| import("./conversation-plan").ConversationPlan.Outgoing
+	| import("./implementation").Implementation.Outgoing
 	| import("./job").Job.Outgoing
 	| import("./plan").Plan.Outgoing
 	| import("./provenance").Provenance.Outgoing

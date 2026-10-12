@@ -9,7 +9,7 @@
 
 import * as limits from "./limits";
 
-export type Kind = "flow" | "text";
+export type Kind = "flow" | "text" | "both";
 
 /** What a component may contain. */
 export type Content =
@@ -28,7 +28,9 @@ export type Attribute =
 	/** Safe opaque identifier owned by a record outside the document. */
 	| { type: "reference"; required: true; max: number }
 	/** Plain text, length-bounded. */
-	| { type: "text"; required: boolean; max: number }
+	| { type: "text"; required: boolean; max: number; empty?: true }
+	/** Canonical decimal integer, quoted rather than evaluated. */
+	| { type: "integer"; required: boolean; min: number; max: number }
 	/** One of a fixed set. */
 	| { type: "enum"; required: boolean; values: readonly string[] };
 
@@ -63,8 +65,7 @@ function component(spec: Spec): Component {
 /**
  * A component with no identity of its own.
  *
- * Two kinds qualify, and they are spelled the same because they need the same
- * thing — nothing added.
+ * Formatting, content without an anchor identity, and projections need no added id.
  *
  * A pure formatting mark carries no state. Giving it an id would also make it
  * behave badly: applying a mark to a selection has to split and merge wrappers,
@@ -73,6 +74,7 @@ function component(spec: Spec): Component {
  *
  * A read-only projection of state owned elsewhere is addressed through its
  * parent, so a separate id would create a second identity for one fact.
+ * Images already use their ordinary Lexical/Yjs node identity.
  */
 function plain(spec: Spec): Component {
 	return { ...spec, attributes: { ...spec.attributes } };
@@ -81,6 +83,27 @@ function plain(spec: Spec): Component {
 export const CALLOUT_TYPES = ["note", "tip", "important", "warning", "danger"] as const;
 
 export const COMPONENTS: Readonly<Record<string, Component>> = Object.freeze({
+	Image: plain({
+		name: "Image",
+		// A sole JSX image parses as flow; one inside prose parses as text.
+		kind: "both",
+		content: { type: "empty" },
+		attributes: {
+			src: { type: "text", required: true, max: limits.MAX_SOURCE_BYTES },
+			alt: { type: "text", required: true, max: limits.MAX_SOURCE_BYTES, empty: true },
+			width: { type: "integer", required: true, min: 1, max: limits.MAX_IMAGE_WIDTH },
+		},
+	}),
+	Experiment: component({
+		name: "Experiment",
+		kind: "flow",
+		content: { type: "empty" },
+		attributes: {
+			experiment: { type: "reference", required: true, max: 96 },
+			view: { type: "text", required: true, max: 64 },
+			decision: { type: "text", required: false, max: 96 },
+		},
+	}),
 	/**
 	 * A questionnaire, and who settled it.
 	 *
@@ -202,6 +225,36 @@ export const COMPONENTS: Readonly<Record<string, Component>> = Object.freeze({
 			by: { type: "text", required: true, max: limits.MAX_HANDLE },
 			text: { type: "text", required: true, max: limits.MAX_NOTE },
 		},
+	}),
+
+	Columns: component({
+		name: "Columns",
+		kind: "flow",
+		content: { type: "components", names: ["Column"] },
+		forbids: ["Columns"],
+	}),
+
+	Column: component({
+		name: "Column",
+		kind: "flow",
+		content: { type: "blocks" },
+		parent: ["Columns"],
+		forbids: [
+			"Experiment",
+			"Questionnaire",
+			"Question",
+			"Option",
+			"Answer",
+			"Previous",
+			"Decision",
+			"Note",
+			"Tabs",
+			"Tab",
+			"Callout",
+			"Research",
+			"Columns",
+			"Column",
+		],
 	}),
 
 	Tabs: component({
@@ -328,8 +381,8 @@ export function leavesRepository(url: string): boolean {
  *
  * Browsers trim surrounding whitespace and drop tabs and newlines anywhere,
  * so ` javascript:` or `java\tscript:` reach a scheme the plain check below
- * never saw. Only images are absolute by rule, so only links can be
- * scheme-less paths that wander off to another host.
+ * never saw. Images are absolute or one exact same-origin path by rule, so
+ * only links can be scheme-less paths that wander off to another host.
  */
 export function disguisedUrl(url: string, kind: "link" | "image" = "link"): string | undefined {
 	let noun = kind === "image" ? "Image URL" : "Link";
@@ -346,19 +399,30 @@ export function disguisedUrl(url: string, kind: "link" | "image" = "link"): stri
 }
 
 /**
- * URL protocols permitted in images.
+ * URL protocols permitted in absolute image URLs.
  *
  * Narrower than links, and absolute where a link need not be: there is no
  * server here to resolve a repository-relative path against, so a relative
- * image would render as a break in every client that opened the plan.
+ * image would render as a break in every client that opened the plan. The one
+ * exception is {@link HOSTED_IMAGE_PATH}.
  */
 export const IMAGE_PROTOCOLS: readonly string[] = Object.freeze(["https:"]);
+
+/**
+ * The only relative image form: an image Chopin stores itself, named by the
+ * SHA-256 of its bytes and served from the document's own origin. Every other
+ * relative path still has nothing to resolve against.
+ */
+export const HOSTED_IMAGE_PATH = /^\/images\/[0-9a-f]{64}\.(?:png|jpg|jpeg|webp|gif)$/;
 
 /** Fenced code language that renders as a diagram. */
 export const MERMAID_LANGUAGE = "mermaid";
 
 /** Fenced JSON source for a bounded SeeCode explanatory diagram. */
 export const SEECODE_LANGUAGE = "seecode";
+
+/** Fenced indented outline for a bounded interface wireframe. */
+export const WIREFRAME_LANGUAGE = "wireframe";
 
 /**
  * Fenced code language that renders as a diff.

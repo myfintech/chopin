@@ -42,6 +42,19 @@
 	--color-lime-10: oklch(0.603 0.132 126.75);
 	--color-lime-11: oklch(0.474 0.14 128.6);
 	--color-lime-12: oklch(0.35370 0.05728 120.98);
+	/* GitHub's merged and completed purple, on the same lightness curve as ruby and lime. */
+	--color-plum-1: oklch(0.99300 0.00350 305);
+	--color-plum-2: oklch(0.98100 0.00950 305);
+	--color-plum-3: oklch(0.95600 0.02300 305);
+	--color-plum-4: oklch(0.92700 0.04000 305);
+	--color-plum-5: oklch(0.89700 0.05600 305);
+	--color-plum-6: oklch(0.85800 0.07000 305);
+	--color-plum-7: oklch(0.80800 0.08800 305);
+	--color-plum-8: oklch(0.74500 0.11500 304);
+	--color-plum-9: oklch(0.58000 0.19000 301);
+	--color-plum-10: oklch(0.52500 0.19000 301);
+	--color-plum-11: oklch(0.47500 0.17500 301);
+	--color-plum-12: oklch(0.34000 0.09500 301);
 
 	/* Warm olive neutrals. The lightest steps are deliberately close, not aliases. */
 	--color-gray-50: oklch(0.99051 0.00263 95); /* #fcfcfa */
@@ -63,7 +76,14 @@
 	--color-ground: var(--color-gray-150);
 	--color-hover: var(--color-gray-100);
 	--color-inset: var(--color-gray-100);
+	--color-count-quiet: var(--color-gray-50);
 	--color-selected: var(--color-gray-200);
+	--color-selected-strong: color-mix(in oklch, var(--color-selected) 75%, var(--color-gray-300));
+	--color-hover-nested: color-mix(
+		in oklch,
+		var(--color-selected-strong) 50%,
+		var(--color-gray-300)
+	);
 
 	--color-text-primary: var(--color-gray-900);
 	--color-text-secondary: var(--color-gray-700);
@@ -72,6 +92,11 @@
 	--color-icon: var(--color-gray-500);
 	--color-chat-body: oklch(0.38064 0.01903 136.21);
 	--color-chat-pane: color-mix(in srgb, var(--color-ground) 30%, var(--color-page));
+	/* Phone chrome floats over content: a translucent page that blurs what scrolls beneath. */
+	--color-glass: color-mix(in oklch, var(--color-page) 72%, transparent);
+	/* Dims the page beneath a phone sheet. Every sheet shares it, and one grabber. */
+	--color-scrim: oklch(var(--shadow-color) / 32%);
+	--color-grabber: var(--color-gray-300);
 
 	/* Petrol is the only accent: action, focus, presence and links all agree. */
 	--color-brand: oklch(0.50006 0.08514 210.06); /* #06707e */
@@ -98,16 +123,39 @@
 	--color-danger-surface: var(--color-ruby-3);
 	--color-danger-surface-hover: var(--color-ruby-4);
 	--color-danger-surface-active: var(--color-ruby-5);
-	--color-danger-edge: color-mix(in srgb, var(--color-ruby-7) 45%, transparent);
+	--color-danger-edge: color-mix(in srgb, var(--color-ruby-7) 15%, transparent);
 	--color-danger-graphic: var(--color-ruby-9);
 	--color-danger-icon: var(--color-ruby-11);
 	--color-danger-text: var(--color-ruby-12);
+	/* A merged pull request or completed issue: finished work, neither success nor failure. */
+	--color-merged-surface: var(--color-plum-3);
+	--color-merged-graphic: var(--color-plum-8);
+	--color-merged-icon: var(--color-plum-11);
+	--color-merged-text: var(--color-plum-12);
 	--color-success: oklch(0.51958 0.10966 145.072); /* #3b793f */
 	--color-success-wash: oklch(0.93 0.026 145);
 	--color-success-ink: oklch(0.44098 0.11068 144.754); /* #236228 */
+	--color-success-outline-subtle: color-mix(in oklch, var(--color-success) 30%, transparent);
 	--color-warning: oklch(0.59898 0.12586 74.986); /* #ab7302 */
 	--color-warning-wash: oklch(0.95 0.032 75);
 	--color-warning-ink: oklch(0.4409 0.0921 74.93); /* #704a02 */
+	/*
+	 * Commented prose: a warm wash from the orange scale. A mark on passages,
+	 * never an action or focus, so it does not compete with petrol. The marker
+	 * roles give a resolved comment its amber disc; green stays for decisions.
+	 */
+	--color-comment-wash: var(--color-orange-2);
+	--color-comment-wash-strong: var(--color-orange-3);
+	--color-comment-underline: var(--color-orange-8);
+	--color-comment-marker: var(--color-orange-3);
+	--color-comment-marker-icon: var(--color-orange-11);
+	--color-comment-marker-ink: var(--color-orange-12);
+	--color-comment-marker-outline: var(--color-orange-8);
+	--color-comment-marker-outline-subtle: color-mix(
+		in oklch,
+		var(--color-orange-8) 35%,
+		transparent
+	);
 	--color-destructive: oklch(0.60513 0.17178 24.175); /* #d54d4c */
 	--color-destructive-hover: oklch(0.56972 0.16045 24.136); /* #c44746 */
 	--color-destructive-active: oklch(0.53376 0.1489 24.091); /* #b34140 */
@@ -118,9 +166,11 @@
 	);
 	--color-destructive-ink: oklch(0.4941 0.19046 25.161); /* #b51421 */
 
-	/* Passive structure and controls are the only two edge weights. */
+	/* Outline buttons use a quieter edge than filled controls. */
 	--color-edge: oklch(0 0 0 / 7%);
-	--color-control-edge: oklch(0 0 0 / 20%);
+	--color-button-outline-edge: oklch(0 0 0 / 12%);
+	--color-control-edge: oklch(0 0 0 / 15%);
+	--color-divider: rgb(0 0 0 / 9%);
 	--color-control-boundary: var(--color-gray-500);
 	--edge-width: 1px;
 	--button-edge-width: 1px;
@@ -149,16 +199,98 @@
 	/* Tailwind's multiplier keeps 4px steps and admits 2, 6, 10 and 22px. */
 	--spacing: 0.25rem;
 
+	/* Compact controls, panel chrome, and their shared icon slots. */
+	--control-height-compact: calc(var(--spacing) * 6);
+	--control-target-coarse: calc(var(--spacing) * 11);
+	/* iOS Safari zooms the page into a focused text field set below 16px. */
+	--field-text-min: 1rem;
+	--control-padding-inline: calc(var(--spacing) * 2);
+	--control-inset: var(--spacing);
+	--split-control-label-padding-start: var(--control-inset);
+	--split-control-label-padding-end: calc(var(--spacing) / 2);
+	--label-measure-compact: 10rem;
+	--opacity-quiet: 0.45;
+	--icon-size-micro: calc(var(--spacing) * 2.5);
+	--icon-size-compact: calc(var(--spacing) * 3);
+	--icon-size-default: calc(var(--spacing) * 3.5);
+	--icon-button-size: calc(var(--spacing) * 7);
+	--icon-button-size-compact: var(--control-height-compact);
+	--icon-button-padding: calc((var(--icon-button-size) - var(--icon-size-default)) / 2);
+	--icon-button-padding-compact: calc(
+		(var(--icon-button-size-compact) - var(--icon-size-compact)) / 2
+	);
+	--count-control-size: calc(var(--spacing) * 4.5);
+	/* The phone composer pill: its 36px controls, their icons, and its 44px resting height. */
+	--composer-pill-control: calc(var(--spacing) * 9);
+	--composer-pill-icon: calc(var(--spacing) * 4.5);
+	--count-control-padding: calc(var(--spacing) / 4);
+	--menu-item-height-normal: calc(var(--spacing) * 8.5);
+	--menu-item-height-compact: calc(var(--spacing) * 7);
+	--menu-item-padding-block-normal: calc(var(--spacing) * 1.75);
+	--menu-item-padding-block-compact: var(--spacing);
+	--menu-item-padding-inline-normal: calc(var(--spacing) * 2.5);
+	--menu-item-padding-inline-compact: var(--control-padding-inline);
+	--menu-item-gap-normal: calc(var(--spacing) * 1.5);
+	--menu-item-gap-compact: calc(var(--spacing) * 2);
+	--menu-separator-margin: calc(var(--spacing) / 2);
+	--panel-header-height: calc(var(--spacing) * 11.5);
+	--panel-header-padding-inline: calc(var(--spacing) * 3.5);
+	--panel-toolbar-padding-inline: calc(var(--spacing) * 2.5);
+	--panel-header-gap: calc(var(--spacing) / 2);
+	--panel-header-control-offset: calc(var(--icon-button-padding) - var(--panel-header-gap));
+
+	/* Authored documents keep prose measure separate from wide content. */
+	--document-prose-measure: 40.625rem;
+	--document-top-inset: calc(var(--spacing) * 15);
+	--document-decisions-top-inset: calc(var(--spacing) * 12);
+	--document-gutter: calc(var(--spacing) * 14);
+	--document-gutter-compact: calc(var(--spacing) * 6);
+	--document-trailing-space: 60vh;
+	--document-line-height: 1.6;
+	--decision-marker-size: calc(var(--spacing) * 6);
+	--choice-content-gap: calc(var(--spacing) * 3);
+
+	/* Phone chrome: a collapsing top bar and a floating bottom tab bar in the thumb zone. */
+	--phone-bar-height: calc(var(--spacing) * 11);
+	--phone-tab-bar-height: calc(var(--spacing) * 15);
+	--phone-tab-bar-gap: calc(var(--spacing) * 2.5);
+	--phone-tab-row-max: 30rem;
+	--glass-filter: blur(20px) saturate(180%);
+	/* Phone sheets: documents stand at a large detent; menus become grouped action sheets. */
+	--sheet-large-detent: 0.92;
+	--sheet-gap: calc(var(--spacing) * 2);
+	--sheet-max-width: 35rem;
+	--action-sheet-row-height: calc(var(--spacing) * 14);
+	--sheet-grabber-width: calc(var(--spacing) * 9);
+	--sheet-grabber-height: var(--spacing);
+	--sheet-grabber-inset: calc(var(--spacing) * 1.5);
+	/* A sheet resting at its medium detent dims the page by this share of the scrim. */
+	--sheet-scrim-medium: 0.75;
+
+	/* Empty states share one illustration and copy rhythm. */
+	--empty-state-icon-frame-size: calc(var(--spacing) * 14);
+	--empty-state-icon-size: calc(var(--spacing) * 6);
+	--empty-state-icon-gap: calc(var(--spacing) * 6);
+	--empty-state-frame-width: 42rem;
+	--empty-state-frame-height: 19rem;
+	--empty-state-frame-padding-block: calc(var(--spacing) * 10);
+	--empty-state-frame-padding-inline: calc(var(--spacing) * 6);
+	--empty-state-copy-width: 27rem;
+	--empty-state-copy-width-short: 32ch;
+
 	/*
 	 * Tailwind's own values, declared here so the scale has one owner: a change
 	 * lands in one place, and a misspelt rung is caught rather than waved through.
 	 */
 	--radius-*: initial;
+	--radius-panel: calc(var(--spacing) * 3);
 	--radius-sm: 0.25rem; /* 4px — buttons, grips, toolbar cells */
 	--radius-md: 0.375rem; /* 6px — cards, inputs, callouts, code blocks */
 	--radius-lg: 0.5rem; /* 8px — popovers and panels */
 	--radius-xl: 0.625rem; /* 10px — the document page */
+	--radius-sheet: 0.875rem; /* 14px — phone sheets and action sheet groups */
 	--radius-full: 9999px; /* saturated pill rounding */
+	--radius-composer-pill: calc(var(--spacing) * 5.5); /* 22px — half the phone composer at rest */
 
 	/*
 	 * Warm-tinted depth, copied from the settled Figma shadow table.
@@ -234,12 +366,35 @@
 	--page-slide-dur: 250ms;
 	--page-slide-distance: 8px;
 	--page-blur: 3px;
+	/* Nested documents: a slow, settled open and a quick close. */
+	--child-open-dur: var(--duration-linger);
+	--child-close-dur: 250ms;
+	--child-scrim-dur: 528ms;
+	--child-scrim-lag-dur: 72ms;
+	--child-ease: var(--ease-out);
+	--child-recede-step: 0.03;
+	--child-scrim-opacity: 0.45;
+	--child-zoom-push: 1.06;
+	--child-bar-height: calc(var(--spacing) * 9);
+	/* Phone destinations glide sideways by tab order; the top bar tucks away while reading. */
+	--tab-slide-dur: 380ms;
+	--tab-slide-ease: cubic-bezier(0.32, 0.72, 0, 1);
+	--phone-bar-dur: 250ms;
+	/* Sheets rise on the same spring-like curve and leave faster than they arrive. */
+	--sheet-rise-dur: 420ms;
+	--sheet-fall-dur: 260ms;
+	--sheet-ease: var(--tab-slide-ease);
+	--sheet-page-dur: 350ms;
 	--route-swap-out-dur: 80ms;
 	--route-swap-in-dur: 150ms;
 	--icon-swap-dur: 250ms;
 	--icon-swap-blur: 2px;
 	--badge-pop-dur: 180ms;
 	--badge-close-dur: 180ms;
+	/* Phone decisions: the save bar rises from the bottom edge; a decided card folds away. */
+	--save-bar-open-dur: 320ms;
+	--save-bar-close-dur: 180ms;
+	--decision-closure-dur: 320ms;
 	--acc-expand: 250ms;
 	--acc-collapse: 200ms;
 	--toast-open: 280ms;
@@ -251,5 +406,11 @@
 
 	/* Inter is loaded in `main.tsx`; the editor reads this token rather than repeating the stack. */
 	--font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+	--font-document-heading: "Lora", Georgia, serif;
+	--font-weight-normal: 400;
+	--font-weight-medium: 500;
+	--font-weight-semibold: 600;
+	--font-weight-bold: 700;
+	--font-weight-document-heading: 400;
 	--font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }

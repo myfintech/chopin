@@ -791,14 +791,21 @@ test("deleting an archived child updates the project total for a viewer in its p
 	);
 	try {
 		await editor.page.goto(`${parentPath}/children/${testChannelSlug(child)}`);
-		await ready(editor.page);
+		// The root stays mounted beneath the open child, so two editors are present.
+		for (let editable of [content(editor.page).first(), content(editor.page).last()]) {
+			await expect(editable).toHaveAttribute("contenteditable", "true", { timeout: 20_000 });
+		}
 		await expect.poll(() => storedCount(editor.page, ARCHIVED_CHILD.name, parent)).toBe(2);
 		await expect.poll(() => storedCount(editor.page, ARCHIVED_CHILD.name, child)).toBe(2);
 
 		let viewer = await join(`parent-viewer-${room.slice(0, 8)}`);
 		await addProject(viewer, baseURL!, ARCHIVED_CHILD);
 		await viewer.goto(parentPath);
-		await expect(content(viewer)).toHaveAttribute("aria-readonly", "true");
+		// A blank parent with open decisions opens on Decisions, so only wait for the room.
+		await expect(viewer.getByRole("button", { name: /^Decisions/, pressed: true }).first())
+			.toBeVisible();
+		await expect(viewer.getByRole("textbox", { name: "editable markdown", includeHidden: true }))
+			.toHaveAttribute("aria-readonly", "true");
 		await expect(viewer).toHaveURL(new RegExp(`${parentPath}$`));
 		let baseline = await catalogueTotal(viewer, ARCHIVED_CHILD.name);
 		let projects = sidebar(viewer);

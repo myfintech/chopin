@@ -8,6 +8,7 @@ import {
 	rebaseChildHistoryState,
 } from "./anchored-child-surface";
 import { readDocumentRecovery, rememberChannel } from "./channel-recovery";
+import { readChildMotionStyle } from "./child-motion-driver";
 import { prepareDocumentLoad } from "./document-loader";
 import { documentRouteIdentity } from "./document-route-swap";
 import {
@@ -18,10 +19,11 @@ import {
 import type { ComponentType } from "react";
 import type { ResearchOpener } from "@chopin/editor";
 import type { ChildFocusToken } from "./anchored-child-surface";
+import type { ChildFocusAttempt } from "./child-history";
 import type { DocumentWorkspaceAction } from "./document-workspace-state";
 import type { DocumentRouteIdentity } from "./document-route-swap";
 import type { HostedRoute } from "./hosted";
-import type { WorkspacePresentation } from "./workspace-model";
+import type { ChildOpen, WorkspacePresentation } from "./workspace-model";
 
 let RoomWorkspace = lazy(() =>
 	import("./room-workspace").then(module => ({ default: module.RoomWorkspace }))
@@ -70,18 +72,64 @@ function workspaceProps(
 	};
 }
 
+function parentScroller(host: HTMLElement | null): HTMLElement | null {
+	return host?.querySelector<HTMLElement>(
+		'[data-document-view="plan"] [data-plan-scroll]:not(.workspace-child-slot *)',
+	) ?? null;
+}
+
 // How long after a request the outgoing document may wait for this one to sync. Past
 // it, the header and body would disagree with the sidebar for too long.
 const REVEAL_LIMIT = 200;
+const CHILD_SYNC_LIMIT = 8000;
+
+/** Moves focus back into a parent once its child has closed, or nothing when it cannot. */
+export type ParentFocusTarget = (attempt: ChildFocusAttempt) => (() => void) | undefined;
+
+// Lives in this lazily loaded host rather than the shell, which only runs it after a close.
+function parentFocusTarget(attempt: ChildFocusAttempt): (() => void) | undefined {
+	let parent = document.querySelector<HTMLElement>(
+		`[data-workspace-room="${CSS.escape(attempt.parentId)}"]`,
+	);
+	if (!parent?.isConnected || parent.closest("[inert]")) return undefined;
+	let opener = attempt.opener?.current;
+	let target = opener;
+	if (!target?.isConnected || target.closest("[inert]")) {
+		target = parent.querySelector<HTMLElement>(`[data-document-view="plan"] h2`);
+	}
+	return () => {
+		if (!target?.isConnected || target.closest("[inert]")) return;
+		target.focus({ preventScroll: true });
+		// An opener the reader clicked is already in view; a provenance target may not be.
+		if (target === opener) target.scrollIntoView({ block: "nearest" });
+	};
+}
+
+/** Settles true once a child's editor has synced, or false if it never does. */
+function childSynced(channelId: string, current: () => boolean): Promise<boolean> {
+	let selector = `[data-workspace-room="${CSS.escape(channelId)}"] [data-plan-synced]`;
+	let started = performance.now();
+	return new Promise(resolve => {
+		let check = () => {
+			if (!current()) resolve(false);
+			else if (document.querySelector(selector)) resolve(true);
+			else if (performance.now() - started > CHILD_SYNC_LIMIT) resolve(false);
+			else requestAnimationFrame(check);
+		};
+		check();
+	});
+}
 
 export default function DocumentWorkspaceHost(
 	{
 		agent,
+		childOrigin,
 		Failure,
 		layerKey,
 		Loading,
 		onCanonicalPath,
 		onChildClose,
+		onChildOpen,
 		onChildClosing,
 		onParentRestored,
 		onReady,
@@ -90,6 +138,7 @@ export default function DocumentWorkspaceHost(
 		user,
 	}: {
 		agent: boolean;
+		childOrigin?: () => Element | undefined;
 		Failure: ComponentType<{
 			channel?: { title?: string; slug?: string };
 			error: unknown;
@@ -97,20 +146,22 @@ export default function DocumentWorkspaceHost(
 			repository?: Pick<Api.Repository, "owner" | "name" | "fullName">;
 		}>;
 		layerKey: DocumentRouteIdentity;
-		Loading: ComponentType<{ label?: string }>;
+		Loading: ComponentType<{ document?: boolean; label?: string }>;
 		onCanonicalPath: (
 			key: DocumentRouteIdentity,
 			routeKey: DocumentRouteIdentity,
 			pathname: string,
 		) => void;
 		onChildClose: (parentId: string, parentPath: string, opener?: ResearchOpener) => void;
+		onChildOpen: (path: string) => void;
 		onChildClosing: (parentId: string, parentPath: string) => ChildFocusToken;
-		onParentRestored: (token: ChildFocusToken) => void;
+		onParentRestored: (token: ChildFocusToken, target: ParentFocusTarget) => void;
 		onReady: (
 			key: DocumentRouteIdentity,
 			resolution?: {
 				canonicalPath: string;
 				channel: Api.Channel;
+				requestKey: DocumentRouteIdentity;
 				routeKey: DocumentRouteIdentity;
 			},
 		) => void;
@@ -138,6 +189,12 @@ export default function DocumentWorkspaceHost(
 	let closingFocus = useRef<ChildFocusToken | undefined>(undefined);
 	let parentScrollTop = useRef<number | undefined>(undefined);
 	let parentSurface = useRef<HTMLDivElement>(null);
+	let openRequest = useRef(0);
+	useEffect(() => () => void (openRequest.current += 1), []);
+	// The card's key follows the child route, not the loaded channel, so loading never remounts
+	// it, and it outlives the route while the card closes.
+	let childKey = useRef<string | undefined>(undefined);
+	if (route.page === "child") childKey.current = route.childSlug;
 
 	useEffect(() => {
 		let active = true;
@@ -148,7 +205,7 @@ export default function DocumentWorkspaceHost(
 		let currentState = stateRef.current;
 		let current = currentState.status === "ready" ? currentState.loaded : undefined;
 		if (requestedRoute.page === "child" && current && !current.child) {
-			let scroller = parentSurface.current?.querySelector<HTMLElement>("[data-plan-scroll]");
+			let scroller = parentScroller(parentSurface.current);
 			if (scroller) parentScrollTop.current = scroller.scrollTop;
 		}
 		let address = {
@@ -197,6 +254,7 @@ export default function DocumentWorkspaceHost(
 			let resolution = {
 				canonicalPath: prepared.pathname,
 				channel: (child ?? parent).channel,
+				requestKey: documentRouteIdentity(requestedRoute),
 				routeKey,
 			};
 			// The outgoing document stays on screen until this one has synced, briefly.
@@ -229,7 +287,7 @@ export default function DocumentWorkspaceHost(
 
 	useLayoutEffect(() => {
 		if (!loaded || parentScrollTop.current === undefined) return;
-		let scroller = parentSurface.current?.querySelector<HTMLElement>("[data-plan-scroll]");
+		let scroller = parentScroller(parentSurface.current);
 		if (scroller) scroller.scrollTop = parentScrollTop.current;
 		if (presentation === "closed") parentScrollTop.current = undefined;
 	}, [loaded, presentation]);
@@ -246,7 +304,7 @@ export default function DocumentWorkspaceHost(
 			&& current.status === "ready"
 			&& current.loaded.parent.channel.id === token.parentId
 		) {
-			onParentRestored(token);
+			onParentRestored(token, parentFocusTarget);
 		}
 	}, [onParentRestored, presentation]);
 
@@ -276,13 +334,10 @@ export default function DocumentWorkspaceHost(
 		send(action);
 	}, [onChildClosing, route, send]);
 
-	useEffect(() => {
-		if (presentation !== "closing") return;
-		let timer = window.setTimeout(() => {
-			send({ type: "closed" });
-		}, 190);
-		return () => window.clearTimeout(timer);
-	}, [presentation, send]);
+	let childClosed = useCallback(() => {
+		if (stateRef.current.presentation === "closing") send({ type: "closed" });
+	}, [send]);
+	let motion = readChildMotionStyle();
 
 	useEffect(() => {
 		if (presentation !== "open") return;
@@ -290,13 +345,23 @@ export default function DocumentWorkspaceHost(
 			if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return;
 			// Escape dismisses the innermost thing first: a field gives up focus, then the next one closes.
 			let target = event.target instanceof Element ? event.target : undefined;
+			// Root Chat and the top bar stay live beside the child, so Escape there is theirs alone.
+			let rootWorkspace = document.querySelector(".workspace-child-slot")?.closest(
+				".workspace-root",
+			);
+			if (
+				target && rootWorkspace?.contains(target) && !target.closest(".workspace-document-stack")
+			) {
+				return;
+			}
 			if (target?.closest(DISMISSIBLE_TARGET)) {
 				event.preventDefault();
-				document.querySelector<HTMLElement>(".anchored-child-surface")?.focus({
+				document.querySelector<HTMLElement>(".anchored-child-card:last-of-type")?.focus({
 					preventScroll: true,
 				});
 				return;
 			}
+			if (document.querySelector(".workspace-child-slot[hidden]")) return;
 			event.preventDefault();
 			let current = stateRef.current;
 			if (current.status === "ready") {
@@ -369,7 +434,7 @@ export default function DocumentWorkspaceHost(
 		);
 	}
 	if (!loaded) {
-		return <Loading label={"Opening document…"} />;
+		return <Loading document label="Opening document…" />;
 	}
 
 	let parentPath = anchoredChildPaths(
@@ -383,22 +448,32 @@ export default function DocumentWorkspaceHost(
 	let childVisible = presentation !== "closed";
 	let childLabel = loaded.child?.channel.title ?? (route.page === "child" ? route.childSlug : "");
 	let closeChild = () => onChildClose(loaded.parent.channel.id, parentPath);
-	let parent = (
-		<Suspense fallback={<Loading label="Opening document…" />}>
-			<RoomWorkspace
-				{...workspaceProps(
-					loaded.parent,
-					agent,
-					user,
-					childVisible
-						? { childLabel, onChildClose: closeChild, type: "parent-with-child" }
-						: { type: "document" },
-					parentMetadataChanged,
-				)}
-				key={loaded.parent.channel.id}
-			/>
-		</Suspense>
-	);
+	let openChild: ChildOpen = async channelId => {
+		let request = ++openRequest.current;
+		let rootId = loaded.parent.channel.id;
+		// A newer request, a different root, or a closed child makes this one stale.
+		let current = () => {
+			let now = stateRef.current;
+			return request === openRequest.current && now.status === "ready"
+				&& now.loaded.parent.channel.id === rootId;
+		};
+		let detail = await Api.channel(channelId).catch(() => undefined);
+		// Only a child of this root opens here; the stored parentage is authoritative.
+		if (!current() || !detail || detail.channel.parentChannelId !== rootId) return false;
+		let path = anchoredChildPaths(
+			{
+				owner: loaded.parent.repository.owner,
+				repository: loaded.parent.repository.name,
+				slug: loaded.parent.channel.slug,
+			},
+			detail.channel.slug,
+		).child;
+		if (!path) return false;
+		onChildOpen(path);
+		// During a switch from another child, `loaded.child` still names the old one until the
+		// new one is ready, so liveness is the request token alone.
+		return childSynced(channelId, current);
+	};
 	let child = loaded.child
 		? (
 			<Suspense fallback={<Loading label="Opening child document…" />}>
@@ -428,18 +503,55 @@ export default function DocumentWorkspaceHost(
 			? <Failure error={error} onRetry={retryFailure} />
 			: <Loading label="Opening child document…" />
 		: undefined;
-	return (
+	let layer = (
 		<AnchoredChildSurface
-			child={child}
-			childLabel={childLabel}
+			entries={[{
+				id: childKey.current ?? "child",
+				label: childLabel,
+				node: child,
+			}]}
 			focusKey={loaded.child?.channel.id ?? (route.page === "child"
 				? `${route.parentSlug}/${route.childSlug}`
 				: undefined)}
-			onBackdropClick={closeChild}
-			parent={parent}
-			parentRef={parentSurface}
+			motion={motion}
+			onClosed={childClosed}
+			origin={childOrigin}
 			presentation={presentation}
-			key={loaded.parent.channel.id}
 		/>
+	);
+	let nested = {
+		child: layer,
+		// Chat's focus follows the open child and lapses as soon as it starts to close.
+		childId: presentation === "open" ? loaded.child?.channel.id : undefined,
+		childState: presentation === "closing" ? "closing" as const : "open" as const,
+		motion,
+		onChildClose: closeChild,
+		onChildOpen: openChild,
+		path: [
+			{ id: loaded.parent.channel.id, label: loaded.parent.channel.title },
+			{ id: loaded.child?.channel.id ?? "child", label: childLabel },
+		],
+		type: "parent-with-child" as const,
+	};
+	return (
+		<div
+			className="anchored-child-host"
+			data-child-presentation={presentation}
+			key={loaded.parent.channel.id}
+			ref={parentSurface}
+		>
+			<Suspense fallback={<Loading document label="Opening document…" />}>
+				<RoomWorkspace
+					{...workspaceProps(
+						loaded.parent,
+						agent,
+						user,
+						childVisible ? nested : { onChildOpen: openChild, type: "document" as const },
+						parentMetadataChanged,
+					)}
+					key={loaded.parent.channel.id}
+				/>
+			</Suspense>
+		</div>
 	);
 }

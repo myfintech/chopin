@@ -1,11 +1,12 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 
 import * as Api from "./api";
-import { HostedApp, HostedFailure, HostedLoading } from "./hosted";
+import { HostedApp, HostedFailure, HostedLoading, hostedRoute } from "./hosted";
 import { clearRepositoryCache } from "./repository-cache";
 
 let loadHostedLogin = () => import("./hosted-login");
 let HostedLogin = lazy(() => loadHostedLogin().then(module => ({ default: module.HostedLogin })));
+let PairingPage = lazy(() => import("./experiments/pairing"));
 let LocalLogin = lazy(() =>
 	import("./local-login").then(module => ({ default: module.LocalLogin }))
 );
@@ -48,12 +49,30 @@ export function App() {
 		setRepositoryCacheReady(true);
 	}, [session]);
 
-	if (error) return <HostedFailure error={error} />;
-	if (!session || !repositoryCacheReady) return <HostedLoading />;
+	if (error) {
+		return (
+			<Suspense fallback={<HostedLoading />}>
+				<HostedFailure error={error} />
+			</Suspense>
+		);
+	}
+	if (!session || !repositoryCacheReady) {
+		let page = hostedRoute(location.pathname).page;
+		return (
+			<HostedLoading document={page === "document" || page === "child" || page === "channel"} />
+		);
+	}
 	if (!session.user) {
 		return (
 			<Suspense fallback={<HostedLoading />}>
 				{session.auth === "local" ? <LocalLogin /> : <HostedLogin />}
+			</Suspense>
+		);
+	}
+	if (location.pathname === "/connect") {
+		return (
+			<Suspense fallback={<HostedLoading />}>
+				<PairingPage />
 			</Suspense>
 		);
 	}

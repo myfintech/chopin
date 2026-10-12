@@ -3,6 +3,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	advanceDecisionView,
 	countUnanswered,
+	decisionsDeck,
 	documentHasPlanningContent,
 	firstOpenDecision,
 	selectDecisionView,
@@ -116,36 +117,39 @@ describe("decision attention", () => {
 		);
 	});
 
-	it("keeps a chat-linked inline card in Document while Planner questions still open Decisions", () => {
+	it("routes a blank document to Decisions whether or not its cards have threads", () => {
 		let plannerQuestion = entry([undefined]);
 		let conversationQuestion = entry([undefined]);
 		conversationQuestion.value = { ...conversationQuestion.value, thread: "thread-1" };
 		let initial: DecisionViewState = { phase: "initial", preferred: "plan" };
-		let plannerHasContent = documentHasPlanningContent(false, [plannerQuestion]);
-		let conversationHasContent = documentHasPlanningContent(false, [conversationQuestion]);
+		let unanswered = countUnanswered([plannerQuestion, conversationQuestion]);
 
-		expect(visibleDecisionView(
-			initial,
-			plannerHasContent,
-			countUnanswered([plannerQuestion]),
-		)).toBe("decisions");
-		expect(visibleDecisionView(
-			initial,
-			conversationHasContent,
-			countUnanswered([conversationQuestion]),
-		)).toBe("plan");
+		expect(documentHasPlanningContent(false)).toBe(false);
+		expect(visibleDecisionView(initial, false, unanswered)).toBe("decisions");
+		expect(advanceDecisionView(initial, false, unanswered).phase).toBe("forced");
+	});
 
-		let state = advanceDecisionView(
-			initial,
-			plannerHasContent,
-			countUnanswered([plannerQuestion]),
-		);
+	it("does not route a reader who is editing the document", () => {
+		let initial: DecisionViewState = { phase: "initial", preferred: "plan" };
+		expect(visibleDecisionView(initial, false, 2, true)).toBe("plan");
+		expect(advanceDecisionView(initial, false, 2, true))
+			.toEqual({ phase: "complete", preferred: "plan" });
+	});
+
+	it("holds forced Decisions while prose arrives and decisions are still open", () => {
+		let state = advanceDecisionView({ phase: "initial", preferred: "plan" }, false, 3);
+		state = advanceDecisionView(state, true, 2);
 		expect(state.phase).toBe("forced");
-		state = advanceDecisionView(
-			state,
-			conversationHasContent,
-			countUnanswered([plannerQuestion, conversationQuestion]),
-		);
+		expect(visibleDecisionView(state, true, 2)).toBe("decisions");
+		state = advanceDecisionView(state, true, 0);
+		expect(state).toEqual({ phase: "complete", preferred: "plan" });
+		expect(visibleDecisionView(state, true, 0)).toBe("plan");
+	});
+
+	it("never routes twice in one entry", () => {
+		let state = advanceDecisionView({ phase: "initial", preferred: "plan" }, false, 1);
+		state = advanceDecisionView(state, true, 0);
+		state = advanceDecisionView(state, false, 3);
 		expect(state).toEqual({ phase: "complete", preferred: "plan" });
 	});
 
@@ -177,6 +181,22 @@ describe("decision attention", () => {
 			expect(visibleDecisionView({ ...state, preferred: preference }, false, 1)).toBe(preference);
 		},
 	);
+
+	it("keeps a forced view when nothing is unanswered and no prose exists", () => {
+		let state = advanceDecisionView({ phase: "initial", preferred: "plan" }, false, 2);
+
+		state = advanceDecisionView(state, false, 0);
+
+		expect(state.phase).toBe("forced");
+		expect(visibleDecisionView(state, false, 0)).toBe("decisions");
+	});
+
+	it("ignores editing once the opening is forced", () => {
+		let state = advanceDecisionView({ phase: "initial", preferred: "plan" }, false, 2);
+
+		expect(advanceDecisionView(state, false, 2, true)).toBe(state);
+		expect(visibleDecisionView(state, false, 2, true)).toBe("decisions");
+	});
 
 	it("lets explicit Document navigation override a forced Decisions opening", () => {
 		let state = advanceDecisionView(
@@ -243,5 +263,27 @@ describe("Decisions opening target", () => {
 
 		expect(firstOpenDecision([])).toBeUndefined();
 		expect(firstOpenDecision([decided, discarded])).toBeUndefined();
+	});
+});
+
+describe("Decisions deck", () => {
+	it("stacks two or more open decisions", () => {
+		expect(decisionsDeck(["a", "b"], ["z"], new Set(["a", "b"])))
+			.toEqual({ deck: ["a", "b"], answered: [], history: ["z"] });
+	});
+
+	it("keeps decisions answered here at the back while one is still open", () => {
+		expect(decisionsDeck(["b"], ["a", "z"], new Set(["a", "b"])))
+			.toEqual({ deck: ["b", "a"], answered: ["a"], history: ["z"] });
+	});
+
+	it("dissolves once nothing is open", () => {
+		expect(decisionsDeck([], ["a", "b"], new Set(["a", "b"])))
+			.toEqual({ deck: [], answered: [], history: ["a", "b"] });
+	});
+
+	it("shows one reopened decision on its own", () => {
+		expect(decisionsDeck(["r"], ["z"], new Set(["r"])))
+			.toEqual({ deck: [], answered: [], history: ["z"] });
 	});
 });

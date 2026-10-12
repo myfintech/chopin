@@ -33,19 +33,6 @@
 		]
 	},
 	{
-		"file": "apps/web/src/theme.css",
-		"reason": "Approved chat divider opacity is 9%, distinct from passive 7% edge and 20% control edge; retained as a checked contextual design-record value.",
-		"cases": [
-			[
-				"color",
-				"border-color",
-				"rgb(0 0 0 / 9%)",
-				"CSS > .workspace-frame .workspace-chat-panel",
-				1
-			]
-		]
-	},
-	{
 		"file": "apps/web/src/local-login-view.tsx",
 		"reason": "Existing reduced-motion-gated Tailwind continuous loader uses its standard one-second linear spin; preserve its established behavior.",
 		"cases": [
@@ -113,33 +100,6 @@
 		]
 	},
 	{
-		"file": "apps/web/src/workspace.tsx",
-		"reason": "Existing workspace frame has an intentional 12px outer radius; preserve the approved layout/hierarchy rather than introducing a one-use scale token.",
-		"cases": [
-			[
-				"utility",
-				"class",
-				"rounded-[12px]",
-				"class > Workspace > <div>",
-				2
-			]
-		],
-		"sourceHash": "7bb4ae6a718f8e37cbdb2f3b5acec007e72a88849b1f9d5dc81447d7cf1b842c"
-	},
-	{
-		"file": "apps/web/src/empty-workspace.tsx",
-		"reason": "The empty workspace repeats the workspace frame's intentional 12px outer radius so the layout does not change when a document opens.",
-		"cases": [
-			[
-				"utility",
-				"class",
-				"rounded-[12px]",
-				"class > EmptyWorkspace > <div>",
-				2
-			]
-		]
-	},
-	{
 		"file": "apps/web/src/navigation.css",
 		"reason": "Sidebar resize affordance uses neutral 20% black; its interaction geometry owns this existing local treatment.",
 		"cases": [
@@ -174,39 +134,20 @@
 	},
 	{
 		"file": "packages/editor/src/styles.css",
-		"reason": "Existing sheet backdrop consumes the legacy shadow channels through rgb(); preserve current appearance and flag the color-space mismatch for separate review.",
-		"cases": [
-			[
-				"color",
-				"background",
-				"rgb(var(--shadow-color))",
-				"CSS > .plan-comment-sheet-backdrop",
-				1
-			]
-		]
-	},
-	{
-		"file": "packages/editor/src/styles.css",
-		"reason": "Bottom-sheet upward shadow has established geometry distinct from shared downward surface shadows; retained pending dedicated visual review.",
-		"cases": [
-			[
-				"shadow",
-				"box-shadow",
-				"0 -1rem 3rem rgb(var(--shadow-color) / 22%)",
-				"CSS > .plan-comment-sheet-popup",
-				1
-			]
-		]
-	},
-	{
-		"file": "packages/editor/src/styles.css",
-		"reason": "Drawer duration multiplies a shared duration by the gesture library runtime swipe-strength scalar; preserve proportional gesture response.",
+		"reason": "Sheet rise multiplies the shared sheet duration by the gesture library's runtime swipe-strength scalar (Base UI's --drawer-swipe-strength); preserve proportional gesture response.",
 		"cases": [
 			[
 				"motion",
 				"transition",
-				"transform calc(var(--drawer-swipe-strength, 1) * var(--duration-base))\n\t\tvar(--ease-out)",
+				"transform calc(var(--drawer-swipe-strength, 1) * var(--sheet-rise-dur))\n\t\tvar(--sheet-ease)",
 				"CSS > .plan-comment-sheet-popup",
+				1
+			],
+			[
+				"motion",
+				"transition-duration",
+				"calc(var(--drawer-swipe-strength, 1) * var(--sheet-fall-dur))",
+				"CSS > .plan-comment-sheet-popup[data-ending-style]",
 				1
 			]
 		]
@@ -344,7 +285,7 @@
 				1
 			]
 		],
-		"sourceHash": "830c3d5275279f75c3fa0da9d01f5d4802daff0deb0923f95df1072150b9d11e"
+		"sourceHash": "2ade3c7e75dbddc215461d425c92282eebf9b3448e8ebca46df68433663af588"
 	},
 	{
 		"file": "packages/editor/src/callout.css",
@@ -462,13 +403,41 @@
 	},
 	{
 		"file": "apps/web/src/theme.css",
-		"reason": "iOS Safari zooms the page when it focuses editable text under 16px; touch devices floor the existing token at 1rem.",
+		"reason": "iOS Safari zooms the page when it focuses editable text under 16px; touch devices raise a field's small type steps to the 1rem field floor.",
 		"cases": [
 			[
 				"typography",
+				"--text-2xs",
+				"var(--field-text-min)",
+				"CSS > @layer base > @media (pointer: coarse) > :is(textarea, select, input:not([type=\"checkbox\"], [type=\"radio\"], [type=\"range\"], [type=\"color\"], [type=\"file\"]), [contenteditable]:not([contenteditable=\"false\"], .plan-content))",
+				1
+			],
+			[
+				"typography",
+				"--text-xs",
+				"var(--field-text-min)",
+				"CSS > @layer base > @media (pointer: coarse) > :is(textarea, select, input:not([type=\"checkbox\"], [type=\"radio\"], [type=\"range\"], [type=\"color\"], [type=\"file\"]), [contenteditable]:not([contenteditable=\"false\"], .plan-content))",
+				1
+			],
+			[
+				"typography",
+				"--text-sm",
+				"var(--field-text-min)",
+				"CSS > @layer base > @media (pointer: coarse) > :is(textarea, select, input:not([type=\"checkbox\"], [type=\"radio\"], [type=\"range\"], [type=\"color\"], [type=\"file\"]), [contenteditable]:not([contenteditable=\"false\"], .plan-content))",
+				1
+			],
+			[
+				"typography",
+				"--text-base",
+				"var(--field-text-min)",
+				"CSS > @layer base > @media (pointer: coarse) > :is(textarea, select, input:not([type=\"checkbox\"], [type=\"radio\"], [type=\"range\"], [type=\"color\"], [type=\"file\"]), [contenteditable]:not([contenteditable=\"false\"], .plan-content))",
+				1
+			],
+			[
+				"typography",
 				"font-size",
-				"max(1rem, var(--text-sm))",
-				"CSS > @media (pointer: coarse) > .chat-composer .composer-draft-input[contenteditable],\n\ttextarea,\n\tselect,\n\tinput:not([type=\"checkbox\"], [type=\"radio\"], [type=\"range\"], [type=\"color\"], [type=\"file\"])",
+				"max(var(--field-text-min), 1em)",
+				"CSS > @layer base > @media (pointer: coarse) > :is(textarea, select, input:not([type=\"checkbox\"], [type=\"radio\"], [type=\"range\"], [type=\"color\"], [type=\"file\"]), [contenteditable]:not([contenteditable=\"false\"], .plan-content))",
 				1
 			]
 		]

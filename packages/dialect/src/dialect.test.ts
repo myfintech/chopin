@@ -11,6 +11,11 @@ const ID = "01K0N4TR8K7JGM4R1J7PW4R8YJ";
 const ID2 = "01K0N4V4E7Y6P4MJ5WD8XZF3B2";
 const ID3 = "01K0N4W3B7P27CBAEC7A8C8WEA";
 
+const COLUMNS = `<Columns id="${ID}">\n`
+	+ `<Column id="${ID2}">\n\nFirst.\n\n</Column>\n`
+	+ `<Column id="${ID3}">\n\nSecond.\n\n</Column>\n`
+	+ `</Columns>`;
+
 function codes(source: string): string[] {
 	let result = validate(parse(source));
 	return result.ok ? [] : result.issues.map(issue => issue.code);
@@ -198,12 +203,41 @@ describe("security boundary", () => {
 		accepts("[x](src/index.ts)");
 	});
 
-	it("requires images to be absolute https URLs", () => {
+	it("requires images to be absolute https URLs or Chopin-hosted paths", () => {
 		expect(codes("![a](http://example.com/x.png)")).toContain("bad-image-protocol");
 		expect(codes("![a](data:image/png;base64,iVBORw0KGgo=)")).toContain("bad-image-protocol");
-		// Unlike a link, a relative image has nothing to resolve against.
+		// A repository-relative image has nothing to resolve against.
 		expect(codes("![a](docs/diagram.png)")).toContain("bad-image");
 		accepts("![a](https://example.com/x.png)");
+	});
+
+	it("accepts only Chopin's own content-addressed image paths as relative images", () => {
+		let hash = "0123456789abcdef".repeat(4);
+		for (let extension of ["png", "jpg", "jpeg", "webp", "gif"]) {
+			accepts(`![a](/images/${hash}.${extension})`);
+		}
+		for (
+			let url of [
+				`/images/${hash.toUpperCase()}.png`,
+				`/images/${hash.slice(1)}.png`,
+				`/images/${hash}.svg`,
+				`/images/${hash}.PNG`,
+				`/images/${hash}.png?x=1`,
+				`images/${hash}.png`,
+				`/other/${hash}.png`,
+				`//images/${hash}.png`,
+			]
+		) {
+			expect(codes(`![a](${url})`)).toContain("bad-image");
+		}
+	});
+
+	it("counts hosted images toward the image limit", () => {
+		let image = `![a](/images/${"0123456789abcdef".repeat(4)}.png)`;
+		accepts(Array(limits.MAX_IMAGES).fill(image).join("\n\n"));
+		expect(codes(Array(limits.MAX_IMAGES + 1).fill(image).join("\n\n"))).toContain(
+			"too-many-images",
+		);
 	});
 
 	it("rejects frontmatter", () => {
@@ -278,6 +312,23 @@ describe("serialization safety", () => {
 	it("leaves closing brackets in links, references and footnotes alone", () => {
 		let source = "[site](https://example.com) and [^1]\n\n[^1]: Note.\n";
 		expect(serialize(parse(source))).toBe(source);
+	});
+
+	// MDX has no autolinks: `<https://…>` reads as a JSX tag and fails to parse.
+	it("writes a link whose text is its URL as a resource link, never an autolink", () => {
+		for (let url of ["https://example.com", "https://example.com/a_b?q=1", "mailto:a@b.co"]) {
+			let source = serialize({
+				type: "root",
+				children: [{
+					type: "paragraph",
+					children: [{ type: "link", url, children: [{ type: "text", value: url }] }],
+				}],
+			});
+			expect(source).not.toContain("<");
+			let link = parse(source).children[0];
+			expect(link?.type === "paragraph" && link.children[0]).toMatchObject({ type: "link", url });
+			expect(serialize(parse(source))).toBe(source);
+		}
 	});
 });
 
@@ -387,6 +438,50 @@ describe("components", () => {
 		let out = canonical(source);
 		expect(out).toContain(`<Callout id="${ID}"`);
 		expect(out).toContain('type="warning"');
+	});
+});
+
+describe("columns", () => {
+	it("accepts two top-level editable regions", () => {
+		accepts(COLUMNS);
+		expect(canonical(COLUMNS)).toContain("First.");
+		expect(canonical(COLUMNS)).toContain("Second.");
+	});
+
+	it("requires exactly two Column children", () => {
+		let one = `<Columns id="${ID}"><Column id="${ID2}">One.</Column></Columns>`;
+		let three = COLUMNS.replace(
+			"</Columns>",
+			`<Column id="${ID}">\n\nThird.\n\n</Column>\n</Columns>`,
+		);
+		expect(codes(one)).toContain("bad-column-count");
+		expect(codes(three)).toContain("bad-column-count");
+		expect(codes(`<Columns id="${ID}">\n\nLoose.\n\n</Columns>`))
+			.toContain("unexpected-child");
+	});
+
+	it("keeps the layout at document root and blocks nested components", () => {
+		expect(codes(`<Callout id="${ID}" type="note">\n${COLUMNS}\n</Callout>`))
+			.toContain("bad-layout-placement");
+		let withCallout = COLUMNS.replace("First.", `<Callout id="${ID}" type="note">x</Callout>`);
+		expect(codes(withCallout)).toContain("bad-nesting");
+	});
+
+	it("allows an Experiment at document root but refuses it inside a column", () => {
+		let experiment = `<Experiment id="${ID}" experiment="investigation-one" view="table" />`;
+		accepts(experiment);
+		expect(codes(COLUMNS.replace("First.", experiment))).toContain("bad-nesting");
+	});
+
+	it("rejects unsupported attributes and record-owned children", () => {
+		expect(codes(COLUMNS.replace("<Columns id=", '<Columns variant="gallery" id=')))
+			.toContain("unknown-attribute");
+		let withDecision = COLUMNS.replace(
+			"First.",
+			`<Decision id="${ID}" quote="q" by="a" at="2026-10-09T10:00:00Z">`
+				+ `<Note by="a" text="n" /></Decision>`,
+		);
+		expect(codes(withDecision)).toContain("bad-nesting");
 	});
 });
 

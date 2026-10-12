@@ -1,6 +1,7 @@
 @import "tailwindcss";
 @import "@chopin/visuals/theme.css";
 @import "./conversation-plan/source.css";
+@import "./build-view.css";
 
 /*
  * Sibling packages that build on these utilities.
@@ -31,6 +32,19 @@
 	:is([data-nucleo-icon], [data-filled-icon]) {
 		flex-shrink: 0;
 	}
+
+	/*
+	 * On touch, controls answer the tap at once and never select or call out their
+	 * label on a long press. Content, links and fields keep both.
+	 */
+	@media (pointer: coarse) {
+		:where(button, summary, [role="button"], [role="tab"], [role="menuitem"], [role="option"]) {
+			touch-action: manipulation;
+			-webkit-user-select: none;
+			user-select: none;
+			-webkit-touch-callout: none;
+		}
+	}
 }
 
 /* Beside text that may wrap: centre on the first line instead of the whole block. */
@@ -43,7 +57,8 @@
 	--color-icon: var(--color-danger-icon);
 }
 
-:where(.btn-primary, .btn-destructive) [data-nucleo-icon] {
+:where(.btn-primary, .btn-destructive, .btn-outline-danger, .document-actions-menu-destructive)
+	:is([data-nucleo-icon], [data-filled-icon]) {
 	color: inherit;
 }
 
@@ -92,14 +107,28 @@
 }
 
 @utility btn-sm {
-	height: 1.5rem;
-	padding-inline: calc(var(--spacing) * 2);
+	height: var(--control-height-compact);
+	padding-inline: var(--control-padding-inline);
+}
+
+@utility btn-compact {
+	height: var(--control-height-compact);
+	padding-inline: var(--control-padding-inline);
+	font-size: var(--text-xs);
+}
+
+@utility btn-with-count {
+	height: auto;
+	min-height: var(--control-height-compact);
+	padding-block: var(--control-inset);
+	padding-inline-end: var(--control-inset);
+	line-height: 1;
 }
 
 @utility btn-icon {
-	width: 1.75rem;
-	height: 1.75rem;
-	padding: 0.4375rem;
+	width: var(--icon-button-size);
+	height: var(--icon-button-size);
+	padding: var(--icon-button-padding);
 }
 
 @utility btn-primary {
@@ -109,8 +138,11 @@
 	outline: var(--button-edge-width) solid var(--color-control-edge);
 	outline-offset: calc(-1 * var(--button-edge-width));
 
-	&:hover:not(:disabled) {
-		background-color: var(--color-brand-hover);
+	/* Touch has no hover to leave, so a tapped button would keep it. */
+	@media (hover: hover) {
+		&:hover:not(:disabled) {
+			background-color: var(--color-brand-hover);
+		}
 	}
 
 	&:active:not(:disabled) {
@@ -124,8 +156,10 @@
 	outline: var(--button-edge-width) solid var(--color-edge);
 	outline-offset: calc(-1 * var(--button-edge-width));
 
-	&:hover:not(:disabled) {
-		background-color: var(--color-gray-300);
+	@media (hover: hover) {
+		&:hover:not(:disabled) {
+			background-color: var(--color-gray-300);
+		}
 	}
 
 	&:active:not(:disabled) {
@@ -136,12 +170,14 @@
 @utility btn-outline {
 	background-color: var(--color-page);
 	color: var(--color-text-primary);
-	outline: var(--button-edge-width) solid var(--color-control-edge);
+	outline: var(--button-edge-width) solid var(--color-button-outline-edge);
 	outline-offset: calc(-1 * var(--button-edge-width));
 	box-shadow: var(--shadow-resting);
 
-	&:hover:not(:disabled) {
-		background-color: var(--color-inset);
+	@media (hover: hover) {
+		&:hover:not(:disabled) {
+			background-color: var(--color-inset);
+		}
 	}
 
 	&:active:not(:disabled) {
@@ -156,8 +192,10 @@
 	outline: var(--button-edge-width) solid var(--color-danger-edge);
 	outline-offset: calc(-1 * var(--button-edge-width));
 
-	&:hover:not(:disabled) {
-		background-color: var(--color-danger-surface-hover);
+	@media (hover: hover) {
+		&:hover:not(:disabled) {
+			background-color: var(--color-danger-surface-hover);
+		}
 	}
 
 	&:active:not(:disabled) {
@@ -169,8 +207,10 @@
 	background-color: transparent;
 	color: var(--color-text-secondary);
 
-	&:hover:not(:disabled) {
-		background-color: var(--color-gray-200);
+	@media (hover: hover) {
+		&:hover:not(:disabled) {
+			background-color: var(--color-gray-200);
+		}
 	}
 
 	&:active:not(:disabled) {
@@ -184,8 +224,10 @@
 	outline: var(--button-edge-width) solid var(--color-control-edge);
 	outline-offset: calc(-1 * var(--button-edge-width));
 
-	&:hover:not(:disabled) {
-		background-color: var(--color-destructive-hover);
+	@media (hover: hover) {
+		&:hover:not(:disabled) {
+			background-color: var(--color-destructive-hover);
+		}
 	}
 
 	&:active:not(:disabled) {
@@ -315,6 +357,8 @@ html,
 body {
 	height: 100%;
 	overflow-x: hidden;
+	/* The fixed shell never scrolls the window: no pull-to-refresh or page bounce. */
+	overscroll-behavior: none;
 }
 
 #root {
@@ -470,37 +514,12 @@ body {
 	}
 }
 
-.chat-toggle-icon-sidebar {
-	opacity: 0;
+.panel-header {
+	block-size: var(--panel-header-height);
 }
 
-.chat-toggle:is(:hover, :focus-visible) .chat-toggle-icon-default {
-	opacity: 0;
-}
-
-.chat-toggle:is(:hover, :focus-visible) .chat-toggle-icon-sidebar {
-	opacity: 1;
-}
-
-@media (hover: hover) and (pointer: fine) {
-	.chat-header-control {
-		opacity: 0;
-		transition: opacity var(--duration-fast) var(--ease-out);
-	}
-
-	.chat-header:is(:hover, :focus-within) .chat-header-control {
-		opacity: 1;
-	}
-}
-
-@media (any-pointer: coarse) {
-	.chat-header-control {
-		opacity: 1;
-	}
-}
-
-:root[data-motion-input="pointer"] .chat-toggle-icon {
-	transition: opacity var(--duration-fast) var(--ease-out);
+.panel-header-control {
+	margin-inline-start: calc(-1 * var(--panel-header-control-offset));
 }
 
 :root[data-motion-input="pointer"] .motion-picker-option {
@@ -521,6 +540,7 @@ body {
 	outline-offset: calc(-1 * var(--edge-width));
 	box-shadow: var(--shadow-overlay);
 	font-size: var(--text-sm);
+	overscroll-behavior: contain;
 }
 
 .menu-item {
@@ -568,7 +588,7 @@ body {
 	-moz-osx-font-smoothing: grayscale;
 }
 
-/* One owner per edge: top chrome owns the top inset, compact navigation the bottom one. */
+/* One owner per edge: top chrome owns the top inset. */
 .room-header {
 	padding-right: calc(0.5rem + env(safe-area-inset-right));
 	padding-left: calc(0.5rem + env(safe-area-inset-left));
@@ -584,7 +604,6 @@ body {
 
 .workspace-navigation {
 	padding-right: calc(0.25rem + env(safe-area-inset-right));
-	padding-bottom: calc(0.25rem + env(safe-area-inset-bottom));
 	padding-left: calc(0.25rem + env(safe-area-inset-left));
 }
 
@@ -594,7 +613,7 @@ body {
 	box-shadow: var(--shadow-resting);
 }
 
-/* The split workspace is one elevated surface; its panes only own the divider. */
+/* The split frame only places the panes; the document panel below is the raised sheet. */
 .workspace-root[data-workspace-mode="split"] .workspace-frame {
 	margin-left: calc(var(--spacing) * 3 + env(safe-area-inset-left));
 	margin-right: calc(var(--spacing) * 3 + env(safe-area-inset-right));
@@ -605,15 +624,128 @@ body {
 }
 
 .workspace-frame .workspace-chat-panel {
-	border-color: rgb(0 0 0 / 9%);
+	border-color: var(--color-divider);
+}
+
+.workspace-root[data-workspace-mode="split"] .workspace-frame > .workspace-document-stack {
+	min-width: 9rem;
+}
+
+/*
+ * Split: Chat and its top bar sit on the ground; the document is the only sheet.
+ * The frame spans both rows so the sheet rises to the top margin beside the bar.
+ */
+.workspace-root[data-workspace-mode="split"] {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr);
+	grid-template-rows: var(--document-shell-header-height) minmax(0, 1fr);
+}
+
+.workspace-root[data-workspace-mode="split"] > .workspace-header-slot {
+	z-index: 1;
+	grid-area: 1 / 1;
+	width: var(--chat-width, 0px);
+	min-width: 0;
+	transition: opacity var(--panel-open-dur) var(--motion-smooth-out);
+}
+
+.workspace-root[data-workspace-mode="split"][data-header-hidden] > .workspace-header-slot {
+	opacity: 0;
+	visibility: hidden;
+	transition:
+		opacity var(--panel-close-dur) var(--motion-smooth-out),
+		visibility 0s linear var(--panel-close-dur);
+}
+
+.workspace-root[data-workspace-mode="split"] > .workspace-frame {
+	grid-area: 1 / 1 / 3 / 2;
+}
+
+/* A visible header while expanded (a child is open) keeps the sheet below its row. */
+.workspace-root[data-workspace-mode="split"][data-document-expanded]:not([data-header-hidden])
+	> .workspace-frame {
+	grid-area: 2 / 1;
 }
 
 .workspace-root[data-workspace-mode="split"] .workspace-chat-panel {
-	--panel-direction: -1;
+	padding-top: var(--document-shell-header-height);
 }
 
-.workspace-root[data-workspace-mode="split"] .workspace-frame > main {
-	min-width: 9rem;
+.workspace-root[data-workspace-mode="split"] .workspace-chat-body {
+	padding-inline-end: calc(var(--spacing) * 2);
+}
+
+.workspace-root[data-workspace-mode="split"] .workspace-document-stack {
+	margin-top: calc(var(--spacing) * 3);
+}
+
+.workspace-root[data-workspace-mode="split"] .workspace-document-panel {
+	overflow: hidden;
+	border-radius: var(--radius-panel);
+	background: var(--color-page);
+	box-shadow: var(--shadow-raised);
+}
+
+/* A child surface is already paper, so its panel never takes the sheet hairline. */
+.workspace-root[data-workspace-mode="split"]
+	.workspace-document-panel:not(.anchored-child-surface *) {
+	outline: var(--edge-width) solid var(--color-edge);
+	outline-offset: calc(-1 * var(--edge-width));
+}
+
+/*
+ * A covered Lift sheet's tab row is one Back control. The button fills the row beneath its
+ * controls, so a click between tabs and keyboard focus both reach it.
+ */
+[data-document-toolbar]:has(> .workspace-tab-row-return) {
+	position: relative;
+}
+
+[data-document-toolbar]:has(> .workspace-tab-row-return) > * {
+	position: relative;
+}
+
+[data-document-toolbar] > .workspace-tab-row-return {
+	position: absolute;
+	inset: 0;
+	cursor: pointer;
+}
+
+.workspace-tab-row-return:focus-visible {
+	outline: var(--focus-ring-width) solid var(--focus-ring-color);
+	outline-offset: calc(-1 * var(--focus-ring-width));
+}
+
+.workspace-surface-toggle-slot {
+	padding-inline-end: var(--spacing);
+	margin-inline-end: var(--spacing);
+	border-inline-end: var(--edge-width) solid var(--color-divider);
+}
+
+/* The restore state carries a label, so it trades the square icon size for padding. */
+.surface-toggle-restore {
+	width: auto;
+	gap: calc(var(--spacing) * 1.5);
+	padding-inline: calc(var(--spacing) * 2) calc(var(--spacing) * 2.5);
+	border: var(--edge-width) solid var(--color-edge);
+	background: var(--color-inset);
+	color: var(--color-text-secondary);
+}
+
+.surface-toggle-restore:hover {
+	background: var(--color-selected);
+	color: var(--color-text-primary);
+}
+
+/* On the ground a white composer is the brightest thing in the column. */
+.workspace-root .chat-composer .field {
+	background: var(--color-inset);
+	box-shadow: none;
+}
+
+.workspace-root[data-workspace-mode="split"] .workspace-chat-panel .chat-composer {
+	padding-inline: var(--spacing);
+	padding-bottom: env(safe-area-inset-bottom);
 }
 
 .motion-panel {
@@ -637,15 +769,21 @@ body {
 	transition-duration: var(--panel-close-dur);
 }
 
-/* Split Chat is a track: its width moves the document, and Chat slides under its clip. */
+/*
+ * Split Chat is a track: its width moves the document, and Chat slides under its clip.
+ * Only the width clips, so the composer's focus ring can pass the panel's bottom edge.
+ */
 .workspace-root[data-workspace-mode="split"] .workspace-chat-panel {
+	overflow: clip visible;
 	width: 0;
+	order: -1;
+	--panel-direction: -1;
 	align-items: flex-end;
 	opacity: 1;
 	transform: none;
 }
 
-.workspace-root[data-workspace-mode="split"] .workspace-chat-panel > * {
+.workspace-root[data-workspace-mode="split"] .workspace-chat-panel > .workspace-chat-body {
 	width: var(--chat-width, 0px);
 }
 
@@ -798,6 +936,68 @@ body {
 	100% {
 		opacity: 0;
 	}
+}
+
+/* A comment sent to Chopin: a compact card in the message column that opens its thread. */
+.chat-comment-notice {
+	display: grid;
+	gap: 0.25rem;
+	margin-left: 2.25rem;
+	padding: 0.5rem 0.75rem;
+	border: 0;
+	border-radius: var(--radius-lg);
+	background: var(--color-page);
+	box-shadow: var(--shadow-resting);
+	outline: var(--edge-width) solid var(--color-edge);
+	outline-offset: calc(-1 * var(--edge-width));
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
+	color: var(--color-text-primary);
+	text-align: left;
+	cursor: pointer;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	.chat-comment-notice {
+		transition: outline-color var(--duration-fast) var(--ease-out);
+	}
+}
+
+.chat-comment-notice:hover {
+	outline-color: var(--color-control-edge);
+}
+
+.chat-comment-notice:focus-visible {
+	outline: var(--focus-ring-width) solid var(--focus-ring-color);
+	outline-offset: var(--focus-ring-offset);
+}
+
+.chat-comment-notice-head {
+	display: flex;
+	align-items: flex-start;
+	gap: 0.375rem;
+	font-size: var(--text-xs);
+	line-height: var(--text-xs--line-height);
+	color: var(--color-text-tertiary);
+}
+
+.chat-comment-notice-title {
+	font-weight: 500;
+	color: var(--color-text-secondary);
+}
+
+.chat-comment-notice-body {
+	overflow-wrap: anywhere;
+	text-wrap: pretty;
+	display: -webkit-box;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 4;
+	overflow: hidden;
+}
+
+.chat-comment-notice-mention {
+	font-weight: 600;
+	color: var(--color-brand);
 }
 
 .chat-message-body:has([data-analysis-trigger]) {
@@ -981,18 +1181,17 @@ button.chat-tool-call-toggle {
 	box-shadow: var(--shadow-resting);
 }
 
-.chat-composer .field:focus-within {
+/*
+ * The ring answers keyboard arrival. A clicked composer is already found, so it
+ * keeps only the quieter brand edge from `.composer-surface:focus-within`.
+ */
+:root:not([data-focus-origin="pointer"]) .chat-composer .field:focus-within {
 	outline: 2px solid var(--color-brand);
 	outline-offset: 2px;
 }
 
 .chat-composer textarea:focus {
 	outline: none;
-}
-
-.chat-header-control:hover:not(:disabled),
-.chat-header-control:active:not(:disabled) {
-	background-color: transparent;
 }
 
 .chat-composer .send-action:disabled {
@@ -1049,21 +1248,32 @@ button.chat-tool-call-toggle {
 :root[data-plan-coarse-pointer] .question-choice-row,
 :root[data-plan-coarse-pointer] .question-actions button,
 :root[data-plan-coarse-pointer] :where(button, [role="button"])[data-press="wide"] {
-	min-width: 44px;
-	min-height: 44px;
+	min-width: var(--control-target-coarse);
+	min-height: var(--control-target-coarse);
 }
 
 :root[data-plan-coarse-pointer] .question-choice-row {
 	padding-block: 0.5rem;
 }
 
-/* iOS Safari zooms the page when it focuses a text field under 16px. */
-@media (pointer: coarse) {
-	.chat-composer .composer-draft-input[contenteditable],
-	textarea,
-	select,
-	input:not([type="checkbox"], [type="radio"], [type="range"], [type="color"], [type="file"]) {
-		font-size: max(1rem, var(--text-sm));
+/*
+ * Text fields on touch never drop below the 16px that stops iOS zooming in on focus.
+ * The small type steps are raised on the field itself, so a field sized by a token, and
+ * its placeholder, resolve to 16px. Important, because an unlayered `font: inherit` or
+ * `font-size: inherit` would otherwise beat any layered floor; `1em` is the size such a
+ * field inherits, so one set in larger type keeps it. The tradeoff: a field given a larger
+ * size by its own class would fall back to its inherited size here. The document body is
+ * already 16px and keeps its smaller inline steps.
+ */
+@layer base {
+	@media (pointer: coarse) {
+		:is(textarea, select, input:not([type="checkbox"], [type="radio"], [type="range"], [type="color"], [type="file"]), [contenteditable]:not([contenteditable="false"], .plan-content)) {
+			--text-2xs: var(--field-text-min);
+			--text-xs: var(--field-text-min);
+			--text-sm: var(--field-text-min);
+			--text-base: var(--field-text-min);
+			font-size: max(var(--field-text-min), 1em) !important;
+		}
 	}
 }
 
@@ -1081,8 +1291,8 @@ button.chat-tool-call-toggle {
 		position: absolute;
 		top: 50%;
 		left: 50%;
-		width: max(100%, 44px);
-		height: max(100%, 44px);
+		width: max(100%, var(--control-target-coarse));
+		height: max(100%, var(--control-target-coarse));
 		transform: translate(-50%, -50%);
 	}
 
@@ -1130,11 +1340,12 @@ button.chat-tool-call-toggle {
 	min-width: 0;
 }
 
-.question-title {
+.question-card .question-title {
 	/* Centre the first line on the 1.5rem mark, then lift 2px optically. */
 	margin: calc((1.5rem - 1lh) / 2 - 0.125rem) 0 0;
-	font-size: var(--text-base);
-	line-height: var(--text-lg--line-height);
+	font-family: var(--font-sans);
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
 	font-weight: 600;
 	color: var(--color-text-primary);
 	overflow-wrap: break-word;
@@ -1165,7 +1376,7 @@ button.chat-tool-call-toggle {
 	position: relative;
 	display: flex;
 	align-items: flex-start;
-	gap: 0.625rem;
+	gap: var(--choice-content-gap);
 	padding: 0.375rem 0.75rem 0.375rem 0.5rem;
 	border-radius: var(--radius-md);
 	font-size: var(--text-sm);
@@ -1212,7 +1423,7 @@ label.question-option:has(.question-input:not(:disabled)) {
 	block-size: 1lh;
 }
 
-/* Same 1.5rem as the header mark, so option text shares the title's left edge. */
+/* The letter tile uses the same 1.5rem size as the header mark. */
 .question-key > span {
 	display: grid;
 	place-items: center;
@@ -1511,6 +1722,11 @@ button.question-add:disabled {
 	outline: none;
 }
 
+/* A comment composer's frame shows focus with its border; its textarea hands that over. */
+.plan-comment-composer textarea:focus {
+	outline: none;
+}
+
 /* A rendered block clips its preview's ring, so show the same ring on the outer block. */
 .plan-content .planCode :is(.plan-code-view, .plan-diagram):focus-visible {
 	outline: none;
@@ -1519,6 +1735,24 @@ button.question-add:disabled {
 :root:not([data-focus-input="pointer"])
 	.plan-content
 	.planCode:has(> [data-plan-preview] :is(.plan-code-view, .plan-diagram):focus-visible) {
+	outline: var(--focus-ring-width) solid var(--focus-ring-color);
+	outline-offset: 0;
+}
+
+/*
+ * A wireframe has no box of its own, so its stage takes the ring: on keyboard
+ * focus, and while the caret is in the source folded open below it.
+ */
+.plan-content .plan-wireframe > .wf:focus-visible {
+	outline: none;
+}
+
+.plan-content .planCode[data-plan-editing] .plan-wireframe .wf-stage,
+:root:not([data-focus-input="pointer"])
+	.plan-content
+	.plan-wireframe
+	> .wf:focus-visible
+	.wf-stage {
 	outline: var(--focus-ring-width) solid var(--focus-ring-color);
 	outline-offset: 0;
 }
@@ -1595,15 +1829,12 @@ button.question-add:disabled {
 		transition: none;
 	}
 
-	:root[data-motion-input="pointer"] .chat-toggle-icon {
+	.workspace-root[data-workspace-mode="split"] > .workspace-header-slot,
+	.workspace-root[data-workspace-mode="split"][data-header-hidden] > .workspace-header-slot {
 		transition: none;
 	}
 
 	[data-chat-enter] {
-		transition: none;
-	}
-
-	.chat-header-control {
 		transition: none;
 	}
 

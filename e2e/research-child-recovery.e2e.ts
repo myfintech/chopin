@@ -226,19 +226,38 @@ async function scriptResearch(
 
 async function startInlineResearch(page: Page, question: string) {
 	let editor = content(page);
-	await editor.click();
-	await page.keyboard.press("ControlOrMeta+End");
+	await editor.getByRole("heading", { level: 1 }).click();
+	await expect(editor).toBeFocused();
+	await page.keyboard.press(process.platform === "darwin" ? "Meta+ArrowDown" : "Control+End");
+	await expect.poll(() =>
+		editor.evaluate(element => {
+			let selection = getSelection();
+			if (!selection?.isCollapsed || !selection.anchorNode) return false;
+			if (!element.contains(selection.anchorNode)) return false;
+			let remaining = document.createRange();
+			remaining.selectNodeContents(element);
+			remaining.setStart(selection.anchorNode, selection.anchorOffset);
+			return remaining.toString() === "";
+		})
+	).toBe(true);
+	// Let the browser's selectionchange reach Lexical before the next keydown.
+	await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())));
 	await page.keyboard.press("Enter");
 	await page.keyboard.type("/research");
 	await page.keyboard.press("Enter");
 	let composer = page.getByRole("region", { name: "Research question", exact: true });
 	await composer.getByRole("textbox", { name: "Research question", exact: true }).fill(question);
+	await expect(composer).toHaveCSS("transform", "none");
 	let authoredOrder = await page.locator("[data-research-draft-anchor]").evaluate(anchor => {
 		let editor = anchor.closest('[role="textbox"][aria-label="editable markdown"]')!;
 		let block = anchor;
 		while (block.parentElement !== editor) block = block.parentElement!;
 		let next = block.nextElementSibling;
-		while (next && !next.textContent?.trim()) next = next.nextElementSibling;
+		while (
+			next && (next.classList.contains("plan-research-draft-host") || !next.textContent?.trim())
+		) {
+			next = next.nextElementSibling;
+		}
 		let previous: Element | null = block;
 		while (previous && !previous.textContent?.trim()) previous = previous.previousElementSibling!;
 		return {
@@ -247,7 +266,12 @@ async function startInlineResearch(page: Page, question: string) {
 		};
 	});
 	await page.keyboard.press("Enter");
-	await expect(composer).toHaveCount(0);
+	await expect(page.getByRole("region", {
+		name: "Research question",
+		exact: true,
+		includeHidden: true,
+	})).toHaveCount(0);
+	await expect(editor.locator(".plan-research-draft-host")).toHaveCount(0);
 	let card = page.getByRole("article", { name: "Research" }).filter({ hasText: question });
 	await expect(card).toHaveCount(1);
 	expect(
@@ -270,6 +294,87 @@ async function startInlineResearch(page: Page, question: string) {
 		.toHaveCount(0);
 	return card;
 }
+
+test(
+	"research drafts and lifecycle cards share the prose column and scroll in document flow",
+	async ({ baseURL, join, page, room, seed }, testInfo) => {
+		await seed(PARENT_SOURCE);
+		let research = await scriptResearch(page, room, port(baseURL!));
+		let opened = await join("ana");
+		await opened.setViewportSize({ width: 1500, height: 895 });
+		let hideChat = opened.getByRole("button", { name: "Expand document", exact: true });
+		if (await hideChat.isVisible()) await hideChat.click();
+		let editor = content(opened);
+		await expect.poll(async () => (await editor.locator("p").first().boundingBox())!.width)
+			.toBeCloseTo(650, 0);
+		await editor.click();
+		await opened.keyboard.press("Enter");
+		await opened.keyboard.type("/research");
+		await opened.keyboard.press("Enter");
+		let composer = opened.getByRole("region", { name: "Research question", exact: true });
+		let question = "Compare evidence without moving the research block outside the document.";
+		await composer.getByRole("textbox", { name: "Research question", exact: true }).fill(question);
+		await expect(composer).toHaveCSS("transform", "none");
+		let layout = await composer.evaluate(element => {
+			let paragraph = document.querySelector<HTMLElement>("[data-research-draft-anchor]")!;
+			let prose = paragraph.getBoundingClientRect();
+			let draft = element.getBoundingClientRect();
+			return {
+				position: getComputedStyle(element).position,
+				proseWidth: prose.width,
+				width: draft.width,
+				left: draft.left,
+				proseLeft: prose.left,
+				top: draft.top,
+				proseBottom: prose.bottom,
+			};
+		});
+		expect(layout.position).toBe("static");
+		expect(layout.proseWidth).toBeCloseTo(650, 0);
+		expect(layout.width).toBeCloseTo(layout.proseWidth, 0);
+		expect(layout.left).toBeCloseTo(layout.proseLeft, 0);
+		expect(layout.top).toBeGreaterThanOrEqual(layout.proseBottom);
+		await opened.screenshot({ path: testInfo.outputPath("research-draft-layout.png") });
+		let before = await composer.boundingBox();
+		let travelled = await editor.evaluate(element => {
+			let scroller = element.closest("[data-plan-scroll]")!;
+			let before = scroller.scrollTop;
+			scroller.scrollTop += 80;
+			return scroller.scrollTop - before;
+		});
+		expect(travelled).toBeCloseTo(80, 0);
+		await expect.poll(async () => (await composer.boundingBox())!.y - before!.y)
+			.toBeCloseTo(-travelled, 0);
+		await expect(composer.getByRole("textbox", { name: "Research question", exact: true }))
+			.toBeFocused();
+		await opened.keyboard.press("Enter");
+		await expect(opened.getByRole("region", {
+			name: "Research question",
+			exact: true,
+			includeHidden: true,
+		})).toHaveCount(0);
+		await expect(editor.locator(".plan-research-draft-host")).toHaveCount(0);
+		let card = opened.getByRole("article", { name: "Research" }).filter({ hasText: question });
+		await expect(card).toBeVisible();
+		for (let stage of ["queued", "searching", "writing"] as const) {
+			if (stage !== "queued") await research.advance(question, stage);
+			await expect(card).toHaveAttribute("data-stage", stage);
+			expect((await card.boundingBox())!.width).toBeCloseTo(layout.proseWidth, 0);
+		}
+		await research.publish(question, "Inline research report");
+		let ready = opened.getByRole("article", { name: "Research" }).filter({
+			has: opened.getByRole("button", { name: "Open Inline research report", exact: true }),
+		});
+		await expect(ready).toHaveAttribute("data-stage", "ready");
+		expect((await ready.boundingBox())!.width).toBeCloseTo(layout.proseWidth, 0);
+		await opened.screenshot({ path: testInfo.outputPath("research-ready-layout.png") });
+		await opened.setViewportSize({ width: 390, height: 844 });
+		await expect.poll(async () => {
+			let prose = (await editor.locator("p").first().boundingBox())!.width;
+			return Math.abs((await ready.boundingBox())!.width - prose);
+		}).toBeLessThan(1);
+	},
+);
 
 test("a submitted /research card stays in the document through reload", async ({ baseURL, join, page, room, seed }) => {
 	await seed(PARENT_SOURCE);
@@ -370,6 +475,8 @@ test("inline research publishes one ordinary child and opens it", async ({ baseU
 	let childLink = sidebar.getByRole("link", { name: childTitle, exact: true });
 	await expect(childLink).toBeVisible();
 	await expect(childLink).toHaveAttribute("href", child.path);
+	await expect.poll(() => catalogueReads).toBe(readsBeforePublication + 1);
+	await opened.waitForTimeout(300);
 	expect(catalogueReads).toBe(readsBeforePublication + 1);
 	await expect.poll(() => countChildChannels(databasePort, room)).toBe(1);
 
@@ -379,7 +486,17 @@ test("inline research publishes one ordinary child and opens it", async ({ baseU
 	let surface = opened.getByRole("region", { name: `Child document: ${childTitle}` });
 	await expect(opened).toHaveURL(url => url.pathname === child.path);
 	await expect(surface.locator(`[data-workspace-room="${child.id}"]`)).toBeVisible();
-	await surface.getByRole("button", { name: `Close ${childTitle}`, exact: true }).click();
+	await expect(surface.getByRole("button", { name: `Close ${childTitle}` })).toHaveCount(0);
+	await expect(surface.getByText("Discuss this report here.")).toHaveCount(0);
+	// Lift's peeking root tab row is the way back; Enter on it closes and refocuses the opener.
+	let back = opened.getByRole("button", { name: /^Back to / });
+	await surface.evaluate(async element => {
+		let finite = element.getAnimations({ subtree: true })
+			.filter(animation => animation.effect?.getComputedTiming().iterations !== Infinity);
+		await Promise.allSettled(finite.map(animation => animation.finished));
+	});
+	await back.focus();
+	await opened.keyboard.press("Enter");
 	await expect(surface).toHaveCount(0);
 	await expect(open).toBeFocused();
 });
@@ -548,8 +665,17 @@ test("a ready research card and its Chat notice survive reconnect without anothe
 	await expect(provenance.getByText(brief, { exact: true })).toBeHidden();
 	await briefToggle.click();
 	await expect(provenance.getByText(brief, { exact: true })).toBeVisible();
-	await expect(surface.getByRole("complementary", { name: "Chat" }))
-		.toContainText("Discuss this report here.");
+	let briefPanel = opened.locator(`[id="${await briefToggle.getAttribute("aria-controls")}"]`);
+	await expect(briefPanel).toHaveAttribute("data-slot", "unfold");
+	await expect(briefPanel).toHaveAttribute("data-open", "");
+	await briefToggle.click();
+	await expect(briefToggle).toHaveAttribute("aria-expanded", "false");
+	await expect(provenance.getByText(brief, { exact: true })).toBeHidden();
+	await expect(briefToggle).toBeFocused();
+	await briefToggle.click();
+	await expect(provenance.getByText(brief, { exact: true })).toBeVisible();
+	await expect(surface.getByRole("complementary", { name: "Chat" })).toHaveCount(0);
+	await expect(opened.getByRole("complementary", { name: "Chat" })).toBeVisible();
 	await provenance.getByRole("button", { name: parentTitle, exact: true }).click();
 	await expect(surface).toHaveCount(0);
 	await expect(

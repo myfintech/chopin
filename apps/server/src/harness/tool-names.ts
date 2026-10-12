@@ -1,8 +1,11 @@
 import type { ConversationPlan } from "@chopin/protocol";
-import { WRITE_TOOLS } from "../agent/job-scope";
+import { CHILD_TOOLS, INVESTIGATION_READS, WRITE_TOOLS } from "../agent/job-scope";
 import { extensionToolNames } from "../planner-extensions/config";
 
 export const PLANNER_TOOL_NAMES = [
+	"list_investigations",
+	"read_investigation",
+	"propose_investigation",
 	"read_plan",
 	"read_reference",
 	"list_background_jobs",
@@ -13,6 +16,11 @@ export const PLANNER_TOOL_NAMES = [
 	"read_implementation_graph",
 	"edit_implementation_graph",
 	"anchor_plan",
+	"reply_comment",
+	"list_children",
+	"read_child",
+	"edit_child",
+	"anchor_child",
 	"read_repository_file",
 	"list_repository_tree",
 	"search_repository",
@@ -22,8 +30,18 @@ export const PLANNER_TOOL_NAMES = [
 	"revise_open_decision",
 ];
 
+export const VISUAL_PLANNER_TOOL_NAMES = Object.freeze([
+	...PLANNER_TOOL_NAMES,
+	"assess_visual",
+]);
+
 function jobNames(own: string): readonly string[] {
-	return Object.freeze([...PLANNER_TOOL_NAMES.filter(name => !WRITE_TOOLS.has(name)), own]);
+	return Object.freeze([
+		...PLANNER_TOOL_NAMES.filter(name =>
+			!WRITE_TOOLS.has(name) && !INVESTIGATION_READS.has(name) && !CHILD_TOOLS.has(name)
+		),
+		own,
+	]);
 }
 
 export const BACKGROUND_TOOL_NAMES: Readonly<Record<ConversationPlan.JobKind, readonly string[]>> =

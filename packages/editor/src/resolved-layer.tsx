@@ -1,6 +1,10 @@
 /**
  * A resolved decision, as a marker beside the prose it produced.
  *
+ * A resolved comment whose turn edited the document stands in the same lane,
+ * in the comment's amber, beside what it wrote. The two share one pin, and
+ * markers that land on one block stack down the lane.
+ *
  * Reader-local chrome, like the comment layer it is modelled on: it is drawn
  * over the document from measurements and never put in it. Only the marker
  * answers: hovering or focusing it washes the passage and previews the
@@ -22,7 +26,14 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
-import { CheckIcon, ClockIcon, CloseIcon, DecisionIcon, MessageForwardIcon } from "@chopin/icons";
+import {
+	CheckIcon,
+	ClockIcon,
+	CloseIcon,
+	DecisionIcon,
+	MessageForwardIcon,
+	MessageIcon,
+} from "@chopin/icons";
 import { InlineCode, ResolvedActions } from "@chopin/question/react";
 import { useCellValue } from "@mdxeditor/gurx";
 
@@ -30,23 +41,31 @@ import { currentDecision, releaseDecision, subscribeDecision } from "./decision-
 import { useResolvedActions } from "./resolved-actions";
 import { decisionHostVisible } from "./decision-placement";
 import { when } from "./card";
+import { Note, stamp } from "./comments";
+import { CommentSheet, commentSheetHeading } from "./comment-sheet";
+import { displayName } from "./display-name";
 import { Face } from "./face";
+import { $rangeOf, paintShared } from "./marks";
 import {
+	commentKey,
 	COMPACT_GUTTER,
 	keyOf,
-	MARKER_SIZE,
 	markerPoint,
 	markerReach,
 	ownedPoint,
 	point,
 	popoverBelow,
+	resolvedCommentMeta,
 	resolvedKeys,
 	shown,
+	stack,
 	unchosen,
 	verticalReach,
 } from "./resolved";
 import { useQuestionnaires, useRelations } from "./questionnaires";
+import { usePhone } from "./pointer";
 import { blockElement } from "./scroll";
+import { openCommentThread } from "./threads";
 import { useTransitionPresence } from "./transition-presence";
 import { widgets$ } from "./widget-options";
 
@@ -55,6 +74,7 @@ import type { Rect } from "./comment-geometry";
 import type { Question } from "@chopin/protocol";
 import type { MarkerPlace, PointerAction } from "./resolved";
 import type { QuestionnaireStore } from "./questionnaires";
+import type { ResolvedView, ThreadStore } from "./threads";
 
 /** One answered question that has prose to sit beside. */
 type Decision = {
@@ -71,10 +91,32 @@ type Decision = {
 	meta?: Question.CardMeta;
 };
 
+/** A marker in the lane: a resolved decision, or a resolved comment that led to edits. */
+type Item =
+	| { kind: "decision"; key: string; keys: string[]; decision: Decision }
+	| { kind: "comment"; key: string; keys: string[]; comment: ResolvedView };
+
+/** The amber wash over what a resolved comment's turn wrote, while its marker is pointed at. */
+const RESOLVED_COMMENT = "plan-comment-resolved";
+
+const NO_RESOLVED: ResolvedView[] = [];
+function noThreads() {
+	return () => {};
+}
+function noResolved() {
+	return NO_RESOLVED;
+}
+
+function excerpt(text: string): string {
+	let flat = text.replace(/\s+/g, " ").trim();
+	return flat.length > 60 ? `${flat.slice(0, 59).trimEnd()}…` : flat;
+}
+
 type Placed = {
-	decision: Decision;
+	item: Item;
 	marker: MarkerPlace;
 	lineHeight: number;
+	markerSize: number;
 	anchor: Rect;
 	/** Where the prose starts, from the host's left edge. */
 	prose: number;
@@ -113,10 +155,11 @@ function lineHeightOf(element: HTMLElement): number {
 function markerStyle(
 	marker: MarkerPlace,
 	lineHeight: number,
+	markerSize: number,
 	prose: number,
 	vertical: { top: number; bottom: number },
 ): CSSProperties {
-	let width = marker.compact ? COMPACT_GUTTER : MARKER_SIZE;
+	let width = marker.compact ? COMPACT_GUTTER : markerSize;
 	let reach = markerReach(marker.left, width, prose);
 	return {
 		top: marker.top,
@@ -134,7 +177,7 @@ function markerStyle(
 }
 
 type PopoverValue = {
-	decision: Decision;
+	item: Item;
 	pinned: boolean;
 	style: CSSProperties;
 };
@@ -147,7 +190,9 @@ function Popover(
 		value: PopoverValue;
 	},
 ) {
-	let { decision, pinned } = value;
+	let { item, pinned } = value;
+	if (item.kind !== "decision") return null;
+	let { decision } = item;
 	let others = decision.others ?? [];
 	let discussion =
 		decision.meta?.involved.filter(handle => handle.toLowerCase() !== decision.by?.toLowerCase())
@@ -220,6 +265,80 @@ function Popover(
 	);
 }
 
+function CommentPopover(
+	{ close, error, onReopen, pending, sheet, value }: {
+		close: () => void;
+		error?: string;
+		onReopen?: () => void;
+		pending: boolean;
+		/** A sheet has its own close in its header row. */
+		sheet?: boolean;
+		value: PopoverValue;
+	},
+) {
+	let { item, pinned } = value;
+	if (item.kind !== "comment") return null;
+	let { thread } = item.comment;
+	let first = thread.notes[0];
+	if (!pinned) {
+		return (
+			<div className="plan-resolved-comment">
+				{first && (
+					<ol className="plan-comment-notes">
+						<Note note={first} />
+					</ol>
+				)}
+				<p className="plan-resolved-comment-meta">
+					{resolvedCommentMeta(
+						{ notes: thread.notes.length, resolver: thread.resolver },
+						displayName,
+					)}
+				</p>
+			</div>
+		);
+	}
+	let at = thread.at !== undefined ? stamp(thread.at) : "";
+	return (
+		<div className="plan-resolved-comment" data-pinned="">
+			<div className="plan-resolved-comment-head">
+				<p className="plan-resolved-comment-status">
+					<CheckIcon aria-hidden="true" size={14} />
+					<span>
+						{thread.resolver ? `Resolved by ${displayName(thread.resolver)}` : "Resolved"}
+						{at && ` · ${at}`}
+					</span>
+				</p>
+				{onReopen && (
+					<button
+						aria-disabled={pending || undefined}
+						className="btn btn-sm btn-outline"
+						// aria-disabled rather than disabled, so focus stays on the button while it works.
+						onClick={() => !pending && onReopen()}
+						type="button"
+					>
+						Reopen
+					</button>
+				)}
+				{!sheet && (
+					<button
+						aria-label="Close"
+						className="btn btn-icon btn-ghost plan-resolved-comment-close"
+						data-plan-decision-close=""
+						onClick={close}
+						type="button"
+					>
+						<CloseIcon aria-hidden="true" size={14} />
+					</button>
+				)}
+			</div>
+			<ol className="plan-comment-notes">
+				{thread.notes.map(note => <Note key={note.id} note={note} />)}
+			</ol>
+			{error && <p className="m-0 text-sm text-destructive-ink" role="alert">{error}</p>}
+		</div>
+	);
+}
+
 function Surface(
 	{ id, immediately, onMeasure, render, value }: {
 		id: string;
@@ -246,11 +365,14 @@ function Surface(
 	return (
 		<div
 			aria-hidden={active ? undefined : "true"}
-			aria-label={current.pinned ? "Decision" : undefined}
+			aria-label={current.pinned
+				? current.item.kind === "comment" ? "Resolved comment" : "Decision"
+				: undefined}
 			className={`plan-comment-preview plan-decision-pop motion-comment-preview ${presence.className}`}
+			data-kind={current.item.kind}
 			data-motion-immediate={immediately || undefined}
 			data-pinned={current.pinned ? "" : undefined}
-			data-plan-decision-pop={current.decision.key}
+			data-plan-decision-pop={current.item.key}
 			id={id}
 			inert={!active}
 			ref={element}
@@ -262,12 +384,21 @@ function Surface(
 	);
 }
 
-export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
+export function ResolvedLayer(
+	{ store, threads }: { store: QuestionnaireStore; threads?: ThreadStore },
+) {
 	let [editor] = useLexicalComposerContext();
+	let resolvedComments = useSyncExternalStore(
+		threads?.subscribe ?? noThreads,
+		threads ? () => threads.snapshot().resolved : noResolved,
+		noResolved,
+	);
+	let [reopening, setReopening] = useState<{ key: string; error?: string }>();
 	let options = useCellValue(widgets$);
 	let entries = useQuestionnaires(store);
 	let relations = useRelations(store);
 	let [host, setHost] = useState<HTMLElement>();
+	let scroller = useMemo(() => host?.querySelector<HTMLElement>("[data-plan-scroll]"), [host]);
 	let [placed, setPlaced] = useState<Placed[]>([]);
 	let [pointer, dispatch] = useReducer(point, {});
 	let pointerRef = useRef(pointer);
@@ -290,6 +421,8 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 	}, []);
 	let [height, setHeight] = useState(0);
 	let root = useRef<HTMLDivElement>(null);
+	let markers = useRef<HTMLDivElement>(null);
+	let markerProbe = useRef<HTMLSpanElement>(null);
 	let wasVisible = useRef(false);
 	let leaving = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 	let painted = useRef(false);
@@ -297,6 +430,13 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 	let pressing = useRef(false);
 	let enterPopover = useRef(false);
 	let origin = useRef<HTMLElement | undefined>(undefined);
+	// On a phone a pinned resolved comment opens in the comment sheet, not a popover over the prose.
+	let phone = usePhone();
+	let compact = options.commentPresentation === "sheet" && phone;
+	let compactRef = useRef(compact);
+	compactRef.current = compact;
+	// A modal sheet hides the document from assistive tech; that is not the document going away.
+	let sheetOpen = useRef(false);
 
 	let decisions = useMemo<Decision[]>(() => {
 		let out: Decision[] = [];
@@ -329,10 +469,26 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 		return out;
 		// `relations` is what says the blocks behind a decision were re-resolved.
 	}, [entries, meta, relations, store]);
-	let decisionsRef = useRef(decisions);
-	decisionsRef.current = decisions;
+	let items = useMemo<Item[]>(() => [
+		...decisions.map((decision): Item => ({
+			kind: "decision",
+			key: decision.key,
+			keys: decision.keys,
+			decision,
+		})),
+		...resolvedComments.map((comment): Item => ({
+			kind: "comment",
+			key: commentKey(comment.thread.id),
+			keys: comment.keys,
+			comment,
+		})),
+	], [decisions, resolvedComments]);
+	let itemsRef = useRef(items);
+	itemsRef.current = items;
 
 	useEffect(() => editor.registerEditableListener(setEditable), [editor]);
+	// Reopening and discarding are sidecar actions, not prose edits, so a phone reader keeps them.
+	let actionable = editable || (options.editMode === "reading" && !options.blocked);
 	useEffect(() => {
 		let off = subscribeDecision(() => {
 			let current = currentDecision();
@@ -354,7 +510,7 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 	}, []);
 	let actions = useResolvedActions({
 		canEdit: options.canEdit !== false && options.connected === true
-			&& editable,
+			&& actionable,
 		dismiss: closeAfterReply,
 		editor,
 		entries,
@@ -372,6 +528,7 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 	}, [editor]);
 
 	let measure = useCallback(() => {
+		if (sheetOpen.current) return;
 		if (!host || !decisionHostVisible(host)) {
 			if (wasVisible.current) act({ type: "dismiss" });
 			wasVisible.current = false;
@@ -379,13 +536,21 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 			return;
 		}
 		wasVisible.current = true;
+		let probe = markerProbe.current;
+		if (!probe) return;
+		let markerSize = Number.parseFloat(getComputedStyle(probe).inlineSize);
+		if (!Number.isFinite(markerSize) || markerSize <= 0) {
+			setPlaced([]);
+			return;
+		}
 		let page = rect(host.getBoundingClientRect());
+		let markerHost = scroller ? rect(scroller.getBoundingClientRect()) : page;
 		let next: Placed[] = [];
-		for (let decision of decisionsRef.current) {
+		for (let item of itemsRef.current) {
 			try {
 				let elements = [
 					...new Set(
-						decision.keys.map(key => blockElement(editor, key)).filter(
+						item.keys.map(key => blockElement(editor, key)).filter(
 							(element): element is HTMLElement => !!element?.isConnected,
 						),
 					),
@@ -398,20 +563,35 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 				let first = rects.reduce((top, value) => value.top < top.top ? value : top);
 				let element = elements[rects.indexOf(first)]!;
 				let lineHeight = lineHeightOf(element);
-				let marker = markerPoint(first, lineHeight, page);
-				next.push({ decision, marker, lineHeight, anchor: first, prose: first.left - page.left });
+				let marker = markerPoint(first, lineHeight, markerHost, markerSize);
+				let prose = first.left - markerHost.left;
+				// Content coordinates let the browser carry markers with native scrolling.
+				if (scroller) {
+					marker.top += scroller.scrollTop - scroller.clientTop;
+					marker.left += scroller.scrollLeft - scroller.clientLeft;
+					prose += scroller.scrollLeft - scroller.clientLeft;
+				}
+				next.push({ item, marker, markerSize, lineHeight, anchor: first, prose });
 			} catch (error) {
 				// A bad anchor must not break Lexical's update listener.
-				console.error(`[plan] could not place decision ${decision.key}:`, error);
+				console.error(`[plan] could not place marker ${item.key}:`, error);
 			}
 		}
+		let tops = stack(next.map(({ lineHeight, marker, markerSize }) => ({
+			top: marker.top,
+			left: marker.left,
+			height: marker.compact ? lineHeight : markerSize,
+		})));
+		next.forEach((entry, index) => {
+			entry.marker.top = tops[index]!;
+		});
 		setPlaced(next);
-		act({ type: "prune", live: new Set(next.map(item => item.decision.key)) });
-	}, [act, editor, host]);
+		act({ type: "prune", live: new Set(next.map(entry => entry.item.key)) });
+	}, [act, editor, host, scroller]);
 
 	useLayoutEffect(() => {
 		measure();
-	}, [measure, decisions]);
+	}, [measure, items]);
 
 	useEffect(() => {
 		if (!host) return;
@@ -419,6 +599,7 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 		host.addEventListener("scroll", measure, true);
 		let observer = new ResizeObserver(measure);
 		observer.observe(host);
+		if (markerProbe.current) observer.observe(markerProbe.current);
 		// React card collapses move prose without resizing the host or updating Lexical.
 		let offRoot = editor.registerRootListener((element, previous) => {
 			if (previous) observer.unobserve(previous);
@@ -443,8 +624,8 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 	}, [editor, host, measure]);
 
 	useEffect(() => {
-		act({ type: "prune", live: new Set(decisions.map(decision => decision.key)) });
-	}, [act, decisions]);
+		act({ type: "prune", live: new Set(items.map(item => item.key)) });
+	}, [act, items]);
 
 	let enter = useCallback((key: string) => {
 		clearTimeout(leaving.current);
@@ -472,6 +653,18 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 		act({ type: "dismiss" });
 		restoreFocus();
 	}, [act, restoreFocus]);
+	// The sheet still holds focus as it closes, so give it back once it has gone.
+	let dismissSheet = useCallback(() => {
+		act({ type: "dismiss" });
+		let target = origin.current;
+		requestAnimationFrame(() => {
+			if (!target?.isConnected) return;
+			// Giving focus back is not a request for the preview.
+			restoring.current = true;
+			target.focus({ preventScroll: true });
+			restoring.current = false;
+		});
+	}, [act]);
 
 	useEffect(() => {
 		if (!pointer.pinned || !enterPopover.current) return;
@@ -480,10 +673,19 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 	}, [pointer.pinned]);
 
 	let view = shown(pointer);
-	let open = view ? placed.find(entry => entry.decision.key === view.key) : undefined;
+	let open = view ? placed.find(entry => entry.item.key === view.key) : undefined;
+	let sheet = compact && open && view?.pinned && open.item.kind === "comment"
+		? open.item
+		: undefined;
+	let sheetKey = sheet?.key;
+	// Measuring waits while the sheet is up, and catches up on what moved once it goes.
+	useLayoutEffect(() => {
+		sheetOpen.current = !!sheetKey;
+		if (!sheetKey) measure();
+	}, [measure, sheetKey]);
 
 	// One wash at a time, and only the one this layer put up is taken down.
-	let openKey = open?.decision.key;
+	let openKey = open?.item.key;
 	useEffect(() => {
 		if (!host || !decisionHostVisible(host)) return;
 		let decision = decisions.find(item => item.key === openKey);
@@ -501,11 +703,19 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 		if (!pointer.pinned && !pointer.hover) return;
 		let outside = (event: PointerEvent) => {
 			if (!pointer.pinned) return;
+			// The sheet closes itself, from its backdrop, close or a swipe.
+			if (
+				(event.target as Element).closest?.(
+					"[data-plan-comment-sheet], [data-plan-comment-sheet-backdrop]",
+				)
+			) return;
 			if (root.current?.contains(event.target as Node)) return;
+			if (markers.current?.contains(event.target as Node)) return;
 			act({ type: "dismiss" });
 		};
 		let escape = (event: KeyboardEvent) => {
 			if (event.key !== "Escape") return;
+			if (compactRef.current && document.querySelector("[data-plan-comment-sheet]")) return;
 			// A hover preview goes quietly; only a pinned popover owns the key, so
 			// Escape still reaches whatever else (a child document) it would close.
 			if (pointer.pinned) event.preventDefault();
@@ -519,27 +729,72 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 		};
 	}, [act, dismiss, pointer.hover, pointer.pinned]);
 
+	// A resolved comment washes what its turn wrote, in the comment's amber, while
+	// its marker is pointed at. Repainted with every placement, because ranges go
+	// stale as the prose moves.
+	let openComment = open?.item.kind === "comment" ? open.item.comment : undefined;
+	useEffect(() => {
+		if (!openComment) return;
+		let ranges: Range[] = [];
+		try {
+			editor.getEditorState().read(() => {
+				for (let points of openComment.places) {
+					let range = $rangeOf(editor, points);
+					if (range) ranges.push(range);
+				}
+			});
+		} catch (error) {
+			console.error("[plan] could not wash a resolved comment:", error);
+		}
+		paintShared(RESOLVED_COMMENT, editor, ranges);
+		return () => paintShared(RESOLVED_COMMENT, editor, []);
+	}, [editor, openComment, placed]);
+
+	let reopen = useCallback((key: string, id: string) => {
+		if (!threads) return;
+		setReopening({ key });
+		void threads.reopen(id).then(outcome => {
+			// Somebody else reopened it first: it is open, which is what was asked.
+			if (!outcome.ok && outcome.reason !== "open") {
+				setReopening({
+					key,
+					error: outcome.reason === "full"
+						? "Couldn’t reopen: this document has too many open comments"
+						: "Couldn’t reopen the comment",
+				});
+				return;
+			}
+			setReopening(undefined);
+			releaseDecision(owner.current);
+			pointerRef.current = {};
+			dispatch({ type: "dismiss" });
+			// The comment layer opens the card once the thread has its passage back.
+			openCommentThread(id, { channel: threads.channel, focus: true });
+		});
+	}, [threads]);
+
 	if (!host) return null;
 
 	let page = rect(host.getBoundingClientRect());
 	let width = Math.min(POPOVER_WIDTH, host.clientWidth - 16);
 	let value: PopoverValue | undefined;
-	if (open && view) {
+	if (open && view && !sheet) {
 		let at = popoverBelow(open.anchor, page, width, height);
 		let maxHeight = Math.max(0, page.height - 16);
-		if (open.decision.meta) {
+		if (open.item.kind === "comment" || open.item.decision.meta) {
 			at.top = Math.max(0, Math.min(at.top, page.height - Math.min(height, maxHeight) - 8));
 		}
+		let scrolls = open.item.kind === "comment" || !!open.item.decision.meta;
 		value = {
-			decision: open.decision,
+			item: open.item,
 			pinned: view.pinned,
-			style: { ...at, width, ...(open.decision.meta ? { maxHeight, overflowY: "auto" } : {}) },
+			style: { ...at, width, ...(scrolls ? { maxHeight, overflowY: "auto" } : {}) },
 		};
 	}
 	let vertical = verticalReach(
-		placed.map(({ lineHeight, marker }) => ({
+		placed.map(({ lineHeight, marker, markerSize }) => ({
 			top: marker.top,
-			height: marker.compact ? lineHeight : MARKER_SIZE,
+			height: marker.compact ? lineHeight : markerSize,
 		})),
 	);
 	let popoverId = "plan-decision-pop";
@@ -547,56 +802,91 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 
 	return createPortal(
 		<div className="plan-decision-layer" ref={root}>
-			{placed.map(({ decision, lineHeight, marker, prose }, index) => {
-				let isPinned = pointer.pinned === decision.key;
-				let previewing = view?.key === decision.key && !view.pinned;
-				return (
-					<button
-						aria-controls={view?.key === decision.key && view.pinned ? popoverId : undefined}
-						aria-describedby={previewing ? popoverId : undefined}
-						aria-expanded={isPinned}
-						aria-label={`Decision: ${decision.answer}`}
-						className="plan-decision-marker"
-						data-plan-decision-marker={decision.key}
-						data-press="small"
-						key={decision.key}
-						onBlur={() => {
-							pressing.current = false;
-							leave(decision.key);
-						}}
-						onClick={event => {
-							pressing.current = false;
-							origin.current = event.currentTarget;
-							// Detail 0 is a key press: the popover is not next in tab order,
-							// so focus goes to it rather than leaving the reader to find it.
-							enterPopover.current = event.detail === 0 && !isPinned;
-							act({ type: "toggle", key: decision.key });
-						}}
-						onFocus={() => !restoring.current && !pressing.current && enter(decision.key)}
-						onPointerDown={() => {
-							// A press focuses too; a mouse already showed the preview and touch has none.
-							pressing.current = true;
-						}}
-						onPointerEnter={event => event.pointerType !== "touch" && enter(decision.key)}
-						onPointerLeave={() => leave(decision.key)}
-						data-compact={marker.compact || undefined}
-						style={markerStyle(marker, lineHeight, prose, vertical[index]!)}
-						type="button"
-					>
-						<span className="plan-decision-disc">
-							<DecisionIcon aria-hidden="true" />
-						</span>
-					</button>
-				);
-			})}
+			{createPortal(
+				<div className="plan-decision-layer" ref={markers}>
+					<span
+						aria-hidden="true"
+						className="plan-decision-disc plan-decision-size-probe"
+						ref={markerProbe}
+					/>
+					{placed.map(({ item, lineHeight, marker, markerSize, prose }, index) => {
+						let key = item.key;
+						let isPinned = pointer.pinned === key;
+						let previewing = view?.key === key && !view.pinned;
+						let opening = item.kind === "comment" ? item.comment.thread.notes[0]?.text : undefined;
+						return (
+							<button
+								aria-controls={view?.key === key && view.pinned ? popoverId : undefined}
+								aria-describedby={previewing ? popoverId : undefined}
+								aria-expanded={isPinned}
+								aria-label={item.kind === "decision"
+									? `Decision: ${item.decision.answer}`
+									: `Resolved comment${opening ? `: ${excerpt(opening)}` : ""}`}
+								className="plan-decision-marker"
+								data-kind={item.kind}
+								data-plan-decision-marker={key}
+								data-press="small"
+								key={key}
+								onBlur={() => {
+									pressing.current = false;
+									leave(key);
+								}}
+								onClick={event => {
+									pressing.current = false;
+									origin.current = event.currentTarget;
+									// Detail 0 is a key press: the popover is not next in tab order,
+									// so focus goes to it rather than leaving the reader to find it.
+									enterPopover.current = event.detail === 0 && !isPinned;
+									act({ type: "toggle", key });
+								}}
+								onFocus={() => !restoring.current && !pressing.current && enter(key)}
+								onPointerDown={() => {
+									// A press focuses too; a mouse already showed the preview and touch has none.
+									pressing.current = true;
+								}}
+								onPointerEnter={event => event.pointerType !== "touch" && enter(key)}
+								onPointerLeave={() => leave(key)}
+								data-compact={marker.compact || undefined}
+								style={markerStyle(marker, lineHeight, markerSize, prose, vertical[index]!)}
+								type="button"
+							>
+								<span className="plan-decision-disc">
+									{item.kind === "decision"
+										? <DecisionIcon aria-hidden="true" />
+										: <MessageIcon aria-hidden="true" />}
+								</span>
+							</button>
+						);
+					})}
+				</div>,
+				scroller ?? host,
+			)}
 			<Surface
 				id={popoverId}
 				immediately={immediately}
 				onMeasure={setHeight}
 				render={current => {
-					let decision = current.decision;
+					if (current.item.kind === "comment") {
+						let { item } = current;
+						let canReopen = !!threads && options.canEdit !== false && options.connected === true
+							&& actionable;
+						return (
+							<CommentPopover
+								close={dismiss}
+								error={reopening?.key === item.key ? reopening.error : undefined}
+								onReopen={canReopen
+									? () => reopen(item.key, item.comment.thread.id)
+									: undefined}
+								pending={reopening?.key === item.key && !reopening.error}
+								value={current}
+							/>
+						);
+					}
+					let decision = current.item.decision;
 					let error = actions.error?.key === decision.key ? actions.error.message : undefined;
-					let pending = actions.pending?.key === decision.key ? actions.pending.kind : undefined;
+					let pending = actions.pending?.key === decision.key
+						? actions.pending.kind
+						: undefined;
 					return (
 						<Popover
 							close={dismiss}
@@ -618,7 +908,7 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 									<ResolvedActions
 										className="mt-3 flex flex-wrap items-center justify-end gap-2"
 										disabled={options.canEdit === false || options.connected !== true
-											|| !editable || !options.wire}
+											|| !actionable || !options.wire}
 										key={`${decision.key}:${intent.current}`}
 										onDiscard={() => actions.request("discard", decision)}
 										onReopen={() => actions.request("reopen", decision)}
@@ -631,6 +921,33 @@ export function ResolvedLayer({ store }: { store: QuestionnaireStore }) {
 				}}
 				value={value}
 			/>
+			{sheet && (
+				<CommentSheet
+					heading={commentSheetHeading({
+						kind: "thread",
+						quote: sheet.comment.thread.quote ?? "",
+						siblings: 1,
+					})}
+					id={popoverId}
+					key={sheet.key}
+					label="Resolved comment"
+					onClose={dismissSheet}
+				>
+					<div className="plan-resolved-comment-sheet">
+						<CommentPopover
+							close={dismiss}
+							error={reopening?.key === sheet.key ? reopening.error : undefined}
+							onReopen={!!threads && options.canEdit !== false && options.connected === true
+									&& actionable
+								? () => reopen(sheet.key, sheet.comment.thread.id)
+								: undefined}
+							pending={reopening?.key === sheet.key && !reopening.error}
+							sheet
+							value={{ item: sheet, pinned: true, style: {} }}
+						/>
+					</div>
+				</CommentSheet>
+			)}
 		</div>,
 		host,
 	);

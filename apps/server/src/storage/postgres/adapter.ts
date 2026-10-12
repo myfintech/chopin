@@ -3,10 +3,13 @@ import { SQL } from "bun";
 import { documentSlug, documentSlugCandidate } from "../../channels/slug";
 import { availableChannelTitle } from "../../channels/title";
 import { sidecarUnansweredDecisions } from "../../questions/unanswered";
+import { childSidecarWithoutConversation } from "../child-conversation";
 import { conflict, corrupt, missing, StorageError, unavailable } from "../errors";
 import { migrate, verifyMigrations } from "./migrations";
 import { PostgresNavigationStore } from "./navigation";
 import { PostgresBackgroundJobStore } from "./jobs";
+import { PostgresExperimentStore } from "./experiments";
+import { PostgresImageStore } from "./images";
 import { PostgresResearchWorkspaceStore } from "./research";
 import { PostgresPreferenceStore } from "../../user-preferences/postgres";
 import { PostgresProvenanceStore } from "../../document-provenance/postgres";
@@ -472,14 +475,63 @@ const LEASE_COLUMNS = `
 	expires_at AS "expiresAt"
 `;
 
+/** Longest a lease renewal statement may run before PostgreSQL cancels it. */
+const LEASE_RENEW_TIMEOUT_MS = 5_000;
+/** Longest renewal waits for the lease row, so a lock wait ends before the statement timeout. */
+const LEASE_RENEW_LOCK_TIMEOUT_MS = 4_000;
+/**
+ * Longest PostgreSQL keeps a renewal transaction that has gone quiet. A renewal whose
+ * client lost the network mid-transaction would otherwise hold the lease row indefinitely.
+ */
+const LEASE_RENEW_IDLE_MS = 2_000;
+/** Abandon a renewal connection that has not answered shortly after its statement timeout. */
+const LEASE_RENEW_STALL_MS = LEASE_RENEW_TIMEOUT_MS + 1_000;
+/**
+ * Bun closes gracefully when `timeout` is 0, waiting for pending queries, so a stalled
+ * connection is closed with the smallest positive timeout, which drops its socket.
+ */
+const FORCE_CLOSE = { timeout: 0.001 };
+
+type LeaseConnection = { sql: SQL; name: string };
+
+function leaseConnection(url: string): LeaseConnection {
+	// A name unique to this connection lets the main pool find and end its session.
+	let name = `chopin-lease-renewal-${crypto.randomUUID()}`;
+	let sql = new SQL(url, {
+		connectionTimeout: 5,
+		idleTimeout: 30,
+		max: 1,
+		connection: {
+			application_name: name,
+			statement_timeout: LEASE_RENEW_TIMEOUT_MS,
+			lock_timeout: LEASE_RENEW_LOCK_TIMEOUT_MS,
+			idle_in_transaction_session_timeout: LEASE_RENEW_IDLE_MS,
+		},
+	});
+	return { sql, name };
+}
+
 /** PostgreSQL is the reference implementation, not part of the storage contract. */
 export class PostgresStorage implements StorageAdapter {
 	readonly driver = "postgres";
 	readonly #sql: SQL;
+	readonly #url: string;
+	// Renewal has its own connection so a busy pool cannot delay it past the lease.
+	#renewal: LeaseConnection;
 
 	constructor(url: string) {
+		this.#url = url;
 		this.#sql = new SQL(url, { connectionTimeout: 10, idleTimeout: 30, max: 10 });
+		this.#renewal = leaseConnection(url);
+		this.experiments = new PostgresExperimentStore(
+			this.#sql,
+			(sql, lease) => this.#assertLease(sql, lease),
+		);
 		this.navigation = new PostgresNavigationStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+		);
+		this.images = new PostgresImageStore(
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
 		);
@@ -631,8 +683,10 @@ export class PostgresStorage implements StorageAdapter {
 	};
 
 	readonly navigation: NavigationStore;
+	readonly experiments: PostgresExperimentStore;
 	readonly jobs: BackgroundJobStore;
 	readonly research: ResearchWorkspaceStore;
+	readonly images: PostgresImageStore;
 	readonly preferences: PreferenceStore;
 	readonly provenance: PostgresProvenanceStore;
 
@@ -644,6 +698,17 @@ export class PostgresStorage implements StorageAdapter {
 				SELECT ${this.#sql.unsafe(CHANNEL_COLUMNS)} FROM channels WHERE id = ${id}
 			`;
 				return found ? channel(found) : undefined;
+			}),
+		children: (parentId, limit) =>
+			this.#run("list child channels", async () => {
+				let rows = await this.#sql<ChannelRow[]>`
+					SELECT ${this.#sql.unsafe(CHANNEL_COLUMNS)}
+					FROM channels
+					WHERE parent_channel_id = ${parentId} AND archived_at IS NULL
+					ORDER BY created_at, id
+					LIMIT ${limit}
+				`;
+				return rows.map(channel);
 			}),
 		resolve: (repositoryId, slug) =>
 			this.#run("resolve channel slug", async () => {
@@ -683,6 +748,7 @@ export class PostgresStorage implements StorageAdapter {
 		commit: input => this.#commit(input),
 		replace: input => this.#replace(input),
 		checkpoint: input => this.#checkpoint(input),
+		dropChildConversations: lease => this.#dropChildConversations(lease),
 	};
 
 	readonly leases: LeaseStore = {
@@ -706,7 +772,7 @@ export class PostgresStorage implements StorageAdapter {
 	}
 
 	async close(): Promise<void> {
-		await this.#sql.close({ timeout: 5 });
+		await Promise.all([this.#sql.close({ timeout: 5 }), this.#renewal.sql.close({ timeout: 5 })]);
 	}
 
 	async #run<T>(action: string, execute: () => Promise<T>): Promise<T> {
@@ -1573,6 +1639,59 @@ export class PostgresStorage implements StorageAdapter {
 			}));
 	}
 
+	#dropChildConversations(lease: Lease): Promise<{ cleared: string[]; kept: string[] }> {
+		return this.#run("drop child conversations", () =>
+			this.#sql.begin(async transaction => {
+				await this.#assertLease(transaction, lease);
+				let rows = await transaction<
+					{ channelId: string; current: unknown; checkpointed: unknown }[]
+				>`
+					SELECT
+						channel_state.channel_id AS "channelId",
+						channel_state.sidecar AS current,
+						channel_snapshots.sidecar AS checkpointed
+					FROM channel_state
+					JOIN channels ON channels.id = channel_state.channel_id
+					LEFT JOIN channel_snapshots
+						ON channel_snapshots.channel_id = channel_state.channel_id
+					WHERE channels.parent_channel_id IS NOT NULL
+					ORDER BY channel_state.channel_id
+					FOR UPDATE OF channel_state
+				`;
+				let cleared: string[] = [];
+				let kept: string[] = [];
+				for (let row of rows) {
+					let current = childSidecarWithoutConversation(row.current);
+					let checkpointed = childSidecarWithoutConversation(row.checkpointed);
+					if (current === "kept" || checkpointed === "kept") {
+						kept.push(row.channelId);
+						continue;
+					}
+					if (current === "unchanged" && checkpointed === "unchanged") continue;
+					if (current !== "unchanged") {
+						await transaction`
+							UPDATE channel_state
+							SET sidecar = ${JSON.stringify(current)}::jsonb
+							WHERE channel_id = ${row.channelId}
+						`;
+					}
+					if (checkpointed !== "unchanged") {
+						await transaction`
+							UPDATE channel_snapshots
+							SET sidecar = ${JSON.stringify(checkpointed)}::jsonb
+							WHERE channel_id = ${row.channelId}
+						`;
+					}
+					await transaction`
+						UPDATE agent_state SET summary = '', transcript_cursor = 0
+						WHERE channel_id = ${row.channelId}
+					`;
+					cleared.push(row.channelId);
+				}
+				return { cleared, kept };
+			}));
+	}
+
 	#replace(input: ReplaceChannel): Promise<CommitResult> {
 		return this.#run("replace channel", () =>
 			this.#sql.begin(async transaction => {
@@ -1652,42 +1771,92 @@ export class PostgresStorage implements StorageAdapter {
 	}
 
 	#acquire(name: string, owner: string, ttlMs: number): Promise<Lease | undefined> {
-		return this.#run("acquire storage lease", async () => {
-			let [saved] = await this.#sql<LeaseRow[]>`
-				INSERT INTO storage_leases (name, owner, fencing, expires_at)
-				VALUES (
-					${name}, ${owner}, 1,
-					clock_timestamp() + (${ttlMs} * interval '1 millisecond')
-				)
-				ON CONFLICT (name) DO UPDATE SET
-					owner = EXCLUDED.owner,
-					fencing = CASE
-						WHEN storage_leases.owner = EXCLUDED.owner
-							AND storage_leases.expires_at > clock_timestamp()
-						THEN storage_leases.fencing
-						ELSE storage_leases.fencing + 1
-					END,
-					expires_at = EXCLUDED.expires_at
-				WHERE storage_leases.expires_at <= clock_timestamp()
-					OR storage_leases.owner = EXCLUDED.owner
-				RETURNING ${this.#sql.unsafe(LEASE_COLUMNS)}
-			`;
-			return saved ? lease(saved) : undefined;
-		});
+		return this.#run("acquire storage lease", () =>
+			this.#sql.begin(async transaction => {
+				let [created] = await transaction<LeaseRow[]>`
+					INSERT INTO storage_leases (name, owner, fencing, expires_at)
+					VALUES (
+						${name}, ${owner}, 1,
+						clock_timestamp() + (${ttlMs} * interval '1 millisecond')
+					)
+					ON CONFLICT (name) DO NOTHING
+					RETURNING ${transaction.unsafe(LEASE_COLUMNS)}
+				`;
+				if (created) return lease(created);
+				// Fenced writes hold FOR KEY SHARE on this row, which an UPDATE alone would
+				// not wait for. FOR UPDATE keeps a takeover behind every write in flight.
+				await transaction`SELECT name FROM storage_leases WHERE name = ${name} FOR UPDATE`;
+				let [saved] = await transaction<LeaseRow[]>`
+					UPDATE storage_leases
+					SET
+						owner = ${owner},
+						fencing = CASE
+							WHEN owner = ${owner} AND expires_at > clock_timestamp() THEN fencing
+							ELSE fencing + 1
+						END,
+						expires_at = clock_timestamp() + (${ttlMs} * interval '1 millisecond')
+					WHERE name = ${name}
+						AND (expires_at <= clock_timestamp() OR owner = ${owner})
+					RETURNING ${transaction.unsafe(LEASE_COLUMNS)}
+				`;
+				return saved ? lease(saved) : undefined;
+			}));
 	}
 
 	#renew(held: Lease, ttlMs: number): Promise<Lease | undefined> {
 		return this.#run("renew storage lease", async () => {
-			let [saved] = await this.#sql<LeaseRow[]>`
-				UPDATE storage_leases
-				SET expires_at = clock_timestamp() + (${ttlMs} * interval '1 millisecond')
-				WHERE name = ${held.name}
-					AND owner = ${held.owner}
-					AND fencing = ${held.fencing}
-					AND expires_at > clock_timestamp()
-				RETURNING ${this.#sql.unsafe(LEASE_COLUMNS)}
-			`;
-			return saved ? lease(saved) : undefined;
+			let renewal = this.#renewal;
+			let sql = renewal.sql;
+			let stalled = false;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			let deadline = new Promise<never>((_, reject) => {
+				timer = setTimeout(() => {
+					stalled = true;
+					reject(new Error(`no reply within ${LEASE_RENEW_STALL_MS} ms`));
+				}, LEASE_RENEW_STALL_MS);
+			});
+			try {
+				let [saved] = await Promise.race([
+					sql.begin(async transaction => {
+						// Lock first and check expiry afterwards. A single UPDATE that waited for the
+						// row would keep its pre-wait expiry check unless the blocker changed the row,
+						// so a takeover that only locked it could let an expired lease be extended.
+						// FOR NO KEY UPDATE still does not wait for fenced writes' FOR KEY SHARE.
+						await transaction`
+							SELECT name FROM storage_leases WHERE name = ${held.name} FOR NO KEY UPDATE
+						`;
+						// The columns are spelled out: Bun registers a `transaction.unsafe` fragment as
+						// a pending query that nothing awaits, so closing the stalled connection
+						// would reject it as an unhandled rejection.
+						return transaction<LeaseRow[]>`
+							UPDATE storage_leases
+							SET expires_at = clock_timestamp() + (${ttlMs} * interval '1 millisecond')
+							WHERE name = ${held.name}
+								AND owner = ${held.owner}
+								AND fencing = ${held.fencing}
+								AND expires_at > clock_timestamp()
+							RETURNING name, owner, fencing, expires_at AS "expiresAt"
+						`;
+					}),
+					deadline,
+				]);
+				return saved ? lease(saved) : undefined;
+			} finally {
+				clearTimeout(timer);
+				if (stalled && this.#renewal === renewal) {
+					// The server's statement timeout did not answer, so the connection is
+					// presumed dead. The next attempt reconnects instead of queueing behind it.
+					this.#renewal = leaseConnection(this.#url);
+					void sql.close(FORCE_CLOSE).catch(() => {});
+					// The server may never see that close. Its idle-in-transaction timeout should
+					// already have ended an abandoned transaction; terminating it is a backstop.
+					void this.#sql`
+						SELECT pg_terminate_backend(pid)
+						FROM pg_stat_activity
+						WHERE application_name = ${renewal.name}
+					`.catch(() => {});
+				}
+			}
 		});
 	}
 
@@ -1704,11 +1873,16 @@ export class PostgresStorage implements StorageAdapter {
 	}
 
 	async #assertLease(transaction: TransactionSQL, held: Lease): Promise<void> {
+		// Fenced writes for one lease run one at a time, as they did when each took the
+		// lease row FOR UPDATE. The row itself is only FOR KEY SHARE: that conflicts with a
+		// takeover's FOR UPDATE, so no new holder can commit while this write is in flight,
+		// but not with renewal's UPDATE of expires_at, which must never wait for a write.
+		await transaction`SELECT pg_advisory_xact_lock(2043237433, hashtext(${held.name}))`;
 		let [locked] = await transaction<{ name: string }[]>`
 			SELECT name
 			FROM storage_leases
 			WHERE name = ${held.name}
-			FOR UPDATE
+			FOR KEY SHARE
 		`;
 		if (!locked) throw conflict(`storage lease ${held.name} is no longer held`);
 		let [active] = await transaction<{ name: string }[]>`

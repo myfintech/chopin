@@ -7,9 +7,9 @@
  * the source reads correctly on its own.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { cardStatus } from "@chopin/dialect";
-import { DecisionIcon, MessageForwardIcon } from "@chopin/icons";
+import { ChevronIcon, DecisionIcon, MessageForwardIcon } from "@chopin/icons";
 import {
 	cardRelation,
 	NOT_LINKED,
@@ -22,8 +22,13 @@ import { useCellValue } from "@mdxeditor/gurx";
 import { Provenance, SidecarCard } from "../card";
 import { useCardMeta } from "../card-meta";
 import { ContentSwapLayer } from "../content-swap";
+import { Deck } from "../deck";
+import { deckLayout } from "../deck-runs";
 import { EvidenceHover, EvidenceTrigger } from "./evidence-hover";
 import { PresenceFaces, withoutSelf } from "../presence-faces";
+import { usePhone } from "../pointer";
+import { PendingAnswersContext } from "../save-bar";
+import { forget, remember, selectionOf, stillMine, useSelections, withChange } from "../touched";
 import { useRelations } from "../questionnaires";
 import { widgets$ } from "../widget-options";
 import { useTransitionPresence } from "../transition-presence";
@@ -35,6 +40,8 @@ import type { Transport } from "@chopin/question/react";
 import type { Answer, Relation } from "@chopin/question";
 import type { Questionnaire, QuestionnaireNode } from "@chopin/dialect";
 import type { QuestionStepMotion } from "../widget-options";
+import type { MemberState } from "../deck-runs";
+import type { QuestionnaireEntry } from "../questionnaires";
 
 /** The plan stores the chosen text; the shared view wants answer records. */
 function answers(value: Questionnaire): Answer[] | undefined {
@@ -316,6 +323,10 @@ function Undecided(
 	let answerable = connected && !!state.definition;
 	let editable = canEdit && answerable;
 	let previous = previousAnswers(value);
+	let pending = useContext(PendingAnswersContext);
+	// Counted in the save bar only while the shared draft still says what this person chose.
+	let selections = useSelections(value.id);
+	let touched = stillMine(selections, state.drafts);
 
 	return (
 		<SidecarCard
@@ -354,7 +365,12 @@ function Undecided(
 				onDiscard={editable ? state.discard : undefined}
 				onChange={editable ? state.change : undefined}
 				onQuestionFocus={editable ? state.focusQuestion : undefined}
-				onSubmit={editable ? state.submit : undefined}
+				onSubmit={editable
+					? suggestion => {
+						pending?.submitted(value.id);
+						state.submit(suggestion);
+					}
+					: undefined}
 				renderPeople={people => (
 					<PresenceFaces
 						handles={withoutSelf(
@@ -373,6 +389,14 @@ function Undecided(
 					: undefined}
 				status="open"
 				submitting={state.submitting}
+				deferSave={!!pending}
+				touched={pending ? touched : undefined}
+				onTouchedChange={pending ? () => forget(value.id) : undefined}
+				onLocalChange={pending
+					? (question, change) =>
+						remember(value.id, question, selectionOf(withChange(state.drafts[question], change)))
+					: undefined}
+				onPending={pending && (answers => pending.set(value.id, answers))}
 				{...pointing}
 			/>
 		</SidecarCard>
@@ -393,7 +417,8 @@ function previousAnswers(value: Questionnaire) {
 	return Object.keys(previous).length === 0 ? undefined : previous;
 }
 
-function labels(value: Questionnaire): string[] {
+/** The chosen answers' labels, as the document projection records them. */
+export function labels(value: Questionnaire): string[] {
 	return value.questions.flatMap(question => {
 		let selected = question.choices?.flatMap(id => {
 			let option = question.options.find(candidate => candidate.id === id);
@@ -586,7 +611,97 @@ function Expired({ value }: { value: Questionnaire }) {
 	);
 }
 
+/** How a document card takes part in a deck; mirrors the inline card's own rules. */
+export function inlineMemberState(
+	value: Questionnaire,
+	meta: Question.CardMeta | undefined,
+	places: { [question: string]: number } | undefined,
+	hasProseKey: boolean,
+): MemberState {
+	if (value.status === "expired") return "settled";
+	if ((!meta || meta.status === "decided") && carriedByMarkers(value, places) && !hasProseKey) {
+		return "hidden";
+	}
+	let shown = cardPresentation(value, meta, "inline");
+	return shown === "open" ? "open" : shown === "hidden" ? "hidden" : "settled";
+}
+
+// Stable empty snapshots: useSyncExternalStore loops on a fresh value per call.
+let NO_CARDS: ReadonlyMap<string, Question.CardMeta> = new Map();
+let NO_ENTRIES: QuestionnaireEntry[] = [];
+let noCards = () => NO_CARDS;
+let noEntries = () => NO_ENTRIES;
+let noop = () => () => {};
+
+function useInlineDeck(id: string) {
+	let options = useCellValue(widgets$);
+	let store = options.questions;
+	let entries = useSyncExternalStore(
+		store?.subscribe ?? noop,
+		store?.snapshot ?? noEntries,
+		store?.snapshot ?? noEntries,
+	);
+	let cards = useSyncExternalStore(
+		options.cardMeta?.subscribe ?? noop,
+		options.cardMeta?.snapshot ?? noCards,
+		options.cardMeta?.snapshot ?? noCards,
+	);
+	useRelations(store);
+	let run = store?.runOf(id);
+	if (!store || !run) return undefined;
+	let values = new Map(entries.map(entry => [entry.id, entry.value]));
+	let members = run.flatMap(member => {
+		let value = values.get(member);
+		if (!value) return [];
+		let state = inlineMemberState(
+			value,
+			cards.get(member),
+			store.counts(member),
+			!!store.proseKey(member),
+		);
+		return [{ id: member, state, value }];
+	});
+	let layout = deckLayout(members);
+	if (!layout || (layout.lead !== id && !layout.members.includes(id))) return undefined;
+	return { layout, members: members.filter(member => layout.members.includes(member.id)) };
+}
+
+/** Where focus goes when a deck dissolves under the reader: the card that was on top. */
+function focusCard(id: string) {
+	let active = document.activeElement;
+	if (active && active !== document.body) return;
+	let card = document.querySelector<HTMLElement>(
+		`[data-plan-questionnaire="${CSS.escape(id)}"] [data-plan-sidecar-questionnaire]:not([hidden])`,
+	);
+	if (!card) return;
+	if (card.tabIndex < 0 && !card.hasAttribute("tabindex")) card.tabIndex = -1;
+	card.focus({ preventScroll: true });
+}
+
 function InlineQuestionnaire({ value }: { value: Questionnaire }) {
+	let options = useCellValue(widgets$);
+	let phone = usePhone();
+	let deck = useInlineDeck(value.id);
+	// Phones answer in the Decisions pane, so each card is already a one-line chip; stacking
+	// chips in a deck would hide all but one pointer behind a gesture.
+	if (!deck || (phone && options.onShowDecision)) return <InlineCard value={value} />;
+	if (deck.layout.lead !== value.id) return <div data-deck-follower="" hidden />;
+	// Named by size, not "Decisions": a document can hold several decks beside the Decisions tab.
+	return (
+		<Deck
+			label={`${deck.members.length} decisions`}
+			onLeave={focusCard}
+			items={deck.members.map(member => ({
+				id: member.id,
+				settled: member.state !== "open",
+				label: member.value.questions[0]?.header ?? "Decision",
+				card: <InlineCard value={member.value} />,
+			}))}
+		/>
+	);
+}
+
+function InlineCard({ value }: { value: Questionnaire }) {
 	let options = useCellValue(widgets$);
 	let meta = useCardMeta(options.cardMeta, value.id);
 	let source = options.hasCardSource?.(value.id) ? options.onCardSource : undefined;
@@ -595,7 +710,13 @@ function InlineQuestionnaire({ value }: { value: Questionnaire }) {
 		: null;
 	// Re-render when anchors arrive: whether the card collapses depends on them.
 	useRelations(options.questions);
+	let phone = usePhone();
 	let places = options.questions?.counts(value.id);
+	if (
+		phone && options.onShowDecision && cardPresentation(value, meta, "inline") === "open"
+	) {
+		return <DecisionChip onShow={options.onShowDecision} value={value} />;
+	}
 	if (
 		(!meta || meta.status === "decided") && carriedByMarkers(value, places)
 		&& !options.questions?.proseKey(value.id)
@@ -622,6 +743,33 @@ function InlineQuestionnaire({ value }: { value: Questionnaire }) {
 			value={value}
 			wire={options.wire}
 		/>
+	);
+}
+
+/**
+ * An open decision in the document, on a phone.
+ *
+ * Phones answer decisions in the Decisions pane only; the prose keeps a
+ * short pointer so the card is not shown, and answered, twice. The icon says
+ * what it is, leaving the width to the question.
+ */
+function DecisionChip(
+	{ onShow, value }: { onShow: (questionnaireId: string) => void; value: Questionnaire },
+) {
+	let question = value.questions.map(item => item.prompt).join(" · ");
+	return (
+		<button
+			aria-label={`Decision: ${question}, answer in Decisions`}
+			className="decision-chip"
+			data-plan-sidecar-questionnaire={value.id}
+			data-press="wide"
+			onClick={() => onShow(value.id)}
+			type="button"
+		>
+			<DecisionIcon aria-hidden="true" className="decision-chip-icon" size={14} />
+			<span className="decision-chip-question">{question}</span>
+			<ChevronIcon aria-hidden="true" className="decision-chip-chevron" size={14} />
+		</button>
 	);
 }
 

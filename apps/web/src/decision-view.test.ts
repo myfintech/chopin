@@ -4,7 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { visibleDecisionView } from "@chopin/editor";
 
-import { decisionAttention, DecisionViewControl } from "./decision-view-control";
+import { BUILD_UNAVAILABLE, decisionAttention, DecisionViewControl } from "./decision-view-control";
 import { storedDocumentView } from "./workspace-model";
 
 test("a questionnaire-only document opens Decisions while prose keeps Plan visible", () => {
@@ -94,10 +94,8 @@ test("unanswered decisions expose an accessible count with quiet styling", () =>
 	let classes = badgeClass?.split(/\s+/) ?? [];
 	for (
 		let className of [
-			"h-5",
-			"min-w-5",
+			"editor-count-control",
 			"rounded-sm",
-			"bg-inset",
 			"text-xs",
 			"text-text-tertiary",
 			"tabular-nums",
@@ -105,4 +103,43 @@ test("unanswered decisions expose an accessible count with quiet styling", () =>
 	) {
 		expect(classes).toContain(className);
 	}
+});
+
+test("Build follows Decisions and marks the selected panel", () => {
+	let markup = renderToStaticMarkup(createElement(DecisionViewControl, {
+		buildEnabled: true,
+		onView() {},
+		unanswered: 0,
+		view: "build",
+	}));
+	expect(markup.indexOf(">Decisions<")).toBeLessThan(markup.indexOf(">Build<"));
+	expect(markup).toContain('aria-current="page" aria-pressed="true"');
+	expect(markup).not.toContain('aria-pressed="true" class="btn btn-sm gap-1');
+});
+
+test("Build is a segment only for a document that can be built", () => {
+	let markup = renderToStaticMarkup(
+		createElement(DecisionViewControl, { onView: () => {}, unanswered: 0, view: "plan" }),
+	);
+
+	expect(markup).not.toContain(">Build<");
+});
+
+test("Build waits for document content and says why", () => {
+	let markup = renderToStaticMarkup(
+		createElement(DecisionViewControl, {
+			buildEnabled: false,
+			onView: () => {},
+			unanswered: 0,
+			view: "plan",
+		}),
+	);
+
+	expect(markup).toMatch(/<button[^>]*aria-disabled="true"[^>]*>Build</);
+	expect(markup).not.toMatch(/<button[^>]*disabled=""[^>]*>Build</);
+	expect(markup).toContain(BUILD_UNAVAILABLE);
+});
+
+test("a stored Build view reopens on Document", () => {
+	expect(storedDocumentView("build")).toBe("plan");
 });

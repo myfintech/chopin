@@ -110,7 +110,7 @@ export default defineConfig({
 	 */
 	testMatch: "**/*.e2e.ts",
 
-	outputDir: "test-results",
+	outputDir: "test-results/integration",
 	fullyParallel: true,
 	// Some motion assertions poll a layer that exists only for its 180-250ms exit;
 	// at the default worker count on a developer machine they outlast that window.
@@ -118,7 +118,11 @@ export default defineConfig({
 	forbidOnly: !!process.env.CI,
 	retries: process.env.CI ? 2 : 0,
 	reporter: process.env.CI
-		? [["github"], ["html", { open: "never", outputFolder: "playwright-report" }]]
+		? [
+			["github"],
+			["html", { open: "never", outputFolder: "playwright-report/integration" }],
+			["json", { outputFile: ".scratch/ci-reports/integration.json" }],
+		]
 		: [["list"]],
 
 	expect: {
@@ -150,11 +154,11 @@ export default defineConfig({
 				join(ROOT, "e2e/decision-anchor-stress.e2e.ts"),
 				join(ROOT, "e2e/decision-evidence.e2e.ts"),
 				join(ROOT, "e2e/sidecar-card-states.e2e.ts"),
-				join(ROOT, "e2e/conversation-plan-layout.e2e.ts"),
 				join(ROOT, "e2e/conversation-plan-stress.e2e.ts"),
 				join(ROOT, "e2e/conversation-plan-ui.e2e.ts"),
 				join(ROOT, "e2e/document-tab-stability.e2e.ts"),
 				join(ROOT, "e2e/discarded-mobile-geometry.e2e.ts"),
+				join(ROOT, "e2e/decisions-phone.e2e.ts"),
 				join(ROOT, "e2e/sidecar-document-spacing.e2e.ts"),
 				join(ROOT, "e2e/sidecar-evidence-absence.e2e.ts"),
 				join(ROOT, "e2e/sidecar-draft-reopen.e2e.ts"),
@@ -165,6 +169,9 @@ export default defineConfig({
 				"**/responsive*.e2e.ts",
 				"**/sidecar.e2e.ts",
 				"**/harness.e2e.ts",
+				"**/harness-comments.e2e.ts",
+				"**/harness-decisions-deck.e2e.ts",
+				"**/harness-children.e2e.ts",
 				"**/auth-lifecycle.e2e.ts",
 			],
 			use: { ...devices["Desktop Chrome"], baseURL: `http://${HOST}:${PLAIN}` },
@@ -183,13 +190,19 @@ export default defineConfig({
 				"**/sidecar-evidence-absence.e2e.ts",
 				"**/document-tab-stability.e2e.ts",
 				"**/discarded-mobile-geometry.e2e.ts",
+				"**/decisions-phone.e2e.ts",
 				"**/sidebar-decision-counts.e2e.ts",
 			],
 			use: { ...devices["Desktop Chrome"], baseURL: `http://${HOST}:${FIXTURES}` },
 		},
 		{
 			name: "harness",
-			testMatch: ["**/harness.e2e.ts"],
+			testMatch: [
+				"**/harness.e2e.ts",
+				"**/harness-comments.e2e.ts",
+				"**/harness-decisions-deck.e2e.ts",
+				"**/harness-children.e2e.ts",
+			],
 			use: { ...devices["Desktop Chrome"], baseURL: `http://${HOST}:${HARNESS}` },
 		},
 		{

@@ -6,9 +6,9 @@ type KIND<K extends string> = Frame & { kind: K };
  * Comments on the plan.
  *
  * A thread marks a passage of prose and collects what people said about it.
- * Accepting one is the room deciding: the thread freezes, becomes a decision
- * recorded beside the plan and projected into it, and the agent is asked to
- * revise the prose accordingly. Dismissing one closes it without the agent.
+ * Resolving one hides it; anyone may reopen it, which is how a resolve is
+ * undone. Threads accepted or dismissed under the earlier lifecycle are still
+ * stored and shown, but nothing creates them any more.
  *
  * A thread's notes are append-only, so unlike a questionnaire's answer there is
  * no shared draft and no CRDT — nobody is co-writing one sentence, they are
@@ -23,8 +23,8 @@ export declare namespace Comment {
 	export type Incoming =
 		| Request<Start.Ask>
 		| Request<Reply.Ask>
-		| Request<Accept.Ask>
-		| Request<Dismiss.Ask>
+		| Request<Resolve.Ask>
+		| Request<Reopen.Ask>
 		| Typing.Input;
 
 	export type Outgoing =
@@ -32,21 +32,41 @@ export declare namespace Comment {
 		| Opened
 		| Said
 		| Resolved
+		| Reopened
+		| Working
 		| Start.Reply
 		| Reply.Reply
-		| Accept.Reply
-		| Dismiss.Reply
+		| Resolve.Reply
+		| Reopen.Reply
 		| Typing.Output;
 
-	export type Status = "open" | "accepted" | "dismissed";
+	/** `accepted` and `dismissed` are only ever read back from storage. */
+	export type Status = "open" | "resolved" | "accepted" | "dismissed";
 
-	export type Note = {
-		id: string;
-		handle: string;
-		text: string;
-		/** Unix seconds. */
-		ts: number;
-	};
+	/**
+	 * One thing said on a thread, by a member or by the Planner.
+	 *
+	 * `to` records that a member addressed the Planner. The mention a client
+	 * shows is drawn from it; the text never carries one, and the server never
+	 * looks for one there.
+	 */
+	export type Note =
+		& {
+			id: string;
+			text: string;
+			/** Unix seconds. */
+			ts: number;
+			to?: "planner";
+		}
+		& ({ author: "member"; handle: string } | { author: "planner" });
+
+	/**
+	 * What became of a note sent to the Planner, as its sender is told.
+	 *
+	 * `running` and `queued` mean a turn will read the thread; `off` means this
+	 * server runs without a Planner, so the note is saved and nothing more.
+	 */
+	export type Planner = "running" | "queued" | "off";
 
 	export type Thread = {
 		id: string;
@@ -60,10 +80,17 @@ export declare namespace Comment {
 		 * was actually being discussed, and the anchor keeps moving.
 		 */
 		quote?: string;
-		/** Who accepted or dismissed it. */
+		/** Who resolved it. */
 		resolver?: string;
 		/** When they did, Unix seconds. */
 		at?: number;
+		/**
+		 * A Planner turn is running or queued for this thread.
+		 *
+		 * Derived from the live turn and its queue when a client joins, and never
+		 * stored: a turn does not survive a restart, so neither does this.
+		 */
+		working?: boolean;
 	};
 
 	/** Every thread the plan holds, sent when a client joins. */
@@ -96,13 +123,15 @@ export declare namespace Comment {
 			length: number;
 			/** The first note. */
 			text: string;
+			/** Address the Planner. The wire destination, never a mention, decides. */
+			to?: "planner";
 		};
 
 		export type Reply =
 			& KIND<"comment:start">
 			& (
-				| { ok: true; thread: Thread }
-				| { ok: false; reason: "invalid" | "full"; message: string }
+				| { ok: true; thread: Thread; planner?: Planner }
+				| { ok: false; reason: "invalid" | "full" | "busy"; message: string }
 			);
 	}
 
@@ -114,23 +143,21 @@ export declare namespace Comment {
 	 *
 	 * `resolved` carries the outcome rather than an error message, because the
 	 * thing the caller wanted to know — what happened to this thread — is
-	 * already decided, and being second to ask is not a failure. `resolving`
-	 * is the same race caught a moment earlier, while the durable half of
-	 * somebody else's resolution is still being written.
+	 * already decided, and being second to ask is not a failure.
 	 */
 	type Blocked =
-		| { ok: false; reason: "missing" | "resolving"; message: string }
+		| { ok: false; reason: "missing"; message: string }
 		| { ok: false; reason: "resolved"; status: Status; resolver: string };
 
 	export namespace Reply {
-		export type Ask = KIND<"comment:reply"> & { id: string; text: string };
+		export type Ask = KIND<"comment:reply"> & { id: string; text: string; to?: "planner" };
 
 		export type Reply =
 			& KIND<"comment:reply">
 			& { id: string }
 			& (
-				| { ok: true; note: Note }
-				| { ok: false; reason: "invalid" | "full"; message: string }
+				| { ok: true; note: Note; planner?: Planner }
+				| { ok: false; reason: "invalid" | "full" | "busy"; message: string }
 				| Blocked
 			);
 	}
@@ -138,35 +165,36 @@ export declare namespace Comment {
 	/** Something said on an open thread. */
 	export type Said = KIND<"comment:said"> & { id: string; note: Note };
 
-	export namespace Accept {
-		/** Take the thread as the room's decision, and ask the agent to act. */
-		export type Ask = KIND<"comment:accept"> & { id: string };
+	export namespace Resolve {
+		/** Close the thread. Nothing about the document changes. */
+		export type Ask = KIND<"comment:resolve"> & { id: string };
 
 		export type Reply =
-			& KIND<"comment:accept">
+			& KIND<"comment:resolve">
+			& { id: string }
+			& ({ ok: true; resolver: string; at: number } | Blocked);
+	}
+
+	/**
+	 * Open a resolved thread again: the undo for resolving.
+	 *
+	 * Only a resolved thread reopens. An accepted one already has a decision in
+	 * the document, and reopening it would leave that decision describing a
+	 * thread that is still being argued.
+	 */
+	export namespace Reopen {
+		export type Ask = KIND<"comment:reopen"> & { id: string };
+
+		export type Reply =
+			& KIND<"comment:reopen">
 			& { id: string }
 			& (
-				| { ok: true; resolver: string; at: number }
-				| { ok: false; reason: "invalid"; message: string }
-				| Blocked
+				| { ok: true; thread: Thread }
+				| { ok: false; reason: "missing" | "open" | "settled" | "full"; message: string }
 			);
 	}
 
-	export namespace Dismiss {
-		/** Close the thread without involving the agent. */
-		export type Ask = KIND<"comment:dismiss"> & { id: string };
-
-		export type Reply =
-			& KIND<"comment:dismiss">
-			& { id: string }
-			& (
-				| { ok: true; resolver: string; at: number }
-				| { ok: false; reason: "invalid"; message: string }
-				| Blocked
-			);
-	}
-
-	/** The thread is closed. Nobody may add to it. */
+	/** The thread is closed. Nobody may add to it until it is reopened. */
 	export type Resolved = KIND<"comment:resolved"> & {
 		id: string;
 		status: Status;
@@ -174,6 +202,22 @@ export declare namespace Comment {
 		at: number;
 		/** The marked prose as it read when this was decided. */
 		quote: string;
+	};
+
+	/** A resolved thread is open again. Followed by a `plan:anchors`. */
+	export type Reopened = KIND<"comment:reopened"> & { thread: Thread };
+
+	/**
+	 * Whether the Planner is working on a thread.
+	 *
+	 * True once a turn for it is running or queued. False when the last one
+	 * ends; `reason` says why when it did not finish on its own: it was stopped,
+	 * it failed, or there is no Planner to run it.
+	 */
+	export type Working = KIND<"comment:working"> & {
+		id: string;
+		working: boolean;
+		reason?: "stopped" | "failed" | "off";
 	};
 
 	/**

@@ -28,6 +28,15 @@ export function CodeIcon(props: IconProps) {
 	);
 }
 
+export function KeyboardIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<rect x="1.75" y="4.75" width="14.5" height="8.5" rx="1.5" />
+			<path d="M4.75 7.75h.5m3.5 0h.5m3.5 0h.5M5.75 10.25h6.5" />
+		</LineIcon>
+	);
+}
+
 export function MessageIcon(props: IconProps) {
 	return (
 		<LineIcon {...props}>
@@ -60,6 +69,16 @@ export function ClockIcon(props: IconProps) {
 		<LineIcon {...props}>
 			<circle cx="9" cy="9" r="7.25" />
 			<polyline points="9 4.75 9 9 12.25 11.25" />
+		</LineIcon>
+	);
+}
+
+export function EllipsisIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<circle cx="3.75" cy="9" fill="currentColor" r="1.25" stroke="none" />
+			<circle cx="9" cy="9" fill="currentColor" r="1.25" stroke="none" />
+			<circle cx="14.25" cy="9" fill="currentColor" r="1.25" stroke="none" />
 		</LineIcon>
 	);
 }
@@ -150,20 +169,6 @@ export function SparkleIcon(props: IconProps) {
 	);
 }
 
-export function WarningIcon(props: IconProps) {
-	return (
-		<LineIcon {...props}>
-			<path d="M7.63796 3.48996L2.21295 12.89C1.60795 13.9399 2.36395 15.25 3.57495 15.25H14.425C15.636 15.25 16.392 13.9399 15.787 12.89L10.362 3.48996C9.75696 2.44996 8.24296 2.44996 7.63796 3.48996Z" />
-			<path d="M9 6.75V9.75" />
-			<path
-				d="M9 13.5C8.448 13.5 8 13.05 8 12.5C8 11.95 8.448 11.5 9 11.5C9.552 11.5 10 11.9501 10 12.5C10 13.0499 9.552 13.5 9 13.5Z"
-				fill="currentColor"
-				stroke="none"
-			/>
-		</LineIcon>
-	);
-}
-
 export function LinkPlusIcon(props: IconProps) {
 	return (
 		<LineIcon {...props}>
@@ -231,6 +236,15 @@ export function TableIcon(props: IconProps) {
 	);
 }
 
+export function ColumnsIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<rect height="12.5" rx="1.5" width="5.25" x="2.75" y="2.75" />
+			<rect height="12.5" rx="1.5" width="5.25" x="10" y="2.75" />
+		</LineIcon>
+	);
+}
+
 export function LinkIcon(props: IconProps) {
 	return (
 		<LineIcon {...props}>
@@ -294,6 +308,107 @@ export function PencilIcon(props: IconProps) {
 		<LineIcon {...props}>
 			<path d="M10.5 4.25 13.75 7.5" />
 			<path d="M3.25 14.75 3.9 11.6c.05-.25.17-.47.35-.65l7.6-7.6c.59-.59 1.54-.59 2.12 0l.94.94c.59.59.59 1.54 0 2.12l-7.6 7.6c-.18.18-.4.3-.65.35l-3.15.65c-.2.04-.4-.16-.36-.36Z" />
+		</LineIcon>
+	);
+}
+
+export function ArrowLeftIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<line x1="15.25" x2="2.75" y1="9" y2="9" />
+			<polyline points="7 4.75 2.75 9 7 13.25" />
+		</LineIcon>
+	);
+}
+
+export function ArrowRightIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<line x1="2.75" x2="15.25" y1="9" y2="9" />
+			<polyline points="11 4.75 15.25 9 11 13.25" />
+		</LineIcon>
+	);
+}
+
+/** Start again: a counter-clockwise turn back to the beginning. */
+export function RestartIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<path d="M2.75 9a6.25 6.25 0 1 0 1.83-4.42L2.75 6.4" />
+			<polyline points="2.75 2.75 2.75 6.4 6.4 6.4" />
+		</LineIcon>
+	);
+}
+
+export function MinusIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<line x1="3.25" x2="14.75" y1="9" y2="9" />
+		</LineIcon>
+	);
+}
+
+/** Fit to width: a span stretched between two edges. */
+export function FitWidthIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<line x1="2" x2="2" y1="4" y2="14" />
+			<line x1="16" x2="16" y1="4" y2="14" />
+			<line x1="5" x2="13" y1="9" y2="9" />
+			<polyline points="7.5 6.5 5 9 7.5 11.5" />
+			<polyline points="10.5 6.5 13 9 10.5 11.5" />
+		</LineIcon>
+	);
+}
+
+/** Actual size: a 1:1 ratio. */
+export function ActualSizeIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<path d="M3 6.25 5.25 4.5v9" />
+			<path d="M12.75 6.25 15 4.5v9" />
+			<path d="M9 7h.01M9 11h.01" />
+		</LineIcon>
+	);
+}
+
+export function PlayIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<path d="M5.5 3.9v10.2c0 .58.63.94 1.13.65l8.5-5.1c.49-.29.49-1 0-1.3l-8.5-5.1c-.5-.3-1.13.07-1.13.65Z" />
+		</LineIcon>
+	);
+}
+
+export function PauseIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<rect height="11.5" rx="1" width="3" x="4.25" y="3.25" />
+			<rect height="11.5" rx="1" width="3" x="10.75" y="3.25" />
+		</LineIcon>
+	);
+}
+
+/** Diagonal arrows pointing outward: let the document fill the workspace. */
+export function ExpandIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<polyline points="11 2.75 15.25 2.75 15.25 7" />
+			<line x1="15.25" x2="10.25" y1="2.75" y2="7.75" />
+			<polyline points="7 15.25 2.75 15.25 2.75 11" />
+			<line x1="2.75" x2="7.75" y1="15.25" y2="10.25" />
+		</LineIcon>
+	);
+}
+
+/** Diagonal arrows pointing inward: give the workspace back to Chat. */
+export function CollapseIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<polyline points="10.25 3.5 10.25 7.75 14.5 7.75" />
+			<line x1="10.25" x2="15.25" y1="7.75" y2="2.75" />
+			<polyline points="7.75 14.5 7.75 10.25 3.5 10.25" />
+			<line x1="7.75" x2="2.75" y1="10.25" y2="15.25" />
 		</LineIcon>
 	);
 }

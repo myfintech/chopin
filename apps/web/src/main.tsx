@@ -12,10 +12,12 @@ import { useVisualViewport } from "./viewport";
 
 import "@fontsource-variable/inter/opsz.css";
 import "@fontsource-variable/inter/opsz-italic.css";
+import "@fontsource/lora/latin-400.css";
 
 import "./theme.css";
 import "@chopin/visuals/styles.css";
 import "./navigation.css";
+import "./phone-skeleton.css";
 import "./icon-tooltip.css";
 import "./local-login.css";
 import "./chat/run-card.css";
@@ -29,9 +31,14 @@ if (!root) throw new Error("missing #root");
 function Root() {
 	useFocusInput();
 	useMotionInput();
-	usePointerCapabilities();
 	useVisualViewport();
 	return <App />;
+}
+
+/** Every route, development pages included, mirrors the phone class into CSS. */
+function PointerCapabilities() {
+	usePointerCapabilities();
+	return null;
 }
 
 let content = isDesignAuditRoute(location.pathname, import.meta.env.DEV)
@@ -40,11 +47,21 @@ let content = isDesignAuditRoute(location.pathname, import.meta.env.DEV)
 	? import("./diagram-gallery/page").then(({ DiagramGalleryPage }) => <DiagramGalleryPage />)
 	: Promise.resolve(<Root />);
 
-void Promise.all([content, import("./icon-tooltip")]).then(([value, { IconTooltip }]) => {
-	createRoot(root).render(
-		<StrictMode>
-			{value}
-			<IconTooltip />
-		</StrictMode>,
-	);
-});
+let agentation = import.meta.env.DEV
+	? import("agentation").then(({ Agentation }) => (
+		<Agentation appName="Chopin" endpoint="http://127.0.0.1:4747" />
+	))
+	: Promise.resolve(null);
+
+void Promise.all([content, import("./icon-tooltip"), agentation]).then(
+	([value, { IconTooltip }, feedback]) => {
+		createRoot(root).render(
+			<StrictMode>
+				<PointerCapabilities />
+				{value}
+				<IconTooltip />
+				{feedback}
+			</StrictMode>,
+		);
+	},
+);

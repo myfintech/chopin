@@ -1,6 +1,9 @@
-import panelIcon from "./assets/icons/panel-close.svg";
+import { createContext } from "react";
 
-import type { RefObject } from "react";
+import panelIcon from "./assets/icons/panel-close.svg";
+import { IconButton } from "./icon-button";
+
+import type { Ref } from "react";
 import type * as Api from "./api";
 
 export const SIDEBAR_MIN = 250;
@@ -25,16 +28,17 @@ export function ProjectSidebarLoading(
 					<header className="project-sidebar-header">
 						<div className="flex items-center gap-2">
 							<span className="size-3.5 shrink-0" />
-							<span className="text-sm font-semibold text-brand">Chopin</span>
+							<span className="text-xs font-semibold text-brand">Chopin</span>
 						</div>
-						<button
+						<IconButton
 							aria-label="Hide sidebar"
-							className="project-sidebar-action"
+							glyph="default"
 							onClick={onCollapse}
-							type="button"
+							placement="sidebar"
+							size="compact"
 						>
 							<img alt="" height="14" src={panelIcon} width="14" />
-						</button>
+						</IconButton>
 					</header>
 					<p className="sr-only" role="status">Loading projects…</p>
 					<div aria-hidden="true" className="pointer-events-none">
@@ -83,13 +87,26 @@ export function ProjectSidebarLoading(
 	);
 }
 
+/**
+ * Lets a phone top bar host the sidebar trigger. While a bar holds a claim, the shell drops
+ * its own floating trigger, so the button scrolls away with the bar instead of over it.
+ */
+export type SidebarTriggerSlot = {
+	buttonRef: Ref<HTMLButtonElement>;
+	claim: () => () => void;
+	onExpand: () => void;
+	shortcut?: string;
+};
+
+export const SidebarTrigger = createContext<SidebarTriggerSlot | undefined>(undefined);
+
 export function ProjectSidebarExpandButton(
 	{
 		buttonRef,
 		onExpand,
 		shortcut,
 	}: {
-		buttonRef?: RefObject<HTMLButtonElement | null>;
+		buttonRef?: Ref<HTMLButtonElement>;
 		onExpand: () => void;
 		shortcut?: string;
 	},

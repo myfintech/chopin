@@ -102,7 +102,7 @@
 				1
 			]
 		],
-		"sourceHash": "e2bcd44481a8df91f73ffcbb0bef8ccc93a7dd64addd9ea4b874755c19afd09f"
+		"sourceHash": "447d5b138a9c02ea7804acc5ad37b9f19f983475c43c73350bc2c322bf7af708"
 	},
 	{
 		"file": "packages/editor/src/toolbar/bubble.tsx",
@@ -120,7 +120,14 @@
 				"class",
 				"CELL",
 				"class > SelectionBubble > <button>",
-				3
+				2
+			],
+			[
+				"dynamic",
+				"class",
+				"CELL",
+				"class > SelectionBubble > comment > <button>",
+				1
 			],
 			[
 				"dynamic",
@@ -134,7 +141,14 @@
 				"class",
 				"CELL_OFF",
 				"class > SelectionBubble > <button>",
-				6
+				5
+			],
+			[
+				"dynamic",
+				"class",
+				"CELL_OFF",
+				"class > SelectionBubble > comment > <button>",
+				1
 			],
 			[
 				"dynamic",
@@ -155,24 +169,10 @@
 				"class",
 				"SEAM",
 				"class > SelectionBubble > <span>",
-				3
+				4
 			]
 		],
-		"sourceHash": "0c55d7382e99b0fc885a47a127dd8f59bf9f50a49261ce7f14fcb0bdf78aff5d"
-	},
-	{
-		"file": "packages/editor/src/toolbar/research.tsx",
-		"reason": "Research draft portal receives measured placement from its anchor; the style boundary is geometry owned by the browser.",
-		"cases": [
-			[
-				"dynamic",
-				"*",
-				"style",
-				"unresolved style > ResearchDraftShell > <div>",
-				1
-			]
-		],
-		"sourceHash": "9efb66508a77c1cce3bf057c61f62f50db047ab318b9928238aefc922a5afa4c"
+		"sourceHash": "e661834fae291b0f83fcfd6ddfa49012435a546b0d298fbed09d1d6ab3e6738d"
 	},
 	{
 		"file": "packages/editor/src/widgets/research-motion.tsx",
@@ -214,7 +214,7 @@
 				1
 			]
 		],
-		"sourceHash": "42d324e8f0d6553de93211b3e56e98026bb90f33e4a6f4b0b735bc9af4dbbbfb"
+		"sourceHash": "6776932ad1c0842647fa490b87ad42234f71bcde1e1fe52f4db8827f9a9a9a21"
 	},
 	{
 		"file": "packages/editor/src/comment-layer.tsx",
@@ -242,7 +242,7 @@
 				1
 			]
 		],
-		"sourceHash": "42d324e8f0d6553de93211b3e56e98026bb90f33e4a6f4b0b735bc9af4dbbbfb"
+		"sourceHash": "6776932ad1c0842647fa490b87ad42234f71bcde1e1fe52f4db8827f9a9a9a21"
 	},
 	{
 		"file": "packages/editor/src/table/rails.tsx",
@@ -361,7 +361,7 @@
 				2
 			]
 		],
-		"sourceHash": "9d4004592b45a77cdf21a669a49e86c0c0bfeba1728288ae084406678498688b"
+		"sourceHash": "b96b0562aee46a93074fbfef7737e13805b68e7847c76a323715234a1c7e798d"
 	},
 	{
 		"file": "packages/editor/src/collaboration.tsx",
@@ -403,7 +403,7 @@
 				1
 			]
 		],
-		"sourceHash": "49ccb021fb60c45cdbe234241549e468ba556277d74d824145ca8707ff2bc908"
+		"sourceHash": "b4d7af43fdc69c771a65f63b5fc0beda6ef389db041b3bcc947e2449aa19a7d3"
 	},
 	{
 		"file": "packages/editor/src/widgets/code-view.tsx",
@@ -417,7 +417,7 @@
 				1
 			]
 		],
-		"sourceHash": "ee8ce4efba7e1ca187de661019e7da027433292f305e0142aedbfba1bbee9b49"
+		"sourceHash": "3ff79cc08a1b10f0ecfa870f508179a2a2c1a70a9ca04f9488ff63dc9db48056"
 	},
 	{
 		"file": "packages/editor/src/changes.ts",
@@ -466,7 +466,7 @@
 				1
 			]
 		],
-		"sourceHash": "49ccb021fb60c45cdbe234241549e468ba556277d74d824145ca8707ff2bc908"
+		"sourceHash": "b4d7af43fdc69c771a65f63b5fc0beda6ef389db041b3bcc947e2449aa19a7d3"
 	},
 	{
 		"file": "packages/editor/src/resolved-layer.tsx",
@@ -478,16 +478,9 @@
 				"current.style",
 				"unresolved style > Surface > <div>",
 				1
-			],
-			[
-				"dynamic",
-				"*",
-				"markerStyle(marker, lineHeight, prose, vertical[index]!)",
-				"unresolved style > ResolvedLayer > <button>",
-				1
 			]
 		],
-		"sourceHash": "74045d002ca932fa97d57774c0d4c4e36b19bb30daa92703a322595de22e37f5"
+		"sourceHash": "dc998b993e2f8ca0980fc0424b635126eb34027828dee1f926d86892d543065e"
 	},
 	{
 		"file": "packages/editor/src/resolved-layer.tsx",
@@ -501,6 +494,6 @@
 				1
 			]
 		],
-		"sourceHash": "74045d002ca932fa97d57774c0d4c4e36b19bb30daa92703a322595de22e37f5"
+		"sourceHash": "dc998b993e2f8ca0980fc0424b635126eb34027828dee1f926d86892d543065e"
 	}
 ]

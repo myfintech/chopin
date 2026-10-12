@@ -6,6 +6,7 @@
  * real peers, and the server accepting what an undo sends.
  */
 
+import { storedAcceptedComment, storedQuestion } from "../apps/server/src/testing/plan";
 import { readSource } from "./database";
 import { content, expect, test, written } from "./room";
 
@@ -92,9 +93,15 @@ test("my undo leaves a peer's edit alone", async ({ join, room, seed }) => {
 	await written(ana, room, "Bo writes here. Theirs.");
 });
 
-test("undo past an accepted decision is accepted by the server", async ({ join, page, room, seed }) => {
+test("undo beside a stored accepted decision leaves it in place", async ({ join, page, room, seed }) => {
 	let quote = "Keep the pilot reversible.";
-	await seed(`${quote}\n`);
+	// Comments are no longer accepted, but stored decisions still project into the plan.
+	// The server-authored edit arriving mid-history is covered by the option test below.
+	let stored = await storedAcceptedComment(`${quote}\n`, quote, {
+		by: "ana",
+		text: "Record this.",
+	});
+	await seed(stored.source, { threads: [stored.thread] });
 	let resets = 0;
 	page.on("websocket", socket =>
 		socket.on("framereceived", ({ payload }) => {
@@ -106,22 +113,6 @@ test("undo past an accepted decision is accepted by the server", async ({ join, 
 	await ana.keyboard.press("Enter");
 	await ana.keyboard.type("Fresh prose.");
 	await written(ana, room, "Fresh prose.");
-
-	// Accepting a comment appends a Decision projection the server owns.
-	let started = await request(ana, room, {
-		kind: "comment:start",
-		blocks: [0],
-		quote,
-		offset: 0,
-		length: quote.length,
-		text: "Record this.",
-	});
-	expect(started.ok).toBe(true);
-	let accepted = await request(ana, room, {
-		kind: "comment:accept",
-		id: (started.thread as { id: string }).id,
-	});
-	expect(accepted.ok).toBe(true);
 	await written(ana, room, "<Decision");
 	let decision = ana.locator("[data-plan-comment-card]").filter({ hasText: "Record this." });
 	await expect(decision).toBeVisible();
@@ -135,5 +126,78 @@ test("undo past an accepted decision is accepted by the server", async ({ join, 
 	await expect.poll(() => readSource(Number(new URL(ana.url()).port), room))
 		.not.toContain("Fresh prose.");
 	await written(ana, room, "<Decision");
+	expect(resets).toBe(0);
+});
+
+const WIDGET = "01K0N4TR8K7JGM4R1J7PW4R8YJ";
+const QUESTION = "01K0N4V4E7Y6P4MJ5WD8XZF3B2";
+const OPTION = "01K0N4W3B7P27CBAEC7A8C8WEA";
+const DEFINITION = {
+	questions: [{
+		id: QUESTION,
+		header: "Rollout",
+		question: "How should we deploy?",
+		multiple: false,
+		options: [{ id: OPTION, label: "Canary", description: "" }],
+	}],
+};
+const CARD = `<Questionnaire id="${WIDGET}" by="ana">
+<Question id="${QUESTION}" header="Rollout" prompt="How should we deploy?" multiple="false">
+<Option id="${OPTION}" label="Canary" />
+</Question>
+</Questionnaire>`;
+
+test("undo past an option the server added is accepted by the server", async ({ join, page, room, seed }) => {
+	let quote = "Keep the pilot reversible.";
+	await seed(`${quote}\n\n${CARD}\n`, {
+		revision: 1,
+		questions: [{
+			id: WIDGET,
+			definition: DEFINITION,
+			status: "open",
+			origin: "planner",
+			history: [],
+			optionOrigins: {},
+			editors: [],
+		}],
+		openQuestions: [{
+			definition: DEFINITION,
+			id: WIDGET,
+			model: storedQuestion(DEFINITION),
+			revision: 0,
+			widget: WIDGET,
+		}],
+	});
+	let resets = 0;
+	page.on("websocket", socket =>
+		socket.on("framereceived", ({ payload }) => {
+			if (typeof payload === "string" && payload.includes('"kind":"plan:reset"')) resets++;
+		}));
+	let ana = await join("ana");
+
+	await caretAfter(ana, quote);
+	await ana.keyboard.press("Enter");
+	await ana.keyboard.type("Fresh prose.");
+	await written(ana, room, "Fresh prose.");
+
+	// The server writes the option into the questionnaire projection after the typing.
+	let added = await request(ana, room, {
+		kind: "question:option",
+		id: WIDGET,
+		question: QUESTION,
+		key: "undo-option-key",
+		label: "Blue-green",
+	});
+	expect(added.ok).toBe(true);
+	await written(ana, room, 'label="Blue-green"');
+
+	await content(ana).locator("p").filter({ hasText: "Fresh prose." }).click();
+	await ana.keyboard.press(UNDO);
+	await ana.keyboard.press(UNDO);
+
+	await expect(content(ana)).not.toContainText("Fresh prose.");
+	await expect.poll(() => readSource(Number(new URL(ana.url()).port), room))
+		.not.toContain("Fresh prose.");
+	await written(ana, room, 'label="Blue-green"');
 	expect(resets).toBe(0);
 });

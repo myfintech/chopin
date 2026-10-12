@@ -1,12 +1,19 @@
 /** The shared chat, grouped for reading rather than event delivery. */
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from "react";
-import { CloseIcon, MessageIcon, SignInIcon, SparkleIcon, WarningIcon } from "@chopin/icons";
+import {
+	CloseIcon,
+	MessageForwardIcon,
+	MessageIcon,
+	SignInIcon,
+	SparkleIcon,
+	WarningIcon,
+} from "@chopin/icons";
 import { parseChildDocumentPath } from "@chopin/protocol/document-url";
 
-import { Face, useCardMeta } from "@chopin/editor";
+import { ChopinMark, Face, openCommentThread, useCardMeta } from "@chopin/editor";
+import { EmptyState } from "@chopin/visuals";
 
-import { ChopinMark } from "./agent-mark";
 import { MessageMarkdown } from "./markdown";
 import { MessageMarkers } from "../conversation-plan/markers";
 import type { ExcerptCorrectionAction } from "../conversation-plan/analysis-overview";
@@ -96,6 +103,46 @@ function SystemEntry(
 					</p>
 				)}
 		</div>
+	);
+}
+
+/** A comment sent to Chopin: what it was about and what it said, linking back to the thread. */
+function CommentSystemEntry(
+	{ comment, enter, onOpenChild, room }: {
+		room?: string;
+		comment: NonNullable<Chat.Entry["comment"]>;
+		enter: boolean;
+		onOpenChild?: (channelId: string) => Promise<boolean>;
+	},
+) {
+	// A thread in a child lives in that child's editor: open it, then ask for the thread once the
+	// child has synced. Thread ids are unique, so only that editor answers.
+	let open = () => {
+		if (!comment.channelId) return openCommentThread(comment.thread, { channel: room });
+		if (!onOpenChild) return;
+		void onOpenChild(comment.channelId).then(ready => {
+			if (ready) openCommentThread(comment.thread, { channel: comment.channelId });
+		});
+	};
+	return (
+		<button
+			className="chat-comment-notice"
+			data-chat-comment={comment.thread}
+			data-chat-enter={enter || undefined}
+			onClick={open}
+			type="button"
+		>
+			<span className="chat-comment-notice-head">
+				<MessageForwardIcon aria-hidden="true" className="icon-first-line" size={14} />
+				<span>
+					Comment on <span className="chat-comment-notice-title">“{comment.excerpt}”</span>{" "}
+					sent to Chopin
+				</span>
+			</span>
+			<span className="chat-comment-notice-body">
+				<span className="chat-comment-notice-mention">@Chopin</span> {comment.note}
+			</span>
+		</button>
 	);
 }
 
@@ -334,6 +381,8 @@ export function Transcript(
 		live,
 		onCardLink,
 		onAddExcerpt,
+		onOpenChild,
+		room,
 		onRetryAnalysis,
 		onRetryJob,
 		onWithdraw,
@@ -349,6 +398,8 @@ export function Transcript(
 		conversationPlanJobs?: ConversationPlan.Job[];
 		onCardLink?: (link: CardLink) => void;
 		onAddExcerpt?: (action: ExcerptCorrectionAction) => Promise<void>;
+		onOpenChild?: (channelId: string) => Promise<boolean>;
+		room?: string;
 		onRetryAnalysis?: (
 			messageId: string,
 			actionId: string,
@@ -568,7 +619,8 @@ export function Transcript(
 
 	return (
 		<div
-			className="flex min-h-0 min-w-0 flex-1 flex-col overflow-auto p-3"
+			className="flex min-h-0 min-w-0 flex-1 flex-col overflow-auto px-5 py-3"
+			data-chat-scroll=""
 			data-focus-boundary=""
 			ref={scroller}
 			onScroll={event => {
@@ -630,6 +682,16 @@ export function Transcript(
 										: true}
 								/>
 							)
+							: item.comment
+							? (
+								<CommentSystemEntry
+									comment={item.comment}
+									enter={enters(key)}
+									key={key}
+									onOpenChild={onOpenChild}
+									room={room}
+								/>
+							)
 							: announced.has(readyChild(item.text) ?? "")
 							? null
 							: <SystemEntry enter={enters(key)} item={item} key={key} />
@@ -658,30 +720,36 @@ export function Transcript(
 				{emptyHint && (
 					<div
 						aria-hidden={groups.length > 0 || undefined}
-						className={`pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 px-6 text-center transition-opacity motion-reduce:transition-none ${
+						className={`pointer-events-none absolute inset-0 flex items-center justify-center px-6 transition-opacity motion-reduce:transition-none ${
 							groups.length > 0 ? "opacity-0" : "opacity-100"
 						}`}
 						data-chat-empty=""
 					>
-						<MessageIcon aria-hidden="true" className="text-text-quaternary" />
-						<p className="max-w-[32ch] text-sm text-text-tertiary">
-							Talk it through with your collaborators.
-							{emptyHint.planner && (
+						<EmptyState
+							density="compact"
+							icon={MessageIcon}
+							measure="short"
+							description={
 								<>
-									{" "}Mention <strong className="font-medium text-text-secondary">@chopin</strong>
-									{" "}
-									to ask the Planner
-									{emptyHint.references ? ", or " : "."}
+									Talk it through with your collaborators.
+									{emptyHint.planner && (
+										<>
+											{" "}Mention{" "}
+											<strong className="font-medium text-text-secondary">@chopin</strong>{" "}
+											to ask the Planner
+											{emptyHint.references ? ", or " : "."}
+										</>
+									)}
+									{emptyHint.references && (
+										<>
+											{emptyHint.planner ? "" : " Use "}
+											<strong className="font-medium text-text-secondary">#</strong>{" "}
+											to point at a document.
+										</>
+									)}
 								</>
-							)}
-							{emptyHint.references && (
-								<>
-									{emptyHint.planner ? "" : " Use "}
-									<strong className="font-medium text-text-secondary">#</strong>{" "}
-									to point at a document.
-								</>
-							)}
-						</p>
+							}
+						/>
 					</div>
 				)}
 			</div>

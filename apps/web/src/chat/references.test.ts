@@ -18,6 +18,7 @@ import {
 	selectedReplacement,
 	withNoticesAfter,
 } from "./references";
+import { WireRefusal } from "../wire";
 
 import type { ReferenceDraft, ReferenceTarget } from "./references";
 
@@ -365,5 +366,33 @@ describe("acknowledged composer drafts", () => {
 		expect(bounded.length).toBeLessThanOrEqual(138);
 		expect(bounded).toEndWith("...");
 		expect(boundedChatError(new Error("connection lost"))).toContain("Check the connection");
+	});
+
+	test("shows a missing remote Planner's instructions whole, however long", () => {
+		let message = `No Planner is attached to this document. ${
+			"Connect a Planner client. ".repeat(20)
+		}`.trim();
+		expect(boundedChatError(new WireRefusal(message, "planner-not-attached"))).toBe(message);
+		expect(boundedChatError(new WireRefusal(message))).toEndWith("...");
+	});
+});
+
+describe("focus", () => {
+	let CHILD = "0f5b2c1e-8d3a-4b6f-9a21-7c4e5d6f7a8b";
+
+	test("attaches the open child only to a Planner message", () => {
+		expect(chatSendPayload("@chopin tighten it", [], true, REQUEST_ID, true, CHILD)).toEqual({
+			requestId: REQUEST_ID,
+			text: "@chopin tighten it",
+			to: "planner",
+			focus: CHILD,
+		});
+		expect(chatSendPayload("tighten it", [], true, REQUEST_ID, true, CHILD)).toEqual({
+			requestId: REQUEST_ID,
+			text: "tighten it",
+			to: "room",
+		});
+		expect(chatSendPayload("@chopin tighten it", [], false, REQUEST_ID, true, CHILD)?.focus)
+			.toBeUndefined();
 	});
 });

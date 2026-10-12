@@ -21,6 +21,7 @@ import { ArchiveIcon, InfoIcon, LockIcon, PlusIcon, WarningIcon } from "@chopin/
 import { DraftInput } from "./draft-input";
 import type { DraftInputHandle } from "./draft-input";
 import { ModeSwitch } from "./mode-switch";
+import { PlannerAttachment } from "./planner-attachment";
 import "./composer.css";
 
 import { CommandPicker } from "./command-picker";
@@ -77,7 +78,7 @@ import type { ResearchOfferControls } from "./research-offer";
 import plannerStop from "../assets/icons/planner-stop.svg";
 import plannerResume from "../assets/icons/planner-resume.svg";
 
-import type { Chat as Wire, ConversationPlan } from "@chopin/protocol";
+import type { Chat as Wire, ConversationPlan, Session } from "@chopin/protocol";
 import type { Repository } from "../api";
 import type { ResearchLaunchBlock, ResearchLaunchResult } from "@chopin/editor";
 import type { ChatCommand } from "./commands";
@@ -86,6 +87,10 @@ import type { ComposerDraft, ReferenceTarget } from "./references";
 import type { Wire as Socket } from "../wire";
 
 export type ChatProps = {
+	/** The child document open beside this Chat, sent with a Planner message as its focus. */
+	focus?: string;
+	/** Open a child document and settle once it has synced. */
+	onOpenChild?: (channelId: string) => Promise<boolean>;
 	wire: Socket | undefined;
 	handle: string;
 	connected: boolean;
@@ -100,7 +105,8 @@ export type ChatProps = {
 	/** Hosted mode keeps the shared chat while repository-scoped agent work is disabled. */
 	agent?: boolean;
 	active?: boolean;
-	onActivity?: (event: { type: "message" | "working"; busy: boolean }) => void;
+	/** `history` marks the transcript arriving, after which `busy` is known rather than assumed. */
+	onActivity?: (event: { type: "message" | "working"; busy: boolean; history?: true }) => void;
 	conversationPlan?: ConversationPlan.State;
 	conversationPlanJobs?: ConversationPlan.Job[];
 	onCardLink?: (link: CardLink) => void;
@@ -127,6 +133,8 @@ export type ChatProps = {
 	notice?: string;
 	/** One calm line shown while the transcript has loaded and is still empty. */
 	emptyNotice?: string;
+	/** Who holds the document's remote Planner; absent under every other harness. */
+	planner?: Session.PlannerAttachment;
 };
 
 /** How many runs are still live, and how many are paused and resumable. */
@@ -180,6 +188,8 @@ export function Chat(
 	{
 		active = true,
 		agent = true,
+		focus,
+		onOpenChild,
 		readonly = false,
 		archived = false,
 		connected,
@@ -197,6 +207,7 @@ export function Chat(
 		people = [],
 		notice,
 		emptyNotice,
+		planner,
 		onShowDecisions,
 		onResearch,
 		onShowResearch,
@@ -360,7 +371,7 @@ export function Chat(
 				setRuns(frame.runs);
 				// History is not unread, but a turn already in progress still needs
 				// a signal outside a closed Chat destination.
-				activity.current?.({ type: "working", busy: frame.busy });
+				activity.current?.({ type: "working", busy: frame.busy, history: true });
 			}),
 			wire.on<Wire.Message>("chat:message", frame => {
 				if (loaded && !seen.has(frame.entry.id)) {
@@ -473,6 +484,7 @@ export function Chat(
 			agent,
 			submitted.requestId,
 			referencesEnabled,
+			focus,
 		);
 		if (!payload) return;
 		let token = {};
@@ -635,6 +647,8 @@ export function Chat(
 			conversationPlanJobs={conversationPlanJobs}
 			onCardLink={onCardLink}
 			onAddExcerpt={onAddExcerpt}
+			onOpenChild={onOpenChild}
+			room={room}
 			onRetryAnalysis={onRetryAnalysis}
 			onRetryJob={onRetryJob}
 			conversationPlan={conversationPlan}
@@ -660,6 +674,7 @@ export function Chat(
 				{transcriptView}
 				<div className="chat-composer shrink-0 px-2.5 pb-2.5">
 					<p className="px-4 py-3 text-sm text-text-tertiary">{notice}</p>
+					<PlannerAttachment planner={planner} />
 				</div>
 			</div>
 		);
@@ -682,7 +697,11 @@ export function Chat(
 				</div>
 			)}
 
-			<div ref={composerRoot} className="chat-composer relative shrink-0 px-2.5 pb-2.5">
+			<div
+				ref={composerRoot}
+				className="chat-composer relative shrink-0 px-2.5 pb-2.5"
+				data-planner={agent ? undefined : "off"}
+			>
 				{referencesEnabled && (
 					<p className="sr-only" id={instructionsId}>
 						Type # to reference a document.
@@ -980,27 +999,30 @@ export function Chat(
 										)}
 									</div>
 									<div className="composer-actions">
-										{/* Always mounted, so the live region hears its first word. */}
-										<span className="composer-connection" id={connectionId} role="status">
-											{connectionLabel && (
-												<span
-													className="composer-connection-label"
-													data-offline={connectionLabel === "Offline" || undefined}
+										{/* A row of its own on a phone; see composer.css. */}
+										<span className="composer-connection-group">
+											{/* Always mounted, so the live region hears its first word. */}
+											<span className="composer-connection" id={connectionId} role="status">
+												{connectionLabel && (
+													<span
+														className="composer-connection-label"
+														data-offline={connectionLabel === "Offline" || undefined}
+													>
+														{connectionLabel}
+													</span>
+												)}
+											</span>
+											{/* Where the document header is out of view; see composer.css. */}
+											{connectionNotice === "offline" && wire && (
+												<button
+													className="composer-reconnect btn btn-sm btn-ghost"
+													onClick={() => wire.reconnect()}
+													type="button"
 												>
-													{connectionLabel}
-												</span>
+													Reconnect
+												</button>
 											)}
 										</span>
-										{/* Where the document header is out of view; see composer.css. */}
-										{connectionNotice === "offline" && wire && (
-											<button
-												className="composer-reconnect btn btn-sm btn-ghost"
-												onClick={() => wire.reconnect()}
-												type="button"
-											>
-												Reconnect
-											</button>
-										)}
 										<span className="composer-run-control">
 											{agent && (busy || counts.active > 0) && (
 												<button
@@ -1040,6 +1062,7 @@ export function Chat(
 							</>
 						)}
 				</div>
+				<PlannerAttachment planner={planner} />
 			</div>
 		</div>
 	);

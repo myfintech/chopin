@@ -30,7 +30,7 @@ export function placeSurface(
 	surface: { width: number; height: number },
 	viewport: ViewportBox,
 	gap = 8,
-	prefer: "auto" | "above" = "auto",
+	prefer: "auto" | "above" | "below" = "auto",
 ): SurfacePlacement {
 	let leftEdge = viewport.left + gap;
 	let rightEdge = viewport.left + viewport.width - gap;
@@ -41,7 +41,13 @@ export function placeSurface(
 	let below = Math.max(0, bottomEdge - anchor.bottom - gap);
 	// `above` keeps a surface off the line under a selection and flips only
 	// when the whole surface no longer fits over it and below has more room.
-	let useAbove = prefer === "above" ? above >= surface.height || above >= below : above > below;
+	// `below` leaves the space over a touch selection to the system's own callout
+	// and flips only when the surface no longer fits under it and above has more room.
+	let useAbove = prefer === "above"
+		? above >= surface.height || above >= below
+		: prefer === "below"
+		? below < surface.height && above > below
+		: above > below;
 
 	if (useAbove) {
 		let top = Math.max(topEdge, anchor.top - gap - surface.height);
@@ -74,89 +80,4 @@ export function visibleAnchor(anchor: DOMRectLike, viewport: ViewportBox): DOMRe
 	let shown = bottom - top;
 	if (shown <= 0 || shown < Math.min(anchor.height / 2, 20)) return undefined;
 	return { ...anchor, top, bottom, height: shown };
-}
-
-export type DraftPlacement = {
-	left: number;
-	top: number;
-	side: "below" | "above" | "pinned" | "away";
-	/** The scroll distance that would show the anchor's last line and the whole draft below it. */
-	reveal: number;
-};
-
-/**
- * Place an inline draft under its anchor block, inside the visible pixels.
- *
- * The draft follows its anchor while the anchor is on screen. When the space
- * below runs out it flips above, then pins to the nearest edge. Once the anchor
- * has scrolled away entirely the draft goes with it rather than floating free.
- */
-export function placeDraft(
-	anchor: DOMRectLike,
-	surface: { width: number; height: number },
-	bounds: ViewportBox,
-	gap = 8,
-	line = 24,
-): DraftPlacement {
-	let topEdge = bounds.top + gap;
-	let bottomEdge = bounds.top + bounds.height - gap;
-	let left = clamp(
-		anchor.left,
-		bounds.left + gap,
-		bounds.left + bounds.width - gap - surface.width,
-	);
-	let lineTop = anchor.bottom - Math.min(line, anchor.height);
-	let below = anchor.bottom;
-	let reveal = 0;
-	if (surface.height + anchor.bottom - lineTop > bottomEdge - topEdge) reveal = lineTop - topEdge;
-	else if (below + surface.height > bottomEdge) reveal = below + surface.height - bottomEdge;
-	else if (lineTop < topEdge) reveal = lineTop - topEdge;
-
-	// Scroll offsets land on whole pixels, so a revealed draft may sit a fraction past the edge.
-	if (below >= topEdge - 1 && below + surface.height <= bottomEdge + 1) {
-		return { left, top: below, side: "below", reveal };
-	}
-	if (anchor.bottom < topEdge || anchor.top > bottomEdge) {
-		return { left, top: below, side: "away", reveal };
-	}
-	let above = anchor.top - surface.height;
-	if (below + surface.height > bottomEdge && above >= topEdge) {
-		return { left, top: above, side: "above", reveal };
-	}
-	return {
-		left,
-		top: clamp(below, topEdge, bottomEdge - surface.height),
-		side: "pinned",
-		reveal,
-	};
-}
-
-/** How far a placed draft overflows the visible bounds at its top and bottom edges. */
-export function draftOverflow(
-	top: number,
-	height: number,
-	bounds: ViewportBox,
-): { top: number; bottom: number } {
-	return {
-		top: Math.max(0, bounds.top - top),
-		bottom: Math.max(0, top + height - (bounds.top + bounds.height)),
-	};
-}
-
-/**
- * Where to scroll to reveal a draft: back to where the reader was when it
- * opened if the draft fits there, otherwise the smallest scroll that shows it.
- */
-export function revealTarget(
-	scrollTop: number,
-	openedAt: number | undefined,
-	placeAt: (shift: number) => DraftPlacement,
-	reveal: number,
-): number {
-	if (openedAt !== undefined && openedAt !== scrollTop) {
-		let shift = scrollTop - openedAt;
-		let back = placeAt(shift);
-		if (back.side === "below" && back.reveal === 0) return openedAt;
-	}
-	return scrollTop + reveal;
 }

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { $isParagraphNode, $nodesOfType } from "lexical";
 import * as Y from "yjs";
-import { CalloutNode } from "@chopin/dialect";
+import { CalloutNode, ulid } from "@chopin/dialect";
 import * as Question from "@chopin/question";
 
 import * as Room from "../plan/room";
@@ -14,6 +14,7 @@ import type { JsonValue } from "../storage/model";
 import type { SocketData } from "../wire";
 
 export type SeedState = {
+	graph?: import("../tasks/graphs").Graph;
 	revision?: number;
 	questions?: unknown[];
 	openQuestions?: unknown[];
@@ -66,6 +67,144 @@ export async function storedLegacyCallout(source: string) {
 	}
 }
 
+/**
+ * A document with one comment accepted under the earlier lifecycle.
+ *
+ * Nothing creates accepted threads any more, but storage still holds them, so
+ * the `<Decision>` projection and its sidecar record are seeded together. The
+ * passage's positions belong to a document the seeded one is not, as after a
+ * restart, so the server recovers it from the quote.
+ */
+export async function storedAcceptedComment(
+	source: string,
+	quote: string,
+	note: { by: string; text: string },
+	block = 0,
+) {
+	let document = await Room.create(source);
+	try {
+		let passage = Room.passageAt(document, [block], quote, 0, quote.length);
+		let id = ulid();
+		let at = new Date("2026-08-13T12:00:00.000Z");
+		Room.insertDecision(document, {
+			id,
+			quote,
+			by: note.by,
+			at: at.toISOString(),
+			notes: [note],
+		});
+		await Room.settle();
+		return {
+			id,
+			source: Room.project(document),
+			thread: {
+				id,
+				status: "accepted",
+				passage,
+				notes: [{ id: ulid(), handle: note.by, text: note.text, ts: at.getTime() / 1_000 }],
+				quote,
+				resolver: note.by,
+				at: at.getTime() / 1_000,
+			},
+		};
+	} finally {
+		document.doc.destroy();
+	}
+}
+
+/**
+ * A resolved comment whose Planner turn wrote the blocks at `result`, as stored.
+ *
+ * The notes alternate between the member and Chopin, starting with the member.
+ */
+export async function storedResolvedComment(
+	source: string,
+	quote: string,
+	{ block = 0, notes, resolver, result }: {
+		block?: number;
+		notes: string[];
+		resolver: string;
+		result: number[];
+	},
+) {
+	let document = await Room.create(source);
+	try {
+		let passage = Room.passageAt(document, [block], quote, 0, quote.length);
+		let hashes = Room.digests(document);
+		let at = new Date("2026-08-13T12:00:00.000Z").getTime() / 1_000;
+		let id = ulid();
+		return {
+			id,
+			thread: {
+				id,
+				status: "resolved",
+				passage,
+				// A leading "@chopin " addresses the Planner the way the wire does: through `to`.
+				notes: notes.map((text, index) => {
+					let ts = at + index * 60;
+					if (index % 2 === 1) return { id: ulid(), author: "planner", text, ts };
+					let addressed = text.startsWith("@chopin ");
+					return {
+						id: ulid(),
+						author: "member",
+						handle: resolver,
+						text: addressed ? text.slice("@chopin ".length) : text,
+						ts,
+						...(addressed ? { to: "planner" } : {}),
+					};
+				}),
+				quote,
+				resolver,
+				at: at + notes.length * 60,
+				result: {
+					anchors: result.map(index => Room.anchorAt(document, index, hashes[index]!)),
+					pending: false,
+				},
+			},
+		};
+	} finally {
+		document.doc.destroy();
+	}
+}
+
+/** Store `source` as a channel's first checkpoint, with an otherwise empty sidecar. */
+export async function checkpointSource(
+	storage: MemoryStorage,
+	lease: NonNullable<Awaited<ReturnType<MemoryStorage["leases"]["acquire"]>>>,
+	channelId: string,
+	source: string,
+	state: SeedState = {},
+	now = new Date(),
+): Promise<void> {
+	let sidecar = {
+		version: 1,
+		revision: state.revision ?? 0,
+		documentSeq: 0,
+		questions: state.questions ?? [],
+		openQuestions: state.openQuestions ?? [],
+		threads: state.threads ?? [],
+		transcript: state.transcript ?? [],
+		...(state.graph ? { graph: state.graph } : {}),
+	} as JsonValue;
+	let document = await Room.create(source);
+	let canonical = Room.project(document);
+	await storage.collaboration.checkpoint({
+		channelId,
+		lease,
+		expectedRevision: 0,
+		generation: crypto.randomUUID(),
+		revision: 0,
+		throughSequence: 0,
+		epoch: document.epoch,
+		source: canonical,
+		sourceHash: `sha256:${createHash("sha256").update(canonical).digest("hex")}`,
+		document: Y.encodeStateAsUpdate(document.doc),
+		sidecar,
+		createdAt: now,
+	});
+	document.doc.destroy();
+}
+
 export async function openPlan(source = "", state: SeedState = {}) {
 	let now = new Date("2026-08-13T12:00:00.000Z");
 	let storage = new MemoryStorage();
@@ -89,32 +228,7 @@ export async function openPlan(source = "", state: SeedState = {}) {
 	});
 	let lease = await storage.leases.acquire("writer", crypto.randomUUID(), 60_000);
 	if (!lease) throw new Error("could not acquire test lease");
-	let sidecar = {
-		version: 1,
-		revision: state.revision ?? 0,
-		documentSeq: 0,
-		questions: state.questions ?? [],
-		openQuestions: state.openQuestions ?? [],
-		threads: state.threads ?? [],
-		transcript: state.transcript ?? [],
-	} as JsonValue;
-	let document = await Room.create(source);
-	let canonical = Room.project(document);
-	await storage.collaboration.checkpoint({
-		channelId: channel.id,
-		lease,
-		expectedRevision: 0,
-		generation: crypto.randomUUID(),
-		revision: 0,
-		throughSequence: 0,
-		epoch: document.epoch,
-		source: canonical,
-		sourceHash: `sha256:${createHash("sha256").update(canonical).digest("hex")}`,
-		document: Y.encodeStateAsUpdate(document.doc),
-		sidecar,
-		createdAt: now,
-	});
-	document.doc.destroy();
+	await checkpointSource(storage, lease, channel.id, source, state, now);
 	let broadcasts: Array<Record<string, unknown>> = [];
 	let broken: string | undefined;
 	let server = {
@@ -145,4 +259,19 @@ export async function openPlan(source = "", state: SeedState = {}) {
 			broken = kind;
 		},
 	};
+}
+
+/** An open comment thread on block `index` of `plan`, marking the block's first word. */
+export function seedOpenThread(plan: Service.Plan, index = 1): string {
+	let source = Room.project(plan.document).split("\n\n")[index] ?? "";
+	let quote = source.split(/\s+/)[0] ?? "";
+	let passage = Room.passageAt(plan.document, [index], quote, 0, quote.length);
+	let id = ulid();
+	plan.threads.set(id, {
+		id,
+		status: "open",
+		passage,
+		notes: [{ id: ulid(), author: "member", handle: "ana", text: "Tighten this.", ts: 1 }],
+	});
+	return id;
 }

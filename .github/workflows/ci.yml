@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:17-alpine
+        image: mirror.gcr.io/library/postgres:17-alpine
         env:
           POSTGRES_DB: chopin
           POSTGRES_USER: chopin
@@ -83,6 +83,8 @@ jobs:
   browser:
     name: e2e
     runs-on: ubuntu-latest
+    env:
+      CHOPIN_CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v7
 
@@ -117,18 +119,40 @@ jobs:
       - name: Diagram gallery (rendering and keyboard behaviour)
         run: bun run diagrams:test
 
-      # Builds the client, then runs it. The build is deliberately here rather
-      # than inside the Playwright config: web servers start before any global
-      # setup, so a build racing them would leave the suite on the previous
-      # bundle — green, about code nobody changed.
-      - run: bun run e2e
+      # Build once, and reject development previews before the long browser suite. The browser
+      # suite reuses this build, so it carries the same child-motion toggle as scripts/e2e.ts.
+      - run: bun run build
+        env:
+          VITE_CHILD_MOTION_TOGGLE: "on"
 
       - name: Verify design audit stays out of production
         run: bun scripts/check-design-production.ts
 
-      # Only on failure, and only the parts worth reading. `test-results`
-      # carries the traces; the report is the thing that indexes them.
-      - if: failure()
+      - name: Cache PostgreSQL from the Docker Hub mirror
+        run: |
+          docker pull mirror.gcr.io/library/postgres:17-alpine
+          docker tag mirror.gcr.io/library/postgres:17-alpine postgres:17-alpine
+
+      - run: E2E_SKIP_BUILD=1 bun run e2e
+
+      - name: Summarise browser results and retries
+        id: browser_summary
+        if: ${{ !cancelled() }}
+        run: bun scripts/browser-ci-summary.ts
+
+      - name: Save browser result counts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-test-summary
+          path: e2e/.scratch/ci-reports/*.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+      # Retry passes need their traces too. Keep each suite's output separate
+      # so integration setup does not erase earlier design/gallery evidence.
+      - if: ${{ !cancelled() && (failure() || steps.browser_summary.outputs.has_flaky == 'true') }}
         uses: actions/upload-artifact@v7
         with:
           name: playwright-report
@@ -144,6 +168,10 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
 
       - uses: docker/build-push-action@v6
         with:

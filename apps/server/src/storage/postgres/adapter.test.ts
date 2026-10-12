@@ -1,5 +1,6 @@
 import { SQL } from "bun";
 import { describe, expect, it } from "bun:test";
+import { type AddressInfo, connect, createServer, type Socket } from "node:net";
 import { join } from "node:path";
 
 import { documentSlug } from "../../channels/slug";
@@ -18,6 +19,75 @@ let url = process.env.TEST_DATABASE_URL;
 
 function digest(source: string): string {
 	return new Bun.CryptoHasher("sha256").update(source).digest("hex");
+}
+
+/** Waits until `expected` sessions in the test database are waiting for a lock. */
+async function lockWaiters(sql: SQL, expected: number): Promise<void> {
+	let deadline = Date.now() + 3_000;
+	while (Date.now() < deadline) {
+		let [row] = await sql<{ count: number }[]>`
+			SELECT count(*)::int AS count
+			FROM pg_stat_activity
+			WHERE datname = current_database() AND cardinality(pg_blocking_pids(pid)) > 0
+		`;
+		if (row!.count >= expected) return;
+		await Bun.sleep(10);
+	}
+	throw new Error(`expected ${expected} sessions waiting for a lock`);
+}
+
+function within<T>(promise: Promise<T>, ms: number): Promise<T | "still waiting"> {
+	return Promise.race([promise, Bun.sleep(ms).then(() => "still waiting" as const)]);
+}
+
+/**
+ * A TCP proxy to PostgreSQL that can partition one connection the moment the server
+ * replies with `tag`: from then on nothing crosses in either direction, not even a close.
+ */
+async function partitionProxy(target: string) {
+	let destination = new URL(target);
+	let armed: string | undefined;
+	let partitioned = Promise.withResolvers<void>();
+	let sockets = new Set<Socket>();
+	let server = createServer(client => {
+		let upstream = connect(Number(destination.port || 5432), destination.hostname);
+		let cut = false;
+		sockets.add(client).add(upstream);
+		client.on("error", () => {});
+		upstream.on("error", () => {});
+		client.on("data", chunk => {
+			if (!cut) upstream.write(chunk);
+		});
+		upstream.on("data", chunk => {
+			if (!cut && armed !== undefined && chunk.includes(armed)) {
+				cut = true;
+				armed = undefined;
+				partitioned.resolve();
+			}
+			if (!cut) client.write(chunk);
+		});
+		client.on("close", () => {
+			if (!cut) upstream.destroy();
+		});
+		upstream.on("close", () => {
+			if (!cut) client.destroy();
+		});
+	});
+	await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+	let proxied = new URL(target);
+	proxied.hostname = "127.0.0.1";
+	proxied.port = String((server.address() as AddressInfo).port);
+	return {
+		url: proxied.toString(),
+		cutAfter(tag: string): Promise<void> {
+			armed = tag;
+			return partitioned.promise;
+		},
+		close(): void {
+			for (let socket of sockets) socket.destroy();
+			server.close();
+		},
+	};
 }
 
 if (url) {
@@ -318,6 +388,246 @@ if (url) {
 			expect((await storage.jobs.list(channelId, 10))!.jobs).toEqual([]);
 		} finally {
 			release.resolve();
+			await storage.close();
+			await sql.close();
+		}
+	});
+
+	it("renews the writer lease while a fenced commit waits for its channel", async () => {
+		let storage = new PostgresStorage(url);
+		let sql = new SQL(url);
+		let release = Promise.withResolvers<void>();
+		let blocker: Promise<void> | undefined;
+		try {
+			await storage.migrate();
+			let { channelId, lease } = await userAndChannel(storage);
+			let locked = Promise.withResolvers<void>();
+			blocker = sql.begin(async transaction => {
+				await transaction`SELECT id FROM channels WHERE id = ${channelId} FOR UPDATE`;
+				locked.resolve();
+				await release.promise;
+			});
+			await locked.promise;
+			let commit = storage.collaboration.commit({
+				channelId,
+				lease,
+				expectedRevision: 0,
+				operationId: contractId("slow-commit"),
+				epoch: "epoch-1",
+				update: new Uint8Array([1]),
+				events: [],
+				now: new Date(),
+			});
+			await lockWaiters(sql, 1);
+
+			let renewed = await within(storage.leases.renew(lease, 60_000), 2_000);
+			expect(renewed).toEqual(
+				expect.objectContaining({ name: lease.name, fencing: lease.fencing }),
+			);
+			release.resolve();
+			await blocker;
+			expect(await commit).toMatchObject({ revision: 1, repeated: false });
+		} finally {
+			release.resolve();
+			await blocker;
+			await storage.close();
+			await sql.close();
+		}
+	});
+
+	it("renews the writer lease while every pooled connection is waiting", async () => {
+		let storage = new PostgresStorage(url);
+		let sql = new SQL(url);
+		let release = Promise.withResolvers<void>();
+		let blocker: Promise<void> | undefined;
+		let renames: Promise<unknown>[] = [];
+		try {
+			await storage.migrate();
+			let { channelId, lease } = await userAndChannel(storage);
+			let locked = Promise.withResolvers<void>();
+			blocker = sql.begin(async transaction => {
+				await transaction`SELECT id FROM channels WHERE id = ${channelId} FOR UPDATE`;
+				locked.resolve();
+				await release.promise;
+			});
+			await locked.promise;
+			// The adapter's pool holds ten connections.
+			for (let index = 0; index < 10; index++) {
+				renames.push(storage.channels.rename({
+					id: channelId,
+					title: `Busy ${index}`,
+					now: new Date(),
+				}));
+			}
+			await lockWaiters(sql, 10);
+
+			let renewed = await within(storage.leases.renew(lease, 60_000), 2_000);
+			expect(renewed).toEqual(
+				expect.objectContaining({ name: lease.name, fencing: lease.fencing }),
+			);
+		} finally {
+			release.resolve();
+			await blocker;
+			await Promise.allSettled(renames);
+			await storage.close();
+			await sql.close();
+		}
+	});
+
+	it("ends a renewal attempt that cannot reach the lease row", async () => {
+		let storage = new PostgresStorage(url);
+		let sql = new SQL(url);
+		let release = Promise.withResolvers<void>();
+		let blocker: Promise<void> | undefined;
+		try {
+			await storage.migrate();
+			let { lease } = await userAndChannel(storage);
+			let locked = Promise.withResolvers<void>();
+			blocker = sql.begin(async transaction => {
+				await transaction`SELECT name FROM storage_leases WHERE name = ${lease.name} FOR UPDATE`;
+				locked.resolve();
+				await release.promise;
+			});
+			await locked.promise;
+
+			let attempt = storage.leases.renew(lease, 60_000).then(() => "renewed", error => error);
+			expect(await within(attempt, 10_000)).toMatchObject({ failure: "unavailable" });
+			release.resolve();
+			await blocker;
+			expect(await storage.leases.renew(lease, 60_000)).toMatchObject({
+				name: lease.name,
+				fencing: lease.fencing,
+			});
+		} finally {
+			release.resolve();
+			await blocker;
+			await storage.close();
+			await sql.close();
+		}
+	}, 20_000);
+
+	it("does not renew a writer lease that expired while renewal waited for its row", async () => {
+		let storage = new PostgresStorage(url);
+		let sql = new SQL(url);
+		let release = Promise.withResolvers<void>();
+		let blocker: Promise<void> | undefined;
+		try {
+			await storage.migrate();
+			let name = contractId("expiring-renewal");
+			let held = await storage.leases.acquire(name, "old-writer", 1_000);
+			let locked = Promise.withResolvers<void>();
+			// A takeover that finds the lease still live locks the row but leaves it unchanged.
+			blocker = sql.begin(async transaction => {
+				await transaction`SELECT name FROM storage_leases WHERE name = ${name} FOR UPDATE`;
+				locked.resolve();
+				await release.promise;
+			});
+			await locked.promise;
+			let renewal = storage.leases.renew(held!, 60_000);
+			await lockWaiters(sql, 1);
+			let deadline = Date.now() + 3_000;
+			while (Date.now() < deadline) {
+				let [expired] = await sql<{ name: string }[]>`
+					SELECT name FROM storage_leases
+					WHERE name = ${name} AND expires_at <= clock_timestamp()
+				`;
+				if (expired) break;
+				await Bun.sleep(20);
+			}
+			release.resolve();
+			await blocker;
+
+			expect(await renewal).toBeUndefined();
+			expect(await storage.leases.acquire(name, "new-writer", 60_000)).toMatchObject({
+				owner: "new-writer",
+				fencing: held!.fencing + 1,
+			});
+		} finally {
+			release.resolve();
+			await blocker;
+			await storage.close();
+			await sql.close();
+		}
+	});
+
+	it("frees the lease row when the network drops a renewal's reply", async () => {
+		let proxy = await partitionProxy(url);
+		let storage = new PostgresStorage(proxy.url);
+		let sql = new SQL(url);
+		try {
+			await storage.migrate();
+			let name = contractId("partitioned-renewal");
+			let held = await storage.leases.acquire(name, "writer", 60_000);
+			let cut = proxy.cutAfter("UPDATE 1");
+			let attempt = storage.leases.renew(held!, 60_000).then(() => "renewed", error => error);
+			await cut;
+			let partitionedAt = Date.now();
+
+			// The abandoned renewal session must not keep the row past a few seconds.
+			let freedAfter: number | undefined;
+			while (Date.now() - partitionedAt < 4_000) {
+				let locked = await sql.begin(async transaction => {
+					await transaction`SELECT name FROM storage_leases WHERE name = ${name} FOR UPDATE NOWAIT`;
+				}).then(() => true, () => false);
+				if (locked) {
+					freedAfter = Date.now() - partitionedAt;
+					break;
+				}
+				await Bun.sleep(50);
+			}
+			expect(freedAfter ?? Infinity).toBeLessThan(3_000);
+
+			expect(await within(attempt, 10_000)).toMatchObject({ failure: "unavailable" });
+			expect(await within(storage.leases.renew(held!, 60_000), 2_000)).toMatchObject({
+				name,
+				fencing: held!.fencing,
+			});
+		} finally {
+			await storage.close();
+			await sql.close();
+			proxy.close();
+		}
+	}, 30_000);
+
+	it("makes a takeover wait for a fenced commit already in flight", async () => {
+		let storage = new PostgresStorage(url);
+		let sql = new SQL(url);
+		let release = Promise.withResolvers<void>();
+		let blocker: Promise<void> | undefined;
+		try {
+			await storage.migrate();
+			let { channelId } = await userAndChannel(storage);
+			let name = contractId("expiring-writer");
+			let old = await storage.leases.acquire(name, "old-writer", 500);
+			let locked = Promise.withResolvers<void>();
+			blocker = sql.begin(async transaction => {
+				await transaction`SELECT id FROM channels WHERE id = ${channelId} FOR UPDATE`;
+				locked.resolve();
+				await release.promise;
+			});
+			await locked.promise;
+			let commit = storage.collaboration.commit({
+				channelId,
+				lease: old!,
+				expectedRevision: 0,
+				operationId: contractId("in-flight-commit"),
+				epoch: "epoch-1",
+				update: new Uint8Array([1]),
+				events: [],
+				now: new Date(),
+			});
+			await lockWaiters(sql, 1);
+			await Bun.sleep(600);
+
+			let takeover = storage.leases.acquire(name, "new-writer", 60_000);
+			expect(await within(takeover, 500)).toBe("still waiting");
+			release.resolve();
+			await blocker;
+			expect(await commit).toMatchObject({ revision: 1, repeated: false });
+			expect(await takeover).toMatchObject({ owner: "new-writer", fencing: old!.fencing + 1 });
+		} finally {
+			release.resolve();
+			await blocker;
 			await storage.close();
 			await sql.close();
 		}
@@ -693,7 +1003,9 @@ if (url) {
 				"014_inline_research",
 				"015_planner_inline_reference",
 				"016_persistent_sessions",
+				"017_experiments",
 				"017_unanswered_decisions",
+				"018_plan_images",
 				"mantl_document_provenance",
 				"mantl_user_preferences",
 			]);

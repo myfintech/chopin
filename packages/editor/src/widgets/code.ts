@@ -10,23 +10,44 @@
  * never have to load.
  */
 
-import { DIFF_LANGUAGE, MERMAID_LANGUAGE, SEECODE_LANGUAGE } from "@chopin/dialect";
+import {
+	DIFF_LANGUAGE,
+	MERMAID_LANGUAGE,
+	SEECODE_LANGUAGE,
+	WIREFRAME_LANGUAGE,
+} from "@chopin/dialect";
 
 /**
  * How a block is drawn, which is not the same as what its fence says.
  *
- * `plain` is a fence with no language: it renders nothing, because a rendered
- * preview of uncoloured text beside the same uncoloured text is two of the
- * same thing and an invitation to edit the wrong one.
+ * `plain` is a fence with no language, or one named as plain text: it
+ * renders nothing, because a rendered preview of uncoloured text beside the
+ * same uncoloured text is two of the same thing and an invitation to edit the
+ * wrong one.
  */
-export type Kind = "plain" | "code" | "diff" | "mermaid" | "seecode";
+export type Kind = "plain" | "code" | "diff" | "mermaid" | "seecode" | "wireframe";
 
 export function kindOf(language: string): Kind {
-	if (!language) return "plain";
+	if (!language || plainText(language)) return "plain";
 	if (language === MERMAID_LANGUAGE) return "mermaid";
 	if (language === SEECODE_LANGUAGE) return "seecode";
+	if (language === WIREFRAME_LANGUAGE) return "wireframe";
 	if (language === DIFF_LANGUAGE) return "diff";
 	return "code";
+}
+
+/** The names a fence uses to say it is prose laid out by hand, not code. */
+const PLAIN_TEXT = new Set(["text", "txt", "plaintext", "plain"]);
+
+/**
+ * Whether a fence was deliberately named as plain text — an ASCII wireframe,
+ * a terminal transcript. It is drawn as the text it is, with no language menu
+ * at rest: the name is the author's answer to the menu's question. A fence
+ * nobody named is not this; it is usually one just inserted, still waiting
+ * for a language, so it keeps the menu.
+ */
+export function plainText(language: string): boolean {
+	return PLAIN_TEXT.has(language.toLowerCase());
 }
 
 /**
@@ -74,6 +95,7 @@ export const LANGUAGES: readonly LanguageOption[] = Object.freeze(
 		["toml", "TOML"],
 		["tsx", "TSX"],
 		["typescript", "TypeScript"],
+		[WIREFRAME_LANGUAGE, "Wireframe"],
 		["xml", "XML"],
 		["yaml", "YAML"],
 	] as const,

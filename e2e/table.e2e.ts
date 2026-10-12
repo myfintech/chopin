@@ -14,7 +14,7 @@
  * which elements get rendered.
  */
 
-import { content, expect, openIsolatedRoom, test } from "./room";
+import { content, edit, expect, openIsolatedRoom, test } from "./room";
 import { expectFocusIndicator } from "./focus";
 import { installPointerMedia } from "./pointer-media";
 import { expectInsideViewport, expectNoHorizontalOverflow } from "./responsive";
@@ -77,6 +77,7 @@ function items(page: Page): Locator {
 }
 
 async function touchToolbar(page: Page, cell: Locator = content(page).locator("td").first()) {
+	await edit(page);
 	await cell.tap();
 	let toolbar = page.getByRole("toolbar", { name: "Table actions" });
 	await expect(toolbar).toBeVisible();
@@ -369,7 +370,11 @@ test("touch table action groups are labelled, reachable, and clear of the select
 		toolbar.getByRole("button", { name: "Move", exact: true }),
 		toolbar.getByRole("button", { name: /^Align column 2/ }),
 	];
-	for (let button of access) await expectInsideViewport(button);
+	for (let button of access) {
+		// The measurement does not retry, and the bar can still be settling after the tap.
+		await expect(button).toBeVisible();
+		await expectInsideViewport(button);
+	}
 	let targets = await Promise.all(access.map(button =>
 		button.evaluate(node => {
 			let box = node.getBoundingClientRect();

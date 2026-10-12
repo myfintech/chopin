@@ -19,6 +19,7 @@ The most useful technical references are:
 - [Repository channels](docs/channels.md)
 - [Storage and persistence](docs/storage.md)
 - [Hosted agent (Planner)](docs/hosted-agent.md)
+- [Planner link wire format](docs/planner-link.md)
 - [Background jobs and workers](docs/background-jobs.md)
 - [Experimental implementation lifecycle](docs/implementation-lifecycle.md)
 - [Self-hosting](docs/self-hosting.md)
@@ -61,20 +62,26 @@ only when the existing client build is known to match the checkout.
 CI has three independent jobs: validation, browser integration, and a Docker
 image build. A documentation-only change should still pass `bun run ci`.
 
+Before opening a PR or repairing CI, use the repository's
+[PR readiness skill](.agents/skills/chopin-pr-readiness/SKILL.md).
+
 ## Repository map
 
-| Area                | Responsibility                                         | Internal workspace dependencies                           |
-| ------------------- | ------------------------------------------------------ | --------------------------------------------------------- |
-| `packages/dialect`  | Restricted MDX, MDAST, and Lexical schema              | none                                                      |
-| `packages/protocol` | WebSocket declarations and addressing helper           | none                                                      |
-| `packages/question` | Questionnaire definitions and shared drafts            | `protocol`                                                |
-| `packages/draft`    | Bounded collaborative plain-text drafts                | none                                                      |
-| `packages/viewport` | Browser geometry and subscriptions                     | none                                                      |
-| `packages/diagrams` | Bounded diagram rendering and scoped React viewing     | none (React peer)                                         |
-| `packages/editor`   | Collaborative editor, decisions, comments, and widgets | `diagrams`, `dialect`, `question`, `protocol`, `viewport` |
-| `apps/server`       | Auth, channels, rooms, storage, Planner, MCP, tasks    | `diagrams`, `dialect`, `draft`, `question`, `protocol`    |
-| `apps/web`          | Repository picker, navigation, conversation, workspace | `dialect`, `draft`, `editor`, `protocol`, `viewport`      |
-| `e2e`               | Browser and system integration harness                 | may import server internals as fixtures                   |
+| Area                    | Responsibility                                            | Internal workspace dependencies                                                      |
+| ----------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `packages/dialect`      | Restricted MDX, MDAST, and Lexical schema                 | none                                                                                 |
+| `packages/protocol`     | WebSocket declarations and addressing helper              | none                                                                                 |
+| `packages/planner-link` | Remote Planner link messages, schemas and test client     | none                                                                                 |
+| `packages/question`     | Questionnaire definitions and shared drafts               | `protocol`                                                                           |
+| `packages/draft`        | Bounded collaborative plain-text drafts                   | none                                                                                 |
+| `packages/viewport`     | Browser geometry and subscriptions                        | none                                                                                 |
+| `packages/diagrams`     | Bounded diagram rendering and scoped React viewing        | `icons` (React peer)                                                                 |
+| `packages/experiment`   | Investigation result schemas, selections and native views | `diagrams` (React peer)                                                              |
+| `apps/connector`        | Local ACP client and run-scoped MCP bridge                | `experiment`, `protocol`                                                             |
+| `packages/editor`       | Collaborative editor, decisions, comments, and widgets    | `diagrams`, `dialect`, `experiment`, `question`, `protocol`, `viewport`              |
+| `apps/server`           | Auth, channels, rooms, storage, Planner, MCP, tasks       | `diagrams`, `dialect`, `draft`, `experiment`, `planner-link`, `question`, `protocol` |
+| `apps/web`              | Repository picker, navigation, conversation, workspace    | `dialect`, `diagrams`, `draft`, `editor`, `experiment`, `protocol`, `viewport`       |
+| `e2e`                   | Browser and system integration harness                    | may import server internals as fixtures                                              |
 
 Runtime workspace packages do not depend on an application. E2E and skill
 contract tests may deliberately import server internals; do not treat those test
@@ -134,6 +141,15 @@ collaborative state and external implementation runs are durable.
   remembered per channel in memory, or else an empty per-channel directory. Its
   summary and research workers stay isolated. There is no flag for this; the
   harness is the choice.
+- **`HARNESS=remote` moves the model, not the authority.** Turns run in a client
+  attached at `/planner-link` with a GitHub bearer and push access; Chopin's
+  host tools, Decisions, and room writes still run in the server. The attached
+  client sees what a turn sees and steers its document writes. Attaching makes
+  the account's live browser login the document's Planner owner, one client per
+  document; nothing else claims ownership. `@chopin` and `invoke_planner` on a
+  document without one fail with `planner-not-attached`. Signing out the
+  owner's login, its expiry, or a Planner reset closes the link. See
+  [Hosted agent](docs/hosted-agent.md#remote-planner).
 - **Repository node IDs are authoritative.** Owner and repository names resolve
   GitHub requests but never replace the stored node identity.
 - **Persistence should precede publication.** Do not acknowledge or broadcast a
@@ -149,10 +165,19 @@ Planner destination without a mention.
 
 `instruction()` strips the mention before model input. Recent room messages that
 did not address the Planner still enter a bounded backscroll for the next turn.
-An accepted comment also starts an explicit Planner turn after it commits. An MCP
+`implementation:draft` from Build also starts an explicit Planner turn: the
+server writes the instruction from the plan, rechecks write access as for
+`chat:send`, records only a system notice of who asked, and keeps one live draft
+per document. An MCP
 `invoke_planner` call posts its instruction as the caller's member message and
 runs under the channel's existing Planner owner; only a caller with a live
 browser login can claim an unowned channel.
+
+`Chat.Send.focus` names the child a member has open. The server resolves it
+against storage and treats it as context, never as an authorization grant. A
+child has no Chat: a comment sent to Chopin inside a child, and an
+`invoke_planner` call naming a child, run on the root's Chat with that child as
+focus, and the turn answers in the child's thread.
 
 Under `copilot-sdk` and `pi` the Planner is a custom agent, not a general coding
 agent; under `atomic` it is a full Atomic session. Either way its turn runs
@@ -192,6 +217,15 @@ server resolves the locator and mints relative positions. It handles stale or
 ambiguous passages conservatively, but does not yet enforce every client-side
 size and ordering bound on custom wire input.
 
+A comment thread is resolved or reopened through `comment:resolve` and
+`comment:reopen`. Both change only the sidecar record and persist before they
+are acknowledged or broadcast; reopening must also drop the store's recent
+resolution tombstone, which otherwise refuses replies. Resolved threads leave
+`comment:sync` and `plan:anchors` and are not rebased, except one whose Planner
+turn recorded a result: it stays synced and rebased so the left margin can mark
+what it wrote. Reopening recovers the passage. Accepted and dismissed threads are legacy persisted states: nothing
+creates them, but accepted `<Decision>` rows and their result anchors remain.
+
 Question and comment relationships have four deliberate states: pending,
 linked, deliberately empty, and orphaned. Preserve the distinction. Empty means
 the Planner reviewed the decision and intentionally linked no prose; orphaned
@@ -214,8 +248,12 @@ the request identity; observational reads must not restart terminal work.
 Successful reconciliation validates the complete report and atomically creates
 an initialized ordinary child channel plus the request link. Publication must be
 idempotent and persistence must precede the ready card or nested navigation row.
-A child owns ordinary document, Conversation, and Decisions state. V1 does not
-offer child research, Background Work, implementation/tasks, or grandchildren.
+A child owns ordinary document and Decisions state. It has no Chat: its root's
+Chat and Planner reach it through the child tools, and a root message carries the
+open child as `focus`. Startup clears any conversation a child stored earlier,
+except one its decision records still cite, which is kept and logged but never
+served. V1 does not offer child research, Background Work, implementation/tasks,
+or grandchildren.
 
 The server retains `research_workspaces`, turns, messages, and historical chat
 references as staging and compatibility internals. Do not present them as a
@@ -226,10 +264,10 @@ standalone report, thread, navigation child, or confirmation flow.
 The hosted Planner's graph tools remain technically available in any channel
 after plan readiness checks pass. That does not make child implementation a
 supported product workflow: the child surface exposes no tasks or implementation
-destination. The supported MCP read path exposes a graph only for an MCP-created
-document. The Planner cannot approve, lock, or start a graph. Approval exists in
-the domain but has no current production UI or route; the workflow is
-experimental.
+destination. The ordinary MCP read path exposes graphs for MCP-created documents. A browser
+plan can approve and dispatch a graph through the owner-paired ACP connector;
+its run-scoped bridge exposes the document and lifecycle reporting tools. The
+Planner cannot approve, lock, or start a graph. See docs/local-launcher.md.
 
 An approved graph binds one plan revision, graph version, and graph revision.
 `start_implementation` atomically claims those values and locks the graph. Task,
@@ -426,11 +464,11 @@ run `bun run ci` and validate relative links with exact casing.
 When a disposable Planner session is created, diagnostics report available tool
 names and the external GitHub MCP contribution. Counts vary with SDK and remote
 MCP versions. A healthy boundary includes Chopin's document tools (currently
-plan-named), repository tools, and allowed pull-request tools, and excludes
-ambient capabilities such as `bash`, filesystem access, URL fetch, host Git,
-issues, and unrestricted search. The exception is an `atomic` Planner session,
-which deliberately adds Atomic's builtins and coding tools; its summary and
-research worker sessions must still show only their own tools.
+plan-named), child document tools, repository tools, and allowed pull-request
+tools, and excludes ambient capabilities such as `bash`, filesystem access, URL
+fetch, host Git, issues, and unrestricted search. The exception is an `atomic`
+Planner session, which deliberately adds Atomic's builtins and coding tools; its
+summary and research worker sessions must still show only their own tools.
 
 Treat a missing required tool or an unexpected ambient tool as a security or
 configuration failure even when the overall count looks plausible.

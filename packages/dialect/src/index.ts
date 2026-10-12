@@ -13,12 +13,14 @@ export {
 	COMPONENTS,
 	DIFF_LANGUAGE,
 	HIDDEN_URL_CHARACTERS,
+	HOSTED_IMAGE_PATH,
 	IMAGE_PROTOCOLS,
 	leavesRepository,
 	LINK_PROTOCOLS,
 	lookup,
 	MERMAID_LANGUAGE,
 	SEECODE_LANGUAGE,
+	WIREFRAME_LANGUAGE,
 } from "./dialect";
 export type { Attribute, Component, Content, Kind } from "./dialect";
 
@@ -42,6 +44,14 @@ export type { ConvertOptions } from "./convert";
 export { plugins, registry, tablePlugin } from "./registry";
 export type { Registry } from "./registry";
 
+export {
+	$createColumnNode,
+	$createColumnsNode,
+	$isColumnNode,
+	$isColumnsNode,
+	ColumnNode,
+	ColumnsNode,
+} from "./nodes/columns";
 export {
 	$createCalloutNode,
 	$createTabNode,
@@ -71,6 +81,7 @@ export {
 	ImageNode,
 	MathNode,
 } from "./nodes/content";
+export { $createExperimentNode, $isExperimentNode, ExperimentNode } from "./nodes/experiment";
 export { $createResearchNode, $isResearchNode, ResearchNode } from "./nodes/research";
 export type { SerializedResearch } from "./nodes/research";
 

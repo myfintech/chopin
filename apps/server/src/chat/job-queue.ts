@@ -42,7 +42,7 @@ export function createJobQueue({ queued, state, startRun, MAX_QUEUE }: {
 		context: Room,
 		handle: string,
 		text: string,
-		thread: string | undefined,
+		about: undefined,
 		claimantSessionId: string,
 		reserved?: boolean,
 		member?: never,
@@ -78,9 +78,16 @@ export function createJobQueue({ queued, state, startRun, MAX_QUEUE }: {
 		chat.busy = false;
 		chat.turn = undefined;
 		chat.acting = undefined;
+		chat.actingChannel = undefined;
 		let waiting = chat.waiting;
 		chat.waiting = [];
 		for (let item of waiting) {
+			// A queued comment turn will never run; its thread must stop showing work.
+			if (item.ended) {
+				void Promise.resolve()
+					.then(() => item.ended?.({ status: "failed" }))
+					.catch(err => console.error("[chat] a dropped turn's end could not be recorded:", err));
+			}
 			if (item.job) {
 				finishJob(item.job, {
 					status: "failed",

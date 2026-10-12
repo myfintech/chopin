@@ -36,6 +36,7 @@ import type { exportLexicalTreeToMdast, importMdastTreeToLexical } from "@mdxedi
 
 import { CONTAINER_EXPORT_VISITORS, CONTAINER_IMPORT_VISITORS } from "./nodes/container-visitors";
 import { CONTAINER_NODES } from "./nodes/containers";
+import { COLUMN_NODES } from "./nodes/columns";
 import { CONTENT_EXPORT_VISITORS, CONTENT_IMPORT_VISITORS } from "./nodes/content-visitors";
 import { CONTENT_NODES } from "./nodes/content";
 import { DecisionNode, LexicalDecisionVisitor, MdastDecisionVisitor } from "./nodes/decision";
@@ -45,6 +46,11 @@ import {
 	QuestionnaireNode,
 } from "./nodes/questionnaire";
 import { ResearchNode } from "./nodes/research";
+import {
+	ExperimentNode,
+	LexicalExperimentVisitor,
+	MdastExperimentVisitor,
+} from "./nodes/experiment";
 import { LexicalResearchVisitor, MdastResearchVisitor } from "./nodes/research-visitors";
 import { LexicalTableVisitor, MdastTableVisitor, TABLE_NODES } from "./nodes/table";
 import { MdastUnderlineVisitor } from "./nodes/underline";
@@ -112,7 +118,7 @@ export const jsxPlugin = realmPlugin({
 export const containersPlugin = realmPlugin({
 	init(realm) {
 		realm.pubIn({
-			[addLexicalNode$]: CONTAINER_NODES,
+			[addLexicalNode$]: [...CONTAINER_NODES, ...COLUMN_NODES],
 			[addImportVisitor$]: CONTAINER_IMPORT_VISITORS,
 			[addExportVisitor$]: CONTAINER_EXPORT_VISITORS,
 		});
@@ -175,6 +181,16 @@ export const researchPlugin = realmPlugin({
 			[addLexicalNode$]: [ResearchNode],
 			[addImportVisitor$]: MdastResearchVisitor,
 			[addExportVisitor$]: LexicalResearchVisitor,
+		});
+	},
+});
+
+export const experimentPlugin = realmPlugin({
+	init(realm) {
+		realm.pubIn({
+			[addLexicalNode$]: [ExperimentNode],
+			[addImportVisitor$]: MdastExperimentVisitor,
+			[addExportVisitor$]: LexicalExperimentVisitor,
 		});
 	},
 });
@@ -264,6 +280,7 @@ export function plugins({ core: withCore = true } = {}): RealmPlugin[] {
 		questionnairePlugin(),
 		decisionPlugin(),
 		researchPlugin(),
+		experimentPlugin(),
 		underlinePlugin(),
 		markdownPlugin(),
 	];

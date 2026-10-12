@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ChevronIcon, DocumentIcon, SearchIcon } from "@chopin/icons";
+import { DocumentIcon } from "@chopin/icons";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
@@ -10,7 +10,7 @@ import {
 	toggleCollapsedProjectIds,
 } from "./project-sidebar";
 import { ProjectSidebarExpandButton } from "./project-sidebar-chrome";
-import { Header } from "./room-workspace";
+import { Header, RoomMembers } from "./room-workspace";
 
 import type { ComponentProps } from "react";
 
@@ -41,7 +41,7 @@ describe("the Figma navigation chrome", () => {
 		expect([...collapsed]).toEqual(["R_other"]);
 	});
 
-	test("uses a pen for document creation and a plus for adding a Project", () => {
+	test("offers document creation, project creation, and search with an accessible project disclosure", () => {
 		let markup = renderToStaticMarkup(createElement(ProjectSidebar, {
 			canCreateDocument: true,
 			pendingCreations: new Map(),
@@ -76,25 +76,15 @@ describe("the Figma navigation chrome", () => {
 			user: { avatarUrl: "/user.png", id: "user-one", login: "MaggieAppleton" },
 		}));
 
-		expect(markup).toMatch(
-			/<button[^>]*class="project-sidebar-primary-action"[^>]*>.*?new-document\.svg.*?New document<\/span>/s,
-		);
-		expect(markup).toMatch(/height="14" src="[^"]*chopin\.svg" width="14"/);
-		expect(markup).toMatch(
-			/aria-label="New document in testing-sql-transcripts"[^>]*>.*?new-document\.svg/s,
-		);
-		expect(markup).toContain(
-			renderToStaticMarkup(createElement(DocumentIcon)),
-		);
-		expect(markup).not.toContain('src="/repository.png"');
-		expect(markup).toMatch(
-			/aria-label="Add project"[^>]*>.*?class="size-3\.5"[^>]*add-project\.svg/s,
-		);
+		let primary = markup.match(
+			/<button[^>]*class="project-sidebar-primary-action"[^>]*>.*?<\/button>/s,
+		)?.[0];
+		expect(primary).toContain("New document</span>");
+		expect(markup).toContain('aria-label="New document in testing-sql-transcripts"');
+		expect(markup).toContain('aria-label="Add project"');
 		expect(markup).toMatch(
 			/<button[^>]*class="project-sidebar-primary-action"[^>]*>.*?Search<\/span>/s,
 		);
-		expect(markup).toContain(renderToStaticMarkup(createElement(SearchIcon)));
-		expect(markup).toContain('class="project-sidebar-projects gap-2"');
 		expect(markup).toMatch(
 			/<button[^>]*aria-expanded="true"[^>]*class="project-sidebar-project-disclosure[^>]*>.*?testing-sql-transcripts<\/span><\/button>/s,
 		);
@@ -182,15 +172,34 @@ describe("the Figma navigation chrome", () => {
 		expect(markup).not.toContain("No documents yet.");
 	});
 
+	test("leaves presence out of the header when the tab row owns it", () => {
+		let markup = renderToStaticMarkup(createElement(Header, {
+			canManage: true,
+			label: "Hushed mountain",
+			onAction() {},
+			onEditingChange() {},
+			onRenamed() {},
+			room: "room-one",
+		}));
+		let members = renderToStaticMarkup(createElement(RoomMembers, {
+			members: [{ handle: "MaggieAppleton", client: "tab-one" }],
+			ring: "page",
+		}));
+
+		expect(markup).not.toContain("People here");
+		expect(members).toContain('aria-label="People here: MaggieAppleton"');
+		expect(members).toContain('role="group"');
+	});
+
 	test("keeps the document header to one project icon and document trigger", () => {
 		let props = {
 			canManage: true,
+			project: { id: "R_test", name: "chopin" },
 			label: "Hushed mountain",
 			members: [{ handle: "MaggieAppleton", client: "tab-one" }],
 			onAction: () => {},
 			onEditingChange: () => {},
 			onRenamed: () => {},
-			presentation: { type: "document" as const },
 			room: "room-one",
 		};
 		let markup = renderToStaticMarkup(createElement(Header, props));
@@ -207,6 +216,7 @@ describe("the Figma navigation chrome", () => {
 		expect(markup).toContain('style="width:24px;height:24px;');
 		expect(markup).not.toContain('aria-label="Show sidebar"');
 		expect(markup).not.toContain('aria-label="Repository:');
+		expect(markup).not.toContain('aria-label="Show chopin in the sidebar"');
 		expect(markup).not.toContain('href="/"');
 		expect(markup).not.toContain("hairline-b");
 	});
@@ -220,7 +230,6 @@ describe("the Figma navigation chrome", () => {
 			onAction() {},
 			onEditingChange() {},
 			onRenamed() {},
-			presentation: { type: "document" },
 			room: "room-one",
 		}));
 
@@ -231,34 +240,6 @@ describe("the Figma navigation chrome", () => {
 		expect(markup).not.toContain(">Save</button>");
 	});
 
-	test("turns the parent title into a child-document breadcrumb", () => {
-		let markup = renderToStaticMarkup(createElement(Header, {
-			canManage: true,
-			label: "Release plan",
-			members: [{ handle: "MaggieAppleton", client: "tab-one" }],
-			onAction() {},
-			onEditingChange() {},
-			onRenamed() {},
-			room: "room-one",
-			presentation: {
-				childLabel: "Source review",
-				onChildClose() {},
-				type: "parent-with-child",
-			},
-		}));
-
-		expect(markup).not.toContain('aria-label="Back to Release plan"');
-		expect(markup).toContain('aria-label="Return to Release plan"');
-		expect(markup).toContain('aria-label="Child document: Source review"');
-		expect(markup).toContain('aria-label="People here: MaggieAppleton"');
-		expect(markup).not.toContain('aria-label="Actions for Release plan"');
-		expect(markup).toContain(renderToStaticMarkup(createElement(ChevronIcon, {
-			className: "document-breadcrumb-separator shrink-0",
-		})));
-		expect(markup).toContain('class="document-breadcrumb-separator shrink-0"');
-		expect(markup).not.toContain(">›</span>");
-	});
-
 	test("labels archived headers while keeping management actions from viewers", () => {
 		let props = {
 			archivedAt: "2026-08-23T00:00:00.000Z",
@@ -267,7 +248,6 @@ describe("the Figma navigation chrome", () => {
 			onAction: () => {},
 			onEditingChange: () => {},
 			onRenamed: () => {},
-			presentation: { type: "document" as const },
 			room: "room-one",
 		};
 		let manager = renderToStaticMarkup(createElement(Header, { ...props, canManage: true }));

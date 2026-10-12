@@ -5,6 +5,7 @@
 	"type": "module",
 	"scripts": {
 		"dev": "bun scripts/dev.ts",
+		"connector": "bun apps/connector/src/main.ts",
 		"dev:exe": "bun scripts/dev.ts --exe",
 		"db:up": "docker compose -f compose.yaml -f compose.local.yaml up -d --wait db",
 		"db:down": "docker compose -f compose.yaml -f compose.local.yaml down",
@@ -66,7 +67,7 @@
 				"@ai-sdk/harness-pi": "1.0.148",
 				"@ai-sdk/mcp": "2.0.72",
 				"@ai-sdk/sandbox-just-bash": "1.0.146",
-				"@bastani/atomic": "0.9.29",
+				"@bastani/atomic": "0.9.34",
 				"@earendil-works/pi-coding-agent": "0.85.1",
 				"ai": "7.0.135",
 				"typebox": "1.3.7",

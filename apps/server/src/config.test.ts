@@ -22,6 +22,19 @@ describe("configuration", () => {
 		expect(configured({ STORAGE_DRIVER: undefined }).storage.driver).toBe("postgres");
 	});
 
+	it("keeps foreground Jev visuals opt-in and requires a Jev key", () => {
+		expect(configured().plannerVisuals).toBe(false);
+		expect(configured({ JEV_API_KEY: "test-key" }).plannerVisuals).toBe(false);
+		expect(configured({ PLANNER_VISUALS: "on", JEV_API_KEY: "test-key" }).plannerVisuals)
+			.toBe(true);
+		expect(() => configured({ PLANNER_VISUALS: "on" }))
+			.toThrow("JEV_API_KEY is required when PLANNER_VISUALS=on");
+		expect(
+			configured({ AGENT: "off", PLANNER_VISUALS: "on", JEV_API_KEY: "test-key" })
+				.plannerVisuals,
+		).toBe(false);
+	});
+
 	it("gates background execution and web research behind the hosted agent", () => {
 		expect(configured()).toMatchObject({ agent: true, backgroundJobs: true, webResearch: true });
 		expect(configured({ WEB_RESEARCH: "off" })).toMatchObject({
@@ -86,6 +99,70 @@ describe("configuration", () => {
 			harness: "atomic",
 			model: "vercel-ai-gateway/anthropic/claude-sonnet-4.6",
 		});
+	});
+
+	it("accepts a remote Planner on a public bind with no MODEL, and only without background jobs", () => {
+		let remote = { HARNESS: "remote", SERVER_HOST: "0.0.0.0", BACKGROUND_JOBS: "off" };
+		let config = configured(remote);
+		expect(config).toMatchObject({ harness: "remote", host: "0.0.0.0", model: "" });
+		expect(description(config)).toContain("agent: chosen by the attached client");
+		expect(description(config)).toContain(
+			"Planner: attached client over /planner-link (model and client tools run on its machine)",
+		);
+		expect(configured({ ...remote, MODEL: "openai/gpt-6" }).model).toBe("openai/gpt-6");
+		expect(() => configured({ HARNESS: "remote" }))
+			.toThrow("HARNESS=remote requires BACKGROUND_JOBS=off");
+	});
+
+	it("keeps a detached remote Planner's ownership two minutes unless PLANNER_ATTACH_GRACE_MS says otherwise", () => {
+		let remote = { HARNESS: "remote", BACKGROUND_JOBS: "off" };
+		expect(configured(remote).plannerAttachGraceMs).toBe(120_000);
+		expect(configured({ ...remote, PLANNER_ATTACH_GRACE_MS: "0" }).plannerAttachGraceMs).toBe(0);
+		expect(configured({ ...remote, PLANNER_ATTACH_GRACE_MS: "3600000" }).plannerAttachGraceMs)
+			.toBe(3_600_000);
+		for (let value of ["", "-1", "1.5", "3600001", "soon"]) {
+			expect(() => configured({ ...remote, PLANNER_ATTACH_GRACE_MS: value }))
+				.toThrow("PLANNER_ATTACH_GRACE_MS must be an integer between 0 and 3600000 milliseconds");
+		}
+	});
+
+	it("pings a remote Planner link every 15 seconds and drops it after 120 silent seconds unless configured", () => {
+		let remote = { HARNESS: "remote", BACKGROUND_JOBS: "off" };
+		expect(configured(remote)).toMatchObject({
+			plannerLinkPingMs: 15_000,
+			plannerLinkTimeoutMs: 120_000,
+		});
+		expect(configured({ ...remote, PLANNER_LINK_PING_MS: "1000", PLANNER_LINK_TIMEOUT_MS: "1001" }))
+			.toMatchObject({ plannerLinkPingMs: 1_000, plannerLinkTimeoutMs: 1_001 });
+		for (let value of ["", "999", "1.5", "600001", "soon"]) {
+			expect(() => configured({ ...remote, PLANNER_LINK_PING_MS: value }))
+				.toThrow("PLANNER_LINK_PING_MS must be an integer between 1000 and 600000 milliseconds");
+			expect(() => configured({ ...remote, PLANNER_LINK_TIMEOUT_MS: value }))
+				.toThrow("PLANNER_LINK_TIMEOUT_MS must be an integer between 1000 and 600000 milliseconds");
+		}
+		expect(() => configured({ ...remote, PLANNER_LINK_TIMEOUT_MS: "15000" }))
+			.toThrow("PLANNER_LINK_TIMEOUT_MS must be longer than PLANNER_LINK_PING_MS");
+	});
+
+	it("caps a remote Planner link's silence at 15 minutes, however its queue drains, unless configured", () => {
+		let remote = { HARNESS: "remote", BACKGROUND_JOBS: "off" };
+		expect(configured(remote).plannerLinkMaxSilenceMs).toBe(900_000);
+		expect(configured({ ...remote, PLANNER_LINK_TIMEOUT_MS: "600000" }).plannerLinkMaxSilenceMs)
+			.toBe(900_000);
+		expect(configured({ ...remote, PLANNER_LINK_MAX_SILENCE_MS: "120000" }).plannerLinkMaxSilenceMs)
+			.toBe(120_000);
+		expect(
+			configured({ ...remote, PLANNER_LINK_MAX_SILENCE_MS: "3600000" }).plannerLinkMaxSilenceMs,
+		)
+			.toBe(3_600_000);
+		for (let value of ["", "999", "1.5", "3600001", "soon"]) {
+			expect(() => configured({ ...remote, PLANNER_LINK_MAX_SILENCE_MS: value }))
+				.toThrow(
+					"PLANNER_LINK_MAX_SILENCE_MS must be an integer between 1000 and 3600000 milliseconds",
+				);
+		}
+		expect(() => configured({ ...remote, PLANNER_LINK_MAX_SILENCE_MS: "119999" }))
+			.toThrow("PLANNER_LINK_MAX_SILENCE_MS must be at least PLANNER_LINK_TIMEOUT_MS");
 	});
 
 	it("chooses a full Atomic Planner by harness alone, in hosted and local configuration", () => {

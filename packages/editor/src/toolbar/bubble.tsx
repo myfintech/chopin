@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
-import { ChevronIcon, CodeIcon, LinkPlusIcon, MessagePlusIcon } from "@chopin/icons";
+import { ChevronIcon, CodeIcon, LinkPlusIcon, ListIcon, MessagePlusIcon } from "@chopin/icons";
 
 import { $linkAt, OPEN_LINK_EDITOR_COMMAND } from "./link";
 import { placeSurface, visibleAnchor } from "./placement";
@@ -55,7 +55,7 @@ import {
 } from "lexical";
 
 import type { HeadingTagType } from "@lexical/rich-text";
-import type { ElementNode, LexicalNode, TextFormatType } from "lexical";
+import type { ElementNode, LexicalEditor, LexicalNode, TextFormatType } from "lexical";
 import type { DOMRectLike, SurfacePlacement } from "./placement";
 
 /** Block shapes the bubble can switch between. */
@@ -63,13 +63,13 @@ import type { DOMRectLike, SurfacePlacement } from "./placement";
 export type Block = "paragraph" | "quote" | "bullet" | "number" | "task" | HeadingTagType;
 
 /** `glyph` is what shows; `label` is what it means, for hover and assistive tech. */
-const BLOCKS: Array<{ id: Block; glyph: string; label: string }> = [
+const BLOCKS: Array<{ id: Block; glyph: ReactNode; label: string }> = [
 	{ id: "paragraph", glyph: "T", label: "Text" },
 	{ id: "h1", glyph: "H1", label: "Heading 1" },
 	{ id: "h2", glyph: "H2", label: "Heading 2" },
 	{ id: "h3", glyph: "H3", label: "Heading 3" },
 	{ id: "quote", glyph: ">", label: "Quote" },
-	{ id: "bullet", glyph: "UL", label: "Bulleted list" },
+	{ id: "bullet", glyph: <ListIcon size={14} />, label: "Bulleted list" },
 	{ id: "number", glyph: "OL", label: "Numbered list" },
 ];
 
@@ -90,7 +90,10 @@ const SHORT: Partial<Record<Block, string>> = {
 function describe(block: Block): { short: string; label: string } {
 	if (block === "task") return { short: "Task list", label: "Task list" };
 	let known = BLOCKS.find(item => item.id === block);
-	if (known) return { short: SHORT[block] ?? known.glyph, label: known.label };
+	if (known) {
+		let glyph = typeof known.glyph === "string" ? known.glyph : known.label;
+		return { short: SHORT[block] ?? glyph, label: known.label };
+	}
 	return { short: block.toUpperCase(), label: `Heading ${block.slice(1)}` };
 }
 
@@ -145,6 +148,51 @@ export function $block(node: LexicalNode | null): Block {
 	return "paragraph";
 }
 
+/** Change the selected blocks from one shape to another, the same way the block menu does. */
+export function convertBlock(editor: LexicalEditor, block: Block, next: Block): void {
+	// Already a quote: converting again would nest one inside the other.
+	if (next === block || next === "task") return;
+
+	if (next === "bullet") {
+		editor.dispatchCommand(INSERT_UNORDERED_LIST_COMMAND, undefined);
+		return;
+	}
+	if (next === "number") {
+		editor.dispatchCommand(INSERT_ORDERED_LIST_COMMAND, undefined);
+		return;
+	}
+	// Containers are unwrapped, not swapped: `$setBlocksType` converts the
+	// block it finds and leaves the list or quote standing around it.
+	if (block === "bullet" || block === "number" || block === "task") {
+		editor.dispatchCommand(REMOVE_LIST_COMMAND, undefined);
+	}
+	if (block === "quote") {
+		editor.update(() => {
+			let selection = $getSelection();
+			if (!$isRangeSelection(selection)) return;
+			let inner = owner(selection.anchor.getNode());
+			// Only the wrapping shape needs lifting. Where the quote is
+			// itself the block, `$setBlocksType` below replaces it.
+			if ($isQuoteNode(inner)) return;
+			let quote = quoted(inner);
+			if (!quote) return;
+			for (let child of quote.getChildren()) quote.insertBefore(child);
+			quote.remove();
+		});
+	}
+
+	let build: () => ElementNode = next === "quote"
+		? $createQuoteNode
+		: next === "paragraph"
+		? $createParagraphNode
+		: () => $createHeadingNode(next);
+
+	editor.update(() => {
+		let selection = $getSelection();
+		if ($isRangeSelection(selection)) $setBlocksType(selection, build);
+	});
+}
+
 type Mark = { format: TextFormatType; label: string; glyph: ReactNode; shortcut: string };
 
 /** Each letter is drawn in the style it applies, so the row reads as a format bar. */
@@ -179,6 +227,9 @@ const MARKS: Mark[] = [
 /** Marks a phone keeps on the row; the rest move into the block menu. */
 const PHONE_ROW = new Set<TextFormatType>(["bold", "italic"]);
 
+/** Roughly how far the system's end handle hangs below a touch selection. */
+const SELECTION_HANDLE = 16;
+
 function usePrimaryCoarse(): boolean {
 	let [coarse, setCoarse] = useState(() => matchMedia(PRIMARY_COARSE_POINTER_QUERY).matches);
 	useEffect(() => {
@@ -191,7 +242,9 @@ function usePrimaryCoarse(): boolean {
 }
 
 export function SelectionBubble(
-	{ disabled, hidden, onComment }: {
+	{ commentOnly, disabled, hidden, onComment }: {
+		/** A reader's selection: the text cannot change, so only commenting is offered. */
+		commentOnly?: boolean;
 		disabled?: boolean;
 		/** Another surface has taken the bubble's place for now. */
 		hidden?: boolean;
@@ -258,45 +311,7 @@ export function SelectionBubble(
 
 	let convert = useCallback((next: Block) => {
 		setChoosing(false);
-		// Already a quote: converting again would nest one inside the other.
-		if (next === block || next === "task") return;
-
-		if (next === "bullet") {
-			return editor.dispatchCommand(INSERT_UNORDERED_LIST_COMMAND, undefined);
-		}
-		if (next === "number") {
-			return editor.dispatchCommand(INSERT_ORDERED_LIST_COMMAND, undefined);
-		}
-		// Containers are unwrapped, not swapped: `$setBlocksType` converts the
-		// block it finds and leaves the list or quote standing around it.
-		if (block === "bullet" || block === "number" || block === "task") {
-			editor.dispatchCommand(REMOVE_LIST_COMMAND, undefined);
-		}
-		if (block === "quote") {
-			editor.update(() => {
-				let selection = $getSelection();
-				if (!$isRangeSelection(selection)) return;
-				let inner = owner(selection.anchor.getNode());
-				// Only the wrapping shape needs lifting. Where the quote is
-				// itself the block, `$setBlocksType` below replaces it.
-				if ($isQuoteNode(inner)) return;
-				let quote = quoted(inner);
-				if (!quote) return;
-				for (let child of quote.getChildren()) quote.insertBefore(child);
-				quote.remove();
-			});
-		}
-
-		let build: () => ElementNode = next === "quote"
-			? $createQuoteNode
-			: next === "paragraph"
-			? $createParagraphNode
-			: () => $createHeadingNode(next);
-
-		editor.update(() => {
-			let selection = $getSelection();
-			if ($isRangeSelection(selection)) $setBlocksType(selection, build);
-		});
+		convertBlock(editor, block, next);
 	}, [editor, block]);
 
 	/*
@@ -333,11 +348,20 @@ export function SelectionBubble(
 	let place = useCallback(() => {
 		let element = ref.current;
 		if (!element || !anchor) return;
-		let liveAnchor = nativeSelectionRect();
-		if (!liveAnchor || (liveAnchor.width === 0 && liveAnchor.height === 0)) {
+		let rect = nativeSelectionRect();
+		if (!rect || (rect.width === 0 && rect.height === 0)) {
 			setPosition(undefined);
 			return;
 		}
+		// A DOMRect's sides are prototype getters, which `visibleAnchor`'s spread would drop.
+		let liveAnchor = {
+			bottom: rect.bottom,
+			height: rect.height,
+			left: rect.left,
+			right: rect.right,
+			top: rect.top,
+			width: rect.width,
+		};
 		let viewport = editorSurfaceViewport(editor);
 		let visible = visibleAnchor(liveAnchor, viewport);
 		if (!visible) {
@@ -352,10 +376,12 @@ export function SelectionBubble(
 		let height = element.offsetHeight;
 		element.style.maxHeight = capped;
 		let centre = visible.left + visible.width / 2;
+		// Below a touch selection the bubble also clears the system's end handle.
+		let handle = coarse ? SELECTION_HANDLE : 0;
 		let next = placeSurface(
 			{
-				bottom: visible.bottom,
-				height: visible.height,
+				bottom: visible.bottom + handle,
+				height: visible.height + handle,
 				left: centre - width / 2,
 				right: centre + width / 2,
 				top: visible.top,
@@ -364,8 +390,9 @@ export function SelectionBubble(
 			{ width, height },
 			viewport,
 			8,
-			// A touch selection has the system's own callout above it.
-			coarse ? "auto" : "above",
+			// A touch selection has the system's own callout above it, so the bubble goes
+			// below, flipping above only when the visible viewport has no room there.
+			coarse ? "below" : "above",
 		);
 		setPosition(current =>
 			current?.left === next.left && current.top === next.top
@@ -381,13 +408,37 @@ export function SelectionBubble(
 		return listenToEditorGeometry(editor, place);
 	}, [anchor, editor, place]);
 
-	if (!anchor || disabled || hidden) return null;
+	if (!anchor || disabled || hidden || (commentOnly && !onComment)) return null;
+
+	let comment = onComment && (
+		<button
+			type="button"
+			aria-label="Comment on this passage"
+			data-tooltip="Add comment"
+			title="Comment on this passage"
+			/*
+			 * The passage is captured now, inside the click, because
+			 * the composer this opens takes focus — and the selection
+			 * goes with it. A draft that forgot what it was about the
+			 * moment you started typing would be no use.
+			 */
+			onClick={() => {
+				onComment();
+				setAnchor(undefined);
+				setPosition(undefined);
+			}}
+			className={`${CELL} ${CELL_OFF}`}
+			data-press="small"
+		>
+			<MessagePlusIcon aria-hidden="true" />
+		</button>
+	);
 
 	return (
 		<div
 			ref={ref}
 			role="toolbar"
-			aria-label="Text formatting"
+			aria-label={commentOnly ? "Selection" : "Text formatting"}
 			data-focus-boundary=""
 			contentEditable={false}
 			// No translate utilities here: placement belongs to the layout effect,
@@ -406,7 +457,9 @@ export function SelectionBubble(
 			 */
 			onMouseDown={event => event.preventDefault()}
 		>
-			{choosing
+			{commentOnly
+				? comment
+				: choosing
 				? BLOCKS.map(item => (
 					<button
 						key={item.id}
@@ -453,6 +506,13 @@ export function SelectionBubble(
 				)
 				: (
 					<>
+						{/* Commenting is what a reader on a phone selects text for, so it leads there. */}
+						{comment && coarse && (
+							<>
+								{comment}
+								<span aria-hidden="true" className={`${SEAM} plan-bubble-seam`} />
+							</>
+						)}
 						<button
 							type="button"
 							aria-label={`Block type: ${describe(block).label}`}
@@ -467,7 +527,7 @@ export function SelectionBubble(
 							<ChevronIcon aria-hidden="true" className="size-3.5 rotate-90" />
 						</button>
 
-						<span aria-hidden="true" className={`${SEAM}`} />
+						<span aria-hidden="true" className={`${SEAM} plan-bubble-seam`} />
 
 						{MARKS.filter(mark => !coarse || PHONE_ROW.has(mark.format)).map(mark => (
 							<button
@@ -485,7 +545,7 @@ export function SelectionBubble(
 							</button>
 						))}
 
-						<span aria-hidden="true" className={`${SEAM}`} />
+						<span aria-hidden="true" className={`${SEAM} plan-bubble-seam`} />
 
 						<button
 							type="button"
@@ -498,30 +558,10 @@ export function SelectionBubble(
 							<LinkPlusIcon aria-hidden="true" />
 						</button>
 
-						{onComment && (
+						{onComment && !coarse && (
 							<>
-								<span aria-hidden="true" className={`${SEAM}`} />
-								<button
-									type="button"
-									aria-label="Comment on this passage"
-									data-tooltip="Add comment"
-									title="Comment on this passage"
-									/*
-									 * The passage is captured now, inside the click, because
-									 * the composer this opens takes focus — and the selection
-									 * goes with it. A draft that forgot what it was about the
-									 * moment you started typing would be no use.
-									 */
-									onClick={() => {
-										onComment();
-										setAnchor(undefined);
-										setPosition(undefined);
-									}}
-									className={`${CELL} ${CELL_OFF}`}
-									data-press="small"
-								>
-									<MessagePlusIcon aria-hidden="true" />
-								</button>
+								<span aria-hidden="true" className={`${SEAM} plan-bubble-seam`} />
+								{comment}
 							</>
 						)}
 					</>

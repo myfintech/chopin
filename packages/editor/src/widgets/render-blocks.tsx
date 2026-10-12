@@ -53,21 +53,24 @@ import { $isTableCellNode, $isTableRowNode } from "@lexical/table";
 import { $isCodeBlockNode, $isMathNode } from "@chopin/dialect";
 
 import { enclosing, remember } from "../collapse";
-import { describeDiagramError, kindOf, languageOptions, titleOf } from "./code";
+import { widgets$ } from "../widget-options";
+import { describeDiagramError, kindOf, languageOptions, plainText, titleOf } from "./code";
 import { CodeView } from "./code-view";
+import { fitsLegibly } from "./diagram-fit";
+import { DiagramSheet, ExpandDiagram } from "./diagram-sheet";
+import { usePhone } from "../pointer";
 import { LanguageMenu } from "./language-menu";
 import { registerPreviewSelection } from "./preview-selection";
 import { diffSourceLine, lastLineStart, offsetOfLine } from "./source-offset";
+import { hiddenSides, scrollEdges } from "./tab-edges";
 import { CodeIcon, WarningIcon } from "@chopin/icons";
 
 import type { ElementNode, LexicalCommand, LexicalEditor, LexicalNode } from "lexical";
+import type { Wireframe as WireframeTree } from "@chopin/diagrams/wireframe";
 import type { Kind } from "./code";
 
 /** How long the source must sit still before a failed drawing is reported. */
 const ERROR_DELAY = 600;
-
-/** Below this, a scaled-down diagram's labels stop being comfortably legible. */
-const MIN_DIAGRAM_SCALE = 0.75;
 
 type Block = {
 	key: string;
@@ -83,10 +86,23 @@ const SeeCodeDiagram = lazy(() =>
 	import("@chopin/diagrams/react").then(({ Diagram }) => ({ default: Diagram }))
 );
 
+const WireframeView = lazy(() =>
+	import("@chopin/diagrams/wireframe/view").then(({ Wireframe }) => ({ default: Wireframe }))
+);
+
+/** A wireframe and the exact source it was drawn from. */
+type Drawing = { source: string; wireframe: WireframeTree };
+
 /** Whether a block has a second reading of itself to show. */
-function renders(block: Block, html: string | undefined, spec: unknown): boolean {
+function renders(
+	block: Block,
+	html: string | undefined,
+	spec: unknown,
+	drawing?: Drawing,
+): boolean {
 	if (!block.source.trim()) return false;
 	if (block.kind === "seecode") return spec !== undefined;
+	if (block.kind === "wireframe") return drawing?.source === block.source;
 	if (block.kind === "math" || block.kind === "mermaid") return !!html;
 	return block.kind === "code" || block.kind === "diff";
 }
@@ -250,11 +266,13 @@ function Toggle({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => v
 
 /** Attaches a preview element beside a block's source, keyed to its content. */
 function Preview(
-	{ block, editor, collapsed, disabled, editing, onToggle, onHidable }: {
+	{ block, editor, collapsed, disabled, editing, onToggle, onHidable, reading }: {
 		block: Block;
 		editor: LexicalEditor;
 		collapsed: boolean;
 		disabled?: boolean;
+		/** A phone reader sees the rendered block; its source is authoring material. */
+		reading?: boolean;
 		/** The caret is in this block's source and the editor has focus. */
 		editing: boolean;
 		onToggle: () => void;
@@ -264,8 +282,12 @@ function Preview(
 	let [html, setHtml] = useState<string>();
 	let [error, setError] = useState<string>();
 	let [spec, setSpec] = useState<unknown>();
+	let [drawing, setDrawing] = useState<Drawing>();
+	/** The wireframe source that last failed to parse. */
+	let [failed, setFailed] = useState<string>();
 
-	let drawn = block.kind === "math" || block.kind === "mermaid" || block.kind === "seecode";
+	let drawn = block.kind === "math" || block.kind === "mermaid" || block.kind === "seecode"
+		|| block.kind === "wireframe";
 
 	useEffect(() => {
 		// A block that stopped being a diagram must stop showing one. Its
@@ -276,6 +298,8 @@ function Preview(
 			setHtml(undefined);
 			setError(undefined);
 			setSpec(undefined);
+			setDrawing(undefined);
+			setFailed(undefined);
 			return;
 		}
 		let cancelled = false;
@@ -286,9 +310,26 @@ function Preview(
 			if (!block.source.trim()) {
 				setHtml(undefined);
 				setError(undefined);
+				setDrawing(undefined);
+				setFailed(undefined);
 				return;
 			}
 			try {
+				if (block.kind === "wireframe") {
+					// The view is fetched beside the parser so it is ready by the
+					// time there is something to draw.
+					let [{ describeWireframeProblem, parseWireframe }] = await Promise.all([
+						import("@chopin/diagrams/wireframe"),
+						import("@chopin/diagrams/wireframe/view"),
+					]);
+					let parsed = parseWireframe(block.source);
+					if (cancelled) return;
+					if (!parsed.ok) throw new Error(describeWireframeProblem(parsed.problems));
+					setDrawing({ source: block.source, wireframe: parsed.wireframe });
+					setFailed(undefined);
+					setError(undefined);
+					return;
+				}
 				if (block.kind === "seecode") {
 					let { parseDiagramSource, renderDiagram } = await import("@chopin/diagrams");
 					let parsed = parseDiagramSource(block.source);
@@ -320,6 +361,7 @@ function Preview(
 				let message = err instanceof Error ? err.message : "could not be rendered";
 				if (block.kind === "seecode") setSpec(undefined);
 				else if (block.kind === "math") setHtml(undefined);
+				else if (block.kind === "wireframe") setFailed(block.source);
 				timer = setTimeout(() => setError(message), ERROR_DELAY);
 			}
 		};
@@ -347,9 +389,23 @@ function Preview(
 	 * showing both would put every line on screen twice. A drawing is a
 	 * different reading of its source, and stays above it while it is edited.
 	 */
-	let hide = collapsed && renders(block, html, spec);
-	let swap = !collapsed && renders(block, html, spec)
-		&& (block.kind === "code" || block.kind === "diff");
+	let text = plainText(block.language);
+	let current = renders(block, html, spec, drawing);
+	/*
+	 * A wireframe keeps its last drawing while a changed source is still being
+	 * read, so nobody's edit flickers it to code and back. One somebody is
+	 * writing keeps it, faded, while the source does not parse; one nobody is
+	 * in that does not parse is plain code.
+	 */
+	let broken = block.kind === "wireframe" && failed === block.source;
+	let pending = block.kind === "wireframe" && !current && !broken && drawing !== undefined;
+	let stale = broken && !collapsed && drawing !== undefined;
+	let wireframe = block.kind === "wireframe" && (current || pending || stale);
+	let hide = collapsed && (current || pending);
+	let swap = !collapsed && current && (block.kind === "code" || block.kind === "diff");
+	useEffect(() => {
+		if (broken && collapsed && drawing) setDrawing(undefined);
+	}, [broken, collapsed, drawing]);
 	useLayoutEffect(() => {
 		let element = editor.getElementByKey(block.key);
 		if (!element) return;
@@ -357,16 +413,26 @@ function Preview(
 		else delete element.dataset.planCollapsed;
 		if (swap) element.dataset.planSwapped = "";
 		else delete element.dataset.planSwapped;
+		if (hide && block.kind === "seecode") element.dataset.planPresentation = "diagram";
+		else if (wireframe) element.dataset.planPresentation = "wireframe";
+		else delete element.dataset.planPresentation;
+		if (text) element.dataset.planText = "";
+		else delete element.dataset.planText;
+		if (wireframe && editing) element.dataset.planEditing = "";
+		else delete element.dataset.planEditing;
 	});
 
 	let element = editor.getElementByKey(block.key);
 	let host = element?.querySelector<HTMLElement>("[data-plan-preview]");
-	let chrome = element?.querySelector<HTMLElement>("[data-plan-chrome='block']");
+	// A wireframe is chromeless: the caret going in is the way to its source.
+	let chrome = block.kind === "wireframe"
+		? undefined
+		: element?.querySelector<HTMLElement>("[data-plan-chrome='block']");
 
 	// A block with nothing rendered has nothing to fall back to, so there is
 	// nothing to offer: hiding a plain fence would leave an empty box. A
 	// formula has no language either, so its row can be empty of both.
-	let hidable = renders(block, html, spec);
+	let hidable = current || pending;
 	let named = block.kind !== "math";
 
 	useEffect(() => {
@@ -381,11 +447,18 @@ function Preview(
 		<>
 			{host
 				&& createPortal(
-					<Rendered block={block} html={html} error={error} spec={spec} />,
+					<Rendered
+						block={block}
+						html={html}
+						error={error}
+						spec={spec}
+						drawing={wireframe ? drawing : undefined}
+						stale={stale}
+					/>,
 					host,
 					`${block.key}:preview`,
 				)}
-			{chrome && (hidable || named) && createPortal(
+			{chrome && (hidable || named) && !(block.kind === "seecode" && hidable) && createPortal(
 				<div
 					// Chrome, not content: keep it out of the editable tree.
 					contentEditable={false}
@@ -407,7 +480,7 @@ function Preview(
 							</span>
 						)
 					}
-					{hidable && <Toggle collapsed={collapsed} onToggle={onToggle} />}
+					{hidable && !reading && <Toggle collapsed={collapsed} onToggle={onToggle} />}
 					{title && <span className="plan-code-title">{title}</span>}
 					{named && <Language block={block} editor={editor} disabled={disabled} />}
 				</div>,
@@ -442,11 +515,8 @@ function DiagramError({ message }: { message: string }) {
 }
 
 /** Which sides of a scroller still hide some of the drawing. */
-function hiddenSides(element: HTMLElement): "start" | "end" | "both" | undefined {
-	let start = element.scrollLeft > 1;
-	let end = element.scrollLeft + element.clientWidth < element.scrollWidth - 1;
-	if (start && end) return "both";
-	return start ? "start" : end ? "end" : undefined;
+function sidesOf(element: HTMLElement): ReturnType<typeof hiddenSides> {
+	return hiddenSides(scrollEdges(element.scrollLeft, element.clientWidth, element.scrollWidth));
 }
 
 /**
@@ -456,9 +526,12 @@ function hiddenSides(element: HTMLElement): "start" | "end" | "both" | undefined
  * measure makes its labels unreadable. A modest overshoot is scaled to fit;
  * anything wider keeps its size and scrolls, fading the side with more to see.
  */
-function Diagram({ html, stale }: { html: string; stale: boolean }) {
+function Diagram({ id, html, stale }: { id: string; html: string; stale: boolean }) {
 	let region = useRef<HTMLDivElement>(null);
 	let [fit, setFit] = useState(false);
+	let [expanded, setExpanded] = useState(false);
+	let phone = usePhone();
+	let expand = useRef<HTMLButtonElement>(null);
 	let [more, setMore] = useState<ReturnType<typeof hiddenSides>>();
 
 	useEffect(() => {
@@ -470,10 +543,10 @@ function Diagram({ html, stale }: { html: string; stale: boolean }) {
 			let style = getComputedStyle(element);
 			let room = element.clientWidth - parseFloat(style.paddingInlineStart)
 				- parseFloat(style.paddingInlineEnd);
-			setFit(!(authored > 0) || room >= authored * MIN_DIAGRAM_SCALE);
-			setMore(hiddenSides(element));
+			setFit(fitsLegibly(room, authored));
+			setMore(sidesOf(element));
 		};
-		let scrolled = () => setMore(hiddenSides(element));
+		let scrolled = () => setMore(sidesOf(element));
 		measure();
 		let observer = new ResizeObserver(measure);
 		observer.observe(element);
@@ -487,39 +560,97 @@ function Diagram({ html, stale }: { html: string; stale: boolean }) {
 	// Fitting changes the drawing's width, so whether anything is hidden is
 	// only known after that has been laid out.
 	useEffect(() => {
-		if (region.current) setMore(hiddenSides(region.current));
+		if (region.current) setMore(sidesOf(region.current));
 	}, [fit, html]);
 
 	return (
-		<div
-			ref={region}
-			aria-label="Diagram preview"
-			className="plan-diagram"
-			data-fit={fit ? "" : undefined}
-			data-more={more}
-			data-stale={stale ? "" : undefined}
-			role="region"
-			tabIndex={0}
-			// Mermaid draws its labels as HTML. Inside the editable root, a
-			// click would otherwise put a caret in a label and type into it.
-			contentEditable={false}
-			dangerouslySetInnerHTML={{ __html: html }}
-		/>
+		<>
+			<div
+				ref={region}
+				aria-label="Diagram preview"
+				className="plan-diagram"
+				data-fit={fit ? "" : undefined}
+				data-more={more}
+				data-stale={stale ? "" : undefined}
+				role="region"
+				tabIndex={0}
+				// Mermaid draws its labels as HTML. Inside the editable root, a
+				// click would otherwise put a caret in a label and type into it.
+				contentEditable={false}
+				dangerouslySetInnerHTML={{ __html: html }}
+			/>
+			{phone && !fit && <ExpandDiagram buttonRef={expand} onExpand={() => setExpanded(true)} />}
+			{expanded && (
+				<DiagramSheet
+					onClose={() => {
+						setExpanded(false);
+						// A tap never focuses the button, so closing would leave focus nowhere.
+						requestAnimationFrame(() => expand.current?.focus());
+					}}
+				>
+					<div
+						className="plan-diagram-sheet-drawing"
+						// The copy's IDs are its own, so its markers and styles
+						// never resolve to the drawing in the document.
+						dangerouslySetInnerHTML={{
+							__html: html.replaceAll(`ace-mermaid-${id}`, `ace-mermaid-${id}-sheet`),
+						}}
+					/>
+				</DiagramSheet>
+			)}
+		</>
+	);
+}
+
+/** Like a diagram's, but its message already names the line. */
+function WireframeError({ message }: { message: string }) {
+	return (
+		<div data-plan-error="">
+			<span aria-hidden="true" className="plan-error-badge">
+				<WarningIcon size={14} />
+			</span>
+			<div className="plan-error-text">
+				<strong className="plan-error-title">This wireframe could not be drawn</strong>
+				<p className="plan-error-message">{message}</p>
+			</div>
+		</div>
 	);
 }
 
 function Rendered(
-	{ block, html, error, spec }: {
+	{ block, html, error, spec, drawing, stale }: {
 		block: Block;
 		html: string | undefined;
 		error: string | undefined;
 		spec: unknown;
+		/** Only while it is shown: current, or the last one while its source is mid-edit. */
+		drawing?: Drawing;
+		/** The drawing is of an earlier source than the one that does not parse now. */
+		stale?: boolean;
 	},
 ) {
+	if (block.kind === "wireframe") {
+		return (
+			<>
+				{drawing && (
+					<div
+						className="plan-wireframe"
+						contentEditable={false}
+						data-stale={stale ? "" : undefined}
+					>
+						<Suspense fallback={null}>
+							<WireframeView wireframe={drawing.wireframe} focusable />
+						</Suspense>
+					</div>
+				)}
+				{error && <WireframeError message={error} />}
+			</>
+		);
+	}
 	if (block.kind === "mermaid" && (html || error)) {
 		return (
 			<>
-				{html && <Diagram html={html} stale={!!error} />}
+				{html && <Diagram id={block.key} html={html} stale={!!error} />}
 				{error && <DiagramError message={error} />}
 			</>
 		);
@@ -749,12 +880,15 @@ function $edgeBlock(
 	return at;
 }
 
+const WIREFRAME_PREVIEW = ".plan-wireframe > .wf";
+
 /** Something a reader can hold focus on in place of a caret. */
-const FOCUSABLE_PREVIEW = ".plan-code-view, .plan-diagram, .plan-seecode";
+const FOCUSABLE_PREVIEW = `.plan-code-view, .plan-diagram, .plan-seecode, ${WIREFRAME_PREVIEW}`;
 
 export function PreviewPlugin() {
 	let [editor] = useLexicalComposerContext();
 	let disabled = useCellValue(readOnly$);
+	let reading = useCellValue(widgets$).editMode === "reading";
 	let [blocks, setBlocks] = useState<Block[]>([]);
 	/** Blocks whose source this viewer is looking at, and why. */
 	let [shown, setShown] = useState<Record<string, Shown>>({});
@@ -827,6 +961,11 @@ export function PreviewPlugin() {
 			// No caret is not somewhere else: the reader may be on a preview
 			// or a control of the block they were editing.
 			if (key === undefined) return;
+			// A wireframe folded on blur stays folded until someone is back in
+			// the editor, whatever else updates the document meanwhile.
+			let root = editor.getRootElement();
+			let away = root?.ownerDocument.activeElement !== root
+				&& latest.current.blocks.some(block => block.key === key && block.kind === "wireframe");
 			setShown(prev => {
 				let next = { ...prev };
 				let changed = false;
@@ -835,7 +974,7 @@ export function PreviewPlugin() {
 					delete next[other];
 					changed = true;
 				}
-				if (key && !prev[key]) {
+				if (key && !prev[key] && !away) {
 					next[key] = "editing";
 					changed = true;
 				}
@@ -884,8 +1023,10 @@ export function PreviewPlugin() {
 		let $enter = (key: string, direction: Direction) => {
 			let block = latest.current.blocks.find(candidate => candidate.key === key);
 			if (!block) return;
-			if (block.kind === "mermaid") {
-				let preview = editor.getElementByKey(key)?.querySelector<HTMLElement>(".plan-diagram");
+			if (block.kind === "mermaid" || block.kind === "wireframe") {
+				let preview = editor.getElementByKey(key)?.querySelector<HTMLElement>(
+					block.kind === "mermaid" ? ".plan-diagram" : WIREFRAME_PREVIEW,
+				);
 				if (preview) {
 					// No caret is left to close what it opened on the way here.
 					$setSelection(null);
@@ -995,8 +1136,8 @@ export function PreviewPlugin() {
 			if (!(event.target instanceof Element) || event.target.closest("[data-plan-chrome]")) return;
 			let block = blockAt(event.target.closest("[data-plan-preview]")?.parentElement);
 			if (!block || !latest.current.hidable.has(block.key)) return;
-			// SeeCode has its own interactive diagram controls; the source toggle
-			// is the explicit way to edit the diagram's specification.
+			// SeeCode owns clicks for diagram interaction; focusing its preview
+			// and pressing Enter opens the canonical source.
 			if (block.kind === "seecode") return;
 			let offset = pressed?.offset ?? block.source.length;
 			editor.update(() => $open(block.key, offset));
@@ -1112,10 +1253,36 @@ export function PreviewPlugin() {
 			editor.registerUpdateListener(refresh),
 			editor.registerCommand(FOCUS_COMMAND, () => {
 				refresh();
+				// Back in the editor with the caret still in a wireframe that blur
+				// folded: open it again, since that is where typing will go.
+				let key = editor.getEditorState().read(() => {
+					let selection = $getSelection();
+					return $isRangeSelection(selection) ? enclosing(selection.anchor.getNode()) : undefined;
+				});
+				let block = key && latest.current.blocks.find(candidate => candidate.key === key);
+				// The DOM's selection says whether a click is already taking the
+				// caret somewhere else, which Lexical has not heard about yet.
+				let anchor = editor.getRootElement()?.ownerDocument.getSelection()?.anchorNode;
+				let inside = key && anchor && editor.getElementByKey(key)?.contains(anchor);
+				if (key && inside && block && block.kind === "wireframe") {
+					setShown(prev => (prev[key] ? prev : { ...prev, [key]: "editing" }));
+				}
 				return false;
 			}, COMMAND_PRIORITY_LOW),
 			editor.registerCommand(BLUR_COMMAND, () => {
 				setEditing(undefined);
+				// A wireframe's source is open only while someone is writing in
+				// it, so leaving the editor folds it as leaving the block does. A
+				// press on its drawing is the click deciding, not someone leaving.
+				if (pressing.current) return false;
+				setShown(prev => {
+					let next = { ...prev };
+					for (let [key, why] of Object.entries(prev)) {
+						let block = latest.current.blocks.find(candidate => candidate.key === key);
+						if (why === "editing" && block?.kind === "wireframe") delete next[key];
+					}
+					return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+				});
 				return false;
 			}, COMMAND_PRIORITY_LOW),
 		);
@@ -1148,8 +1315,9 @@ export function PreviewPlugin() {
 					key={block.key}
 					block={block}
 					editor={editor}
-					collapsed={!shown[block.key]}
+					collapsed={!shown[block.key] || reading}
 					disabled={disabled}
+					reading={reading}
 					editing={editing === block.key}
 					onToggle={() => toggle(block.key)}
 					onHidable={reportHidable}

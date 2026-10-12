@@ -64,8 +64,16 @@ export declare namespace Chat {
 		status: ToolStatus;
 		/** Truncated and redacted; the arguments the model supplied, once its input finished. */
 		args?: string;
-		/** Truncated and redacted; partial output while running, final output once finished. */
+		/**
+		 * Truncated and redacted; partial output while running, final output once finished.
+		 * With `error`, the failed tool's human-readable message.
+		 */
 		result?: string;
+		/**
+		 * Redacted; present, with status "failed", when the tool failed with a structured
+		 * error. `code` is stable; `kind`, when present, is the name to show.
+		 */
+		error?: { code: string; kind?: string };
 		/** Milliseconds since the epoch, set by the server when the tool's input began. */
 		startedAt?: number;
 		/** Present, with status "failed", when the Planner was refused permission to run the tool. */
@@ -104,6 +112,13 @@ export declare namespace Chat {
 				sources: ConversationPlan.SourceRef[];
 			}
 			| { questionnaireId: string; kind: "activity"; label?: string; generation?: never };
+		/**
+		 * A system notice that a comment was sent to the Planner; text remains its fallback.
+		 *
+		 * `excerpt` is a short cut of the marked passage, `note` the comment as sent, and
+		 * `channelId` the child document holding the thread, absent when it is this one.
+		 */
+		comment?: { thread: string; excerpt: string; note: string; channelId?: string };
 		/** True while the agent is still writing this one. */
 		streaming?: boolean;
 		tools?: Activity[];
@@ -212,6 +227,12 @@ export declare namespace Chat {
 		text: string;
 		to: Destination;
 		references?: ReferenceRequest[];
+		/**
+		 * The child document open beside this Chat, by channel id. Context for the
+		 * Planner only: the server resolves it against this root's children and
+		 * refuses one it cannot, and the Planner's child tools recheck it again.
+		 */
+		focus?: string;
 	};
 
 	/** The member message or queue entry is accepted by the server. */

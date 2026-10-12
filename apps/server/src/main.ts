@@ -1,3 +1,5 @@
+import { registerImplementationRoutes } from "./tasks/routes";
+import { draftInstruction, draftRefusal } from "./tasks/draft";
 /**
  * The server.
  *
@@ -11,9 +13,22 @@ import { join } from "node:path";
 import { ulid } from "@chopin/dialect";
 
 import { harnessFor, shutdownHarnesses } from "./harness/harnesses";
+import {
+	admitPlannerLink,
+	isPlannerLinkSocket,
+	openPlannerLinkSocket,
+} from "./harness/remote/endpoint";
+import { notAttachedMessage, PlannerAttachments } from "./harness/remote/attachments";
+import { documentUrl } from "./channels/document-url";
 import { ActiveOwnerBindings } from "./agent/active-owner";
 import { registerAuthRoutes } from "./auth/routes";
+import { registerExperimentRoutes } from "./experiments/routes";
+import { registerImageRoutes } from "./images/routes";
+import type { ExperimentRuntime } from "./experiments/routes";
+import { fingerprint } from "./experiments/service";
 import * as Chat from "./chat/service";
+import { createChildDocuments } from "./chat/children";
+import { createRootChat } from "./chat/root";
 import { CHAT_CAPABILITIES, incomingFrame, sidebarFrame } from "./chat/incoming";
 import { ReferenceService } from "./chat/references";
 import { createConversationRuntime } from "./conversation-plan/runtime";
@@ -31,7 +46,8 @@ import { registerChannelRoutes } from "./channels/routes";
 import * as Comments from "./comments/service";
 import { proxy, serve } from "./client";
 import { describe, load } from "./config";
-import { GitHubError } from "./github/client";
+import { GitHubClient, GitHubError } from "./github/client";
+import { GitHubReferences } from "./github/references";
 import { Router } from "./http/router";
 import { JobExecutionError, JobRegistry } from "./jobs/registry";
 import * as JobBrowser from "./jobs/browser";
@@ -41,6 +57,7 @@ import { JobRunner } from "./jobs/runner";
 import { researchAnswerDefinition, researchEvidenceDefinition } from "./jobs/research-workspace";
 import { JobService } from "./jobs/service";
 import { DocumentSummaryCoordinator } from "./jobs/summary-coordinator";
+import { invokeRouted } from "./mcp/invoke";
 import { registerMcpRoutes } from "./mcp/routes";
 import { registerNavigationRoutes } from "./navigation/routes";
 import { registerPreferenceRoutes } from "./user-preferences/routes";
@@ -66,15 +83,20 @@ import {
 	watchDecisions,
 	watchRequest,
 } from "./socket/decision-watch";
+import { SessionSockets } from "./socket/session-sockets";
 import { StorageError } from "./storage/errors";
 import { createStorage } from "./storage/registry";
+import { WriterLease } from "./storage/writer-lease";
 import { broadcast, fail, relay, reply, repositoryTopic, tell, topic } from "./wire";
 
+import { LINK_CLOSE, PLANNER_LINK_PATH } from "@chopin/planner-link";
+
 import type { Server, ServerWebSocket } from "bun";
+import type { PlannerLinkSocketData } from "./harness/remote/endpoint";
 import type { RepositoryAuthorizer, WatchTopics } from "./socket/decision-watch";
 import type { DocumentSummaryInput } from "./jobs/document-summary";
 import type { JobDefinition } from "./jobs/registry";
-import type { ChannelRecord, Lease } from "./storage/model";
+import type { ChannelRecord } from "./storage/model";
 import type {
 	AuthorizationResult,
 	SidebarSocket,
@@ -101,18 +123,27 @@ const EVICT_MS = 30_000;
 const LEASE_TTL_MS = 30_000;
 const LEASE_RENEW_MS = 10_000;
 const LEASE_SAFETY_MS = 5_000;
+const LEASE_RETRY_MS = 1_000;
 const SESSION_CLEANUP_MS = 5 * 60_000;
 const ACCESS_RECHECK_MS = 60_000;
 const RESEARCH_RECOVERY_RETRY_MS = 10_000;
 
 let server: Server<SocketData>;
-let heldLease: Lease | undefined;
-let leaseRenewal: ReturnType<typeof setInterval> | undefined;
-let leaseWatchdog: ReturnType<typeof setTimeout> | undefined;
-let renewingLease: Promise<void> | undefined;
+const writerLease = new WriterLease(storage.leases, {
+	ttlMs: LEASE_TTL_MS,
+	renewMs: LEASE_RENEW_MS,
+	safetyMs: LEASE_SAFETY_MS,
+	retryMs: LEASE_RETRY_MS,
+}, () => signal());
+let experiments: ExperimentRuntime | undefined;
+let implementations: ReturnType<typeof registerImplementationRoutes> | undefined;
+let experimentTimer: ReturnType<typeof setInterval> | undefined;
 let sessionCleanup: ReturnType<typeof setInterval> | undefined;
 let cleaningSessions: Promise<void> | undefined;
 let ownerBindings: ActiveOwnerBindings | undefined;
+let plannerAttachments: PlannerAttachments | undefined;
+/** Browser sockets by login, so a login that ends closes them before another broadcast. */
+let sessionSockets = new SessionSockets(sessionId => hostedAuth.sessions.isLive(sessionId));
 let jobRunner: JobRunner | undefined;
 let researchService: ResearchWorkspaceService | undefined;
 let researchRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -154,6 +185,32 @@ function withDocumentTransition<T>(channelId: string, action: () => Promise<T>):
 	return operation;
 }
 
+/**
+ * Hold a child's room open for a root Planner tool.
+ *
+ * The child's document transition serializes this with archive and delete; the
+ * edit itself still queues behind the child's own browser batches through
+ * `Service.exclusive` inside the tool.
+ */
+function withChildPlan<T>(
+	childId: string,
+	action: (opened: Service.Plan) => Promise<T>,
+): Promise<T> {
+	return withDocumentTransition(childId, async () => {
+		if (deletingChannels.has(childId) || archivingChannels.has(childId)) {
+			throw new Error("child document is unavailable");
+		}
+		await Rooms.get(childId)?.closing;
+		let held = Rooms.hold(childId);
+		try {
+			return await action(await plan(held.room, server));
+		} finally {
+			held.release();
+			evict(held.room);
+		}
+	});
+}
+
 function presence(server: Server<SocketData>, room: Rooms.Room): void {
 	broadcast(server, room.id, {
 		kind: "session:presence",
@@ -166,8 +223,8 @@ function documentBackend(): Service.Backend {
 	return {
 		storage,
 		lease: () => {
-			if (!heldLease) throw new Error("storage writer lease is unavailable");
-			return heldLease;
+			if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+			return writerLease.held;
 		},
 		fatal: err => {
 			console.error("chopin: plan persistence failed -", err);
@@ -240,8 +297,9 @@ async function plan(room: Rooms.Room, server: Server<SocketData>): Promise<Servi
 		let channel: ChannelRecord | undefined;
 		await prepareOpenedPlan(room, opened, async () => {
 			channel = await storage.channels.get(room.id);
+			room.parentChannelId = channel?.parentChannelId;
 			if (room.closing) throw new Error("document is unavailable");
-			if (config.conversationPlan && !channel?.archivedAt) {
+			if (config.conversationPlan && !channel?.archivedAt && !channel?.parentChannelId) {
 				await backfillPlannerAskThreads(opened);
 			}
 		});
@@ -292,11 +350,114 @@ function conversation(
 		auth: hostedAuth,
 		claimantSessionId,
 		repository,
+		plannerNotAttached: plannerAttachments
+			? async () => {
+				if (await plannerAttachments!.confirmed(room.id)) return undefined;
+				let channel = await storage.channels.get(room.id);
+				let path = channel
+					? await documentUrl(channel, storage.channels)
+					: `/channels/${room.id}`;
+				return notAttachedMessage(
+					new URL(path, hostedAuth.config.origin).href,
+					`${repository.owner}/${repository.name}`,
+				);
+			}
+			: undefined,
 		persist: chat => Service.persist(opened, chat),
+		...(room.parentChannelId
+			? {
+				rootChannelId: room.parentChannelId,
+				root: rootChat(room, room.parentChannelId, claimantSessionId, repository),
+			}
+			: {
+				children: createChildDocuments({
+					rootId: room.id,
+					repositoryId: repository.id,
+					channels: storage.channels,
+					server,
+					withChildPlan,
+				}),
+			}),
 		activeOwner: () => ownerBindings!.resolve(room.id),
 		ownerAvailable: () => jobRunner?.ownerAvailable(room.id) ?? Promise.resolve(),
 		jobs: config.backgroundJobs ? jobService : undefined,
 		references: referenceService,
+		investigations: experiments
+			? {
+				async list() {
+					return {
+						investigations: (await experiments!.service.store.list(room.id)).slice(0, 20).map(
+							value => ({ id: value.id, brief: value.brief.slice(0, 400), state: value.state }),
+						),
+						workspaces: experiments!.connections.list(room.id).map(value => ({
+							label: value.label,
+							owner: value.login,
+						})),
+					};
+				},
+				async read(id, dataset, offset = 0) {
+					let value = await experiments!.service.store.get(id);
+					if (!value || value.documentId !== room.id) throw new Error("Investigation unavailable");
+					if (dataset) {
+						let data = value.result?.datasets.find(item => item.key === dataset);
+						if (!data) throw new Error("Dataset unavailable");
+						let rows: typeof data.rows = [];
+						for (let row of data.rows.slice(offset, offset + 50)) {
+							if (JSON.stringify([...rows, row]).length > 40_000) break;
+							rows.push(row);
+						}
+						if (!rows.length && offset < data.rows.length) {
+							throw new Error(
+								"This row exceeds the tool response limit. Inspect the dataset download or request a later offset.",
+							);
+						}
+						return {
+							...data,
+							rows,
+							totalRows: data.rows.length,
+							nextOffset: offset + rows.length < data.rows.length
+								? offset + rows.length
+								: undefined,
+						};
+					}
+					return {
+						id: value.id,
+						state: value.state,
+						source: value.input?.source,
+						report: value.result?.report.slice(0, 16_000),
+						reportTruncated: (value.result?.report.length ?? 0) > 16_000,
+						datasets: value.result?.datasets.map(data => ({
+							key: data.key,
+							title: data.title,
+							rows: data.rows.length,
+						})),
+						decisions: value.decisions.slice(-10).map(decision => ({
+							...decision,
+							rationale: decision.rationale.slice(0, 2000),
+							rationaleTruncated: decision.rationale.length > 2000,
+						})),
+					};
+				},
+				async propose(request) {
+					await experiments!.access(
+						await hostedAuth.sessions.forUser(request.userId),
+						room.id,
+						true,
+					);
+					await experiments!.mutationAllowed(room.id);
+					let hash = fingerprint([room.id, request.entryId, request.key]);
+					let id = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-a${
+						hash.slice(17, 20)
+					}-${hash.slice(20, 32)}`;
+					let value = await experiments!.service.create(room.id, request.userId, request.brief, id);
+					return {
+						id: value.id,
+						state: value.state,
+						message: "Open Investigations and authorize Run on my workspace to execute.",
+					};
+				},
+			}
+			: undefined,
 		hold: () => {
 			let held = Rooms.hold(room.id);
 			return () => {
@@ -335,6 +496,61 @@ function conversation(
 	});
 }
 
+/**
+ * Open a root's room and its Chat, holding it, and `alsoHold`, until `release`.
+ *
+ * Refuses a root being archived or deleted rather than reopening it.
+ */
+async function openRootChat(
+	rootId: string,
+	claimantSessionId: string | undefined,
+	repository: Chat.Room["repository"],
+	alsoHold?: string,
+): Promise<{ context: Chat.Room; release: () => void }> {
+	if (deletingChannels.has(rootId) || archivingChannels.has(rootId)) {
+		throw new Error("the root document is unavailable");
+	}
+	await Rooms.get(rootId)?.closing;
+	let holds = [Rooms.hold(rootId), ...alsoHold ? [Rooms.hold(alsoHold)] : []];
+	let release = () => {
+		for (let hold of holds) {
+			hold.release();
+			evict(hold.room);
+		}
+	};
+	try {
+		await plan(holds[0]!.room, server);
+		return { context: conversation(holds[0]!.room, claimantSessionId, repository), release };
+	} catch (err) {
+		release();
+		throw err;
+	}
+}
+
+/**
+ * A child room's way to its root's Chat.
+ *
+ * Opening the root holds both rooms, so the root's turn and the child's thread
+ * it answers stay loaded until that instruction's own turn has ended. The
+ * turn runs under the root's Planner owner or the sender's session, exactly as
+ * a comment in the root does; the sender's write access was checked on the child.
+ */
+function rootChat(
+	child: Rooms.Room,
+	rootId: string,
+	claimantSessionId: string | undefined,
+	repository: Chat.Room["repository"],
+): Chat.RootChat {
+	return createRootChat({
+		rootId,
+		childId: child.id,
+		repositoryId: repository.id,
+		channels: storage.channels,
+		open: () => openRootChat(rootId, claimantSessionId, repository, child.id),
+		live: () => Rooms.get(rootId)?.plan?.chat,
+	});
+}
+
 async function closeRoom(room: Rooms.Room, force = false): Promise<void> {
 	if (room.closing) return room.closing;
 	let closing = withDocumentLock(room.id, async () => {
@@ -365,6 +581,51 @@ function evict(room: Rooms.Room): void {
 			console.error("chopin: room close failed -", err);
 		});
 	}, EVICT_MS);
+}
+
+const REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Whether this socket may start Planner work in this room now.
+ *
+ * A Planner turn spends the claimant's entitlement and can edit the document,
+ * so access is rechecked at the moment of asking rather than trusted from the
+ * upgrade, and the room must still be the one the socket joined.
+ */
+async function plannerWritable(
+	room: Rooms.Room,
+	ws: Socket,
+	rid: string,
+): Promise<boolean> {
+	let opened = await readyPlan(room);
+	if (!opened) {
+		fail(ws, rid, "document is unavailable");
+		return false;
+	}
+	let access = await refreshAccess(ws);
+	if (access === "unavailable") {
+		fail(ws, rid, "authorization is temporarily unavailable");
+		return false;
+	}
+	if (access === "denied") {
+		fail(ws, rid, "authorization expired");
+		ws.close(4403, "authorization expired");
+		return false;
+	}
+	if (!ws.data.canEdit) {
+		fail(ws, rid, "repository write access is required");
+		return false;
+	}
+	if (
+		Rooms.get(room.id) !== room || room.plan !== opened
+		|| room.closing || archivingChannels.has(room.id) || deletingChannels.has(room.id)
+		|| ws.data.closed || ws.data.room !== room.id
+		|| room.members.get(ws.data.client) !== ws
+	) {
+		fail(ws, rid, "document is unavailable");
+		return false;
+	}
+	return true;
 }
 
 async function receive(ws: Socket, raw: string): Promise<void> {
@@ -401,6 +662,8 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 		case "plan:open": {
 			try {
 				let opened = await plan(room, server);
+				implementations?.track(room.id);
+				let parent = room.parentChannelId;
 				await greetJoinedPlan(
 					opened,
 					ws,
@@ -411,6 +674,10 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 						&& !room.closing && !deletingChannels.has(room.id)
 						&& !ws.data.closed && ws.data.room === room.id
 						&& room.members.get(ws.data.client) === ws,
+					// A child's threads are worked on by its root's Chat.
+					parent
+						? { working: thread => Chat.workingFor(Rooms.get(parent)?.plan?.chat, thread, room.id) }
+						: undefined,
 				);
 			} catch (err) {
 				fail(ws, frame.rid, err instanceof Error ? err.message : "cannot open plan");
@@ -432,55 +699,73 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 
 		case "chat:send":
 			try {
-				let opened = await readyPlan(room);
-				if (!opened) {
-					fail(ws, frame.rid, "document is unavailable");
-					return;
-				}
-				let access = await refreshAccess(ws);
-				if (access === "unavailable") {
-					fail(ws, frame.rid, "authorization is temporarily unavailable");
-					return;
-				}
-				if (access === "denied") {
-					fail(ws, frame.rid, "authorization expired");
-					ws.close(4403, "authorization expired");
-					return;
-				}
-				if (!ws.data.canEdit) {
-					fail(ws, frame.rid, "repository write access is required");
-					return;
-				}
-				if (
-					Rooms.get(room.id) !== room || room.plan !== opened
-					|| room.closing || archivingChannels.has(room.id) || deletingChannels.has(room.id)
-					|| ws.data.closed || ws.data.room !== room.id
-					|| room.members.get(ws.data.client) !== ws
-				) {
-					fail(ws, frame.rid, "document is unavailable");
-					return;
-				}
+				if (!await plannerWritable(room, ws, frame.rid)) return;
 				await Chat.send(chat(room, ws), ws, frame);
 			} catch (error) {
 				fail(ws, frame.rid, error instanceof Error ? error.message : "cannot send message");
 			}
 			return;
 
+		case "implementation:draft":
+			try {
+				if (
+					typeof frame.requestId !== "string" || !REQUEST_ID.test(frame.requestId)
+					|| !Number.isInteger(frame.planRevision) || frame.planRevision < 0
+				) {
+					fail(ws, frame.rid, "invalid task draft request");
+					return;
+				}
+				let channel = await storage.channels.get(room.id);
+				if (!channel || channel.parentChannelId) {
+					fail(ws, frame.rid, "this document cannot be built");
+					return;
+				}
+				if (!await plannerWritable(room, ws, frame.rid)) return;
+				let opened = room.plan!;
+				let refusal = draftRefusal(opened);
+				if (refusal) {
+					fail(ws, frame.rid, refusal);
+					return;
+				}
+				let { text, said } = draftInstruction(opened, ws.data.handle);
+				let result = await Chat.draftTasks(
+					chat(room, ws),
+					ws.data.handle,
+					opened.revision,
+					text,
+					said,
+				);
+				if (!result.ok) {
+					fail(ws, frame.rid, result.reason);
+					return;
+				}
+				reply(ws, frame.rid, {
+					kind: "implementation:draft",
+					ts: 0,
+					id: result.draft.id,
+					planRevision: result.draft.planRevision,
+					state: result.state,
+					existing: result.existing,
+				});
+			} catch (error) {
+				fail(ws, frame.rid, error instanceof Error ? error.message : "cannot draft tasks");
+			}
+			return;
+
 		case "chat:abort":
-			if (room.plan) await Chat.abort(chat(room, ws), ws);
-			return;
-
 		case "chat:resume":
-			if (room.plan) await Chat.resume(chat(room, ws), ws);
-			return;
-
 		case "chat:pause-run":
 		case "chat:resume-run":
-			if (room.plan) await Chat.controlRun(chat(room, ws), ws, frame);
-			return;
-
 		case "chat:unqueue":
-			if (room.plan) Chat.unqueue(chat(room, ws), ws, frame);
+			if (!room.plan) return;
+			if (room.plan.parentChannelId) {
+				if (frame.rid) fail(ws, frame.rid, "this document's Chat is on its root document");
+				return;
+			}
+			if (frame.kind === "chat:abort") await Chat.abort(chat(room, ws), ws);
+			else if (frame.kind === "chat:resume") await Chat.resume(chat(room, ws), ws);
+			else if (frame.kind === "chat:unqueue") Chat.unqueue(chat(room, ws), ws, frame);
+			else await Chat.controlRun(chat(room, ws), ws, frame);
 			return;
 
 		case "conversation-plan:correct":
@@ -518,6 +803,7 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 						refreshAccess,
 						unavailable: id => archivingChannels.has(id) || deletingChannels.has(id),
 						ownerAvailable: id => jobRunner?.ownerAvailable(id) ?? Promise.resolve(),
+						claimsOwnership: !plannerAttachments,
 						placeReference: placeResearchReference,
 						scheduleRecovery: scheduleResearchRecovery,
 					}),
@@ -567,24 +853,43 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 			if (room.plan) await Questions.addOption(room.plan, server, room.id, ws, frame);
 			return;
 
+		// A note sent to the Planner starts a turn on the sender's entitlement, so
+		// their authority to do that is rechecked first, exactly as for Chat; the
+		// sender's session is the turn's claimant.
 		case "comment:start":
-			if (room.plan) await Comments.start(room.plan, server, room.id, ws, frame);
+			if (!room.plan) return;
+			if (frame.to === "planner" && !await plannerWritable(room, ws, frame.rid)) return;
+			await Comments.start(
+				room.plan,
+				server,
+				room.id,
+				ws,
+				frame,
+				frame.to === "planner" ? chat(room, ws) : undefined,
+			);
 			return;
 
 		case "comment:reply":
-			if (room.plan) await Comments.respond(room.plan, ws, frame);
+			if (!room.plan) return;
+			if (frame.to === "planner" && !await plannerWritable(room, ws, frame.rid)) return;
+			await Comments.respond(
+				room.plan,
+				ws,
+				frame,
+				frame.to === "planner" ? chat(room, ws) : undefined,
+			);
 			return;
 
 		case "comment:typing":
 			if (room.plan) Comments.typing(room.plan, ws, frame);
 			return;
 
-		case "comment:accept":
-			if (room.plan) await Comments.accept(chat(room, ws), ws, frame);
+		case "comment:resolve":
+			if (room.plan) await Comments.resolve(room.plan, server, room.id, ws, frame);
 			return;
 
-		case "comment:dismiss":
-			if (room.plan) await Comments.dismiss(chat(room, ws), ws, frame);
+		case "comment:reopen":
+			if (room.plan) await Comments.reopen(room.plan, server, room.id, ws, frame);
 			return;
 
 		case "provenance:authorship":
@@ -640,7 +945,7 @@ const VIEWER_ALLOWED = new Set([
 	"provenance:authorship",
 ]);
 
-type AnySocket = ServerWebSocket<SocketData | SidebarSocketData>;
+type AnySocket = ServerWebSocket<SocketData | SidebarSocketData | PlannerLinkSocketData>;
 
 function isSidebarSocket(ws: AnySocket): ws is SidebarSocket {
 	return ws.data.sidebar === true;
@@ -918,6 +1223,9 @@ function openRoomSocket(ws: Socket): void {
 		webResearch: config.webResearch,
 		...CHAT_CAPABILITIES,
 	});
+	if (plannerAttachments) {
+		tell(ws, { kind: "session:planner", ts: 0, planner: plannerAttachments.status(room.id) });
+	}
 	relay(ws, { kind: "session:presence", ts: 0, members: Rooms.members(room) });
 	scheduleAuthorization(ws);
 	void validateOpenedSocket(ws).catch(err => {
@@ -950,8 +1258,8 @@ function closeSidebarSocket(ws: SidebarSocket): void {
 
 function upgraded(
 	req: Request,
-	self: Server<SocketData | SidebarSocketData>,
-	data: SocketData | SidebarSocketData,
+	self: Server<SocketData | SidebarSocketData | PlannerLinkSocketData>,
+	data: SocketData | SidebarSocketData | PlannerLinkSocketData,
 ): Response | undefined {
 	if (
 		req.headers.get("x-chopin-socket-probe") === "1"
@@ -962,7 +1270,7 @@ function upgraded(
 }
 
 function listen(): Server<SocketData> {
-	return Bun.serve<SocketData | SidebarSocketData>({
+	return Bun.serve<SocketData | SidebarSocketData | PlannerLinkSocketData>({
 		hostname: config.host,
 		port: config.port,
 
@@ -979,6 +1287,11 @@ function listen(): Server<SocketData> {
 				}
 				return upgraded(req, self, outcome.data);
 			}
+			if (url.pathname === PLANNER_LINK_PATH) {
+				let outcome = await admitPlannerLink(req, hostedAuth, !!plannerAttachments);
+				if (outcome instanceof Response) return outcome;
+				return upgraded(req, self, outcome);
+			}
 			if (url.pathname === "/ws/sidebar") {
 				let outcome = await admitSidebar(req, hostedAuth);
 				if ("status" in outcome) {
@@ -994,11 +1307,28 @@ function listen(): Server<SocketData> {
 
 		websocket: {
 			open(ws: AnySocket) {
+				if (isPlannerLinkSocket(ws)) {
+					if (!plannerAttachments) return ws.close(LINK_CLOSE.failed, "unavailable");
+					openPlannerLinkSocket(ws, hostedAuth, {
+						attachments: plannerAttachments,
+						unavailable: channelId => deletingChannels.has(channelId),
+						pingEveryMs: config.plannerLinkPingMs,
+						pongTimeoutMs: config.plannerLinkTimeoutMs,
+						maxSilenceMs: config.plannerLinkMaxSilenceMs,
+					});
+					return;
+				}
+				// Before any subscription or frame: a login that ended since admission gets 4401.
+				if (!sessionSockets.opened(ws as Socket | SidebarSocket)) return;
 				if (isSidebarSocket(ws)) scheduleSidebarRecheck(ws);
 				else openRoomSocket(ws as Socket);
 			},
 
 			message(ws: AnySocket, raw) {
+				if (isPlannerLinkSocket(ws)) {
+					ws.data.alive?.heard();
+					return ws.data.link?.receive(raw);
+				}
 				if (typeof raw !== "string") return;
 				let received = isSidebarSocket(ws)
 					? receiveSidebar(ws, raw)
@@ -1008,7 +1338,17 @@ function listen(): Server<SocketData> {
 				});
 			},
 
+			// Only Planner links are pinged by the server itself; see openPlannerLinkSocket.
+			pong(ws: AnySocket) {
+				if (isPlannerLinkSocket(ws)) ws.data.alive?.heard();
+			},
+
 			close(ws: AnySocket) {
+				if (isPlannerLinkSocket(ws)) {
+					ws.data.alive?.stop();
+					return ws.data.link?.disconnected();
+				}
+				sessionSockets.closed(ws as Socket | SidebarSocket);
 				if (isSidebarSocket(ws)) closeSidebarSocket(ws);
 				else closeRoomSocket(ws as Socket);
 			},
@@ -1034,6 +1374,7 @@ function drain(): Promise<void> {
 		};
 		await attempt(() => server.stop(true));
 		if (researchRecoveryTimer) clearTimeout(researchRecoveryTimer);
+		if (experimentTimer) clearInterval(experimentTimer);
 		if (recoveringResearch) await attempt(() => recoveringResearch!);
 		if (sessionCleanup) clearInterval(sessionCleanup);
 		for (let result of await Promise.allSettled([cleaningSessions])) {
@@ -1055,16 +1396,13 @@ function drain(): Promise<void> {
 		summaryCoordinator?.close();
 		let stoppingJobs = jobRunner?.shutdown();
 		ownerBindings?.revokeAll();
+		plannerAttachments?.close();
 		for (let result of await Promise.allSettled([stoppingJobs])) {
 			if (result.status === "rejected") record(result.reason);
 		}
 		await attempt(() => shutdownHarnesses());
-		if (leaseRenewal) clearInterval(leaseRenewal);
-		if (leaseWatchdog) clearTimeout(leaseWatchdog);
-		for (let result of await Promise.allSettled([renewingLease])) {
-			if (result.status === "rejected") record(result.reason);
-		}
-		let lease = heldLease;
+		await attempt(() => writerLease.stop());
+		let lease = writerLease.held;
 		if (lease) await attempt(() => storage.leases.release(lease));
 		await attempt(() => storage.close());
 		if (errors.length > 0) throw new AggregateError(errors, "Chopin shutdown failed.");
@@ -1079,35 +1417,6 @@ function signal(): void {
 			process.exit(1);
 		},
 	);
-}
-
-function renewLease(): void {
-	if (!heldLease || renewingLease) return;
-	renewingLease = storage.leases.renew(heldLease, LEASE_TTL_MS).then(renewed => {
-		if (renewed) {
-			heldLease = renewed;
-			armLeaseWatchdog();
-		} else {
-			console.error("chopin: lost the storage writer lease");
-			heldLease = undefined;
-			signal();
-		}
-	}, err => {
-		console.error("chopin: could not renew the storage writer lease -", err);
-		heldLease = undefined;
-		signal();
-	}).finally(() => {
-		renewingLease = undefined;
-	});
-}
-
-function armLeaseWatchdog(): void {
-	if (leaseWatchdog) clearTimeout(leaseWatchdog);
-	leaseWatchdog = setTimeout(() => {
-		console.error("chopin: storage writer lease was not renewed before its safety deadline");
-		heldLease = undefined;
-		signal();
-	}, LEASE_TTL_MS - LEASE_SAFETY_MS);
 }
 
 function cleanSessions(): void {
@@ -1419,9 +1728,16 @@ async function commitCurrentSummary(
 }
 
 async function sessionRevoked(sessionId: string): Promise<void> {
+	// First, so nothing the rest of the revocation announces reaches the ended login.
+	sessionSockets.revoke(sessionId);
+	experiments?.connections.revokeSession(sessionId);
 	let jobs = jobRunner?.ownerRevoked(sessionId);
 	ownerBindings?.revokeSession(sessionId);
-	await Promise.all([resetOpenAgents(() => true, sessionId), jobs]);
+	await Promise.all([
+		resetOpenAgents(() => true, sessionId),
+		jobs,
+		plannerAttachments?.sessionRevoked(sessionId),
+	]);
 }
 
 async function credentialsWillRotate(sessionId: string, revision: number): Promise<void> {
@@ -1441,6 +1757,7 @@ async function credentialsWillRotate(sessionId: string, revision: number): Promi
 async function channelOwnerReset(channelId: string): Promise<void> {
 	let jobs = jobRunner?.channelOwnerReset(channelId);
 	ownerBindings?.revokeChannel(channelId);
+	plannerAttachments?.ownerReset(channelId);
 	await Promise.all([resetOpenAgents(room => room.id === channelId), jobs]);
 }
 
@@ -1451,7 +1768,55 @@ let hostedAuth = registerAuthRoutes(router, {
 	onSessionRevoked: sessionRevoked,
 	onCredentialsWillRotate: credentialsWillRotate,
 });
+experiments = registerExperimentRoutes(router, hostedAuth, {
+	implementations: () => implementations,
+	lease() {
+		if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+		return writerLease.held;
+	},
+	context: currentDocumentTarget,
+	place: (id, experiment, view, decision, remove) =>
+		withDocumentTransition(id, async () => {
+			await Rooms.get(id)?.closing;
+			await Rooms.get(id)?.opening;
+			return withDocumentLock(id, async () => {
+				let active = Rooms.get(id)?.plan;
+				if (active) {
+					return Service.placeExperimentReference(active, experiment, view, decision, remove);
+				}
+				let detached = await Service.open(id, documentBackend(), server);
+				try {
+					await Service.placeExperimentReference(detached, experiment, view, decision, remove);
+				} finally {
+					await Service.close(detached);
+				}
+			});
+		}),
+	changed(documentId) {
+		if (server && !draining) {
+			broadcast(server, documentId, { kind: "experiment:changed", ts: 0, documentId });
+		}
+	},
+	async canMutate(id) {
+		let active = Rooms.get(id)?.plan;
+		if (active) return !Service.implementationActive(active);
+		let stored = await storage.collaboration.load(id, new Date());
+		let sidecar = stored?.sidecar as
+			| { execution?: unknown; builds?: Array<{ state: string }> }
+			| undefined;
+		return !sidecar?.execution
+			&& !sidecar?.builds?.some(build => ["queued", "starting", "running"].includes(build.state));
+	},
+});
 ownerBindings = new ActiveOwnerBindings(hostedAuth);
+if (config.agent && config.harness === "remote") {
+	plannerAttachments = new PlannerAttachments(hostedAuth, config.plannerAttachGraceMs);
+	plannerAttachments.onChange((channelId, planner) => {
+		if (server && !draining) {
+			broadcast(server, channelId, { kind: "session:planner", ts: 0, planner });
+		}
+	});
+}
 let definitions: JobDefinition[] = [];
 if (config.backgroundJobs) {
 	definitions.push(researchBriefDefinition({ config }));
@@ -1473,8 +1838,8 @@ let jobService = new JobService({
 	storage,
 	registry: jobRegistry,
 	lease() {
-		if (!heldLease) throw new Error("storage writer lease is unavailable");
-		return heldLease;
+		if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+		return writerLease.held;
 	},
 	onChange: job => {
 		jobRunner?.notify(job);
@@ -1494,8 +1859,8 @@ if (config.backgroundJobs) {
 	descriptionProjector = new DocumentDescriptionProjector({
 		storage,
 		lease() {
-			if (!heldLease) throw new Error("storage writer lease is unavailable");
-			return heldLease;
+			if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+			return writerLease.held;
 		},
 		publish: announceChannel,
 	});
@@ -1504,8 +1869,8 @@ researchService = new ResearchWorkspaceService({
 	storage,
 	jobs: jobService,
 	lease() {
-		if (!heldLease) throw new Error("storage writer lease is unavailable");
-		return heldLease;
+		if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+		return writerLease.held;
 	},
 	current: currentDocumentTarget,
 	publish: announceResearchChanged,
@@ -1530,8 +1895,8 @@ jobRunner = new JobRunner({
 	service: jobService,
 	registry: jobRegistry,
 	lease() {
-		if (!heldLease) throw new Error("storage writer lease is unavailable");
-		return heldLease;
+		if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+		return writerLease.held;
 	},
 	resolveActivePlanner: async job => {
 		let binding = await ownerBindings!.resolve(job.channelId);
@@ -1587,35 +1952,18 @@ jobRunner = new JobRunner({
 });
 registerMcpRoutes(router, hostedAuth, {
 	lease() {
-		if (!heldLease) throw new Error("storage writer lease is unavailable");
-		return heldLease;
+		if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+		return writerLease.held;
 	},
 }, {
+	// A child's instruction runs on its root's Chat with the child as focus.
 	invokePlanner: input =>
-		withDocumentTransition(input.channel.id, async () => {
-			let channel = await storage.channels.get(input.channel.id);
-			if (!channel || deletingChannels.has(channel.id)) return "document-unavailable";
-			if (channel.archivedAt) return "document-archived";
-			await Rooms.get(channel.id)?.closing;
-			let held = Rooms.hold(channel.id);
-			let release = () => {
-				held.release();
-				evict(held.room);
-			};
-			let running = false;
-			try {
-				await plan(held.room, server);
-				let context = conversation(held.room, input.session?.session.id, input.repository);
-				let code = await Chat.invoke(context, input.user, input.instruction, input.checkout);
-				if (!code && context.chat.running) {
-					running = true;
-					void context.chat.running.finally(release).catch(() => {});
-				}
-				return code;
-			} finally {
-				if (!running) release();
-			}
-		}),
+		invokeRouted({
+			channels: storage.channels,
+			deleting: id => deletingChannels.has(id) || archivingChannels.has(id),
+			transition: withDocumentTransition,
+			open: rootId => openRootChat(rootId, input.session?.session.id, input.repository),
+		}, input),
 	archiveChannel,
 	isChannelDeleting: channelId => deletingChannels.has(channelId),
 	onChannelRenamed: announceChannel,
@@ -1626,12 +1974,35 @@ registerMcpRoutes(router, hostedAuth, {
 	serializeDocument: (channelId, action) =>
 		withDocumentTransition(channelId, () => withDocumentLock(channelId, action)),
 });
+implementations = registerImplementationRoutes(router, hostedAuth, {
+	connections: experiments.connections,
+	busy: async id =>
+		(await experiments!.service.store.list(id)).filter(item =>
+			["running", "publishing"].includes(item.state)
+		).map(item => item.connectionId!),
+	withPlan: (id, action) =>
+		withDocumentTransition(id, async () => {
+			if (deletingChannels.has(id)) throw new Error("document is unavailable");
+			await Rooms.get(id)?.closing;
+			let held = Rooms.hold(id);
+			try {
+				let opened = await plan(held.room, server);
+				return await withDocumentLock(id, () => action(opened));
+			} finally {
+				held.release();
+				evict(held.room);
+			}
+		}),
+});
 registerChannelRoutes(router, hostedAuth, {
 	onAgentReset: channelOwnerReset,
 	onChannelArchived: archiveChannel,
 	onChannelDeleted: deleteChannel,
 	onChannelRenamed: announceChannel,
 	onChannelRestored: restoreChannel,
+	references: hostedAuth.github instanceof GitHubClient
+		? new GitHubReferences(hostedAuth.github)
+		: undefined,
 });
 registerResearchWorkspaceRoutes(router, hostedAuth, {
 	service: researchService,
@@ -1645,13 +2016,14 @@ registerResearchWorkspaceRoutes(router, hostedAuth, {
 				defaultBranch: repository.defaultBranch,
 			},
 			channel.id,
-			session.session.id,
+			plannerAttachments ? undefined : session.session.id,
 		);
 		await jobRunner?.ownerAvailable(channel.id);
 	},
 });
 registerNavigationRoutes(router, hostedAuth, { storage });
 registerPreferenceRoutes(router, hostedAuth, { storage });
+registerImageRoutes(router, hostedAuth);
 
 try {
 	await storage.health();
@@ -1663,30 +2035,49 @@ try {
 }
 
 try {
-	heldLease = await storage.leases.acquire(
+	let acquired = await storage.leases.acquire(
 		"chopin:writer",
 		crypto.randomUUID(),
 		LEASE_TTL_MS,
 	);
-	if (!heldLease) throw new Error("another Chopin instance owns the database");
-	let reset = await storage.sessions.reset(new Date(), heldLease, LEASE_TTL_MS);
-	heldLease = reset.lease;
+	if (!acquired) throw new Error("another Chopin instance owns the database");
+	writerLease.hold(acquired);
+	let reset = await storage.sessions.reset(new Date(), acquired, LEASE_TTL_MS);
+	writerLease.held = reset.lease;
+	// Before any room opens, so no child Conversation is ever loaded or served.
+	let children = await storage.collaboration.dropChildConversations(reset.lease);
+	if (children.cleared.length) {
+		console.info(`chopin: cleared ${children.cleared.length} child conversation(s)`);
+	}
+	if (children.kept.length) {
+		console.warn(
+			`chopin: kept ${children.kept.length} child conversation(s) cited by decisions: ${
+				children.kept.join(", ")
+			}`,
+		);
+	}
 } catch (err) {
 	await shutdownHarnesses();
-	if (heldLease) await storage.leases.release(heldLease).catch(() => {});
+	if (writerLease.held) await storage.leases.release(writerLease.held).catch(() => {});
 	await storage.close().catch(() => {});
 	let reason = err instanceof Error ? err.message : String(err);
 	console.error(`chopin: storage writer lease could not start - ${reason}`);
 	process.exit(1);
 }
-armLeaseWatchdog();
-leaseRenewal = setInterval(renewLease, LEASE_RENEW_MS);
+writerLease.start();
 cleanSessions();
 sessionCleanup = setInterval(cleanSessions, SESSION_CLEANUP_MS);
 
 let listening: Server<SocketData> | undefined;
 try {
+	await experiments.service.recover(true);
 	server = listening = listen();
+	experimentTimer = setInterval(() => {
+		void experiments!.sweep().catch(error =>
+			console.error("chopin: experiment recovery failed", error)
+		);
+	}, 15_000);
+	experimentTimer.unref();
 	let recovery = await researchService.recoverPendingPlannerInline(placeResearchReference);
 	scheduleResearchRecovery(recovery.deferred);
 	await researchService.recoverTerminalPlannerInline();
@@ -1695,16 +2086,15 @@ try {
 	if (listening) await listening.stop(true).catch(() => {});
 	if (researchRecoveryTimer) clearTimeout(researchRecoveryTimer);
 	if (sessionCleanup) clearInterval(sessionCleanup);
-	if (leaseRenewal) clearInterval(leaseRenewal);
-	if (leaseWatchdog) clearTimeout(leaseWatchdog);
+	let stoppingLease = writerLease.stop();
 	await cleaningSessions;
-	await renewingLease;
+	await stoppingLease;
 	summaryCoordinator?.close();
 	let stoppingJobs = jobRunner.shutdown();
 	ownerBindings.revokeAll();
 	await stoppingJobs.catch(() => {});
 	await shutdownHarnesses();
-	if (heldLease) await storage.leases.release(heldLease).catch(() => {});
+	if (writerLease.held) await storage.leases.release(writerLease.held).catch(() => {});
 	await storage.close().catch(() => {});
 	throw err;
 }

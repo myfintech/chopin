@@ -11,7 +11,7 @@ import { harnessSelection } from "../config";
 import { extensionPlaceholders } from "../planner-extensions";
 import { agentTools } from "../document-provenance";
 import { GITHUB_TOOL_SCHEMAS } from "./github-tools";
-import { BACKGROUND_TOOL_NAMES, PLANNER_TOOL_NAMES } from "./tool-names";
+import { BACKGROUND_TOOL_NAMES, PLANNER_TOOL_NAMES, VISUAL_PLANNER_TOOL_NAMES } from "./tool-names";
 import { harnessFor } from "./harnesses";
 
 import type { HarnessV1 } from "@ai-sdk/harness";
@@ -50,10 +50,18 @@ type PlannerCallOptions = {
 	extensionTools?: ToolSet;
 	instructions: string;
 	model?: string;
+	/**
+	 * Also stops the host tools, beside the caller's signal: a remote Planner's turn can
+	 * end, or its link drop, while one of them still runs.
+	 */
+	toolSignal?: AbortSignal;
 };
 
-/** Tells the chat when a host tool's own execution ends; the harness reports its result only at step end. */
-function reporting(tools: ToolSet, room: DocumentRoom): ToolSet {
+/**
+ * Tells the chat when a host tool's own execution ends; the harness reports its result
+ * only at step end. A `toolSignal` stops the tool as the caller's signal does.
+ */
+function reporting(tools: ToolSet, room: DocumentRoom, toolSignal?: AbortSignal): ToolSet {
 	return Object.fromEntries(
 		Object.entries(tools).map(([name, original]) => {
 			let execute = original.execute;
@@ -62,8 +70,12 @@ function reporting(tools: ToolSet, room: DocumentRoom): ToolSet {
 				...original,
 				execute: async (input, options) => {
 					let output: Awaited<ReturnType<typeof execute>>;
+					let stops = [options.abortSignal, toolSignal].filter(signal => signal !== undefined);
 					try {
-						output = await execute(input, options);
+						output = await execute(
+							input,
+							toolSignal ? { ...options, abortSignal: AbortSignal.any(stops) } : options,
+						);
 					} catch (error) {
 						room.plan.chat?.toolFinished?.(options.toolCallId, error, false);
 						throw error;
@@ -78,8 +90,16 @@ function reporting(tools: ToolSet, room: DocumentRoom): ToolSet {
 	);
 }
 
-export function createPlannerAgent(harness: HarnessV1, profile?: ConversationPlan.JobKind) {
-	let names = profile ? BACKGROUND_TOOL_NAMES[profile] : PLANNER_TOOL_NAMES;
+export function createPlannerAgent(
+	harness: HarnessV1,
+	profile?: ConversationPlan.JobKind,
+	visual = false,
+) {
+	let names = profile
+		? BACKGROUND_TOOL_NAMES[profile]
+		: visual
+		? VISUAL_PLANNER_TOOL_NAMES
+		: PLANNER_TOOL_NAMES;
 	return new HarnessAgent({
 		harness,
 		tools: plannerTools,
@@ -97,6 +117,7 @@ export function createPlannerAgent(harness: HarnessV1, profile?: ConversationPla
 						options.room,
 					),
 					options.room,
+					options.toolSignal,
 				)),
 				toolsContext: Object.fromEntries(names.map(name => [name, {
 					room: options.room,
@@ -109,6 +130,7 @@ export function createPlannerAgent(harness: HarnessV1, profile?: ConversationPla
 }
 
 export let plannerAgent = createPlannerAgent(harnessFor(harnessSelection()));
+export let visualPlannerAgent = createPlannerAgent(harnessFor(harnessSelection()), undefined, true);
 export let headingPlannerAgent = createPlannerAgent(harnessFor(harnessSelection()), "heading");
 export let refinePlannerAgent = createPlannerAgent(harnessFor(harnessSelection()), "refine");
 export let prosePlannerAgent = createPlannerAgent(harnessFor(harnessSelection()), "prose");

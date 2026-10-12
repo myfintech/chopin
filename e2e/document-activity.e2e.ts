@@ -31,8 +31,8 @@ async function rewrite(baseURL: string, room: string, plan: string): Promise<voi
 
 async function showDecisions(page: Page): Promise<void> {
 	let decisions = page.getByRole("button", { name: /^Decisions/ });
-	if (await decisions.getAttribute("aria-pressed") !== "true") await decisions.click();
-	await expect(decisions).toHaveAttribute("aria-pressed", "true");
+	if (await decisions.getAttribute("aria-current") !== "page") await decisions.click();
+	await expect(decisions).toHaveAttribute("aria-current", "page");
 }
 
 for (
@@ -47,7 +47,8 @@ for (
 		await expect(content(page)).toContainText("Original paragraph.");
 		await showDecisions(page);
 
-		let documentTab = page.getByRole("button", { name: /^Document/ });
+		// Not the top bar's Documents button.
+		let documentTab = page.getByRole("button", { name: /^Document(?!s)/ });
 		await expect(documentTab).toHaveAccessibleName("Document");
 		await rewrite(baseURL!, room, "# Title\n\nRevised paragraph.\n");
 

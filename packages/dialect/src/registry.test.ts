@@ -2,14 +2,22 @@ import { describe, expect, it } from "bun:test";
 
 import { contentEditableClassName$, corePlugin, readOnly$ } from "@mdxeditor/editor";
 import { Realm } from "@mdxeditor/gurx";
+import { createHeadlessEditor } from "@lexical/headless";
+import { createYjsBinding, syncLexicalUpdateToYjs, syncYjsChangesToLexical } from "@lexical/yjs";
+import { $getRoot, $isElementNode } from "lexical";
+import * as Y from "yjs";
 import { toMarkdown } from "mdast-util-to-markdown";
 
+import { exportPlan, importPlan } from "./convert";
 import { NODES } from "./dialect";
 import { parse } from "./parse";
-import { plugins } from "./registry";
+import { plugins, registry } from "./registry";
 import { extensions } from "./serialize";
+import { validate } from "./validate";
+import { $isImageNode } from "./nodes/content";
 
 import type { Nodes } from "mdast";
+import type { Provider } from "@lexical/yjs";
 
 /**
  * Stand in for `<MDXEditor>`, which installs a core plugin built from its own
@@ -76,6 +84,10 @@ Text with **bold**, _italic_, ~~struck~~, \`code\`, a [link](https://example.com
 an ![image](https://example.com/x.png) and $a + b$ inline math.\\
 A hard break precedes this line.
 
+Inline <Image src="https://example.com/inline.png" alt="Inline" width="180" /> here.
+
+<Image src="https://example.com/sized.png" alt="Sized" width="320" />
+
 ---
 
 > Quoted.
@@ -97,7 +109,7 @@ $$
 | - | - |
 | 1 | 2 |
 
-A reference[^01K0N4V4E7Y6P4MJ5WD8XZF3B2] and <Var name="x" /> inline.
+A reference[^01K0N4V4E7Y6P4MJ5WD8XZF3B2] and <Underline>x</Underline> inline.
 
 [^01K0N4V4E7Y6P4MJ5WD8XZF3B2]: The note.
 
@@ -105,7 +117,43 @@ A reference[^01K0N4V4E7Y6P4MJ5WD8XZF3B2] and <Var name="x" /> inline.
 
 Inside.
 
+<Image src="https://example.com/callout.png" alt="Callout" width="240" />
+
 </Callout>
+
+<Tabs id="01K0N4TR8K7JGM4R1J7PW4R8YJ">
+<Tab id="01K0N4V4E7Y6P4MJ5WD8XZF3B2" label="One">
+
+Tab body.
+
+</Tab>
+</Tabs>
+
+<Columns id="01K0N4W3B7P27CBAEC7A8C8WEB">
+<Column id="01K0N4W3B7P27CBAEC7A8C8WEC">
+
+Left side.
+
+<Image src="/images/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png" alt="Hosted" width="280" />
+
+</Column>
+<Column id="01K0N4W3B7P27CBAEC7A8C8WED">
+
+Right side.
+
+</Column>
+</Columns>
+
+<Research id="8f4d193b-2018-4977-b404-0092bb911676" />
+
+<Experiment id="01K0N4W3B7P27CBAEC7A8C8WEH" experiment="investigation-one" view="table" />
+
+<Questionnaire id="01K0N4W3B7P27CBAEC7A8C8WEE">
+<Question id="01K0N4W3B7P27CBAEC7A8C8WEF" header="Choice" prompt="Choose one" multiple="false">
+<Option id="01K0N4W3B7P27CBAEC7A8C8WEG" label="Yes" />
+<Answer value="Yes" />
+</Question>
+</Questionnaire>
 
 <Decision id="01K0N4X2M5R8T3VQ7YB6ZC4DEF" quote="Cached for 60 seconds." by="ana" at="2026-07-28T10:14:00Z">
   <Note by="ana" text="Too long; the data changes every 10s." />
@@ -133,6 +181,117 @@ function types(node: Nodes, seen = new Set<string>()): Set<string> {
  * happens to meet.
  */
 describe("markdown extensions", () => {
+	it("imports and exports all registered nodes in the headless editor", () => {
+		let reg = registry();
+		let errors: Error[] = [];
+		let editor = createHeadlessEditor({ nodes: reg.nodes, onError: error => errors.push(error) });
+		importPlan(editor, SAMPLE, { registry: reg });
+		let output = exportPlan(editor, { registry: reg });
+		expect(output).toContain("<Columns");
+		expect(output).toContain("<Questionnaire");
+		expect(validate(parse(output))).toEqual({ ok: true });
+		expect(errors).toEqual([]);
+	});
+
+	it("synchronizes every registered node and restores a Yjs checkpoint", async () => {
+		let reg = registry();
+		let errors: Error[] = [];
+		let provider = {
+			awareness: {
+				getLocalState: () => null,
+				getStates: () => new Map(),
+				off() {},
+				on() {},
+				setLocalState() {},
+				setLocalStateField() {},
+			},
+			connect() {},
+			disconnect() {},
+			off() {},
+			on() {},
+		} as unknown as Provider;
+		let peer = () => {
+			let editor = createHeadlessEditor({ nodes: reg.nodes, onError: error => errors.push(error) });
+			let doc = new Y.Doc();
+			let binding = createYjsBinding({ editor, id: "plan", doc, docMap: new Map([["plan", doc]]) });
+			let stop = editor.registerUpdateListener(
+				({ dirtyElements, dirtyLeaves, editorState, normalizedNodes, prevEditorState, tags }) => {
+					syncLexicalUpdateToYjs(
+						binding,
+						provider,
+						prevEditorState,
+						editorState,
+						dirtyElements,
+						dirtyLeaves,
+						normalizedNodes,
+						tags,
+					);
+				},
+			);
+			let shared = binding.root.getSharedType();
+			let receive: Parameters<typeof shared.observeDeep>[0] = (events, transaction) => {
+				if (transaction.origin !== binding) {
+					syncYjsChangesToLexical(binding, provider, events, false, () => {});
+				}
+			};
+			shared.observeDeep(receive);
+			return {
+				editor,
+				doc,
+				close() {
+					stop();
+					shared.unobserveDeep(receive);
+					doc.destroy();
+				},
+			};
+		};
+		let source = peer();
+		let target = peer();
+		let restored = peer();
+		let flush = (client: ReturnType<typeof peer>) =>
+			new Promise<void>(resolve => client.editor.update(() => {}, { onUpdate: resolve }));
+		try {
+			importPlan(source.editor, SAMPLE, { registry: reg });
+			let original = exportPlan(source.editor, { registry: reg });
+			Y.applyUpdate(target.doc, Y.encodeStateAsUpdate(source.doc));
+			await flush(target);
+			expect(errors).toEqual([]);
+			expect(exportPlan(target.editor, { registry: reg })).toBe(original);
+
+			let before = Y.encodeStateVector(target.doc);
+			source.editor.update(() => {
+				let text = $getRoot().getAllTextNodes().find(node =>
+					node.getTextContent() === "Left side."
+				);
+				expect(text).toBeDefined();
+				text!.setTextContent("Edited left side.");
+				let image = $getRoot().getChildren().flatMap(node =>
+					$isElementNode(node) ? node.getChildren() : []
+				).find(node => $isImageNode(node) && node.getWidth() === 320);
+				expect($isImageNode(image)).toBe(true);
+				if ($isImageNode(image)) image.setWidth(640);
+			}, { discrete: true });
+			Y.applyUpdate(target.doc, Y.encodeStateAsUpdate(source.doc, before));
+			await flush(target);
+			expect(errors).toEqual([]);
+			let edited = exportPlan(source.editor, { registry: reg });
+			expect(edited).toContain("Edited left side.");
+			expect(edited).toContain('alt="Sized" width="640"');
+			expect(exportPlan(target.editor, { registry: reg })).toBe(edited);
+
+			Y.applyUpdate(restored.doc, Y.encodeStateAsUpdate(target.doc));
+			await flush(restored);
+			let checkpoint = exportPlan(restored.editor, { registry: reg });
+			expect(checkpoint).toBe(edited);
+			expect(validate(parse(checkpoint))).toEqual({ ok: true });
+			expect(errors).toEqual([]);
+		} finally {
+			source.close();
+			target.close();
+			restored.close();
+		}
+	});
+
 	it("write every node type the dialect accepts", () => {
 		expect(() => toMarkdown(parse(SAMPLE), { extensions: extensions() })).not.toThrow();
 	});
