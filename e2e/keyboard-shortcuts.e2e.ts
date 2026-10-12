@@ -65,6 +65,11 @@ test("the search chord opens search, even from the editor", async ({ join }) => 
 	await content(page).click();
 	await page.keyboard.type("linked");
 	for (let step = 0; step < "linked".length; step++) await page.keyboard.press("Shift+ArrowLeft");
+	// Lexical reads the range on `selectionchange`, which a shortcut pressed now can beat.
+	await expect.poll(() => page.evaluate(() => getSelection()?.toString())).toBe("linked");
+	await page.evaluate(() =>
+		new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+	);
 	await page.keyboard.press("ControlOrMeta+KeyK");
 	await expect(page.getByRole("textbox", { name: "Link URL" })).toBeFocused();
 	await expect(page.getByRole("dialog", { name: "Search documents" })).toHaveCount(0);
