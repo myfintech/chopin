@@ -501,6 +501,13 @@ test("returning from GitHub App setup invalidates the tab cache", async ({ baseU
 	await authenticate(page, "paged", baseURL!);
 	await page.goto("/");
 	await expect(repositoryOption(page, "archive-12")).toBeVisible();
+	// The list shows its first page before the finished snapshot is cached.
+	await expect.poll(() =>
+		page.evaluate(() => {
+			let user = sessionStorage.getItem("chopin:repositories:active-user");
+			return !!user && !!sessionStorage.getItem(`chopin:repositories:${encodeURIComponent(user)}`);
+		})
+	).toBe(true);
 	await page.evaluate(() => {
 		let user = sessionStorage.getItem("chopin:repositories:active-user")!;
 		let key = `chopin:repositories:${encodeURIComponent(user)}`;
