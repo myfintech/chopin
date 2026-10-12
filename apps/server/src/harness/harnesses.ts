@@ -9,6 +9,7 @@ import { piProviders } from "../pi-providers";
 import { redeliverToolResults } from "../pi-redelivery";
 import { traceHarness } from "../harness-trace.debug"; // TEMP DEBUG
 import { createPiAdapter } from "./pi/adapter";
+import { createRemoteAdapter } from "./remote/adapter";
 
 import type { HarnessV1 } from "@ai-sdk/harness";
 import type { AtomicAuthMode } from "./atomic/adapter";
@@ -36,10 +37,16 @@ function createAtomicHarness(
 	});
 }
 
+/** The model runs in a client attached over the Planner link, so the server holds no credential. */
+function createRemoteHarness(): HarnessV1 & { shutdown(): Promise<void> } {
+	return createRemoteAdapter();
+}
+
 export const harnesses = {
 	"copilot-sdk": createCopilotSdk,
 	pi: createPiHarness,
 	atomic: createAtomicHarness,
+	remote: createRemoteHarness,
 } satisfies Record<
 	string,
 	(settings: {
@@ -95,6 +102,11 @@ export function harnessFor(config: {
 	}
 	let extensions = checkedExtensions(config.harness, config.harnessExtensions);
 	let auth = config.harnessAuth;
+	if (config.harness === "remote" && auth) {
+		throw new Error(
+			"HARNESS_AUTH does not apply to HARNESS=remote: the model runs in the attached client",
+		);
+	}
 	let isLoopback = loopback(config.host ?? "127.0.0.1");
 	let modes = AUTH_MODES.get(config.harness);
 	if (modes) {

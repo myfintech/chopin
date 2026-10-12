@@ -20,16 +20,20 @@ import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext
 import { $copyBlockFormatIndent, $setBlocksType } from "@lexical/selection";
 import {
 	$getSelection,
+	$isParagraphNode,
 	$isRangeSelection,
 	$isTextNode,
 	COLLABORATION_TAG,
 	COMMAND_PRIORITY_LOW,
+	createCommand,
 	HISTORIC_TAG,
 	KEY_DOWN_COMMAND,
 } from "lexical";
 import {
 	$createCalloutNode,
 	$createCodeBlockNode,
+	$createColumnNode,
+	$createColumnsNode,
 	$createImageNode,
 	$createMathNode,
 	$createTabNode,
@@ -47,6 +51,7 @@ import { $createParagraphNode, $createTextNode, $insertNodes } from "lexical";
 import {
 	CheckIcon,
 	CodeIcon,
+	ColumnsIcon,
 	DiagramIcon,
 	DiffIcon,
 	FormulaIcon,
@@ -69,9 +74,10 @@ import {
 	SHELL,
 } from "./surface";
 
+import { aboveDock } from "./dock-clearance";
 import type { ReactElement } from "react";
 import type { IconProps } from "@chopin/icons";
-import type { ElementNode, LexicalEditor, LexicalNode } from "lexical";
+import type { ElementNode, LexicalCommand, LexicalEditor, LexicalNode } from "lexical";
 import type { DOMRectLike, SurfacePlacement } from "./placement";
 import type { OpenResearch } from "./research";
 
@@ -181,6 +187,31 @@ const COMMANDS: SlashCommand[] = [
 				 * something on screen that the saved source does not say.
 				 */
 				$insertNodes([$createTableNodeWithDimensions(3, 3, { rows: true, columns: false })]);
+			}),
+	},
+	{
+		id: "columns",
+		label: "Columns",
+		hint: "Two editable regions side by side",
+		icon: ColumnsIcon,
+		group: "Blocks",
+		keywords: ["column", "layout", "side by side", "compare"],
+		kind: "insert",
+		run: editor =>
+			editor.update(() => {
+				let selection = $getSelection();
+				let topLevel = $isRangeSelection(selection)
+					? selection.anchor.getNode().getTopLevelElement()
+					: null;
+				let columns = $createColumnsNode(ulid());
+				let first = $createColumnNode(ulid());
+				let second = $createColumnNode(ulid());
+				first.append($createParagraphNode());
+				second.append($createParagraphNode());
+				columns.append(first, second);
+				if (topLevel && !$isParagraphNode(topLevel)) topLevel.insertAfter(columns);
+				else $insertNodes([columns]);
+				first.getFirstChild()?.selectStart();
 			}),
 	},
 	{
@@ -382,6 +413,12 @@ export type SlashMenuProps = {
 
 const NO_ACTIONS = new Set<string>();
 
+/**
+ * Type a `/` at the caret and open the menu for it, for a control that stands in for the key:
+ * a phone's docked toolbar, where a software keyboard may not report the key at all.
+ */
+export const OPEN_SLASH_MENU_COMMAND: LexicalCommand<void> = createCommand("OPEN_SLASH_MENU");
+
 export function SlashMenu({ actions = NO_ACTIONS, disabled }: SlashMenuProps) {
 	let [editor] = useLexicalComposerContext();
 	let [query, setQuery] = useState<string>();
@@ -467,6 +504,34 @@ export function SlashMenu({ actions = NO_ACTIONS, disabled }: SlashMenuProps) {
 		);
 	}, [editor]);
 
+	useEffect(() => {
+		if (disabled) return;
+		return editor.registerCommand(
+			OPEN_SLASH_MENU_COMMAND,
+			() => {
+				armed.current = true;
+				editor.update(() => {
+					let selection = $getSelection();
+					if (!$isRangeSelection(selection)) return;
+					// A block with words in it gets a new paragraph after it, rather than a slash
+					// splitting a word or trailing a sentence. Deliberately the top-level block: a
+					// table cell holds only inline text in the dialect, and the inserted components
+					// cannot live inside a list item, so those go after the whole table or list.
+					let block = selection.anchor.getNode().getTopLevelElement();
+					if (block && block.getTextContentSize() > 0) {
+						let paragraph = $createParagraphNode();
+						block.insertAfter(paragraph);
+						paragraph.select();
+					}
+					let next = $getSelection();
+					if ($isRangeSelection(next)) next.insertText("/");
+				});
+				return true;
+			},
+			COMMAND_PRIORITY_LOW,
+		);
+	}, [editor, disabled]);
+
 	// Track what follows the `/` so the list can filter as the user types.
 	useEffect(() => {
 		// Clears any query left behind by the lock, which would otherwise spring
@@ -514,7 +579,7 @@ export function SlashMenu({ actions = NO_ACTIONS, disabled }: SlashMenuProps) {
 			setPosition(undefined);
 			return;
 		}
-		let viewport = editorSurfaceViewport(editor);
+		let viewport = aboveDock(editorSurfaceViewport(editor));
 		element.style.maxWidth = `${Math.max(0, viewport.width - 16)}px`;
 		let next = placeSurface(
 			liveAnchor,

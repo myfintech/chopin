@@ -21,6 +21,7 @@ describe("adaptive workspace", () => {
 	it("derives child capabilities from the workspace presentation", () => {
 		expect(workspaceProfile(childPresentation))
 			.toEqual({
+				chat: false,
 				implementation: false,
 				persistChat: false,
 				persistPaneSize: false,
@@ -52,10 +53,11 @@ describe("adaptive workspace", () => {
 		expect(initialDocumentView(workspaceProfile(documentPresentation), "tasks")).toBe("plan");
 	});
 
-	it("limits a child to Document, Decisions, and Chat", () => {
+	it("gives a child no Chat, tabs, or persistence of its own", () => {
 		let capabilities = workspaceProfile(childPresentation);
 
 		expect(capabilities).toEqual({
+			chat: false,
 			implementation: false,
 			persistChat: false,
 			persistPaneSize: false,
@@ -63,15 +65,11 @@ describe("adaptive workspace", () => {
 			research: false,
 			surface: "child",
 		});
-		expect(workspaceDestinations()).toEqual([
-			"chat",
-			"plan",
-			"decisions",
-		]);
 	});
 
 	it("keeps the parent's research and implementation capabilities", () => {
 		expect(workspaceProfile(documentPresentation)).toEqual({
+			chat: true,
 			implementation: true,
 			persistChat: true,
 			persistPaneSize: true,
@@ -79,10 +77,11 @@ describe("adaptive workspace", () => {
 			research: true,
 			surface: "document",
 		});
-		expect(workspaceDestinations()).toEqual([
+		expect(workspaceDestinations(true)).toEqual([
 			"chat",
 			"plan",
 			"decisions",
+			"build",
 		]);
 	});
 
@@ -138,6 +137,19 @@ describe("adaptive workspace", () => {
 			chatVisible: true,
 			separatorVisible: false,
 		});
+	});
+
+	it("expands the document only when split Chat is hidden", () => {
+		let hidden: WorkspaceState = { chatOpen: false, desktopChatOpen: false };
+		let shown: WorkspaceState = { chatOpen: false, desktopChatOpen: true };
+		let unset: WorkspaceState = { chatOpen: false, desktopChatOpen: undefined };
+
+		expect(presentWorkspace(hidden, "split", "plan").documentExpanded).toBe(true);
+		expect(presentWorkspace(shown, "split", "plan").documentExpanded).toBe(false);
+		expect(presentWorkspace(unset, "split", "plan").documentExpanded).toBe(false);
+		expect(presentWorkspace(hidden, "compact", "plan").documentExpanded).toBe(false);
+		expect(presentWorkspace({ ...hidden, chatOpen: true }, "split", "plan").documentExpanded)
+			.toBe(false);
 	});
 });
 

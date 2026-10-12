@@ -3,24 +3,33 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
-import { MessageIcon } from "@chopin/icons";
+import { CheckIcon, MessageIcon } from "@chopin/icons";
 import { useCellValue } from "@mdxeditor/gurx";
 import { $getNodeByKey } from "lexical";
 
-import { Author, DraftCard, ThreadCard, ThreadList } from "./comments";
-import { blockMarkerPoints, commentCardPoint, markerRect, popoverPoint } from "./comment-geometry";
+import { DraftCard, NoteAuthor, ThreadCard, ThreadList } from "./comments";
+import {
+	blockMarkerPoints,
+	commentCardPoint,
+	lineGroups,
+	markerRect,
+	passageLine,
+	popoverPoint,
+} from "./comment-geometry";
 import { containsHit, passageHits } from "./comment-hits";
-import { CommentSheet, usesCommentSheet } from "./comment-sheet";
+import { CommentSheet, commentSheetHeading } from "./comment-sheet";
 import { useCommentSheetReveal } from "./comment-sheet-reveal";
 import { $rangeOf } from "./marks";
 import { blockElement } from "./scroll";
-import { COARSE_POINTER_QUERY, PRIMARY_COARSE_POINTER_QUERY } from "./pointer";
-import { useThreads } from "./threads";
+import { COARSE_POINTER_QUERY, PRIMARY_COARSE_POINTER_QUERY, usePhone } from "./pointer";
+import { handlesOpenComment, OPEN_COMMENT, openOutcome, openRequest, useThreads } from "./threads";
+import type { OpenRequest } from "./threads";
 import { useTransitionPresence } from "./transition-presence";
 import { widgets$ } from "./widget-options";
 
 import type { CSSProperties, ReactNode } from "react";
-import type { BlockMarkerPoint, CardSide, Point, Rect } from "./comment-geometry";
+import type { CommentSheetHeading, CommentSheetPager } from "./comment-sheet";
+import type { BlockMarkerPoint, CardSide, Line, Point, Rect } from "./comment-geometry";
 import type { PassageHit } from "./comment-hits";
 import type { ThreadStore, ThreadView } from "./threads";
 
@@ -32,35 +41,54 @@ const MARKER_LANE = 56;
 
 type PlacedThread = {
 	view: ThreadView;
-	/** The block marker that stands for this thread. */
+	/** The line marker that stands for this thread. */
 	marker: string;
 	hits: PassageHit[];
 	passages: Rect[];
 };
-/** One marker per commented block, standing for every open thread on it. */
+/** One marker per commented line, standing for every open thread whose passage starts on it. */
 type PlacedMarker = {
 	key: string;
 	views: ThreadView[];
 	excerpt: string;
 	button: BlockMarkerPoint;
-	/** The first line box's height; a touch target stays within it so the next line takes taps. */
+	/** The line box's height; a touch target stays within it so the next line takes taps. */
 	line: number;
 };
+/** One open thread, measured: the block it is in and the line its passage starts on. */
 type MeasuredThread = {
+	id: string;
+	/** The top-level block's key; threads share a marker only within one block. */
+	block: string;
+	line: Line;
+	/** The block's box, whose right edge the marker lane follows. */
+	box: Rect;
+	/** Where the passage starts on its line, so the leftmost one names a shared chip. */
+	start: number;
 	view: ThreadView;
 	passages: Rect[];
 	hits: Rect[];
 };
-type MeasuredBlock = {
-	key: string;
-	block: Rect;
-	line: { top: number; height: number };
-	excerpt: string;
-	threads: MeasuredThread[];
-};
 
-/** A pinned list of one block's threads, as opposed to a pinned thread id. */
+/** A pinned list of one line's threads, as opposed to a pinned thread id. */
 const LIST = "list:";
+
+/** How long a resolve can be undone from its toast, while nobody is pointing at it. */
+const UNDO_WINDOW = 6_000;
+
+/** What the toast says: a resolve that can still be undone, or why an undo failed. */
+type Notice = { id: string; text: string; undo: boolean };
+
+/** Fields and the editor keep their own Mod+Z. */
+const OWNS_UNDO = 'input, textarea, select, [contenteditable]:not([contenteditable="false"])';
+
+/** The fragment Copy link writes and a page load follows. */
+const LINK = "#comment-";
+const OPEN_WAIT = 6000;
+
+function linkTo(id: string): string {
+	return `${location.origin}${location.pathname}${location.search}${LINK}${id}`;
+}
 
 function dialogId(pinned: string): string {
 	return pinned.startsWith(LIST)
@@ -90,6 +118,10 @@ function proseColumn(root: HTMLElement): Rect {
 	return { top: box.top, right, bottom: box.bottom, left, width: right - left, height: box.height };
 }
 
+function passageTop(entry: PlacedThread): number {
+	return Math.min(...entry.passages.map(passage => passage.top));
+}
+
 function union(rects: Rect[]): Rect | undefined {
 	if (rects.length === 0) return undefined;
 	let top = Math.min(...rects.map(item => item.top));
@@ -99,8 +131,19 @@ function union(rects: Rect[]): Rect | undefined {
 	return { top, right, bottom, left, width: right - left, height: bottom - top };
 }
 
+/** An icon and the count of threads on the line: "1" included, so every chip reads alike. */
 function chipWidth(count: number): number {
-	return count > 1 ? 30 + 7 * String(count).length : CHIP;
+	return 27 + 7 * String(count).length;
+}
+
+/** A touch chip in a phone's narrow padding still shows its icon beside the count. */
+function slimChipWidth(count: number): number {
+	return 15 + 7 * String(count).length;
+}
+
+/** What a chip's tooltip says, and its label for a line with several threads. */
+export function commentCount(count: number): string {
+	return count === 1 ? "1 comment" : `${count} comments`;
 }
 
 type PassagePress = { id: string; left: number; pointer: number; top: number; moved: boolean };
@@ -188,7 +231,7 @@ function PreviewContent({ view }: { view: ThreadView }) {
 			{opening && (
 				<>
 					<p className="plan-comment-preview-author">
-						<Author handle={opening.handle} />
+						<NoteAuthor note={opening} textSize="xs" />
 					</p>
 					<p className="plan-comment-preview-note">{opening.text}</p>
 				</>
@@ -334,10 +377,17 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 	let [previewMeasurement, setPreviewMeasurement] = useState<PreviewMeasurement>();
 	let [pinned, setPinned] = useState<string>();
 	let [returnTo, setReturnTo] = useState<string>();
+	let [notice, setNotice] = useState<Notice>();
+	let [noticeHeld, setNoticeHeld] = useState(false);
+	let [linked, setLinked] = useState<string | undefined>(() =>
+		location.hash.startsWith(LINK) ? location.hash.slice(LINK.length) : undefined
+	);
 	let pinnedRef = useRef<string | undefined>(undefined);
 	pinnedRef.current = pinned;
 	let [coarse, setCoarse] = useState(false);
 	let [primaryCoarse, setPrimaryCoarse] = useState(false);
+	let [sheetSurface, setSheetSurface] = useState<HTMLDivElement | null>(null);
+	let [sheetDetent, setSheetDetent] = useState<number>();
 	let [cardHeights, setCardHeights] = useState<{ [id: string]: number }>({});
 	let root = useRef<HTMLDivElement>(null);
 	let placedRef = useRef<PlacedThread[]>([]);
@@ -348,10 +398,17 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 	let origin = useRef<HTMLElement | undefined>(undefined);
 	let draftOpen = useRef(false);
 	let selected = useRef<string | undefined>(undefined);
+	/** A thread whose card should take focus once it is pinned, after a reopen from the margin. */
+	let focusOnOpen = useRef<string | undefined>(undefined);
+	/** A request for a thread the store has not received yet. */
+	let waiting = useRef<{ request: OpenRequest; timer: ReturnType<typeof setTimeout> } | undefined>(
+		undefined,
+	);
 	let options = useCellValue(widgets$);
 	let canEdit = options.canEdit !== false;
-	let compact = options.commentPresentation === "sheet"
-		&& usesCommentSheet({ coarse: primaryCoarse, width: host?.clientWidth ?? Infinity });
+	let phone = usePhone();
+	// The comment sheet belongs to the phone class, portrait or landscape.
+	let compact = options.commentPresentation === "sheet" && phone;
 	let previousCompact = useRef(compact);
 	let immediately = options.motionImmediately?.() ?? false;
 	let draft = canEdit ? state.draft : undefined;
@@ -404,6 +461,11 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 		dialog?.querySelector<HTMLElement>("[data-plan-comment-close], button")?.focus();
 	}, [compact, pinned]);
 
+	// A preview belongs to the thread it was raised for; another pinned thread clears it.
+	useEffect(() => {
+		if (pinned) setPreview(current => current === pinned ? current : undefined);
+	}, [pinned]);
+
 	let enter = useCallback((id: string) => {
 		clearTimeout(close.current);
 		setPreview(id);
@@ -430,7 +492,7 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 	let measure = () => {
 		if (!host) return;
 		let page = rect(host.getBoundingClientRect());
-		let blocks = new Map<string, MeasuredBlock>();
+		let measured: MeasuredThread[] = [];
 
 		for (let view of state.threads) {
 			if (view.thread.status !== "open") continue;
@@ -443,36 +505,47 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 						? $getNodeByKey(anchor!)?.getTopLevelElement()?.getKey() ?? anchor!
 						: `thread:${view.thread.id}`;
 					if (exact) {
+						let start = exact.startContainer;
+						let styled = start instanceof Element ? start : start.parentElement;
 						return {
 							bounds: exact.getBoundingClientRect(),
 							element,
 							hits: Array.from(exact.getClientRects(), rect),
 							key,
+							lineHeight: styled ? parseFloat(getComputedStyle(styled).lineHeight) : undefined,
 						};
 					}
 					let fallback = view.targetKey ? blockElement(editor, view.targetKey) : undefined;
 					return fallback
-						? { bounds: fallback.getBoundingClientRect(), element: fallback, hits: [], key }
+						? {
+							bounds: fallback.getBoundingClientRect(),
+							element: fallback,
+							hits: [],
+							key,
+							lineHeight: undefined,
+						}
 						: undefined;
 				});
 				if (!target || (target.bounds.width === 0 && target.bounds.height === 0)) continue;
 				let targetRect = rect(target.bounds);
 				let passages = target.hits.length > 0 ? target.hits : [targetRect];
-				let block = blocks.get(target.key!);
-				if (!block) {
-					let box = target.element ? rect(target.element.getBoundingClientRect()) : targetRect;
-					block = {
-						key: target.key!,
-						block: box,
-						line: target.element
-							? firstLine(target.element, box)
-							: { top: box.top, height: Math.min(box.height, CHIP) },
-						excerpt: excerptOf(target.element?.textContent ?? view.quote),
-						threads: [],
-					};
-					blocks.set(block.key, block);
-				}
-				block.threads.push({ view, passages, hits: target.hits });
+				let box = target.element ? rect(target.element.getBoundingClientRect()) : targetRect;
+				// The chip sits beside the line the passage starts on, not its block's first line.
+				let line = passageLine(target.hits, target.lineHeight)
+					?? (target.element
+						? firstLine(target.element, box)
+						: { top: box.top, height: Math.min(box.height, CHIP) });
+				let start = target.hits.find(hit => hit.width > 0)?.left ?? box.left;
+				measured.push({
+					id: view.thread.id,
+					block: target.key,
+					line,
+					box,
+					start,
+					view,
+					passages,
+					hits: target.hits,
+				});
 			} catch (error) {
 				// A bad anchor must not break Lexical's update listener.
 				if (failures.current.has(view.thread.id)) continue;
@@ -481,32 +554,40 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 			}
 		}
 
-		let measured = [...blocks.values()].sort((a, b) => a.block.top - b.block.top);
+		let groups = lineGroups(measured);
 		let focused = document.activeElement?.getAttribute("data-plan-comment-button");
 		let points = blockMarkerPoints(
-			measured.map(({ block, key, line, threads }) => ({
-				block,
+			groups.map(({ entries, key, line }) => ({
+				block: entries[0]!.box,
 				line,
-				width: chipWidth(threads.length),
-				...(threads.length >= 10 ? { minimum: 18 } : {}),
+				width: chipWidth(entries.length),
+				...(coarse
+					? { minimum: slimChipWidth(entries.length) }
+					: entries.length >= 10
+					? { minimum: 18 }
+					: {}),
 				held: focused === key
 					|| pinnedRef.current === `${LIST}${key}`
-					|| threads.some(({ view }) => view.thread.id === pinnedRef.current),
+					|| entries.some(({ id }) => id === pinnedRef.current),
 			})),
 			page,
 			{ size: CHIP },
 		);
-		let nextMarkers = measured.map<PlacedMarker>((entry, index) => ({
-			key: entry.key,
-			views: entry.threads.map(({ view }) => view),
-			excerpt: entry.excerpt,
+		let nextMarkers = groups.map<PlacedMarker>((group, index) => ({
+			key: group.key,
+			views: group.entries.map(({ view }) => view),
+			// The passage that starts first on the line names the chip.
+			excerpt: excerptOf(
+				group.entries.reduce((first, entry) => entry.start < first.start ? entry : first).view
+					.quote,
+			),
 			button: points[index]!,
-			line: entry.line.height,
+			line: group.line.height,
 		}));
-		let next = measured.flatMap(entry =>
-			entry.threads.map<PlacedThread>(thread => ({
+		let next = groups.flatMap(group =>
+			group.entries.map<PlacedThread>(thread => ({
 				view: thread.view,
-				marker: entry.key,
+				marker: group.key,
 				hits: passageHits(page, thread.hits),
 				passages: thread.passages,
 			}))
@@ -537,6 +618,36 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 	}, [editor, host, state.threads, coarse]);
 
 	useEffect(() => () => clearTimeout(close.current), []);
+
+	// The passages behind an open card, or an open list, are underlined.
+	let openIds = pinned?.startsWith(LIST)
+		? markers.find(marker => `${LIST}${marker.key}` === pinned)?.views.map(view => view.thread.id)
+			?? []
+		: pinned && pinned !== "orphans"
+		? [pinned]
+		: [];
+	let openKey = openIds.join(" ");
+	useEffect(() => {
+		store.open(openKey ? openKey.split(" ") : []);
+	}, [openKey, store]);
+	useEffect(() => () => {
+		store.open([]);
+		store.light([]);
+	}, [store]);
+
+	// A chip lights every thread on its line; when that set changes under the pointer, follow it.
+	let litMarker = useRef<string | undefined>(undefined);
+	let lightMarker = useCallback((key: string | undefined, ids: string[]) => {
+		litMarker.current = key;
+		store.light(ids);
+	}, [store]);
+	useEffect(() => {
+		let key = litMarker.current;
+		if (!key) return;
+		let marker = markers.find(entry => entry.key === key);
+		if (!marker || marker.views.length < 2) lightMarker(undefined, []);
+		else store.light(marker.views.map(view => view.thread.id));
+	}, [lightMarker, markers, store]);
 
 	useEffect(() => {
 		if (!canEdit && state.draft) store.draft(undefined);
@@ -639,6 +750,121 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 		store.draft(undefined);
 		restoreOrigin();
 	}, [restoreOrigin, store]);
+	let resolve = useCallback((id: string) => {
+		setNotice({ id, text: "Comment resolved", undo: true });
+		void store.resolve(id).then(resolved => {
+			// The card came back, so there is nothing to undo.
+			if (!resolved) setNotice(current => current?.id === id ? undefined : current);
+		});
+	}, [store]);
+	let reopen = useCallback((id: string) => {
+		setNotice(undefined);
+		setNoticeHeld(false);
+		void store.reopen(id).then(outcome => {
+			if (!outcome.ok) {
+				setNotice({
+					id,
+					text: outcome.reason === "full"
+						? "Couldn’t reopen: this document has too many open comments"
+						: "Couldn’t reopen the comment",
+					undo: false,
+				});
+				return;
+			}
+			setReturnTo(undefined);
+			setPinned(id);
+		});
+	}, [store]);
+
+	// The window runs down only while nobody is pointing at or focused in the toast.
+	useEffect(() => {
+		if (!notice || noticeHeld) return;
+		let timer = setTimeout(() => setNotice(undefined), UNDO_WINDOW);
+		return () => clearTimeout(timer);
+	}, [notice, noticeHeld]);
+
+	// Mod+Z undoes the resolve while it can, unless a field or the editor has focus and
+	// would undo its own typing.
+	useEffect(() => {
+		if (!notice?.undo) return;
+		let id = notice.id;
+		let key = (event: KeyboardEvent) => {
+			if (
+				!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey
+				|| event.key.toLowerCase() !== "z" || event.defaultPrevented
+			) return;
+			let target = event.target instanceof Element ? event.target : undefined;
+			if (target?.closest(OWNS_UNDO)) return;
+			event.preventDefault();
+			reopen(id);
+		};
+		document.addEventListener("keydown", key);
+		return () => document.removeEventListener("keydown", key);
+	}, [notice, reopen]);
+
+	useEffect(() => {
+		let follow = () => {
+			if (location.hash.startsWith(LINK)) setLinked(location.hash.slice(LINK.length));
+		};
+		// Chat can point at a thread that has since gone; say so rather than
+		// leaving a request to open it waiting for a thread that will not come.
+		let settle = (request: OpenRequest, waited: boolean): boolean => {
+			let id = request.thread;
+			let view = store.snapshot().threads.find(entry => entry.thread.id === id);
+			let outcome = openOutcome(view, store.status(id), waited);
+			if ("wait" in outcome) return false;
+			focusOnOpen.current = request.focus ? id : undefined;
+			if ("open" in outcome) setLinked(id);
+			else {
+				setLinked(undefined);
+				setNotice({ id, text: outcome.gone, undo: false });
+			}
+			return true;
+		};
+		let open = (event: Event) => {
+			let request = openRequest((event as CustomEvent<unknown>).detail);
+			// The root's editor stays mounted under an open child; a request for the child's
+			// thread is the child's alone to answer.
+			if (!request || !handlesOpenComment(store.channel, request.channel)) return;
+			clearTimeout(waiting.current?.timer);
+			waiting.current = undefined;
+			if (settle(request, false)) return;
+			// Thread state follows the document; hold the request until the thread arrives,
+			// then say so plainly if it never does.
+			waiting.current = {
+				request,
+				timer: setTimeout(() => {
+					waiting.current = undefined;
+					settle(request, true);
+				}, OPEN_WAIT),
+			};
+		};
+		let arrived = store.subscribe(() => {
+			let pending = waiting.current;
+			if (!pending || store.status(pending.request.thread) === undefined) return;
+			clearTimeout(pending.timer);
+			waiting.current = undefined;
+			settle(pending.request, true);
+		});
+		addEventListener("hashchange", follow);
+		addEventListener(OPEN_COMMENT, open);
+		return () => {
+			removeEventListener("hashchange", follow);
+			removeEventListener(OPEN_COMMENT, open);
+			arrived();
+			clearTimeout(waiting.current?.timer);
+			waiting.current = undefined;
+		};
+	}, [store]);
+
+	// A copied link opens its thread once the thread has somewhere to stand.
+	useEffect(() => {
+		if (!linked || !placed.some(entry => entry.view.thread.id === linked)) return;
+		setLinked(undefined);
+		setReturnTo(undefined);
+		setPinned(linked);
+		store.reveal(linked);
+	}, [linked, placed, store]);
 
 	useLayoutEffect(() => {
 		let open = !!draft;
@@ -665,14 +891,30 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 		restoreOrigin();
 	}, [draft, editor, pinned, restoreOrigin, state.threads, store]);
 
+	// A thread reopened from its margin marker takes the focus its Reopen button had.
+	useLayoutEffect(() => {
+		let id = focusOnOpen.current;
+		if (!id || id !== pinned) return;
+		focusOnOpen.current = undefined;
+		let tries = 0;
+		let land = () => {
+			let dialog = document.getElementById(dialogId(id));
+			let target = dialog?.querySelector<HTMLElement>("[data-plan-comment-close]")
+				?? dialog?.querySelector<HTMLElement>("textarea")
+				?? dialog?.querySelector<HTMLElement>("button");
+			if (target) target.focus({ preventScroll: true });
+			else if (tries++ < 10) requestAnimationFrame(land);
+		};
+		land();
+	}, [pinned]);
+
 	// The list item that held focus is replaced by the thread it opened; focus its way back.
 	useLayoutEffect(() => {
 		let id = selected.current;
 		if (!id || id !== pinned) return;
 		selected.current = undefined;
-		document.querySelector<HTMLElement>(
-			`[data-plan-comment-thread="${id}"] [data-plan-comment-back]`,
-		)?.focus();
+		document.getElementById(dialogId(id))?.querySelector<HTMLElement>("[data-plan-comment-back]")
+			?.focus();
 	}, [pinned]);
 
 	let sheetId = compact && pinned !== "orphans" ? pinned : undefined;
@@ -690,9 +932,11 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 		[compact, draft?.placement, sheetPassages],
 	);
 	useCommentSheetReveal({
+		detent: sheetDetent,
 		host,
 		id: revealId,
 		passages: revealPassages,
+		sheet: sheetSurface,
 	});
 
 	useEffect(() => {
@@ -735,33 +979,36 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 		selected.current = id;
 		setPinned(id);
 	};
-	let card = (view: ThreadView, showClose = true) => {
+	let backTo = (view: ThreadView) => {
 		let group = markerOf(view.thread.id);
 		let back = group && group.views.length > 1 ? group : undefined;
+		return back
+			? {
+				count: back.views.length,
+				go: () => {
+					setReturnTo(view.thread.id);
+					setPinned(`${LIST}${back.key}`);
+				},
+			}
+			: undefined;
+	};
+	// A sheet says where it is, and leads back, in its own header row.
+	let card = (view: ThreadView, sheet = false) => {
+		let back = sheet ? undefined : backTo(view);
 		return (
 			<ThreadCard
-				backLabel={back ? `All ${back.views.length} comments` : undefined}
-				busy={false}
+				backLabel={back ? `All ${back.count} comments` : undefined}
 				canEdit={canEdit}
-				focused={state.focused === view.thread.id}
-				inDocument
 				key={view.thread.id}
-				onAccept={() => store.accept(view.thread.id)}
-				onBack={back
-					? () => {
-						setReturnTo(view.thread.id);
-						setPinned(`${LIST}${back.key}`);
-					}
-					: undefined}
+				link={linkTo(view.thread.id)}
+				onBack={back?.go}
 				onBlur={() => unhover(view.thread.id)}
-				onClose={showClose ? dismiss : undefined}
-				onDismiss={() => store.dismiss(view.thread.id)}
 				onFocus={() => hover(view.thread.id)}
-				onReply={text => store.reply(view.thread.id, text)}
-				onRetry={() => store.retry(view.thread.id)}
+				onReply={(text, to) => store.reply(view.thread.id, text, to)}
+				onResolve={() => resolve(view.thread.id)}
 				onTyping={writing => store.announce(view.thread.id, writing)}
 				quote={view.quote}
-				showClose={showClose}
+				sheet={sheet}
 				view={view}
 				writing={state.writing[view.thread.id]}
 			/>
@@ -799,8 +1046,10 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 	let compactKey: string | undefined;
 	let compactId: string | undefined;
 	let compactLabel: string | undefined;
-	let compactTitle: string | undefined;
+	let compactHeading: CommentSheetHeading | undefined;
+	let compactBack: (() => void) | undefined;
 	let compactClose: (() => void) | undefined;
+	let compactPager: CommentSheetPager | undefined;
 	let compactContent: ReactNode = undefined;
 	let previewView = preview && pinned !== preview
 		? placed.find(entry => entry.view.thread.id === preview)?.view
@@ -824,39 +1073,71 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 		compactKey = "draft";
 		compactId = "plan-comment-draft";
 		compactLabel = "New comment";
-		compactTitle = "New comment";
+		compactHeading = commentSheetHeading({ kind: "draft", quote: draft.quote });
 		compactClose = cancelDraft;
 		compactContent = (
 			<DraftCard
-				busy={false}
 				onCancel={cancelDraft}
-				onSend={text => store.start(text)}
-				showClose={false}
+				onSend={(text, to) => store.start(text, to)}
+				sheet
 			/>
 		);
 	} else if (compact && pinned === "orphans" && orphaned.length > 0) {
 		compactKey = "orphans";
 		compactId = "plan-comment-thread-orphans";
 		compactLabel = "Orphaned comments";
-		compactTitle = "Orphaned comments";
+		compactHeading = commentSheetHeading({
+			kind: "other",
+			title: `${commentCount(orphaned.length)} without prose`,
+		});
 		compactClose = dismiss;
-		compactContent = orphaned.map(view => card(view, false));
+		compactContent = orphaned.map(view => card(view));
 	} else if (compact && pinned && (pinnedView || pinnedList)) {
-		// One sheet serves a block's list and its threads, so moving between them does not reopen it.
-		compactKey = pinnedMarker && pinnedMarker.views.length > 1
-			? `marker:${pinnedMarker.key}`
-			: `thread:${pinned}`;
+		// One sheet serves a line's list and every thread, so moving between them does not reopen it.
+		compactKey = "pinned";
 		compactId = dialogId(pinned);
 		compactLabel = pinnedView ? "Comment thread" : "Comments";
-		let count = pinnedView?.thread.notes.length;
-		compactTitle = count ? count === 1 ? "Comment" : `${count} comments` : "Comments";
+		let back = pinnedView ? backTo(pinnedView) : undefined;
+		compactHeading = pinnedView
+			? commentSheetHeading({
+				kind: "thread",
+				quote: pinnedView.quote,
+				siblings: back?.count ?? 1,
+			})
+			: commentSheetHeading({ kind: "list", count: pinnedList!.views.length });
+		compactBack = back?.go;
 		compactClose = dismiss;
-		compactContent = pinnedView ? card(pinnedView, false) : (
+		// The document's open threads in reading order, so the sheet can step through them.
+		let order = [...placed]
+			.sort((a, b) => passageTop(a) - passageTop(b))
+			.map(entry => entry.view.thread.id);
+		let at = pinnedView ? order.indexOf(pinnedView.thread.id) : -1;
+		// Paging moves the way back too: closing returns focus to the marker of the thread shown.
+		let step = (by: number) => {
+			let next = order[at + by];
+			if (!next) return;
+			let marker = markerOf(next);
+			origin.current = (marker
+				&& root.current?.querySelector<HTMLElement>(`[data-plan-comment-button="${marker.key}"]`))
+				|| origin.current;
+			setReturnTo(undefined);
+			setPreview(undefined);
+			setPinned(next);
+		};
+		compactPager = at >= 0
+			? {
+				count: order.length,
+				index: at,
+				onNext: at < order.length - 1 ? () => step(1) : undefined,
+				onPrevious: at > 0 ? () => step(-1) : undefined,
+			}
+			: undefined;
+		compactContent = pinnedView ? card(pinnedView, true) : (
 			<ThreadList
 				autoFocus={false}
+				heading={false}
 				onSelect={selectThread}
 				returnTo={returnTo}
-				showClose={false}
 				views={pinnedList!.views}
 			/>
 		);
@@ -881,7 +1162,6 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 				? card(pinnedView)
 				: (
 					<ThreadList
-						onClose={dismiss}
 						onSelect={selectThread}
 						returnTo={returnTo}
 						views={pinnedMarker.views}
@@ -904,6 +1184,7 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 			data-plan-comment-presentation={compact ? "sheet" : "popover"}
 			ref={root}
 		>
+			<p className="sr-only" role="status">{notice?.text ?? ""}</p>
 			{placed.flatMap(({ hits, view }) =>
 				hits.map((hit, index) => (
 					<div
@@ -926,6 +1207,10 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 					0,
 				);
 				let previewId = single ? `plan-comment-preview-${single.thread.id}` : undefined;
+				let ids = views.map(view => view.thread.id);
+				// Linked with its passage: pointing at the prose lights the chip too.
+				let lit = !dimmed && !shown
+					&& (state.focused !== undefined && ids.includes(state.focused));
 				let width = coarse ? Math.max(TOUCH_TARGET, button.width) : button.width;
 				// Never taller than the first line, so a tap at the end of the second line reaches the text.
 				let height = coarse ? Math.min(TOUCH_TARGET, Math.max(CHIP, marker.line)) : CHIP;
@@ -934,6 +1219,17 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 					0,
 					Math.min(button.left - (width - button.width) / 2, page.width - width),
 				);
+				// Over the prose the target keeps to the first line; in the margin beside it, where
+				// there is no text to take a tap from, it reaches the full 44px.
+				let margin = Math.max(0, Math.min(left + width, page.width) - (column.right - page.left));
+				let reach = coarse && height < TOUCH_TARGET && margin > 0
+					? {
+						left: width - margin,
+						top: (height - TOUCH_TARGET) / 2,
+						width: margin,
+						height: TOUCH_TARGET,
+					}
+					: undefined;
 				return (
 					<button
 						aria-label={single
@@ -948,15 +1244,20 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 						aria-expanded={shown}
 						className="plan-comment-button"
 						data-dimmed={dimmed || undefined}
+						data-lit={lit || undefined}
 						data-plan-comment-button={marker.key}
 						data-plan-comment-count={single ? undefined : views.length}
 						data-press="small"
-						data-replies={replies > 0 || undefined}
 						data-slim={button.slim || undefined}
+						// One thread previews itself on hover; several say how many there are.
+						data-tooltip={single ? undefined : commentCount(views.length)}
+						data-tooltip-verbatim={single ? undefined : ""}
+						data-tooltip-detail={single ? undefined : ""}
 						inert={dimmed || undefined}
 						key={marker.key}
 						onBlur={() => {
 							if (single) unhover(single.thread.id);
+							else lightMarker(undefined, []);
 							// A focused marker whose passage scrolled away hides once focus leaves it.
 							measure();
 						}}
@@ -968,9 +1269,19 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 								setPinned(single ? single.thread.id : `${LIST}${marker.key}`);
 							}
 						}}
-						onFocus={single ? () => hover(single.thread.id) : undefined}
-						onMouseEnter={single ? () => hover(single.thread.id) : undefined}
-						onMouseLeave={single ? () => unhover(single.thread.id) : undefined}
+						// Touch has no hover to preview with; focus coming back from a closed sheet
+						// would otherwise leave a preview card standing over the prose.
+						onFocus={primaryCoarse
+							? undefined
+							: single
+							? () => hover(single.thread.id)
+							: () => lightMarker(marker.key, ids)}
+						onMouseEnter={single
+							? () => hover(single.thread.id)
+							: () => lightMarker(marker.key, ids)}
+						onMouseLeave={single
+							? () => unhover(single.thread.id)
+							: () => lightMarker(undefined, [])}
 						style={{
 							top: button.top - (height - CHIP) / 2,
 							left,
@@ -980,14 +1291,17 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 						}}
 						type="button"
 					>
+						{reach && <span aria-hidden="true" className="plan-comment-reach" style={reach} />}
 						<span
 							className="plan-comment-chip"
 							style={{ left: button.left - left, top: (height - CHIP) / 2, width: button.width }}
 						>
-							{(single || !button.slim) && (
+							{(single || !button.slim || coarse) && (
 								<MessageIcon aria-hidden="true" size={button.slim ? 10 : 14} />
 							)}
-							{!single && <span className="plan-comment-count">{views.length}</span>}
+							{(!single || !button.slim || coarse) && (
+								<span className="plan-comment-count">{views.length}</span>
+							)}
 						</span>
 					</button>
 				);
@@ -1010,9 +1324,8 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 						ariaLabel: "New comment",
 						children: (
 							<DraftCard
-								busy={false}
 								onCancel={cancelDraft}
-								onSend={text => store.start(text)}
+								onSend={(text, to) => store.start(text, to)}
 							/>
 						),
 						className: "plan-comment-card",
@@ -1035,7 +1348,7 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 						}}
 						type="button"
 					>
-						{orphaned.length} comments without prose
+						{commentCount(orphaned.length)} without prose
 					</button>
 					<CommentSurface
 						compact={false}
@@ -1055,17 +1368,54 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 		host,
 	);
 
+	// Only the reader who resolved sees the toast, beneath the document they resolved it in.
+	// It is mounted only while it shows: the live region that announces it stays in the layer.
+	let toast = notice && createPortal(
+		<div className="plan-comment-toast-region" style={{ left: page.left + page.width / 2 }}>
+			<div
+				className="plan-comment-toast"
+				key={notice.id}
+				onBlur={event => {
+					if (!event.currentTarget.contains(event.relatedTarget)) setNoticeHeld(false);
+				}}
+				onFocus={() => setNoticeHeld(true)}
+				onMouseEnter={() => setNoticeHeld(true)}
+				onMouseLeave={() => setNoticeHeld(false)}
+			>
+				{notice.undo && <CheckIcon aria-hidden="true" size={14} />}
+				<span>{notice.text}</span>
+				{notice.undo && (
+					<button
+						aria-keyshortcuts="Control+Z Meta+Z"
+						className="plan-comment-toast-undo"
+						onClick={() => reopen(notice.id)}
+						type="button"
+					>
+						Undo
+					</button>
+				)}
+			</div>
+		</div>,
+		document.body,
+	);
+
 	return (
 		<>
 			{documentChrome}
-			{compactKey && compactId && compactLabel && compactClose && (
+			{toast}
+			{compactKey && compactId && compactLabel && compactClose && compactHeading && (
 				<CommentSheet
-					closeVisible={compactKey === "draft"}
+					focus={compactKey === "draft" ? "field" : "close"}
+					heading={compactHeading}
 					id={compactId}
 					key={compactKey}
 					label={compactLabel}
+					onBack={compactBack}
 					onClose={compactClose}
-					title={compactTitle}
+					contentKey={pinned}
+					onDetentHeight={setSheetDetent}
+					onSurface={setSheetSurface}
+					pager={compactPager}
 				>
 					{compactContent}
 				</CommentSheet>

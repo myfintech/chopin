@@ -13,18 +13,17 @@ import {
 	useState,
 	useSyncExternalStore,
 } from "react";
+import { usePhone } from "@chopin/editor/pointer";
 import { useTransitionPresence } from "@chopin/editor/transition-presence";
 import { documentPath } from "@chopin/protocol/document-url";
 
 import * as Api from "./api";
-import { forgetChannel } from "./channel-recovery";
 import { newestDocument, updateDocumentMetadata } from "./document-actions";
 import { WorkspaceNotice } from "./workspace-notice";
 import { documentRouteIdentity } from "./document-route-swap";
 import type { DocumentAction } from "./document-actions-menu";
 import type { NoticeOptions } from "./navigation-notice";
 import { motionContract } from "./motion-contract";
-import { NavigationFocusScope } from "./navigation-focus";
 import { useMenuDismissal } from "./menu-dismissal";
 import { motionImmediately } from "./motion-input";
 import {
@@ -44,17 +43,23 @@ import {
 	SIDEBAR_MAX,
 	SIDEBAR_MIN,
 	SIDEBAR_STORAGE_KEY,
+	SidebarTrigger,
 } from "./project-sidebar-chrome";
 import { clearRepositoryCache } from "./repository-cache";
-import { TerminalAlert } from "./terminal-alert";
+import { NavigationError } from "./navigation-error";
 import { useProjectDocuments } from "./use-project-documents";
 import { useDocumentCreation } from "./use-document-creation";
 import { requestTitleEdit } from "./title-edit";
 
 import type { Research } from "@chopin/protocol";
 import type { ResearchOpener } from "@chopin/editor";
-import type { TransitionPresence } from "@chopin/editor/transition-presence";
-import type { CSSProperties, MouseEvent as ReactMouseEvent, ReactNode } from "react";
+import type {
+	ComponentProps,
+	ComponentType,
+	CSSProperties,
+	MouseEvent as ReactMouseEvent,
+	ReactNode,
+} from "react";
 import type { DocumentMetadata } from "./document-actions";
 import type { DocumentRouteIdentity } from "./document-route-swap";
 import type { ShortcutActions } from "./global-shortcuts";
@@ -65,33 +70,39 @@ export type Navigate = (
 	options?: { opener?: ResearchOpener; replace?: boolean },
 ) => void;
 
-class LazyDialogBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+class LazyDialogBoundary extends Component<
+	{ children: ReactNode; onFailure: () => void },
+	{ failed: boolean }
+> {
 	override state = { failed: false };
 
 	static getDerivedStateFromError() {
 		return { failed: true };
 	}
 
+	override componentDidCatch() {
+		this.props.onFailure();
+	}
+
 	override render() {
 		if (!this.state.failed) return <Suspense fallback={null}>{this.props.children}</Suspense>;
-		return (
-			<TerminalAlert className="navigation-error">
-				Could not load this dialog.
-				<button
-					className="btn btn-sm btn-secondary ml-2"
-					onClick={() => location.reload()}
-					type="button"
-				>
-					Reload
-				</button>
-			</TerminalAlert>
-		);
+		return null;
 	}
 }
 
 let NavigationNotice = lazy(() => import("./navigation-notice-view"));
+// Once prefetched, the sheet renders directly: lazy() would still suspend its first render.
+let documentsSheet: typeof import("./documents-sheet") | undefined;
+export let loadDocumentsSheet = () =>
+	import("./documents-sheet").then(module => (documentsSheet = module));
+let LazyDocumentsSheet = lazy(() =>
+	loadDocumentsSheet().then(module => ({ default: module.DocumentsSheet }))
+);
+let NavigationDrawer = lazy(() =>
+	import("./navigation-drawer").then(module => ({ default: module.NavigationDrawer }))
+);
 
-class SidebarDecisionBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+class SidebarFeatureBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
 	override state = { failed: false };
 
 	static getDerivedStateFromError() {
@@ -107,6 +118,9 @@ let ProjectSidebar = lazy(() =>
 	import("./project-sidebar").then(module => ({ default: module.ProjectSidebar }))
 );
 let SidebarDecisionCounts = lazy(() => import("./sidebar-decision-counts"));
+let SidebarResizeHandle = lazy(() =>
+	import("./sidebar-resize-handle").then(module => ({ default: module.SidebarResizeHandle }))
+);
 let EmptyWorkspace = lazy(() =>
 	import("./empty-workspace").then(module => ({ default: module.EmptyWorkspace }))
 );
@@ -192,84 +206,6 @@ function useSidebarWidth() {
 	return [width, (delta: number) => setWidth(current => clamp(current + delta))] as const;
 }
 
-function SidebarResizeHandle(
-	{ onResize, width }: { onResize: (delta: number) => void; width: number },
-) {
-	let origin = useRef(0);
-	return (
-		<div
-			aria-label="Resize Projects sidebar"
-			aria-orientation="vertical"
-			aria-valuemax={SIDEBAR_MAX}
-			aria-valuemin={SIDEBAR_MIN}
-			aria-valuenow={width}
-			className="project-sidebar-resize"
-			onKeyDown={event => {
-				let step = event.shiftKey ? 64 : 16;
-				if (event.key === "ArrowRight") onResize(step);
-				else if (event.key === "ArrowLeft") onResize(-step);
-				else if (event.key === "Home") onResize(SIDEBAR_MIN - width);
-				else if (event.key === "End") onResize(SIDEBAR_MAX - width);
-				else return;
-				event.preventDefault();
-			}}
-			onPointerDown={event => {
-				origin.current = event.clientX;
-				event.currentTarget.setPointerCapture(event.pointerId);
-			}}
-			onPointerMove={event => {
-				if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
-				let delta = event.clientX - origin.current;
-				origin.current = event.clientX;
-				onResize(delta);
-			}}
-			role="separator"
-			tabIndex={0}
-		/>
-	);
-}
-
-function NavigationDrawer(
-	{
-		children,
-		motion,
-		onDismiss,
-	}: {
-		children: ReactNode;
-		motion: Exclude<TransitionPresence<boolean>, { phase: "closed" }>;
-		onDismiss: () => void;
-	},
-) {
-	let active = motion.phase !== "closing";
-	return (
-		<div
-			aria-hidden={active ? undefined : "true"}
-			className={`navigation-drawer motion-drawer ${motion.className}`}
-			inert={!active}
-			role="presentation"
-		>
-			<button
-				aria-label="Close Projects sidebar"
-				className="navigation-drawer-backdrop"
-				data-press="none"
-				onClick={onDismiss}
-				type="button"
-			/>
-			<NavigationFocusScope active={active} onDismiss={onDismiss}>
-				<div
-					aria-label="Projects"
-					aria-modal="true"
-					className="project-sidebar-frame"
-					role="dialog"
-					tabIndex={-1}
-				>
-					{children}
-				</div>
-			</NavigationFocusScope>
-		</div>
-	);
-}
-
 export function NavigationShell(
 	{
 		children,
@@ -313,6 +249,14 @@ export function NavigationShell(
 	);
 	let [drawerOpen, setDrawerOpen] = useState(false);
 	let drawerOpener = useRef<HTMLButtonElement>(null);
+	// The phone bar and the shell can each host the trigger; one leaving must not clear the other.
+	let openerRef = useCallback((node: HTMLButtonElement | null) => {
+		if (!node) return;
+		drawerOpener.current = node;
+		return () => {
+			if (drawerOpener.current === node) drawerOpener.current = null;
+		};
+	}, []);
 	let [catalogueMode, setCatalogueMode] = useState<"active" | "archived">("active");
 	let [dialog, setDialog] = useState<
 		| "add"
@@ -322,12 +266,22 @@ export function NavigationShell(
 		| { channel: Api.Channel; type: "delete" }
 	>();
 	let [accountOpen, setAccountOpen] = useState(false);
+	let [dialogLoadFailed, setDialogLoadFailed] = useState(false);
 	let [settledRouteKey, setSettledRouteKey] = useState<DocumentRouteIdentity>();
 	let [focusProjectId, setFocusProjectId] = useState<string>();
 	let [notice, showNotice] = useState<NoticeOptions>();
 	let [reveal, setReveal] = useState<{ id: string; nonce: number }>();
 	let [width, resize] = useSidebarWidth();
 	let mode = useNavigationMode();
+	let phone = usePhone();
+	// Phones navigate from a bottom sheet; it stays mounted once loaded so it can animate out.
+	// Chosen once when first opened, so a load finishing later never remounts an open sheet.
+	let [Sheet, setSheet] = useState<
+		ComponentType<ComponentProps<typeof import("./documents-sheet").DocumentsSheet>>
+	>();
+	if (phone && drawerOpen && !Sheet) {
+		setSheet(() => documentsSheet?.DocumentsSheet ?? LazyDocumentsSheet);
+	}
 	let immediateMotion = motionImmediately();
 	let previousMode = useRef(mode);
 	let modeChanged = previousMode.current !== mode;
@@ -342,7 +296,7 @@ export function NavigationShell(
 		immediateMotion || modeChanged,
 	);
 	let drawerPresence = useTransitionPresence(
-		mode === "drawer" && drawerOpen ? true : undefined,
+		mode === "drawer" && drawerOpen && !phone ? true : undefined,
 		180,
 		immediateMotion,
 	);
@@ -369,7 +323,12 @@ export function NavigationShell(
 	);
 	let dialogMotion = dialogPresence.phase === "closed" ? undefined : dialogPresence;
 	let presentedDialog = dialogMotion?.value;
-	let triggerVisible = !sidebarVisible && !drawerOpen;
+	let [triggerClaims, setTriggerClaims] = useState(0);
+	let claimTrigger = useCallback(() => {
+		setTriggerClaims(count => count + 1);
+		return () => setTriggerClaims(count => count - 1);
+	}, []);
+	let triggerVisible = !sidebarVisible && !drawerOpen && triggerClaims === 0;
 	let resyncDecisions = useRef<(repositoryId: string) => void>(() => {});
 	let {
 		beginTotalRequest,
@@ -661,6 +620,7 @@ export function NavigationShell(
 	};
 
 	let showDialog = useCallback((next: NonNullable<typeof dialog>) => {
+		setDialogLoadFailed(false);
 		setDrawerOpen(false);
 		setAccountOpen(false);
 		setDialog(next);
@@ -678,7 +638,10 @@ export function NavigationShell(
 	}, [clearLastDocument, upsertDocument]);
 	let documentDeleted = useCallback((documentId: string) => {
 		let channel = knownChannelsRef.current.get(documentId);
-		if (channel) forgetChannel(user.id, channel);
+		// Loaded on demand: forgetting a deleted document's recovery state is not first-paint work.
+		if (channel) {
+			void import("./channel-recovery").then(recovery => recovery.forgetChannel(user.id, channel));
+		}
 		removeDocument(documentId);
 		clearLastDocument(documentId);
 		let current = resolvedDocumentRef.current;
@@ -699,7 +662,8 @@ export function NavigationShell(
 		if (action === "copy-link") {
 			let href =
 				new URL(documentDestination(projectsRef.current, channel.id), location.origin).href;
-			void import("./copy-link").then(module => module.copyLink(href, showNotice));
+			let written = (async () => navigator.clipboard.writeText(href))();
+			void import("./copy-link").then(module => module.copyLink(written, showNotice));
 			return;
 		}
 		if (action === "rename") {
@@ -807,6 +771,11 @@ export function NavigationShell(
 		workspaceDocumentAction,
 	]);
 
+	let expandSidebar = useCallback(
+		() => mode === "drawer" ? setDrawerOpen(true) : setCollapsed(false),
+		[mode],
+	);
+
 	let signOut = async () => {
 		try {
 			await Api.logout();
@@ -829,6 +798,12 @@ export function NavigationShell(
 	};
 	let dismissDialog = () => setDialog(undefined);
 	let [sidebarShortcut, setSidebarShortcut] = useState<string>();
+	let sidebarTrigger = useMemo(() => ({
+		buttonRef: openerRef,
+		claim: claimTrigger,
+		onExpand: expandSidebar,
+		shortcut: sidebarShortcut,
+	}), [claimTrigger, expandSidebar, openerRef, sidebarShortcut]);
 	let shortcutActions = useRef<ShortcutActions>({});
 	shortcutActions.current = {
 		search: () => showDialog("search"),
@@ -883,9 +858,23 @@ export function NavigationShell(
 		navigate(`${destination.pathname}${destination.search}${destination.hash}`);
 	};
 	let sidebarLoading = <ProjectSidebarLoading onCollapse={collapseSidebar} user={user} />;
+	// What the Projects sidebar and the phone documents sheet both read and do.
+	let catalogue = {
+		catalogueMode,
+		currentDocumentId,
+		onAddProject: () => showDialog("add"),
+		onCatalogueModeChange: setCatalogueMode,
+		onCreateDocument: (project: Api.NavigationProject) => void createDocument(project),
+		onDocumentAction: documentAction,
+		onLoadMore: loadMore,
+		pendingCreations: creation.pending,
+		projects,
+		user,
+	};
 	let sidebar = (
 		<Suspense fallback={sidebarLoading}>
 			<ProjectSidebar
+				{...catalogue}
 				accountMenu={accountPresence.phase !== "closed" && {
 					className: accountPresence.className,
 					closing: accountPresence.phase === "closing",
@@ -898,29 +887,19 @@ export function NavigationShell(
 				accountTriggerRef={accountTrigger}
 				accountWrapRef={accountWrap}
 				canCreateDocument={creationTarget.type !== "loading"}
-				pendingCreations={creation.pending}
 				newDocumentPhase={creationTarget.type === "loading"
 					? "loading"
 					: creationTarget.type === "project"
 					? creation.pending.get(creationTarget.project.repositoryId)
 					: undefined}
-				currentDocumentId={currentDocumentId}
 				onAccount={() => setAccountOpen(open => !open)}
 				focusProjectId={focusProjectId}
-				onAddProject={() => showDialog("add")}
 				onFocusedProject={() => setFocusProjectId(undefined)}
 				onRevealed={() => setReveal(undefined)}
 				reveal={reveal}
 				onCollapse={collapseSidebar}
-				onCreateDocument={project => void createDocument(project)}
-				onDocumentAction={documentAction}
-				onLoadMore={loadMore}
 				onNewDocument={newDocument}
 				onSearch={() => showDialog("search")}
-				onCatalogueModeChange={setCatalogueMode}
-				projects={projects}
-				catalogueMode={catalogueMode}
-				user={user}
 			/>
 		</Suspense>
 	);
@@ -933,6 +912,13 @@ export function NavigationShell(
 		: undefined;
 	let content = (
 		<>
+			{dialogLoadFailed && (
+				<NavigationError
+					message="Could not load this dialog."
+					onRetry={() => location.reload()}
+					retryLabel="Reload"
+				/>
+			)}
 			{notice && (
 				<Suspense>
 					<NavigationNotice notice={notice} show={showNotice} />
@@ -949,192 +935,214 @@ export function NavigationShell(
 				</div>
 			)}
 			{creation.error && presentedDialog !== "new" && (
-				<TerminalAlert className="navigation-error">
-					{creation.error.message}
-					{retryProject && (
-						<button
-							className="btn btn-sm btn-secondary ml-2"
-							onClick={() => createDocument(retryProject)}
-							type="button"
-						>
-							Try again
-						</button>
-					)}
-				</TerminalAlert>
+				<NavigationError
+					message={creation.error.message}
+					onRetry={retryProject ? () => void createDocument(retryProject) : undefined}
+				/>
 			)}
 			{error !== undefined && (
-				<TerminalAlert className="navigation-error">
-					{error.reason instanceof Error
+				<NavigationError
+					message={error.reason instanceof Error
 						? error.reason.message
 						: "Could not update navigation."}
-					{error.retry && (
-						<button
-							className="btn btn-sm btn-secondary ml-2"
-							onClick={retryError}
-							type="button"
-						>
-							Try again
-						</button>
-					)}
-				</TerminalAlert>
+					onRetry={error.retry ? retryError : undefined}
+				/>
 			)}
-			{children ?? (unknownRepository
-				? (
-					<WorkspaceNotice
-						actions={
-							<button
-								className="btn btn-md btn-primary"
-								onClick={() => showDialog("add")}
-								type="button"
-							>
-								Add project
-							</button>
-						}
-						body="Add it to open its documents."
-						title={`${unknownRepository} isn't one of your projects`}
-					/>
-				)
-				: (
-					<Suspense fallback={null}>
-						<EmptyWorkspace
-							disabled={creationTarget.type === "loading" || creation.pending.size > 0}
-							hasProjects={navigation?.projects.length !== 0}
-							onAddProject={() => showDialog("add")}
-							onNewDocument={newDocument}
+			<div className="navigation-body">
+				{children ?? (unknownRepository
+					? (
+						<WorkspaceNotice
+							actions={
+								<button
+									className="btn btn-md btn-primary"
+									onClick={() => showDialog("add")}
+									type="button"
+								>
+									Add project
+								</button>
+							}
+							body="Add it to open its documents."
+							title={`${unknownRepository} isn't one of your projects`}
 						/>
-					</Suspense>
-				))}
+					)
+					: (
+						<Suspense fallback={null}>
+							<EmptyWorkspace
+								disabled={creationTarget.type === "loading" || creation.pending.size > 0}
+								hasProjects={navigation?.projects.length !== 0}
+								onAddProject={() => showDialog("add")}
+								onNewDocument={newDocument}
+							/>
+						</Suspense>
+					))}
+			</div>
 		</>
 	);
 
 	return (
 		<NavigationDocument.Provider value={navigationDocument}>
-			{countsReady && (
-				<SidebarDecisionBoundary>
-					<SidebarDecisionCounts
-						archived={catalogueMode === "archived"}
-						onCounts={updateDecisionCounts}
-						onSnapshot={updateDecisionSnapshot}
-						priorityRepositoryId={active?.repositoryId}
-						projects={projects}
-						refreshProject={refreshProject}
-						resync={resyncDecisions}
-					/>
-				</SidebarDecisionBoundary>
-			)}
-			<div
-				className="navigation-shell"
-				data-navigation-mode={mode}
-				onClickCapture={navigateLink}
-			>
-				{sidebarPresence.phase !== "closed" && (
-					<div
-						aria-hidden={sidebarPresence.phase === "closing" ? "true" : undefined}
-						className={`project-sidebar-frame ${sidebarMotion.className} ${sidebarPresence.className}`}
-						inert={sidebarPresence.phase === "closing"}
-						style={{ "--project-sidebar-width": `${width}px` } as CSSProperties}
-					>
-						<div className="project-sidebar-motion-content">{sidebar}</div>
-						<SidebarResizeHandle onResize={resize} width={width} />
-					</div>
+			<SidebarTrigger.Provider value={sidebarTrigger}>
+				{countsReady && (
+					<SidebarFeatureBoundary>
+						<SidebarDecisionCounts
+							archived={catalogueMode === "archived"}
+							onCounts={updateDecisionCounts}
+							onSnapshot={updateDecisionSnapshot}
+							priorityRepositoryId={active?.repositoryId}
+							projects={projects}
+							refreshProject={refreshProject}
+							resync={resyncDecisions}
+						/>
+					</SidebarFeatureBoundary>
 				)}
-				{triggerVisible && (
-					<ProjectSidebarExpandButton
-						buttonRef={drawerOpener}
-						onExpand={() => mode === "drawer" ? setDrawerOpen(true) : setCollapsed(false)}
-						shortcut={sidebarShortcut}
-					/>
-				)}
-				{drawerPresence.phase !== "closed" && (
-					<NavigationDrawer motion={drawerPresence} onDismiss={dismissDrawer}>
-						{sidebar}
-					</NavigationDrawer>
-				)}
-				{children === undefined
-					? (
-						<main
-							className="navigation-content"
-							data-project-sidebar-trigger={triggerVisible || undefined}
-						>
-							{content}
-						</main>
-					)
-					: (
+				<div
+					className="navigation-shell"
+					data-navigation-mode={mode}
+					// The documents sheet is portalled out; the page beneath it is inert while it is up.
+					inert={phone && drawerOpen}
+					onClickCapture={navigateLink}
+				>
+					{sidebarPresence.phase !== "closed" && (
 						<div
-							className="navigation-content"
-							data-project-sidebar-trigger={triggerVisible || undefined}
+							aria-hidden={sidebarPresence.phase === "closing" ? "true" : undefined}
+							className={`project-sidebar-frame ${sidebarMotion.className} ${sidebarPresence.className}`}
+							inert={sidebarPresence.phase === "closing"}
+							style={{ "--project-sidebar-width": `${width}px` } as CSSProperties}
 						>
-							{content}
+							<div className="project-sidebar-motion-content">{sidebar}</div>
+							<SidebarFeatureBoundary>
+								<SidebarResizeHandle onResize={resize} width={width} />
+							</SidebarFeatureBoundary>
 						</div>
 					)}
-				{dialogMotion && presentedDialog === "add" && (
-					<LazyDialogBoundary>
-						<AddProjectDialog
-							added={navigation?.projects ?? []}
-							motion={dialogMotion}
-							onAdded={project => {
-								catalogueRefreshes.current.set(project.repositoryId, Date.now());
-								setFocusProjectId(project.repositoryId);
-								setCollapsed(false);
-								if (mode === "drawer") setDrawerOpen(true);
-								void refresh();
+					{triggerVisible && (
+						<ProjectSidebarExpandButton
+							buttonRef={openerRef}
+							onExpand={expandSidebar}
+							shortcut={sidebarShortcut}
+						/>
+					)}
+					{(phone ? Sheet : drawerPresence.phase !== "closed") && (
+						<LazyDialogBoundary
+							onFailure={() => {
+								dismissDrawer();
+								setDialogLoadFailed(true);
 							}}
-							onDismiss={dismissDialog}
-							userId={user.id}
-						/>
-					</LazyDialogBoundary>
-				)}
-				{dialogMotion && presentedDialog === "new" && (
-					<LazyDialogBoundary>
-						<Suspense fallback={null}>
-							<NewDocumentDialog
-								error={creation.error?.message}
+						>
+							{phone
+								? (
+									Sheet && (
+										<Sheet
+											{...catalogue}
+											activeRepositoryId={active?.repositoryId}
+											onNavigate={navigateToDocument}
+											onOpenChange={setDrawerOpen}
+											onSignOut={signOut}
+											open={drawerOpen}
+											opener={drawerOpener}
+										/>
+									)
+								)
+								: (
+									<NavigationDrawer
+										motion={drawerPresence as Exclude<typeof drawerPresence, { phase: "closed" }>}
+										onDismiss={dismissDrawer}
+									>
+										{sidebar}
+									</NavigationDrawer>
+								)}
+						</LazyDialogBoundary>
+					)}
+					{children === undefined
+						? (
+							<main
+								className="navigation-content"
+								data-project-sidebar-trigger={triggerVisible || undefined}
+							>
+								{content}
+							</main>
+						)
+						: (
+							<div
+								className="navigation-content"
+								data-project-sidebar-trigger={triggerVisible || undefined}
+							>
+								{content}
+							</div>
+						)}
+					{dialogMotion && presentedDialog === "add" && (
+						<LazyDialogBoundary onFailure={() => setDialogLoadFailed(true)}>
+							<AddProjectDialog
+								added={navigation?.projects ?? []}
 								motion={dialogMotion}
-								onAddProject={() => showDialog("add")}
-								onCreate={createDocument}
-								onDismiss={() => {
-									setDialog(undefined);
+								onAdded={project => {
+									catalogueRefreshes.current.set(project.repositoryId, Date.now());
+									setFocusProjectId(project.repositoryId);
+									setCollapsed(false);
 									if (mode === "drawer") {
-										requestAnimationFrame(() => drawerOpener.current?.focus());
+										setDrawerOpen(true);
 									}
+									void refresh();
 								}}
-								onRetry={retryProject ? () => createDocument(retryProject) : undefined}
-								pending={creation.pending}
-								projects={navigation?.projects ?? []}
+								onDismiss={dismissDialog}
+								userId={user.id}
 							/>
-						</Suspense>
-					</LazyDialogBoundary>
-				)}
-				{dialogMotion && presentedDialog === "search" && (
-					<LazyDialogBoundary>
-						<DocumentSearchDialog
-							includeArchived={catalogueMode === "archived"}
-							motion={dialogMotion}
-							onDismiss={dismissDialog}
-							onSelect={navigateToDocument}
-							projects={navigation?.projects ?? []}
-							source={projects}
-							userId={user.id}
-						/>
-					</LazyDialogBoundary>
-				)}
-				{dialogMotion && presentedDialog === "shortcuts" && (
-					<LazyDialogBoundary>
-						<KeyboardShortcutsDialog motion={dialogMotion} onDismiss={dismissDialog} />
-					</LazyDialogBoundary>
-				)}
-				{dialogMotion && typeof presentedDialog === "object"
-					&& presentedDialog.type === "delete" && (
-					<LazyDialogBoundary>
-						<DeleteDocumentDialog
-							channel={presentedDialog.channel}
-							motion={dialogMotion}
-							onDeleted={() => documentDeleted(presentedDialog.channel.id)}
-							onDismiss={dismissDialog}
-						/>
-					</LazyDialogBoundary>
-				)}
-			</div>
+						</LazyDialogBoundary>
+					)}
+					{dialogMotion && presentedDialog === "new" && (
+						<LazyDialogBoundary onFailure={() => setDialogLoadFailed(true)}>
+							<Suspense fallback={null}>
+								<NewDocumentDialog
+									error={creation.error?.message}
+									motion={dialogMotion}
+									onAddProject={() =>
+										showDialog("add")}
+									onCreate={createDocument}
+									onDismiss={() => {
+										setDialog(undefined);
+										if (mode === "drawer") {
+											requestAnimationFrame(() => drawerOpener.current?.focus());
+										}
+									}}
+									onRetry={retryProject ? () => createDocument(retryProject) : undefined}
+									pending={creation.pending}
+									projects={navigation?.projects ?? []}
+								/>
+							</Suspense>
+						</LazyDialogBoundary>
+					)}
+					{dialogMotion && presentedDialog === "search" && (
+						<LazyDialogBoundary onFailure={() => setDialogLoadFailed(true)}>
+							<DocumentSearchDialog
+								includeArchived={catalogueMode === "archived"}
+								motion={dialogMotion}
+								onDismiss={dismissDialog}
+								onSelect={navigateToDocument}
+								projects={navigation?.projects ?? []}
+								source={projects}
+								userId={user.id}
+							/>
+						</LazyDialogBoundary>
+					)}
+					{dialogMotion && presentedDialog === "shortcuts" && (
+						<LazyDialogBoundary onFailure={() => setDialogLoadFailed(true)}>
+							<KeyboardShortcutsDialog motion={dialogMotion} onDismiss={dismissDialog} />
+						</LazyDialogBoundary>
+					)}
+					{dialogMotion && typeof presentedDialog === "object"
+						&& presentedDialog.type === "delete" && (
+						<LazyDialogBoundary onFailure={() => setDialogLoadFailed(true)}>
+							<DeleteDocumentDialog
+								channel={presentedDialog.channel}
+								motion={dialogMotion}
+								onDeleted={() =>
+									documentDeleted(presentedDialog.channel.id)}
+								onDismiss={dismissDialog}
+							/>
+						</LazyDialogBoundary>
+					)}
+				</div>
+			</SidebarTrigger.Provider>
 		</NavigationDocument.Provider>
 	);
 }

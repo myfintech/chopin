@@ -55,6 +55,8 @@ Every adapter must provide:
 - expiring session rows with optional opaque encrypted credentials;
 - revision-checked credential rotation that cannot recreate a deleted session;
 - startup removal of expired and metadata-only sessions and every Planner owner reference;
+- startup clearing of child channel conversations, fenced by the writer lease
+  and idempotent;
 - renewable leases whose fencing token protects commits, epoch replacements,
   checkpoints, jobs, and research request mutations;
 - idempotent, independently revisioned publication of generated channel
@@ -125,6 +127,7 @@ applied migration. The application schema contains:
 | `research_workspaces`      | Internal request staging: parent channel, exact brief fields, optional published child, attribution, revision, idempotency, and compatibility counters.    |
 | `research_turns`           | Internal initial attempt and compatibility turns with evidence and answer job links.                                                                       |
 | `research_messages`        | Compatibility transcript rows retained for historical workspace references; not a current product thread.                                                  |
+| `plan_images`              | Images uploaded to a document through MCP `upload_image`: SHA-256, type, bytes, size, uploader, and time, keyed by channel and hash.                       |
 
 `channel_state.unanswered_decisions` is maintained in JavaScript rather than a
 generated column. Sidecar text may contain an escaped NUL or an unpaired UTF-16
@@ -257,15 +260,35 @@ runtime does not advance the summary or cursor, and startup forces status to
 `unavailable`. A later owner creates a fresh Copilot SDK session from bounded
 transcript context and the current document.
 
+A child document has no Chat of its own. Next, still under the writer lease and
+before any room opens, `CollaborationStore.dropChildConversations` empties each
+child's transcript and removes its workflow runs, conversation analysis, card
+mirrors, and effect outbox from both `channel_state` and the latest
+`channel_snapshots` row, and resets that child's reserved summary and transcript
+cursor. Question records, comment threads, and the document are untouched. A
+child whose decision records cite a Chat message or conversation thread would
+fail restoration without it, so it is left unchanged and its ID is logged; the
+runtime still never serves or routes to its Chat. A second run finds nothing to
+clear.
+
 Active external implementation runs are different: their graph lock, run
 identity, progress, and history remain durable across application restart.
 
 ## Writer lease
 
 One database-wide `chopin:writer` lease permits one active application process.
-A second process refuses startup. The holder renews the lease while serving and
-drains and stops if renewal fails or its safety deadline passes. Adapter fencing
-prevents an expired holder from committing even before shutdown completes.
+A second process refuses startup. The holder renews the lease every 10 seconds
+on its own connection, outside the shared pool. A renewal attempt that takes
+more than about five seconds fails and is retried until the safety deadline,
+25 seconds after the last successful renewal was sent. The holder drains and
+stops if the lease is lost or the deadline passes, and logs when it last renewed
+and the last renewal error.
+
+Adapter fencing prevents an expired holder from committing even before shutdown
+completes. Each fenced write holds the lease row `FOR KEY SHARE` and a
+per-lease advisory lock, so writes for one lease still run one at a time. A
+takeover takes the row `FOR UPDATE` and waits for any write in flight, while
+renewal only extends `expires_at` and never waits for a write.
 
 This lease is why the current deployment model cannot perform a rolling
 application replacement against one database. See

@@ -11,6 +11,14 @@
 			"types": "./src/index.ts",
 			"default": "./src/index.ts"
 		},
+		"./inline-notice": {
+			"types": "./src/ui/inline-notice.tsx",
+			"default": "./src/ui/inline-notice.tsx"
+		},
+		"./unfold": {
+			"types": "./src/ui/unfold.tsx",
+			"default": "./src/ui/unfold.tsx"
+		},
 		"./styles.css": "./src/styles.css",
 		"./theme.css": "./theme.css"
 	},

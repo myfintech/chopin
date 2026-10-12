@@ -1,3 +1,6 @@
+import { restoreBuilds } from "../tasks/builds";
+import { implementationStatus } from "../tasks/notifications";
+import type { BuildRequest } from "@chopin/protocol/implementation";
 /**
  * The plan, as a room offers it.
  *
@@ -167,7 +170,10 @@ type Captured = {
 };
 
 export type Plan = {
+	builds: BuildRequest[];
 	id: string;
+	/** Set when this is a child document, which has no Chat of its own. */
+	readonly parentChannelId?: string;
 	/** Context retained for plans created through MCP. */
 	creation?: CreationMetadata;
 	/** Idempotent MCP rewrites retained so later edits do not change a replay. */
@@ -249,6 +255,7 @@ function recent(stamps: number[], window: number): number[] {
 }
 
 type Sidecar = {
+	builds?: BuildRequest[];
 	version: 1;
 	revision: number;
 	documentSeq: number;
@@ -279,6 +286,7 @@ function state(plan: Plan, chat: ChatView = plan.chat): Sidecar {
 		documentSeq: plan.document.seq,
 		...(plan.creation ? { creation: plan.creation } : {}),
 		...(plan.graph ? { graph: plan.graph } : {}),
+		...(plan.builds.length ? { builds: plan.builds } : {}),
 		...(plan.execution ? { execution: plan.execution } : {}),
 		...(plan.lifecycle.events?.length || plan.lifecycle.history.length > 0
 			? { lifecycle: plan.lifecycle }
@@ -471,6 +479,8 @@ function restoredState(
 		"version",
 	];
 	if (created) expected.push(...(legacy ? ["brief", "origin"] : ["creation"]));
+	if (Object.hasOwn(item, "builds")) expected.push("builds");
+	let builds = restoreBuilds(item.builds, scope?.repositoryId);
 	if (Object.hasOwn(item, "graph")) expected.push("graph");
 	if (Object.hasOwn(item, "execution")) expected.push("execution");
 	if (Object.hasOwn(item, "lifecycle")) expected.push("lifecycle");
@@ -538,7 +548,7 @@ function restoredState(
 	let threads = objects(item.threads, "comment thread");
 	for (let thread of threads) {
 		if (
-			(thread.status !== "open" && thread.status !== "accepted" && thread.status !== "dismissed")
+			!["open", "resolved", "accepted", "dismissed"].includes(thread.status as string)
 			|| !thread.passage
 			|| typeof thread.passage !== "object"
 			|| Array.isArray(thread.passage)
@@ -645,6 +655,7 @@ function restoredState(
 		documentSeq: item.documentSeq,
 		...(created ? { creation: created } : {}),
 		...(graph ? { graph } : {}),
+		...(builds.length ? { builds } : {}),
 		...(execution ? { execution } : {}),
 		...(lifecycle ? { lifecycle } : {}),
 		...(mcpUpdates.length > 0 ? { mcpUpdates } : {}),
@@ -1140,7 +1151,10 @@ export async function drain(plan: Plan): Promise<void> {
 
 /** One gate for every path that can mutate a plan during implementation. */
 export function implementationActive(plan: Plan): boolean {
-	return plan.claiming || !!plan.execution;
+	return plan.claiming || !!plan.execution
+		|| plan.builds.some(build =>
+			build.state === "queued" || build.state === "starting" || build.state === "running"
+		);
 }
 
 /** Sidecar-only commit for a caller already holding `exclusive`. */
@@ -1292,6 +1306,7 @@ export async function readStored(
 ): Promise<{
 	source: string;
 	revision: number;
+	builds?: BuildRequest[];
 	creation?: CreationMetadata;
 	graph?: Graph;
 	execution?: Run;
@@ -1305,6 +1320,7 @@ export async function readStored(
 			revision: restored.sidecar.revision,
 			...(restored.sidecar.creation ? { creation: restored.sidecar.creation } : {}),
 			...(restored.sidecar.graph ? { graph: restored.sidecar.graph } : {}),
+			...(restored.sidecar.builds ? { builds: restored.sidecar.builds } : {}),
 			...(restored.sidecar.execution ? { execution: restored.sidecar.execution } : {}),
 			...(restored.sidecar.lifecycle ? { lifecycle: restored.sidecar.lifecycle } : {}),
 		};
@@ -1326,6 +1342,10 @@ export async function open(
 
 	let plan: Plan = {
 		id,
+		...(loaded.channel.parentChannelId
+			? { parentChannelId: loaded.channel.parentChannelId }
+			: {}),
+		builds: sidecar.builds ?? [],
 		...(sidecar.creation ? { creation: sidecar.creation } : {}),
 		mcpUpdates: sidecar.mcpUpdates ?? [],
 		server,
@@ -1344,7 +1364,7 @@ export async function open(
 		records: new Map(
 			sidecar.questions.map(record => [record.id, Questions.normalizeRecord(record)]),
 		),
-		threads: new Map(sidecar.threads.map(record => [record.id, record])),
+		threads: new Map(sidecar.threads.map(record => [record.id, Comments.normalize(record)])),
 		revision: sidecar.revision,
 		graph: sidecar.graph,
 		execution: sidecar.execution,
@@ -1438,6 +1458,7 @@ export function greet(plan: Plan, ws: Socket, msg: Request<Wire.Open.Ask>): void
 		threads: Comments.anchors(plan),
 		prose: Questions.prose(plan),
 		limits: room.LIMITS,
+		implementation: implementationStatus(plan),
 		...(hello ? { awareness: encode(hello) } : {}),
 	});
 }
@@ -2126,6 +2147,33 @@ export function placeResearchReference(plan: Plan, id: string): Promise<"placed"
 				throw err;
 			}
 			return "placed";
+		} finally {
+			document.doc.destroy();
+		}
+	});
+}
+
+export function placeExperimentReference(
+	plan: Plan,
+	experiment: string,
+	view: string,
+	decision: string,
+	remove = false,
+): Promise<void> {
+	return exclusive(plan, async () => {
+		if (implementationActive(plan)) throw new ImplementationActiveError();
+		let document = await room.restore(
+			plan.document.epoch,
+			Y.encodeStateAsUpdate(plan.document.doc),
+			room.project(plan.document),
+			[],
+		);
+		document.seq = plan.document.seq;
+		try {
+			let mutation = room.placeExperiment(document, experiment, view, decision, remove);
+			if (mutation) {
+				await publishStaged(plan, plan.server, plan.id, { ...plan, document }, mutation);
+			}
 		} finally {
 			document.doc.destroy();
 		}

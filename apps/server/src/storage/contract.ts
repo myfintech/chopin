@@ -1,4 +1,8 @@
 import { researchWorkspace } from "./research-inline-contract-fixtures";
+import { childChannelContract } from "./child-channel-contract";
+import { experimentContract } from "./experiment-contract";
+import { imageContract } from "./image-contract";
+import { plannerAttachmentContract } from "./planner-attachment-contract";
 import { researchInlineContract } from "./research-inline-contract";
 import { describe, expect, it } from "bun:test";
 
@@ -31,6 +35,10 @@ function attempt<T>(action: () => Promise<T>): Promise<T> {
 
 /** The behavioral gate every built-in storage adapter must pass. */
 export function storageContract(name: string, factory: Factory): void {
+	experimentContract(name, factory);
+	imageContract(name, factory);
+	childChannelContract(name, factory);
+	plannerAttachmentContract(name, factory);
 	describe(`${name} storage`, () => {
 		it("supports expiring metadata-only sessions for local authentication", async () => {
 			let storage = await opened(factory);

@@ -16,7 +16,7 @@ test("Chat grows to available space and preserves a preferred width across narro
 	await join("ana");
 	let chat = chatPane(page);
 	let handle = page.getByRole("separator", { name: "Resize chat" });
-	let document = page.locator(".workspace-frame > main");
+	let document = page.locator(".workspace-frame > .workspace-document-stack > main");
 	await handle.press("End");
 	let preferred = Number(await handle.getAttribute("aria-valuemax"));
 	expect(preferred).toBeGreaterThan(750);
@@ -50,20 +50,24 @@ test("desktop Chat retains its width and stays beside the document as the window
 	await page.setViewportSize({ width: 1280, height: 800 });
 	await join("ana");
 	let chat = chatPane(page);
-	let document = page.locator("main");
 	let initialWidth = (await box(chat)).width;
 	expect(initialWidth).toBeCloseTo(500, 0);
 
 	for (let width of [1280, 1440]) {
 		await page.setViewportSize({ width, height: 800 });
-		await expect.poll(async () => (await box(chat)).width).toBeCloseTo(initialWidth, 0);
-		let [chatBox, documentBox, frameBox] = await Promise.all([
-			box(chat),
-			box(document),
-			box(page.locator(".workspace-frame")),
-		]);
-		expect(chatBox.x).toBeCloseTo(frameBox.x, 0);
-		expect(chatBox.x + chatBox.width).toBeLessThanOrEqual(documentBox.x + 1);
+		await expect.poll(() =>
+			page.locator(".workspace-frame").evaluate(frame => {
+				let frameBox = frame.getBoundingClientRect();
+				let documentBox = frame.querySelector("main")!.getBoundingClientRect();
+				let chatBox = frame.querySelector("aside")!.getBoundingClientRect();
+				return {
+					chatWidth: Math.round(chatBox.width),
+					chatStart: Math.round(chatBox.x - frameBox.x),
+					gap: Math.round(documentBox.x - chatBox.right),
+					documentEnd: Math.round(frameBox.right - documentBox.right),
+				};
+			})
+		).toEqual({ chatWidth: Math.round(initialWidth), chatStart: 0, gap: 0, documentEnd: 0 });
 	}
 
 	await expect(chat).toBeVisible();
@@ -72,7 +76,7 @@ test("desktop Chat retains its width and stays beside the document as the window
 	await expectNoHorizontalOverflow(page);
 });
 
-test("the Chat edge grows right, keeps its left-side reopen control, and remembers its width", async ({ join, page }) => {
+test("the right Chat edge grows right, keeps its left-side reopen control, and remembers its width", async ({ join, page }) => {
 	await page.setViewportSize({ width: 1440, height: 900 });
 	await join("ana");
 	let chat = chatPane(page);
@@ -89,7 +93,8 @@ test("the Chat edge grows right, keeps its left-side reopen control, and remembe
 	});
 	await page.mouse.up();
 	await expect.poll(async () => (await box(chat)).width).toBeGreaterThan(initial.width + 10);
-	expect((await box(chat)).x).toBeCloseTo(initial.x, 0);
+	let widened = await box(chat);
+	expect(widened.x).toBeCloseTo(initial.x, 0);
 	let pointerWidth = (await box(chat)).width;
 
 	await handle.press("ArrowRight");
@@ -99,7 +104,7 @@ test("the Chat edge grows right, keeps its left-side reopen control, and remembe
 	expect(rememberedWidth).toBeLessThanOrEqual(Number(await handle.getAttribute("aria-valuemax")));
 	let frame = await box(page.locator(".workspace-frame"));
 
-	await page.getByRole("button", { name: "Hide chat" }).click();
+	await page.getByRole("button", { name: "Expand document" }).click();
 	await expect(chat).toBeHidden();
 	let opener = page.getByRole("button", { name: "Show chat" });
 	let openerBox = await box(opener);

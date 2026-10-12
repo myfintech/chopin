@@ -17,18 +17,20 @@ import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext
 import { useEffect } from "react";
 
 import { resolve } from "./anchors";
-import { clear as unpaint, holds, paint, pin, unpin } from "./marks";
+import { clear as unpaint, holds, paintComments, pin, unpin } from "./marks";
 import { $blockPoints, $recover, locate } from "./passage";
 import { blockElement, scrollToKey } from "./scroll";
 
 import type { Binding } from "@lexical/yjs";
 import type { LexicalEditor } from "lexical";
-import type { Chat, Comment, Plan } from "@chopin/protocol";
+import type { Comment, Plan } from "@chopin/protocol";
 import type { Marked as Selected, Points } from "./passage";
 import type { Transport } from "./transport";
 
 /** A thread being written but not yet sent. It has no id until the server gives it one. */
 export type Draft = Selected & {
+	/** The selection it was drafted from, kept washed while the composer is open. */
+	points?: Points;
 	/** Local card position; the server verifies prose, not client pixels. */
 	placement?: {
 		top: number;
@@ -66,10 +68,29 @@ export type ThreadView = {
 	quote: string;
 	/** Position in the document, for ordering the pane. Undefined if unresolved. */
 	at?: number;
+	/**
+	 * Chopin's turn on this thread: running or queued, or why the last one
+	 * ended without finishing. Absent once it finished, or if it never started.
+	 */
+	planner?: "working" | "stopped" | "failed" | "off";
+};
+
+/**
+ * A resolved thread whose turn edited the document, beside the prose it wrote.
+ *
+ * Only these leave a trace once resolved: a thread resolved without edits has
+ * nothing in the document to stand beside.
+ */
+export type ResolvedView = {
+	thread: Comment.Thread;
+	/** The blocks its turn wrote, in document order of the result anchors. */
+	keys: string[];
+	places: Points[];
 };
 
 export type ThreadState = {
 	threads: ThreadView[];
+	resolved: ResolvedView[];
 	draft?: Draft;
 	/** Who is writing a reply, by thread. */
 	writing: { [thread: string]: string[] };
@@ -78,18 +99,41 @@ export type ThreadState = {
 	error?: string;
 };
 
-const EMPTY: ThreadState = { threads: [], writing: {} };
+const EMPTY: ThreadState = { threads: [], resolved: [], writing: {} };
+
+/** Whether a note was taken, and if not, why, in words the composer can show. */
+export type Sent = { ok: true } | { ok: false; message: string };
+
+const UNSENT: Sent = { ok: false, message: "Not connected. Try again in a moment." };
+
+function failed(err: unknown): Sent {
+	return {
+		ok: false,
+		message: err instanceof Error && err.message ? err.message : "Couldn't send. Try again.",
+	};
+}
 
 export class ThreadStore {
+	/** The document these threads belong to, so a request can name it. */
+	readonly channel: string | undefined;
+	constructor(channel?: string) {
+		this.channel = channel;
+	}
+
 	#state: ThreadState = EMPTY;
 	#listeners = new Set<() => void>();
 
 	#threads = new Map<string, Comment.Thread>();
 	#anchors = new Map<string, Plan.ThreadAnchors>();
 	#writing = new Map<string, Map<string, string>>();
-	#retryRequests = new Map<string, string>();
+	/** Chopin's turn per thread, from `comment:working` and the replies to addressed notes. */
+	#planner = new Map<string, NonNullable<ThreadView["planner"]>>();
 	#draft: Draft | undefined;
 	#focused: string | undefined;
+	/** Threads pointed at together, through a margin chip that stands for several. */
+	#group: string[] = [];
+	/** Threads whose card, or whose block's list, is open. */
+	#opened: string[] = [];
 	#error: string | undefined;
 	/**
 	 * Which card the reader last asked to be taken to, and how far along it.
@@ -139,7 +183,9 @@ export class ThreadStore {
 			wire.on<Comment.Opened>("comment:opened", frame => this.opened(frame.thread)),
 			wire.on<Comment.Said>("comment:said", frame => this.said(frame.id, frame.note)),
 			wire.on<Comment.Resolved>("comment:resolved", frame => this.resolved(frame)),
+			wire.on<Comment.Reopened>("comment:reopened", frame => this.reopened(frame.thread)),
 			wire.on<Comment.Typing.Output>("comment:typing", frame => this.typing(frame)),
+			wire.on<Comment.Working>("comment:working", frame => this.working(frame)),
 		];
 
 		return () => {
@@ -150,61 +196,122 @@ export class ThreadStore {
 
 	// -- acting ----------------------------------------------------------------
 
-	/** Send the drafted comment. The thread arrives back as `comment:opened`. */
-	start(text: string): void {
+	/**
+	 * Send the drafted comment. The thread arrives back as `comment:opened`.
+	 *
+	 * A refusal keeps the draft open and settles with the server's reason, so
+	 * the composer can put the text back and say why rather than losing both.
+	 */
+	start(text: string, to?: "planner"): Promise<Sent> {
 		let draft = this.#draft;
-		if (!draft || !this.#wire) return;
+		if (!draft || !this.#wire) return Promise.resolve(UNSENT);
 
 		let { blocks, length, offset, quote } = draft;
-		void this.#wire
-			.ask<Comment.Start.Reply>("comment:start", { blocks, quote, offset, length, text })
-			.then(frame => {
-				if (frame.ok) return this.opened(frame.thread);
-				// The plan moved under the selection, or there are too many
-				// open threads. Either way the draft is no longer sendable.
-				this.#draft = undefined;
-				this.#error = frame.message;
-				this.refresh();
+		return this.#wire
+			.ask<Comment.Start.Reply>("comment:start", {
+				blocks,
+				quote,
+				offset,
+				length,
+				text,
+				...(to ? { to } : {}),
 			})
-			.catch(() => {});
-	}
-
-	reply(id: string, text: string): void {
-		void this.#wire
-			?.ask<Comment.Reply.Reply>("comment:reply", { id, text })
-			.then(frame => {
-				if (frame.ok) this.said(id, frame.note);
+			.then((frame): Sent => {
+				if (!frame.ok) return { ok: false, message: frame.message };
+				this.#sent(frame.thread.id, frame.planner);
+				this.opened(frame.thread);
+				return { ok: true };
 			})
-			.catch(() => {});
+			.catch(failed);
 	}
 
-	accept(id: string): void {
-		void this.#wire?.ask("comment:accept", { id }).catch(() => {});
+	/** Add to a thread; settles with the server's reason when it is refused. */
+	reply(id: string, text: string, to?: "planner"): Promise<Sent> {
+		if (!this.#wire) return Promise.resolve(UNSENT);
+		return this.#wire
+			.ask<Comment.Reply.Reply>("comment:reply", { id, text, ...(to ? { to } : {}) })
+			.then((frame): Sent => {
+				if (!frame.ok) {
+					return {
+						ok: false,
+						message: frame.reason === "resolved"
+							? "This comment was resolved."
+							: frame.message,
+					};
+				}
+				this.#sent(id, frame.planner);
+				this.said(id, frame.note);
+				return { ok: true };
+			})
+			.catch(failed);
 	}
 
-	dismiss(id: string): void {
-		void this.#wire?.ask("comment:dismiss", { id }).catch(() => {});
+	/** A thread's status, including one that is hidden because it was resolved. */
+	status(id: string): Comment.Status | undefined {
+		return this.#threads.get(id)?.status;
 	}
 
 	/**
-	 * Ask the agent to have another go at an accepted thread.
+	 * What the sender of an addressed note learns at once.
 	 *
-	 * An ordinary chat message, because that is what it is: the decision was
-	 * already made and recorded, and what is missing is a turn. Inventing a
-	 * frame for "run that again" would be a second way to start one.
+	 * The room hears the same from `comment:working`; this only spares the
+	 * sender a beat of nothing, and says when no Planner will come at all.
 	 */
-	retry(id: string): void {
-		let view = this.#state.threads.find(entry => entry.thread.id === id);
-		if (!view || !this.#wire) return;
-		let requestId = this.#retryRequests.get(id) ?? crypto.randomUUID();
-		this.#retryRequests.set(id, requestId);
-		void this.#wire.ask<Chat.Sent>("chat:send", {
-			requestId,
-			text: `apply the accepted comment on "${view.quote}" — it has not been actioned yet.`,
-			to: "planner",
-		}).then(() => {
-			if (this.#retryRequests.get(id) === requestId) this.#retryRequests.delete(id);
-		}).catch(() => {});
+	#sent(id: string, planner: Comment.Planner | undefined): void {
+		if (!planner) return;
+		this.#planner.set(id, planner === "off" ? "off" : "working");
+	}
+
+	/** Chopin started, finished or stopped working on a thread. */
+	working(event: Comment.Working): void {
+		if (event.working) this.#planner.set(event.id, "working");
+		else if (event.reason) this.#planner.set(event.id, event.reason);
+		else this.#planner.delete(event.id);
+		this.refresh();
+	}
+
+	/**
+	 * Close a thread, hiding it at once.
+	 *
+	 * Optimistic because a resolve changes nothing anybody else is relying on,
+	 * and a card that lingers after its check was pressed reads as a miss. A
+	 * refusal other than "somebody already did" puts it back, and settles false.
+	 */
+	resolve(id: string): Promise<boolean> {
+		let thread = this.#threads.get(id);
+		if (!thread || thread.status !== "open" || !this.#wire) return Promise.resolve(false);
+		this.#threads.set(id, { ...thread, status: "resolved" });
+		this.refresh();
+
+		let restore = () => {
+			let current = this.#threads.get(id);
+			if (current?.status !== "resolved" || current.resolver) return false;
+			this.#threads.set(id, { ...current, status: "open" });
+			this.refresh();
+			return false;
+		};
+		return this.#wire
+			.ask<Comment.Resolve.Reply>("comment:resolve", { id })
+			.then(frame => frame.ok || frame.reason === "resolved" || restore())
+			.catch(restore);
+	}
+
+	/**
+	 * Open a resolved thread again.
+	 *
+	 * Settles with the server's refusal rather than throwing, so whoever asked
+	 * can say why: a document at its ceiling of open threads refuses.
+	 */
+	reopen(id: string): Promise<{ ok: true } | { ok: false; reason?: string }> {
+		if (!this.#wire) return Promise.resolve({ ok: false });
+		return this.#wire
+			.ask<Comment.Reopen.Reply>("comment:reopen", { id })
+			.then(frame => {
+				if (!frame.ok) return { ok: false as const, reason: frame.reason };
+				this.reopened(frame.thread);
+				return { ok: true as const };
+			})
+			.catch(() => ({ ok: false as const }));
 	}
 
 	announce(id: string, writing: boolean): void {
@@ -216,6 +323,9 @@ export class ThreadStore {
 	/** Replace everything, from `comment:sync`. */
 	sync(threads: Comment.Thread[]): void {
 		this.#threads = new Map(threads.map(thread => [thread.id, thread]));
+		this.#planner = new Map(
+			threads.flatMap(thread => thread.working ? [[thread.id, "working" as const]] : []),
+		);
 		this.refresh();
 	}
 
@@ -223,6 +333,12 @@ export class ThreadStore {
 		this.#threads.set(thread.id, thread);
 		// The card that was being drafted is now a real thread.
 		this.#draft = undefined;
+		this.refresh();
+	}
+
+	/** Unlike `opened`, leaves any draft alone: somebody else's undo is not a reply to it. */
+	reopened(thread: Comment.Thread): void {
+		this.#threads.set(thread.id, thread);
 		this.refresh();
 	}
 
@@ -290,6 +406,20 @@ export class ThreadStore {
 		this.refresh();
 	}
 
+	/** Strengthen several passages at once, for a chip that stands for all of them. */
+	light(ids: string[]): void {
+		if (same(this.#group, ids)) return;
+		this.#group = ids;
+		this.refresh();
+	}
+
+	/** Underline the passages whose card is open. */
+	open(ids: string[]): void {
+		if (same(this.#opened, ids)) return;
+		this.#opened = ids;
+		this.refresh();
+	}
+
 	/**
 	 * Take the reader to the prose a thread points at.
 	 *
@@ -352,14 +482,40 @@ export class ThreadStore {
 		let binding = this.#binding;
 
 		let views: ThreadView[] = [];
-		let marks: Points[] = [];
+		let resolved: ResolvedView[] = [];
+		let tones: { rest: Points[]; hover: Points[]; open: Points[] } = {
+			rest: [],
+			hover: [],
+			open: [],
+		};
+		let toneOf = (id: string) =>
+			this.#opened.includes(id)
+				? "open"
+				: this.#focused === id || this.#group.includes(id)
+				? "hover"
+				: "rest";
 
-		// Dismissed threads are not shown at all — the transcript is where they
-		// left their trace — so they are dropped once here rather than in each
-		// branch below, where one copy of the rule could outlive the other.
-		let live = [...this.#threads.values()].filter(thread => thread.status !== "dismissed");
+		// Resolved and dismissed threads are not shown at all, so they are
+		// dropped once here rather than in each branch below, where one copy of
+		// the rule could outlive the other.
+		let live = [...this.#threads.values()].filter(thread =>
+			thread.status !== "dismissed" && thread.status !== "resolved"
+		);
 
 		let build = () => {
+			if (editor && binding) {
+				for (let thread of this.#threads.values()) {
+					if (thread.status !== "resolved") continue;
+					try {
+						let anchors = this.#anchors.get(thread.id);
+						let keys = anchors ? produced(binding, anchors) : [];
+						let places = keys.map($blockPoints).filter((points): points is Points => !!points);
+						if (places.length > 0) resolved.push({ thread, keys, places });
+					} catch (err) {
+						console.error(`[plan] could not place resolved comment ${thread.id}:`, err);
+					}
+				}
+			}
 			for (let thread of live) {
 				/*
 				 * One thread at a time, and the whole of it.
@@ -379,7 +535,7 @@ export class ThreadStore {
 					// Nothing resolves before the editor exists; the card still
 					// renders, with the quote and no highlight.
 					let placement = editor && binding && anchors
-						? this.#places(binding, anchors)
+						? this.#places(binding, anchors, thread.status === "open")
 						: { places: [] };
 					let { places } = placement;
 					let targetKey = thread.status === "open" ? placement.targetKey : undefined;
@@ -399,10 +555,11 @@ export class ThreadStore {
 						applied: !!anchors && !anchors.result.pending,
 						quote: thread.quote ?? anchors?.subject.quote ?? "",
 						...(first && editor ? { at: order(editor, first.anchorKey) } : {}),
+						...(this.#planner.has(thread.id) ? { planner: this.#planner.get(thread.id) } : {}),
 					});
 
 					// Accepted threads render through their inline Decision instead.
-					if (thread.status === "open") marks.push(...places);
+					if (thread.status === "open") tones[toneOf(thread.id)].push(...places);
 				} catch (err) {
 					console.error(`[plan] could not place comment ${thread.id}:`, err);
 					// Unplaceable, but still worth reading.
@@ -420,9 +577,10 @@ export class ThreadStore {
 
 		if (editor && binding) editor.getEditorState().read(build);
 		else build();
+		if (this.#draft?.points) tones.hover.push(this.#draft.points);
 
 		views.sort((a, b) => (a.at ?? Infinity) - (b.at ?? Infinity));
-		if (editor) paint(editor, "comments", marks);
+		if (editor) paintComments(editor, tones);
 
 		let writing: { [thread: string]: string[] } = {};
 		for (let [id, entry] of this.#writing) {
@@ -431,6 +589,7 @@ export class ThreadStore {
 
 		let next: ThreadState = {
 			threads: views,
+			resolved,
 			writing,
 			...(this.#draft ? { draft: this.#draft } : {}),
 			...(this.#focused ? { focused: this.#focused } : {}),
@@ -462,23 +621,29 @@ export class ThreadStore {
 	#places(
 		binding: Binding,
 		anchors: Plan.ThreadAnchors,
+		open: boolean,
 	): { places: Points[]; targetKey?: string } {
-		let { result, subject } = anchors;
+		let { subject } = anchors;
 
-		// Pending means nobody has checked this since the plan moved, so it is
-		// not somewhere worth sending a reader.
-		if (result.anchors.length > 0 && !result.pending) {
-			let produced = result.anchors
-				.map(anchor => resolve(binding, anchor))
-				.flatMap(key => (key ? [$blockPoints(key)] : []))
-				.filter((points): points is Points => !!points);
-			if (produced.length > 0) return { places: produced };
+		let written = () =>
+			produced(binding, anchors).map($blockPoints).filter((points): points is Points => !!points);
+
+		// An open thread is still about the phrase somebody marked, even after
+		// Chopin has written something for it; only once that phrase is gone
+		// does it follow what was written.
+		if (!open) {
+			let places = written();
+			if (places.length > 0) return { places };
 		}
 
 		let targetKey = subject.blocks
 			.map(block => resolve(binding, block))
 			.find((key): key is string => !!key);
 		let found = locate(binding, subject) ?? this.#recover(binding, subject);
+		if (!found && open) {
+			let places = written();
+			if (places.length > 0) return { places };
+		}
 		return {
 			places: found ? [found] : [],
 			...(targetKey ? { targetKey } : {}),
@@ -494,6 +659,27 @@ export class ThreadStore {
 
 		return $recover(subject, keys);
 	}
+}
+
+/**
+ * The blocks a thread's turn wrote, as they are now.
+ *
+ * Pending means nobody has checked this since the plan moved, so it is not
+ * somewhere worth sending a reader. Call inside a read.
+ */
+function produced(binding: Binding, anchors: Plan.ThreadAnchors): string[] {
+	let { result } = anchors;
+	if (result.anchors.length === 0 || result.pending) return [];
+	let keys: string[] = [];
+	for (let anchor of result.anchors) {
+		let key = resolve(binding, anchor);
+		if (key && !keys.includes(key)) keys.push(key);
+	}
+	return keys;
+}
+
+function same(a: string[], b: string[]): boolean {
+	return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
 /**
@@ -516,6 +702,77 @@ function order(editor: LexicalEditor, key: string): number | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+/** The event that asks the open document to show a comment thread. */
+export const OPEN_COMMENT = "chopin:open-comment";
+
+/** A thread id, or one whose card should take focus and whose document is named. */
+export type OpenComment = string | { thread: string; focus?: true; channel?: string };
+
+export type OpenRequest = { thread: string; focus: boolean; channel?: string };
+
+/** Read an open request from an event's detail, or nothing when it is not one. */
+export function openRequest(detail: unknown): OpenRequest | undefined {
+	if (typeof detail === "string") return { thread: detail, focus: false };
+	if (!detail || typeof detail !== "object" || !("thread" in detail)) return undefined;
+	if (typeof detail.thread !== "string") return undefined;
+	return {
+		thread: detail.thread,
+		focus: "focus" in detail && detail.focus === true,
+		...("channel" in detail && typeof detail.channel === "string"
+			? { channel: detail.channel }
+			: {}),
+	};
+}
+
+/**
+ * Whether a comment layer answers a request. A request naming a document belongs to that
+ * document alone: a root's editor stays mounted under an open child and must not claim the
+ * child's thread. A request naming none, or a layer with no identity, is answered by all.
+ */
+export function handlesOpenComment(layer: string | undefined, target: string | undefined): boolean {
+	return target === undefined || layer === undefined || layer === target;
+}
+
+/** What a layer does with a request for a thread: open it, wait for it to arrive, or say why not. */
+export function openOutcome(
+	view: { orphaned?: boolean; drifted?: boolean } | undefined,
+	status: Comment.Status | undefined,
+	waited: boolean,
+): { open: true } | { wait: true } | { gone: string } {
+	if (status === "resolved") return { gone: "This comment was resolved" };
+	if (status === undefined) {
+		// Thread state arrives after the document does; a request waits for it.
+		return waited ? { gone: "This comment is no longer here" } : { wait: true };
+	}
+	if (status !== "open") return { gone: "This comment is no longer here" };
+	if (view?.orphaned || view?.drifted) return { gone: "This comment's passage has changed" };
+	return { open: true };
+}
+
+/**
+ * Ask the open document to show a comment thread, from anywhere.
+ *
+ * An event rather than the fragment a copied link uses: following a fragment
+ * is navigation, and Chat pointing at a thread should not add history or wake
+ * the router. Name `channel` to reach one document when several are mounted.
+ */
+export function openCommentThread(
+	thread: string,
+	options: { focus?: boolean; channel?: string } = {},
+): void {
+	dispatchEvent(
+		new CustomEvent<OpenComment>(OPEN_COMMENT, {
+			detail: options.focus || options.channel
+				? {
+					thread,
+					...(options.focus ? { focus: true as const } : {}),
+					...(options.channel ? { channel: options.channel } : {}),
+				}
+				: thread,
+		}),
+	);
 }
 
 /** Mounted inside the editor, so resolution re-runs as the document changes. */

@@ -42,13 +42,13 @@
 	},
 	{
 		"file": "apps/web/src/document-workspace-host.tsx",
-		"reason": "Workspace assembly supplies document/session callbacks and data, not design values; scanner does not execute the workspaceProps function.",
+		"reason": "Workspace assembly supplies document/session callbacks and data, not design values; scanner does not execute the workspaceProps function. Its returned keys contain no className or style; the parent presentation carries the child layer node, a finite \"open\" | \"closing\" state, a finite \"lift\" | \"zoom\" motion that Workspace renders only as a data attribute, path labels, a close callback, the open child's channel id that Chat sends as its focus, and a child-open callback; a document presentation carries only that child-open callback.",
 		"cases": [
 			[
 				"dynamic",
 				"*",
-				"workspaceProps(\n\t\t\t\t\tloaded.parent,\n\t\t\t\t\tagent,\n\t\t\t\t\tuser,\n\t\t\t\t\tchildVisible\n\t\t\t\t\t\t? { childLabel, onChildClose: closeChild, type: \"parent-with-child\" }\n\t\t\t\t\t\t: { type: \"document\" },\n\t\t\t\t\tparentMetadataChanged,\n\t\t\t\t)",
-				"unresolved JSX props > DocumentWorkspaceHost > parent > <RoomWorkspace>",
+				"workspaceProps(\n\t\t\t\t\t\tloaded.parent,\n\t\t\t\t\t\tagent,\n\t\t\t\t\t\tuser,\n\t\t\t\t\t\tchildVisible ? nested : { onChildOpen: openChild, type: \"document\" as const },\n\t\t\t\t\t\tparentMetadataChanged,\n\t\t\t\t\t)",
+				"unresolved JSX props > DocumentWorkspaceHost > <RoomWorkspace>",
 				1
 			],
 			[
@@ -59,7 +59,7 @@
 				1
 			]
 		],
-		"sourceHash": "890443cedd0584c3e57e5295f4fafff7f0bc8231c818cb706c061d097991b49a"
+		"sourceHash": "345dc2d3be31b1d7c46b5e575d3dcdf7ed525944ead9cf0737de867c7b5a8deb"
 	},
 	{
 		"file": "apps/web/src/document-rename.tsx",
@@ -73,7 +73,7 @@
 				1
 			]
 		],
-		"sourceHash": "40ca22148b2b9580fa180823db072d1ba59234ba5f146c45bb98d94f9cc6a610"
+		"sourceHash": "834ae3a6082aff6f1456bacfb943f9f419c1ffd120de974ef2800a595f647be5"
 	},
 	{
 		"file": "apps/web/src/chat/markdown.tsx",
@@ -101,7 +101,7 @@
 				1
 			]
 		],
-		"sourceHash": "477aa401229f3086830dc6943ab1ee920a150001f1540c43844c8117dbcf31b4"
+		"sourceHash": "dd6b04ffeeb0a69121c30e09a20a5328d95eeed5aedb8e74c67d05500e015eac"
 	},
 	{
 		"file": "apps/web/src/project-sidebar.tsx",
@@ -115,7 +115,7 @@
 				1
 			]
 		],
-		"sourceHash": "477aa401229f3086830dc6943ab1ee920a150001f1540c43844c8117dbcf31b4"
+		"sourceHash": "dd6b04ffeeb0a69121c30e09a20a5328d95eeed5aedb8e74c67d05500e015eac"
 	},
 	{
 		"file": "apps/web/src/design-audit/icons.tsx",
@@ -129,7 +129,7 @@
 				1
 			]
 		],
-		"sourceHash": "078a445e391d0b35a6a13244dd2a8009277ecd1ad2b815dd9ec3f2d747d1c980"
+		"sourceHash": "08ac02d34f1c383b8e67469a125b92bff7ef1e0dc6ed77e43c34b6b765c53644"
 	},
 	{
 		"file": "apps/web/src/design-audit/controls.tsx",
@@ -157,7 +157,7 @@
 				1
 			]
 		],
-		"sourceHash": "fb330a89359e98822a720be68add8398dcad5a434788c1a96947a15b0f06f770"
+		"sourceHash": "6a831eddad9bc4aa3ee4e0d0be0b76611110e72c36dda112fdc1650bc4f1719a"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -171,7 +171,7 @@
 				1
 			]
 		],
-		"sourceHash": "fb330a89359e98822a720be68add8398dcad5a434788c1a96947a15b0f06f770"
+		"sourceHash": "6a831eddad9bc4aa3ee4e0d0be0b76611110e72c36dda112fdc1650bc4f1719a"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -192,7 +192,7 @@
 				1
 			]
 		],
-		"sourceHash": "fb330a89359e98822a720be68add8398dcad5a434788c1a96947a15b0f06f770"
+		"sourceHash": "6a831eddad9bc4aa3ee4e0d0be0b76611110e72c36dda112fdc1650bc4f1719a"
 	},
 	{
 		"file": "apps/web/src/terminal-alert.tsx",
@@ -215,13 +215,6 @@
 			[
 				"dynamic",
 				"class",
-				"motion.className",
-				"class > NavigationDrawer > <div>",
-				1
-			],
-			[
-				"dynamic",
-				"class",
 				"sidebarMotion.className",
 				"class > NavigationShell > <div>",
 				1
@@ -234,7 +227,21 @@
 				1
 			]
 		],
-		"sourceHash": "32351868c1423465eac33e7db7df58ef0c5c321c3ac304776dc9e00e7b14326f"
+		"sourceHash": "085a1e93a556df3e2e0374330c3272badfbb1d53e5cbd748e71a8a4b4c7e69be"
+	},
+	{
+		"file": "apps/web/src/navigation-drawer.tsx",
+		"reason": "Motion/presence contract returns finite semantic state classes; imported function evaluation is outside this static scanner. Review the producer when changing this boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"class",
+				"motion.className",
+				"class > NavigationDrawer > <div>",
+				1
+			]
+		],
+		"sourceHash": "2b72ef13673383cad8334636e328ec9367fd263a46b0281b2fe7ce0e4efdd729"
 	},
 	{
 		"file": "apps/web/src/viewport.ts",
@@ -248,21 +255,7 @@
 				1
 			]
 		],
-		"sourceHash": "7a500f7e32a5c4f8db23dfd0a11f66cb164a0ce0676f5ce1b0ff4df2607a410d"
-	},
-	{
-		"file": "apps/web/src/workspace.tsx",
-		"reason": "Component forwards or combines caller class names; static call-site classes are scanned. Runtime/cross-module values require review at this exact component boundary.",
-		"cases": [
-			[
-				"dynamic",
-				"class",
-				"className",
-				"class > ChatToggle > <button>",
-				1
-			]
-		],
-		"sourceHash": "c67c1e2ab9c4cf2886619429a10451766d50f964f5839a87deb35526e7f124e9"
+		"sourceHash": "118bf3770755db660ca06af9f24cb03dabe49a901f453b5bdfcbccb12c90a1db"
 	},
 	{
 		"file": "apps/web/src/workspace.tsx",
@@ -272,15 +265,8 @@
 				"dynamic",
 				"class",
 				"feedback",
-				"class > ChatToggle > <span>",
+				"class > SurfaceToggle > <span>",
 				2
-			],
-			[
-				"dynamic",
-				"class",
-				"feedback",
-				"class > ChatToggle > <img>",
-				1
 			],
 			[
 				"dynamic",
@@ -290,7 +276,7 @@
 				1
 			]
 		],
-		"sourceHash": "c67c1e2ab9c4cf2886619429a10451766d50f964f5839a87deb35526e7f124e9"
+		"sourceHash": "831e66816a4d138cd1aa768c8544cafdb451c35c3cae026f7003481b73fba155"
 	},
 	{
 		"file": "apps/web/src/navigation-dialog.tsx",
@@ -346,7 +332,7 @@
 				1
 			]
 		],
-		"sourceHash": "e9796d7c5c66ea469a4fffa8976d341f22ef4e67b6a256fbf693de763b9a4a55"
+		"sourceHash": "a09e6f8b44c76129cae233c1d57ddf54b7109b22e990febb4dddb9de11d6ca8c"
 	},
 	{
 		"file": "apps/web/src/document-picker.tsx",
@@ -360,7 +346,7 @@
 				1
 			]
 		],
-		"sourceHash": "e9796d7c5c66ea469a4fffa8976d341f22ef4e67b6a256fbf693de763b9a4a55"
+		"sourceHash": "a09e6f8b44c76129cae233c1d57ddf54b7109b22e990febb4dddb9de11d6ca8c"
 	},
 	{
 		"file": "apps/web/src/conversation-plan/markers.tsx",

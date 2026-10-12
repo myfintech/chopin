@@ -140,6 +140,8 @@ type Seen = {
 	full: ReturnType<typeof fullPlanner>;
 	instructions: string;
 	prompt: string;
+	visual: boolean;
+	tools: readonly string[];
 };
 
 /** The real session opener, over a harness stub that records what each turn runs with. */
@@ -165,6 +167,8 @@ function observe(context: Chat.Room): Seen[] {
 						full: fullPlanner(call.session.sessionId),
 						instructions: call.options.instructions,
 						prompt: call.prompt,
+						visual: !!channel.room.visual,
+						tools: context.chat.agent?.activeTools ?? [],
 					});
 					return { fullStream: (async function*() {})() };
 				},
@@ -196,6 +200,30 @@ async function browserTurn(context: Chat.Room, text: string) {
 	} as never);
 	await context.chat.running;
 }
+
+test("visual routing only attaches to bounded member turns on disposable harnesses", async () => {
+	for (let harness of ["copilot-sdk", "pi", "atomic"]) {
+		let { context } = await setup(configured({
+			HARNESS: harness,
+			HARNESS_AUTH: "ai-gateway",
+			MODEL: "stub/model",
+			PLANNER_VISUALS: "on",
+			JEV_API_KEY: "test-key",
+		}));
+		let seen = observe(context);
+		await browserTurn(context, "Explain the process.");
+		await browserTurn(context, "A".repeat(1_001));
+		await Chat.instruct(context, "ana", "Apply the accepted comment.", "Comment accepted.");
+		await context.chat.running;
+		expect(seen).toHaveLength(3);
+		for (let [index, turn] of seen.entries()) {
+			let routed = harness !== "atomic" && index === 0;
+			expect(turn.visual).toBe(routed);
+			expect(turn.tools.includes("assess_visual")).toBe(routed);
+			expect(turn.instructions.includes("call assess_visual")).toBe(routed);
+		}
+	}
+});
 
 test("an invoked instruction persists verbatim as a member message before publication and returns before the turn", async () => {
 	let { context, events, user } = await setup();
@@ -292,6 +320,24 @@ test("queued invocations post their durable message exactly once", async () => {
 	} finally {
 		first.resolve();
 	}
+});
+
+test("a child document's Planner cannot be invoked, so its Chat stays empty", async () => {
+	let { context, user } = await setup();
+	context.rootChannelId = crypto.randomUUID();
+	expect(await Chat.invoke(context, user, "Review")).toBe("planner-unavailable");
+	expect(context.chat.entries).toEqual([]);
+	expect(context.chat.busy).toBe(false);
+});
+
+test("an invoked instruction with focus names the child in its turn", async () => {
+	let { context, user } = await setup();
+	let seen = observe(context);
+	let focus = { channelId: "0f5b2c1e-8d3a-4b6f-9a21-7c4e5d6f7a8b", title: "Source review" };
+	expect(await Chat.invoke(context, user, "Summarize the open findings.", undefined, focus))
+		.toBeUndefined();
+	await context.chat.running;
+	expect(seen[0]!.prompt).toContain(`child id ${focus.channelId}`);
 });
 
 test("failed persistence, an unavailable Planner and a full queue start no invoked turn", async () => {
@@ -882,6 +928,63 @@ test("a run first reported as ended gets one finish message and never a repeat",
 	expect(spoken(context, "lint failed after 10 min.")).toBe(1);
 });
 
+const followUps = (calls: string[]) =>
+	calls.filter(call => call.includes("plan-review (run-1) ended blocked"));
+
+test("a run that ends blocked between turns starts one Planner turn about it before the kept session is let go", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	let planner = runningSession();
+	let opened = 0;
+	context.openPlannerSession = async () => {
+		opened++;
+		return { ok: true, value: planner.session };
+	};
+	await Chat.invoke(context, user, "Run the workflow");
+	await context.chat.running;
+	expect(context.chat.retained).toBeDefined();
+	planner.set({ active: [], paused: [], cards: [card("blocked")] });
+	while (!planner.calls.includes("destroy")) await tick();
+	expect(followUps(planner.calls)).toHaveLength(1);
+	expect(planner.calls.indexOf(followUps(planner.calls)[0]!)).toBeLessThan(
+		planner.calls.indexOf("destroy"),
+	);
+	expect(opened).toBe(1);
+	expect(spoken(context, "plan-review ended blocked after 10 min.")).toBe(1);
+	expect(context.chat.retained).toBeUndefined();
+});
+
+test("a run that ends blocked during the Planner's own turn starts no follow-up turn", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	let planner = runningSession();
+	context.openPlannerSession = async () => ({ ok: true, value: planner.session });
+	await Chat.invoke(context, user, "Run the workflow");
+	await context.chat.running;
+	let stream = planner.session.stream;
+	planner.session.stream = async (prompt: string) => {
+		planner.set({ active: [], paused: [], cards: [card("blocked")] });
+		return stream(prompt);
+	};
+	await Chat.invoke(context, user, "Check on it");
+	await context.chat.running;
+	while (!planner.calls.includes("destroy")) await tick();
+	expect(followUps(planner.calls)).toHaveLength(0);
+	expect(spoken(context, "plan-review ended blocked after 10 min.")).toBe(1);
+});
+
+test("a remote Planner's run that ends blocked between turns starts no turn nobody asked for", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	let planner = runningSession();
+	let remote = Object.assign(planner.session, { followsUpRuns: false });
+	context.openPlannerSession = async () => ({ ok: true, value: remote });
+	await Chat.invoke(context, user, "Run the workflow");
+	await context.chat.running;
+	expect(context.chat.retained).toBeDefined();
+	planner.set({ active: [], paused: [], cards: [card("blocked")] });
+	while (!planner.calls.includes("destroy")) await tick();
+	expect(followUps(planner.calls)).toHaveLength(0);
+	expect(spoken(context, "plan-review ended blocked after 10 min.")).toBe(1);
+});
+
 test("the last job finishing while a reply is still being saved still lets the Planner go afterwards", async () => {
 	let { context, user } = await setup(configured(ATOMIC));
 	let planner = runningSession();
@@ -1226,4 +1329,87 @@ test("an old helper's card still gets its stop message when its release could no
 		false,
 	);
 	expect(events.findLast(event => event.kind === "chat:state")?.runs).toEqual(context.chat.runs);
+});
+
+test("a focused member turn names the child before the member's words", async () => {
+	let { context } = await setup();
+	let child = "0f5b2c1e-8d3a-4b6f-9a21-7c4e5d6f7a8b";
+	context.children = {
+		list: async () => [],
+		resolve: async id => id === child ? { id, title: "Source review", createdAt: "" } : undefined,
+		open: async () => {
+			throw new Error("not used");
+		},
+	};
+	let seen = observe(context);
+	let ws = { data: { handle: "ana", principalId: "U_ana" }, send() {} } as unknown as Socket;
+	await Chat.send(context, ws, {
+		kind: "chat:send",
+		rid: "send",
+		requestId: crypto.randomUUID(),
+		to: "planner",
+		text: "@chopin shorten the summary",
+		focus: child,
+		ts: 0,
+	} as never);
+	await context.chat.running;
+	expect(seen).toHaveLength(1);
+	let prompt = seen[0]!.prompt;
+	expect(prompt.indexOf(`child id ${child}`)).toBeGreaterThanOrEqual(0);
+	expect(prompt.indexOf(`child id ${child}`)).toBeLessThan(prompt.indexOf("shorten the summary"));
+	expect(context.chat.entries.find(entry => entry.author.kind === "member")?.text)
+		.toBe("shorten the summary");
+});
+
+test("a focused message queued behind a busy turn still names the child when it drains", async () => {
+	let { context } = await setup();
+	let child = "0f5b2c1e-8d3a-4b6f-9a21-7c4e5d6f7a8b";
+	context.children = {
+		list: async () => [],
+		resolve: async id => id === child ? { id, title: "Source review", createdAt: "" } : undefined,
+		open: async () => {
+			throw new Error("not used");
+		},
+	};
+	let first = Promise.withResolvers<void>();
+	let opened = Promise.withResolvers<void>();
+	let prompts: string[] = [];
+	context.openPlannerSession = async () => ({
+		ok: true,
+		value: {
+			async stream(prompt) {
+				prompts.push(prompt);
+				opened.resolve();
+				return {
+					fullStream: (async function*() {
+						if (prompts.length === 1) await first.promise;
+						yield { type: "finish" };
+					})(),
+				} as never;
+			},
+			destroy: async () => {},
+		},
+	});
+	let ws = { data: { handle: "ana", principalId: "U_ana" }, send() {} } as unknown as Socket;
+	let send = (text: string, focus?: string) =>
+		Chat.send(context, ws, {
+			kind: "chat:send",
+			rid: crypto.randomUUID(),
+			requestId: crypto.randomUUID(),
+			to: "planner",
+			text,
+			...(focus ? { focus } : {}),
+			ts: 0,
+		} as never);
+	await send("@chopin first");
+	await opened.promise;
+	await send("@chopin shorten the summary", child);
+	expect(context.chat.waiting).toHaveLength(1);
+	first.resolve();
+	await context.chat.running;
+	expect(prompts).toHaveLength(2);
+	expect(prompts[0]).not.toContain(child);
+	let drained = prompts[1]!;
+	expect(drained.indexOf(`child id ${child}`)).toBeGreaterThanOrEqual(0);
+	expect(drained.indexOf(`child id ${child}`)).toBeLessThan(drained.indexOf("shorten the summary"));
 });

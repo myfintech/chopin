@@ -1,6 +1,6 @@
-import { useLayoutEffect } from "react";
+import { useLayoutEffect, useRef } from "react";
 
-import { currentViewport } from "@chopin/viewport";
+import { currentViewport, listenToViewportChanges } from "@chopin/viewport";
 
 import { commentRevealScroll } from "./comment-reveal";
 import { commentSheetTop } from "./comment-sheet";
@@ -8,47 +8,83 @@ import { planScroller } from "./scroll";
 
 import type { Rect } from "./comment-geometry";
 
-/** Keep a compact comment beside its passage, then return the reader on close. */
+/**
+ * Keep a compact comment's passage above its sheet, then return the reader on close.
+ *
+ * The sheet is as tall as its content, rests at a detent and rises with the
+ * keyboard, so the passage is placed again whenever any of them changes, from
+ * where it is now.
+ */
 export function useCommentSheetReveal({
+	detent,
 	host,
 	id,
 	passages,
+	sheet,
 }: {
+	/** How much of the sheet shows at its medium detent; undefined at the large one. */
+	detent?: number;
 	host: HTMLElement | undefined;
 	id: string | undefined;
 	passages: Rect[] | undefined;
+	/** The sheet's surface, which mounts a frame after the comment opens. */
+	sheet: HTMLElement | null;
 }) {
+	// The reader goes back to where they were only if the sheet still shows what it opened
+	// with; after paging to another thread, the document stays at that one.
+	let shown = useRef(id);
 	useLayoutEffect(() => {
-		if (!host || !id) return;
+		if (id) shown.current = id;
+	}, [id]);
+	let open = !!id;
+	useLayoutEffect(() => {
+		if (!host || !open) return;
 		let scroller = planScroller(host);
 		if (!scroller) return;
 		let top = scroller.scrollTop;
+		let opened = shown.current;
 		return () => {
-			if (scroller.isConnected) scroller.scrollTop = top;
+			if (scroller.isConnected && shown.current === opened) scroller.scrollTop = top;
 		};
-	}, [host, id]);
+	}, [host, open]);
 
 	useLayoutEffect(() => {
-		if (!host || !id || !passages || passages.length === 0) return;
+		if (!host || !id || !sheet || !passages || passages.length === 0) return;
 		let scroller = planScroller(host);
 		if (!scroller) return;
-		let frame = requestAnimationFrame(() => {
-			if (!scroller.isConnected) return;
-			let viewport = currentViewport();
-			let fit = Number(
-				document.querySelector<HTMLElement>("[data-plan-comment-sheet]")?.dataset.fit,
-			) || undefined;
-			let next = commentRevealScroll({
-				currentScroll: scroller.scrollTop,
-				gap: 20,
-				maxScroll: scroller.scrollHeight - scroller.clientHeight,
-				passageBottom: Math.max(...passages.map(passage => passage.bottom)),
-				passageTop: Math.min(...passages.map(passage => passage.top)),
-				sheetTop: viewport.top + commentSheetTop(viewport.height, fit),
-				viewportTop: host.getBoundingClientRect().top,
+		// Passages are measured relative to the scroll position they were taken at.
+		let measuredAt = scroller.scrollTop;
+		let frame = 0;
+		let reveal = () => {
+			cancelAnimationFrame(frame);
+			frame = requestAnimationFrame(() => {
+				if (!scroller.isConnected || !sheet.isConnected) return;
+				let viewport = currentViewport();
+				let keyboard = Math.max(0, window.innerHeight - viewport.top - viewport.height);
+				let shift = scroller.scrollTop - measuredAt;
+				let next = commentRevealScroll({
+					currentScroll: scroller.scrollTop,
+					gap: 20,
+					maxScroll: scroller.scrollHeight - scroller.clientHeight,
+					passageBottom: Math.max(...passages.map(passage => passage.bottom)) - shift,
+					passageTop: Math.min(...passages.map(passage => passage.top)) - shift,
+					sheetTop: commentSheetTop(
+						{ top: 0, height: window.innerHeight - keyboard },
+						Math.min(sheet.offsetHeight, detent ?? Infinity),
+					),
+					viewportTop: host.getBoundingClientRect().top,
+				});
+				if (Math.abs(next - scroller.scrollTop) >= 1) scroller.scrollTop = next;
 			});
-			if (Math.abs(next - scroller.scrollTop) >= 1) scroller.scrollTop = next;
-		});
-		return () => cancelAnimationFrame(frame);
-	}, [host, id, passages]);
+		};
+		reveal();
+		let observer = new ResizeObserver(reveal);
+		observer.observe(sheet);
+		let off = listenToViewportChanges(reveal);
+		return () => {
+			cancelAnimationFrame(frame);
+			observer.disconnect();
+			off();
+		};
+	}, [detent, host, id, passages, sheet]);
 }

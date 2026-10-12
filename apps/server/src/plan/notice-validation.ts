@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import { ULID } from "@chopin/dialect";
+import { isChannelId } from "../channels/id";
 import * as Question from "@chopin/question";
 import { assertSourceShape, validateSource } from "../conversation-plan/sources";
 import type { ConversationPlan } from "@chopin/protocol";
@@ -11,6 +12,20 @@ export function validateNotice(
 	entry: Record<string, JsonValue>,
 	savedMessages: Map<JsonValue, Record<string, JsonValue>>,
 ): void {
+	if (Object.hasOwn(entry, "comment")) {
+		let author = entry.author as Record<string, JsonValue>;
+		let comment = entry.comment as Record<string, JsonValue> | null;
+		if (
+			author.kind !== "system" || !comment || typeof comment !== "object"
+			|| Array.isArray(comment)
+			|| Object.keys(comment).some(key => !["thread", "excerpt", "note", "channelId"].includes(key))
+			|| typeof comment.thread !== "string" || !ULID.test(comment.thread)
+			|| typeof comment.excerpt !== "string" || comment.excerpt.length > 200
+			|| typeof comment.note !== "string" || comment.note.length > 4_000
+			|| Object.hasOwn(comment, "channelId")
+				&& (typeof comment.channelId !== "string" || !isChannelId(comment.channelId))
+		) throw new Error("hosted channel has an invalid transcript entry");
+	}
 	if (Object.hasOwn(entry, "decision")) {
 		let author = entry.author as Record<string, JsonValue>;
 		let decision = entry.decision;

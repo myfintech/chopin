@@ -3,6 +3,7 @@ export type { AuthorshipView } from "./authorship";
 export { SidecarCard } from "./card";
 export type { SidecarCardProps } from "./card";
 export { CardMetaStore, useCardMeta } from "./card-meta";
+export { ChopinMark } from "./chopin-mark";
 export { collaborationPlugin } from "./collaboration";
 export type { CollaborationOptions } from "./collaboration";
 export { CONNECTION_GRACE, CONNECTION_STALL, useConnectionNotice } from "./connection-notice";
@@ -15,6 +16,7 @@ export type { Cursor } from "./cursor";
 export {
 	advanceDecisionView,
 	countUnanswered,
+	decisionsDeck,
 	documentHasPlanningContent,
 	firstOpenDecision,
 	selectDecisionView,
@@ -23,6 +25,8 @@ export {
 export type { DecisionView, DecisionViewState, OpeningPhase } from "./decision-state";
 export { Decisions } from "./decisions";
 export type { DecisionsProps } from "./decisions";
+export { Deck, DECK_FRONT_EVENT, revealDeckItem } from "./deck";
+export type { DeckItem, DeckProps } from "./deck";
 export {
 	disclosureAccessibility,
 	MotionDisclosure,
@@ -30,12 +34,15 @@ export {
 } from "./disclosure-motion";
 export type { MotionDisclosureContract } from "./disclosure-motion";
 export { displayName } from "./display-name";
+export { documentEditMode, opensEditing, selectionOffer } from "./edit-mode";
+export type { EditMode } from "./edit-mode";
 export { AgentFace, Face } from "./face";
 export type { FaceProps } from "./face";
+export { GitHubReferencesProvider } from "./github-references";
 export type { Refusal } from "./history";
 export { PlanEditor } from "./plan-editor";
 export type { PlanEditorProps, PlanState } from "./plan-editor";
-export { usePointerCapabilities } from "./pointer";
+export { isPhone, usePhone, usePointerCapabilities } from "./pointer";
 export { usePopoverDismissal } from "./popover-dismissal";
 export { PlanProvider } from "./provider";
 export type { PlanProviderOptions } from "./provider";
@@ -51,7 +58,15 @@ export type { ResearchLaunchBlock, ResearchLaunchResult } from "./research-launc
 export { SendAction } from "./send-action";
 export { PlanStatus } from "./status";
 export type { PlanStatusProps } from "./status";
-export { ThreadObserver, ThreadStore, useThreads } from "./threads";
+export {
+	handlesOpenComment,
+	openCommentThread,
+	openOutcome,
+	openRequest,
+	ThreadObserver,
+	ThreadStore,
+	useThreads,
+} from "./threads";
 export type { Draft, ThreadState, ThreadView } from "./threads";
 export {
 	MENU_SURFACE,
@@ -64,6 +79,8 @@ export type { PresenceAction, PresencePhase, TransitionPresence } from "./transi
 export type { Connection, Transport, Unsubscribe } from "./transport";
 export type {
 	CommentPresentation,
+	GitHubReferenceEntry,
+	GitHubReferenceStore,
 	QuestionStepMotion,
 	ResearchOpener,
 	ResearchStore,

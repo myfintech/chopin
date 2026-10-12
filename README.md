@@ -62,8 +62,9 @@ and tool vocabulary remain optimized for planning.
 
 - Chopin supports GitHub.com. GitHub Enterprise Server endpoints are not
   configurable.
-- The Planner's file, tree, and history tools read the default branch captured
-  when its session starts; code search is repository-scoped. Except under
+- The Planner's file, tree, and history tools normally read the default branch captured
+  when its session starts; investigation evidence can supply an exact commit instead.
+  Code search is repository-scoped. Except under
   `HARNESS=atomic`, it never reads a local checkout or uncommitted changes.
 - Every browser participant signs in, passes the instance admission policy, and
   needs repository access through the GitHub App installation. MCP callers also
@@ -100,6 +101,11 @@ and tool vocabulary remain optimized for planning.
   Independent research analysis can propose [research offers](docs/conversation-research.md)
   with shared editable briefs. Brief synthesis uses an isolated harness worker;
   a writer starts the research explicitly.
+- Experimental Planner visual routing is opt-in with `PLANNER_VISUALS=on` and
+  `JEV_API_KEY`. Jev makes small possibility, comprehension, and type decisions
+  for one explanatory paragraph at a time; Planner authors the selected visual.
+  Routing applies to explicit member requests of at most 1,000 characters under
+  `copilot-sdk` or `pi`. Other turns keep their ordinary authoring behavior.
 - One Chopin process may write to a database at a time. Horizontal application
   scaling and zero-downtime rolling deployment are not supported.
 
@@ -185,7 +191,10 @@ a Chat reference.
 
 Chopin exposes a bearer-authenticated Streamable HTTP MCP endpoint. See
 [Connect a local coding agent](docs/local-agent-mcp.md) for Claude Code, Codex
-CLI, and GitHub Copilot CLI configuration.
+CLI, and GitHub Copilot CLI configuration. Its document tools include
+[`upload_image`](docs/local-agent-mcp.md#upload-an-image), which hosts a PNG,
+JPEG, WebP, or GIF of at most 1 MiB for a document; only people who can read
+that document can load it.
 
 Planning is one way to use a Chopin document today. The optional
 [creating-chopin-plans skill](skills/creating-chopin-plans/SKILL.md) turns a
@@ -197,6 +206,10 @@ created through MCP, and Chopin does not yet provide a user-facing way to approv
 a draft graph.
 
 ## Documentation
+
+For owner-authorized local prototypes, measurements, and service-data investigations,
+see [Local investigations](docs/local-experiments.md). An ACP-compatible agent works
+in a local checkout and publishes captured evidence to Chopin's native views.
 
 | Topic                                      | Document                                                     |
 | ------------------------------------------ | ------------------------------------------------------------ |

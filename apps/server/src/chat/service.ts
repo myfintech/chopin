@@ -25,13 +25,15 @@ import type { PlannerSession } from "../harness/session";
 import { verifiedCheckout } from "../harness/atomic/checkout";
 import { rememberCheckout } from "../harness/atomic/workspace";
 import { plannerInstructions } from "../agent/planner";
+import { askJev } from "../conversation-plan/jev";
 import type { ActiveOwnerBinding } from "../agent/active-owner";
 import type { DocumentRoom, ResearchWorkspaceRequest } from "../agent/tools";
+import type { ChildDocuments } from "./children";
 import * as Service from "../plan/service";
 import * as DocumentProvenance from "../document-provenance";
 import { instruction } from "@chopin/protocol/address";
 
-import { annotatedText, compose, referenceCatalog, remember } from "./address";
+import { annotatedText, compose, focusContext, referenceCatalog, remember } from "./address";
 import { createNotices } from "./notices";
 import { createJobQueue, finishJob, jobReason, type JobTurn, safeProjection } from "./job-queue";
 import { translateJob } from "./job-translate";
@@ -40,6 +42,7 @@ import { watchJobAbort } from "./job-fence";
 import { JOB_TOOLS } from "../agent/job-scope";
 import type { JobOutcome } from "../conversation-plan/jobs";
 export type { Announcer, NoticeInput } from "./notices";
+import { isChannelId } from "../channels/id";
 import { broadcast, fail, reply, tell } from "../wire";
 import { MAX_MESSAGE_BYTES } from "./limits";
 
@@ -51,7 +54,7 @@ import type { HostedAuth } from "../auth/routes";
 import type { HostedRepository } from "../agent/repository";
 import type { JobService } from "../jobs/service";
 import type { Plan } from "../plan/service";
-import type { Said } from "./address";
+import type { Focus, Said } from "./address";
 import type { ReferenceService } from "./references";
 import type { Socket, SocketData } from "../wire";
 
@@ -88,6 +91,9 @@ export type Waiting = Wire.Waiting & {
 	message?: boolean;
 	/** The comment thread this turn was started to act on, if one was. */
 	thread?: string;
+	/** Told how the turn went, before the queue moves on; see `Instruction`. */
+	ended?: Instruction["ended"];
+	started?: Instruction["started"];
 	/** Login session whose Copilot entitlement owns this queued turn. */
 	sessionId?: string;
 	/** Verified member identity, retained only for a queued composer message. */
@@ -97,6 +103,21 @@ export type Waiting = Wire.Waiting & {
 	posted?: boolean;
 	/** MCP caller whose instruction this is; it never claims ownership without their login. */
 	invokedBy?: string;
+	/** The task draft this queued turn carries; it has no message to show in the queue. */
+	draft?: string;
+	/** The child the member had open, resolved when the message was accepted. */
+	focus?: Focus;
+	/** The child holding `thread`, when the thread is not in this document. */
+	threadChannel?: string;
+};
+
+/** A request for implementation tasks, live while its turn is queued or running. */
+export type TaskDraft = {
+	id: string;
+	planRevision: number;
+	state: "queued" | "running";
+	/** The running turn, once it has begun. */
+	turn?: string;
 };
 
 export type ActiveMemberRequest = {
@@ -107,15 +128,103 @@ export type ActiveMemberRequest = {
 	claimantSessionId: string | undefined;
 	turnId: string;
 	lifecycle: number;
+	focus?: Focus;
 };
 
-type MemberRequest = Pick<ActiveMemberRequest, "entryId" | "userId">;
+type MemberRequest = Pick<ActiveMemberRequest, "entryId" | "userId" | "focus">;
+
+/** How a turn started by an instruction finished, for whoever started it. */
+export type Ended = {
+	/** `skipped` means it never ran, because it was spent or withdrawn first. */
+	status: "done" | "stopped" | "failed" | "skipped";
+	/** The last thing the Planner said in Chat during the turn, if anything. */
+	text?: string;
+};
 
 /** What a turn other than a message needs to say about itself. */
 export type Instruction = {
 	spent?: () => boolean;
 	thread?: string;
+	/**
+	 * Awaited once the turn has been persisted and before the next one starts,
+	 * so whatever it records lands before anything the next turn does. Also
+	 * called, with `skipped`, for a turn that never runs.
+	 */
+	ended?: (outcome: Ended) => void | Promise<void>;
+	/** Called when the turn begins running, so its owner knows what it was shown. */
+	started?: () => void;
+	/** Shown on the transcript notice, so Chat can draw it as a comment card. */
+	comment?: NonNullable<Wire.Entry["comment"]>;
+	/** The child the turn is about; named ahead of the prompt like a member's focus. */
+	focus?: Focus;
+	/** The child holding `thread`, when the thread is not in this document. */
+	threadChannel?: string;
 };
+
+/**
+ * A child room's way to its root's Chat, which is the only one.
+ *
+ * Each call opens the root's room and re-asks storage that the child still
+ * belongs to it, so a child that moved, or a root that went away, refuses.
+ */
+export type RootChat = {
+	id: string;
+	/** Admission against the root's queue, opening the root's room if needed. */
+	admission(thread: string): Promise<"running" | "queued" | "off" | "busy">;
+	/** An explicit Planner turn on the root's Chat about a thread in this child. */
+	instruct(handle: string, text: string, said: string, about: Instruction): Promise<void>;
+	/** Whether the root's Chat is running or holding a turn for this child's thread. */
+	working(thread: string): boolean;
+};
+
+/** Tell an instruction's owner how it went; their failure is theirs, not the queue's. */
+async function report(about: Instruction | undefined, outcome: Ended): Promise<void> {
+	if (!about?.ended) return;
+	try {
+		await about.ended(outcome);
+	} catch (err) {
+		console.error("[chat] an instruction's end could not be recorded:", err);
+	}
+}
+
+/**
+ * Whether an instruction about `thread` would run now, wait, or be refused.
+ *
+ * Asked before anything is saved, so a full queue refuses a comment rather than
+ * saving one nobody will act on. A thread that already has a turn waiting
+ * folds into it instead of queueing again, so it never counts against the cap.
+ */
+export function admission(
+	context: Pick<Room, "chat" | "config">,
+	thread?: string,
+	channel?: string,
+): "running" | "queued" | "off" | "busy" {
+	let { chat, config } = context;
+	if (!config.agent) return "off";
+	if (thread && queuedFor(chat, thread, channel)) return "queued";
+	if (!chat.busy) return "running";
+	return chat.waiting.length >= MAX_QUEUE ? "busy" : "queued";
+}
+
+/**
+ * The waiting turn for a thread, if one is queued and still worth running.
+ *
+ * `channel` names the child holding the thread; absent, the thread is this document's.
+ */
+export function queuedFor(chat: Chat, thread: string, channel?: string): Waiting | undefined {
+	return chat.waiting.find(item =>
+		item.thread === thread && item.threadChannel === channel
+		&& !item.message && !item.job && !item.draft && !item.spent?.()
+	);
+}
+
+/** Whether a turn is running or waiting for a thread; `channel` as for `queuedFor`. */
+export function workingFor(chat: Chat | undefined, thread: string, channel?: string): boolean {
+	// A closed Chat runs nothing more, whatever its last turn left behind.
+	if (!chat || chat.closed) return false;
+	return chat.acting === thread && chat.actingChannel === channel
+		|| !!queuedFor(chat, thread, channel);
+}
 
 export type Chat = {
 	job?: ConversationPlan.Job;
@@ -157,6 +266,8 @@ export type Chat = {
 	 * that decision produced even when the agent forgets to say so itself.
 	 */
 	acting?: string;
+	/** The child holding `acting`, or undefined when the thread is in this document. */
+	actingChannel?: string;
 	/** The entry the agent is currently writing into. */
 	writing?: string;
 	/** The dedicated entry collecting tool calls for this turn. */
@@ -187,6 +298,8 @@ export type Chat = {
 	 * than losing it.
 	 */
 	backscroll: Said[];
+	/** The document's live task draft; never persisted, like the turn it rides. */
+	draft?: TaskDraft;
 };
 
 export function create(): Chat {
@@ -267,7 +380,15 @@ function requestFingerprint(msg: Request<Wire.Send>, principalId: string): strin
 			return Object.keys(item).sort().map(key => [key, item[key]]);
 		})
 		: msg.references ?? [];
-	return digest(JSON.stringify([principalId, msg.to, msg.text, references]));
+	// Appended only when present, so replays of entries saved before focus existed still match.
+	let focus = (msg as { focus?: unknown }).focus;
+	return digest(JSON.stringify([
+		principalId,
+		msg.to,
+		msg.text,
+		references,
+		...(focus !== undefined ? [focus] : []),
+	]));
 }
 
 function canonicalFingerprint(
@@ -409,7 +530,7 @@ function responded(chat: Chat, server: Server<SocketData>, room: string, text: s
  * None of it belongs in the wire projection.
  */
 function visible(chat: Chat): Wire.Waiting[] {
-	return chat.waiting.map(({ handle, id, text, references }) => ({
+	return chat.waiting.filter(item => !item.draft).map(({ handle, id, text, references }) => ({
 		handle,
 		id,
 		text,
@@ -450,6 +571,7 @@ export function greet(chat: Chat, ws: Socket): void {
 }
 
 export type Room = {
+	investigations?: import("../agent/experiment-tools").InvestigationTools;
 	chat: Chat;
 	plan: Plan;
 	server: Server<SocketData>;
@@ -463,6 +585,12 @@ export type Room = {
 	 */
 	claimantSessionId: string | undefined;
 	repository: HostedRepository;
+	/**
+	 * Under `HARNESS=remote`, how to attach a Planner when none is attached, or
+	 * undefined while one is. Planner requests are refused before anything is
+	 * posted or queued, and only an attachment takes Planner ownership.
+	 */
+	plannerNotAttached?: () => Promise<string | undefined>;
 	activeOwner?: () => Promise<ActiveOwnerBinding | undefined>;
 	persist: (chat?: () => Pick<Chat, "entries" | "runs">) => Promise<void>;
 	commitRoomMessage?: (entry: Wire.Entry) => Promise<void>;
@@ -481,6 +609,14 @@ export type Room = {
 	}) => Promise<ResearchWorkspaceRequest>;
 	/** Keeps the room loaded while a retained Planner still owns workflow runs; returns the release. */
 	hold?: () => () => void;
+	/** The task draft the turn being started carries. */
+	draft?: string;
+	/** This root's children. Absent when this room is itself a child. */
+	children?: ChildDocuments;
+	/** Set only when this room is a child: its root, which owns the only Chat. */
+	rootChannelId?: string;
+	/** Set only when this room is a child: how its comments reach the root's Chat. */
+	root?: RootChat;
 };
 
 type Retained = {
@@ -522,8 +658,12 @@ export async function invoke(
 	user: { id: string; login: string },
 	text: string,
 	checkout?: string,
+	focus?: Focus,
+	/** Called once, when the invoked turn ends or is dropped; never when this refuses. */
+	settled?: () => void,
 ): Promise<
 	| "planner-unavailable"
+	| "planner-not-attached"
 	| "planner-owner-unavailable"
 	| "planner-queue-full"
 	| "checkout-unverified"
@@ -533,14 +673,17 @@ export async function invoke(
 	if (chat.pendingSends >= MAX_PENDING_SENDS) return "planner-queue-full";
 	chat.pendingSends++;
 	let post = async () => {
-		if (!context.config.agent || chat.closed) return "planner-unavailable" as const;
+		if (!context.config.agent || chat.closed || context.rootChannelId) {
+			return "planner-unavailable" as const;
+		}
+		if (await context.plannerNotAttached?.()) return "planner-not-attached" as const;
 		let verified: string | undefined;
 		if (checkout !== undefined && context.config.harness === "atomic") {
 			verified = await verifiedCheckout(context.repository, checkout);
 			if (!verified) return "checkout-unverified" as const;
 		}
 		try {
-			await resolveOwner(context.auth, context.repository, room, context.claimantSessionId);
+			await resolveOwner(context.auth, context.repository, room, claimant(context));
 		} catch {
 			return "planner-owner-unavailable" as const;
 		}
@@ -572,6 +715,8 @@ export async function invoke(
 				sessionId: context.claimantSessionId,
 				userId: user.id,
 				invokedBy: user.id,
+				...(focus ? { focus } : {}),
+				...(settled ? { ended: settled } : {}),
 			});
 			queued(chat, server, room);
 		} else {
@@ -582,8 +727,14 @@ export async function invoke(
 				undefined,
 				context.claimantSessionId,
 				false,
-				{ entryId: entry.id, userId: user.id },
+				{ entryId: entry.id, userId: user.id, ...(focus ? { focus } : {}) },
 			);
+			// Started here, so this promise is this turn's own (and the queue it drains).
+			let running = chat.running;
+			if (settled) {
+				if (running) void running.finally(settled).catch(() => {});
+				else settled();
+			}
 		}
 		return undefined;
 	};
@@ -610,6 +761,9 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 	if (destination !== "room" && destination !== "planner") {
 		return fail(ws, msg.rid, "invalid message destination");
 	}
+	if (context.rootChannelId) {
+		return fail(ws, msg.rid, "this document's Chat is on its root document");
+	}
 	if (typeof msg.text !== "string") return fail(ws, msg.rid, "invalid message text");
 	if (Buffer.byteLength(msg.text) > MAX_MESSAGE_BYTES) {
 		return fail(ws, msg.rid, "chat message exceeds the 64 KiB limit");
@@ -617,6 +771,24 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 	let request = requestFingerprint(msg, ws.data.principalId);
 	if (replay(chat, ws, msg, requestId, request)) return;
 	if (chat.closed) return fail(ws, msg.rid, "chat is closed");
+	let focus: Focus | undefined;
+	let suppliedFocus = (msg as { focus?: unknown }).focus;
+	if (suppliedFocus !== undefined) {
+		if (typeof suppliedFocus !== "string" || !isChannelId(suppliedFocus)) {
+			return fail(ws, msg.rid, "invalid chat focus");
+		}
+		if (destination === "planner") {
+			let child: Awaited<ReturnType<ChildDocuments["resolve"]>>;
+			try {
+				child = await context.children?.resolve(suppliedFocus);
+			} catch (err) {
+				// Storage detail stays in the log; the member only learns the child is unavailable.
+				console.error("[chat] could not resolve the focused child document:", err);
+			}
+			if (!child) return fail(ws, msg.rid, "the open child document is unavailable");
+			focus = { channelId: child.id, title: child.title };
+		}
+	}
 	let projected: { text: string; references?: Wire.Reference[] };
 	try {
 		if (context.references) {
@@ -702,6 +874,10 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 		return;
 	}
 
+	let unattached = await context.plannerNotAttached?.();
+	if (unattached) return fail(ws, msg.rid, unattached, "planner-not-attached");
+	if (chat.closed) return fail(ws, msg.rid, "chat is closed");
+
 	if (chat.busy) {
 		if (chat.waiting.length >= MAX_QUEUE) {
 			say(chat, server, room, {
@@ -721,6 +897,7 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 			message: true,
 			sessionId: context.claimantSessionId,
 			userId: ws.data.principalId,
+			...(focus ? { focus } : {}),
 		};
 		chat.waiting.push(waiting);
 		reply(ws, msg.rid, { kind: "chat:send", ts: 0, id: waiting.id, queued: true });
@@ -758,7 +935,7 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 		undefined,
 		context.claimantSessionId,
 		true,
-		{ entryId: entry.id, userId: ws.data.principalId },
+		{ entryId: entry.id, userId: ws.data.principalId, ...(focus ? { focus } : {}) },
 		references,
 	);
 }
@@ -769,9 +946,19 @@ export let { notice, noticeOnce, noticeExclusive, refreshNoticeExclusive } = cre
 	announce,
 });
 
-function instructionNotice(context: Room, text: string): void | Promise<void> {
+function instructionNotice(
+	context: Room,
+	text: string,
+	comment?: Instruction["comment"],
+): void | Promise<void> {
 	let { chat, room, server } = context;
-	let entry: Wire.Entry = { id: ulid(), author: { kind: "system" }, text, ts: now() };
+	let entry: Wire.Entry = {
+		id: ulid(),
+		author: { kind: "system" },
+		text,
+		ts: now(),
+		...(comment ? { comment } : {}),
+	};
 	chat.entries.push(entry);
 	return context.persist().then(() => announce(server, room, entry));
 }
@@ -793,6 +980,8 @@ export function instruct(
 	about: Instruction = {},
 ): void | Promise<void> {
 	let { chat, config, room, server } = context;
+	// A child has no Chat to explain the turn in, and its root's Planner reaches it there.
+	if (context.rootChannelId) return report(about, { status: "skipped" });
 	let proceed = (): void | Promise<void> => {
 		if (chat.closed) return;
 		// `AGENT=off` runs the room without one. The decision that got here is
@@ -809,29 +998,170 @@ export function instruct(
 			return context.persist().then(() => announce(server, room, entry));
 		}
 
+		// A thread that already has a turn waiting is told about the newer note
+		// by that turn: its prompt is replaced, since it reads the whole thread.
+		let folded = about.thread ? queuedFor(chat, about.thread, about.threadChannel) : undefined;
+		if (folded) {
+			folded.handle = handle;
+			folded.text = text;
+			return;
+		}
+
 		if (chat.busy) {
 			if (chat.waiting.length >= MAX_QUEUE) {
-				return void say(chat, server, room, {
+				say(chat, server, room, {
 					id: ulid(),
 					author: { kind: "system" },
 					text: "The queue is full. Wait for the current turn to finish.",
 					ts: now(),
 				});
+				return report(about, { status: "failed" });
 			}
+			let { comment: _comment, ...rest } = about;
 			chat.waiting.push({
 				id: ulid(),
 				handle,
 				text,
-				...about,
+				...rest,
 				sessionId: context.claimantSessionId,
 			});
 			return queued(chat, server, room);
 		}
 
-		startRun(context, handle, text, about.thread, context.claimantSessionId);
+		startRun(context, handle, text, about, context.claimantSessionId);
 	};
-	let announced = instructionNotice(context, said);
+	let announced = instructionNotice(context, said, about.comment);
 	return announced instanceof Promise ? announced.then(proceed) : proceed();
+}
+
+function drafting(
+	server: Server<SocketData>,
+	room: string,
+	draft: TaskDraft,
+	state: "queued" | "running" | "ended",
+): void {
+	broadcast(server, room, {
+		kind: "implementation:drafting",
+		ts: 0,
+		id: draft.id,
+		planRevision: draft.planRevision,
+		state,
+	});
+}
+
+/**
+ * The draft that is still queued or running, if one is.
+ *
+ * A record whose queue entry or turn has gone without reaching the end of a
+ * turn (a closed room, a queue cleared after a failed save) is dropped here
+ * rather than tracked down every path that can discard it.
+ */
+function liveDraft(chat: Chat): TaskDraft | undefined {
+	let draft = chat.draft;
+	if (!draft) return;
+	let alive = draft.state === "queued"
+		? chat.waiting.some(item => item.draft === draft.id)
+		: chat.busy && (!draft.turn || chat.turn?.id === draft.turn);
+	if (alive) return draft;
+	chat.draft = undefined;
+}
+
+export type TaskDraftResult =
+	| {
+		ok: true;
+		draft: TaskDraft;
+		/** As of the reply: a turn can finish before its request is answered. */
+		state: "queued" | "running" | "ended";
+		existing: boolean;
+	}
+	| { ok: false; reason: string };
+
+/**
+ * Ask the Planner for implementation tasks without a member message.
+ *
+ * Like an accepted comment, this is an instruction rather than something said:
+ * the transcript gets a system line saying who asked, and the instruction goes
+ * to the model alone. One draft per document is live, whatever revision it was
+ * asked for, since its instruction reads the latest document; asking again
+ * returns it, so collaborators opening Build together start one turn. It takes
+ * the same place in line, and the same limits, as a Chat message.
+ */
+export function draftTasks(
+	context: Room,
+	handle: string,
+	planRevision: number,
+	text: string,
+	said: string,
+): Promise<TaskDraftResult> {
+	let { chat } = context;
+	if (chat.pendingSends >= MAX_PENDING_SENDS) {
+		return Promise.resolve({ ok: false, reason: "the Planner queue is full" });
+	}
+	chat.pendingSends++;
+	let post = () => postDraft(context, handle, planRevision, text, said);
+	let accepted = chat.sending.then(post, post);
+	let completed = accepted.finally(() => chat.pendingSends--);
+	chat.sending = completed.then(() => {}, () => {});
+	return completed;
+}
+
+async function postDraft(
+	context: Room,
+	handle: string,
+	planRevision: number,
+	text: string,
+	said: string,
+): Promise<TaskDraftResult> {
+	let { chat, config, room, server } = context;
+	if (!config.agent) return { ok: false, reason: "the Planner is not running" };
+	if (chat.closed) return { ok: false, reason: "chat is closed" };
+	let existing = liveDraft(chat);
+	if (existing) return { ok: true, draft: existing, state: existing.state, existing: true };
+	// The draft waits in the queue even when the Planner is idle, so it counts against it.
+	if (chat.waiting.length >= MAX_QUEUE) return { ok: false, reason: "the Planner queue is full" };
+	let draft: TaskDraft = { id: ulid(), planRevision, state: "queued" };
+	chat.draft = draft;
+	let waiting: Waiting = {
+		id: draft.id,
+		handle,
+		text,
+		draft: draft.id,
+		sessionId: context.claimantSessionId,
+	};
+	// Held in the queue while the notice saves, so the draft stays live throughout.
+	chat.waiting.push(waiting);
+	let abandon = (reason: string): TaskDraftResult => {
+		chat.waiting = chat.waiting.filter(item => item !== waiting);
+		if (chat.draft === draft) chat.draft = undefined;
+		return { ok: false, reason };
+	};
+	try {
+		await instructionNotice(context, said);
+	} catch {
+		return abandon("could not save the request");
+	}
+	if (chat.closed) return abandon("chat is closed");
+	let answer = (): TaskDraftResult => ({
+		ok: true,
+		draft,
+		state: liveDraft(chat) === draft ? draft.state : "ended",
+		existing: false,
+	});
+	// A turn that ended while the notice saved may already have started, or finished, this one.
+	if (!chat.waiting.includes(waiting)) return answer();
+	if (chat.busy) {
+		drafting(server, room, draft, "queued");
+		return answer();
+	}
+	chat.waiting = chat.waiting.filter(item => item !== waiting);
+	startRun(
+		{ ...context, draft: draft.id },
+		handle,
+		text,
+		undefined,
+		context.claimantSessionId,
+	);
+	return answer();
 }
 
 let jobState = safeProjection(state);
@@ -851,6 +1181,7 @@ export function unqueue(context: Room, ws: Socket, msg: Request<Wire.Unqueue>): 
 	if (!found || found.job || found.handle !== ws.data.handle) return;
 	chat.waiting = chat.waiting.filter(item => item.id !== msg.id);
 	queued(chat, server, room);
+	void report(found, { status: "skipped" });
 }
 
 /**
@@ -1005,6 +1336,9 @@ const ENDED_RUN: Partial<Record<Wire.Run["status"], string>> = {
 	stopped: "was stopped",
 };
 
+/** Ended runs the Planner is asked to follow up on when they end between its turns. */
+const NEEDS_FOLLOW_UP: Partial<Record<Wire.Run["status"], true>> = { blocked: true, failed: true };
+
 /**
  * The run cards Chat shows after the retained session reports `incoming`. Ended
  * cards stay until a new run starts in the document. With no report, the session
@@ -1049,12 +1383,13 @@ function publishRuns(
 	session: PlannerSession,
 	runs: Runs | undefined,
 	releasing = false,
+	followUp = false,
 ): Promise<void> {
 	let known = owners.get(context.chat) ?? new Map<string, PlannerSession>();
 	owners.set(context.chat, known);
 	for (let run of runs?.cards ?? []) known.set(run.id, session);
 	let turn = (publishing.get(context.chat) ?? Promise.resolve()).then(() =>
-		publishReport(context, session, runs, releasing)
+		publishReport(context, session, runs, releasing, followUp)
 	);
 	publishing.set(context.chat, turn);
 	return turn;
@@ -1065,6 +1400,7 @@ async function publishReport(
 	session: PlannerSession,
 	runs: Runs | undefined,
 	releasing: boolean,
+	followUp: boolean,
 ): Promise<void> {
 	let { chat, room, server } = context;
 	let at = now();
@@ -1093,17 +1429,18 @@ async function publishReport(
 	let shown = new Set(cards.map(run => run.id));
 	let replaced = mine.filter(run => !shown.has(run.id));
 	let finished: Wire.Entry[] = [];
+	let attention: Array<{ run: Wire.Run; said: string }> = [];
 	for (let run of [...cards, ...replaced]) {
 		let ended = ENDED_RUN[run.status];
 		let previous = before.get(run.id);
 		if (!ended || (previous && ENDED_RUN[previous])) continue;
 		let minutes = Math.max(1, Math.round(((run.ended ?? run.updated) - run.started) / 60));
-		finished.push({
-			id: ulid(),
-			author: { kind: "system" },
-			text: `${run.name} ${ended} after ${minutes} min.`,
-			ts: now(),
-		});
+		let said = `${run.name} ${ended} after ${minutes} min.`;
+		if (followUp && !releasing && NEEDS_FOLLOW_UP[run.status] && known.get(run.id) === session) {
+			attention.push({ run, said });
+			continue;
+		}
+		finished.push({ id: ulid(), author: { kind: "system" }, text: said, ts: now() });
 	}
 	let next = cards.length ? cards : undefined;
 	try {
@@ -1119,6 +1456,20 @@ async function publishReport(
 	chat.runs = next;
 	for (let entry of finished) announce(server, room, entry);
 	state(chat, server, room);
+	for (let { run, said } of attention) await followUpEndedRun(context, run, said);
+}
+
+/**
+ * Start a Planner turn about a run that ended blocked or failed while the
+ * Planner was idle. Atomic's own notice would start a turn nobody sees, so the
+ * adapter stops that one and this turn, recorded like any other, takes its place.
+ */
+function followUpEndedRun(context: Room, run: Wire.Run, said: string): Promise<void> {
+	let text = `The workflow run ${run.name} (${run.id}) ${ENDED_RUN[run.status]}. `
+		+ "Check its status with the workflow tool, then tell the team what happened and what, if anything, they need to do.";
+	return Promise.resolve(instruct(context, "chopin", text, said)).catch(err =>
+		console.error("[chat] could not follow up on an ended workflow run:", err)
+	);
 }
 
 /**
@@ -1144,9 +1495,12 @@ function retain(
 		let unhold = context.hold?.();
 		let stopWatching = opened.session.watchRuns?.(next => {
 			if (chat.retained?.session !== opened.session) return;
-			void report(next);
+			let planning = chat.busy && !chat.job && chat.agent === opened.session;
+			let followUp = !planning && opened.session.followsUpRuns !== false;
+			void publishRuns(context, opened.session, next, false, followUp);
 			if (next.active.length || next.paused.length) return;
 			let releaseWhenIdle = async () => {
+				await publishing.get(chat);
 				if (chat.busy) await chat.running;
 				if (chat.busy || chat.retained?.session !== opened.session) return;
 				let current = opened.session.runs?.();
@@ -1191,7 +1545,8 @@ function retain(
 function currentMemberRequest(chat: Chat): ActiveMemberRequest | undefined {
 	let active = chat.activeRequest;
 	if (
-		!active || chat.closed || !chat.busy || chat.lifecycle !== active.lifecycle
+		!active || chat.closed || !chat.busy || !chat.turnController
+		|| chat.turnController.signal.aborted || chat.lifecycle !== active.lifecycle
 		|| chat.turn?.id !== active.turnId || !active.userId
 	) return undefined;
 	let entry = chat.entries.find(value => value.id === active.entryId);
@@ -1202,9 +1557,19 @@ function currentMemberRequest(chat: Chat): ActiveMemberRequest | undefined {
 	return active;
 }
 
+function visualRouting(context: Room): boolean {
+	if (
+		!context.config?.plannerVisuals || context.chat.job
+		|| !["copilot-sdk", "pi"].includes(context.config.harness)
+	) return false;
+	let request = currentMemberRequest(context.chat);
+	return !!request && request.text.length <= 1_000;
+}
+
 export function documentRoom(context: Room): DocumentRoom {
 	let { chat, plan, room, server } = context;
 	return {
+		investigations: context.investigations,
 		id: room,
 		plan,
 		server,
@@ -1214,7 +1579,18 @@ export function documentRoom(context: Room): DocumentRoom {
 		anchors: () => Service.anchors(plan, server, room),
 		changes: found => Service.changes(plan, server, room, found),
 		jobs: context.jobs,
+		children: context.children,
 		currentMemberRequest: () => currentMemberRequest(chat),
+		...(visualRouting(context) && {
+			visual: {
+				ask: (request: Parameters<typeof askJev>[0]) =>
+					askJev(request, {
+						model: context.config.conversationPlanModel,
+						timeoutMs: context.config.conversationPlanTimeoutMs,
+						signal: chat.turnController?.signal,
+					}),
+			},
+		}),
 		readReference: async (id, repositoryId) => {
 			let reference = chat.referenceCache.get(id);
 			if (!reference) throw new Error("reference is not available in this Planner session");
@@ -1353,7 +1729,7 @@ async function repositorySession(
 		context.auth,
 		context.repository,
 		context.room,
-		claimantSessionId,
+		context.plannerNotAttached ? undefined : claimantSessionId,
 	);
 	if (context.ownerAvailable) void context.ownerAvailable().catch(() => {});
 	let { chat, auth } = context;
@@ -1403,8 +1779,9 @@ async function repositorySession(
 					`${repository.owner}/${repository.name}`,
 					bootstrap,
 					workspace,
+					visualRouting(context),
 				),
-			model: context.config.model,
+			model: context.config.model || undefined,
 			harness: context.config.harness,
 		});
 		if (!result.ok) throw new Error(`Planner session unavailable (${result.error.kind})`);
@@ -1435,6 +1812,11 @@ async function repositorySession(
 	} finally {
 		if (chat.openingOwner === openingOwner) chat.openingOwner = undefined;
 	}
+}
+
+/** The login that may claim Planner ownership for the room; none where only an attachment may. */
+function claimant(context: Room): string | undefined {
+	return context.plannerNotAttached ? undefined : context.claimantSessionId;
 }
 
 /**
@@ -1506,7 +1888,7 @@ async function run(
 	context: Room,
 	handle: string,
 	text: string,
-	thread: string | undefined,
+	about: Instruction | undefined,
 	claimantSessionId: string | undefined,
 	reserved = false,
 	member?: MemberRequest,
@@ -1518,13 +1900,33 @@ async function run(
 		if (jobTurn) finishJob(jobTurn, { status: "failed", reason: "The document closed." });
 		return;
 	}
+	let thread = about?.thread;
+	// Where this turn's own messages begin, so its last word can be found again.
+	let firstEntry = chat.entries.length;
+	let failed = false;
 
 	if (!reserved) {
 		chat.busy = true;
 		chat.turn = begin(handle, chat.entries.length);
 		chat.acting = thread;
+		chat.actingChannel = about?.threadChannel;
 		(jobTurn ? jobState : state)(chat, server, room);
-	} else chat.acting = thread;
+	} else {
+		chat.acting = thread;
+		chat.actingChannel = about?.threadChannel;
+	}
+	try {
+		about?.started?.();
+	} catch (err) {
+		console.error("[chat] an instruction's start could not be recorded:", err);
+	}
+	// Read directly: the drain has already taken this draft's queue entry.
+	let draft = context.draft && chat.draft?.id === context.draft ? chat.draft : undefined;
+	if (draft) {
+		draft.state = "running";
+		draft.turn = chat.turn?.id;
+		drafting(server, room, draft, "running");
+	}
 
 	chat.activeRequest = member && chat.turn
 		? {
@@ -1535,6 +1937,7 @@ async function run(
 			claimantSessionId,
 			turnId: chat.turn.id,
 			lifecycle: chat.lifecycle,
+			...(member.focus ? { focus: member.focus } : {}),
 		}
 		: undefined;
 	chat.messageIds = new Map();
@@ -1579,6 +1982,8 @@ async function run(
 			retainReferences(chat, promptReferences);
 			let available = promptReferences.filter(reference => chat.referenceCache.has(reference.id));
 			prompt = compose(backscroll, handle, text, references, available, !!context.invokedBy);
+			let focus = about?.focus ?? member?.focus;
+			if (focus) prompt = `${focusContext(focus)}\n\n${prompt}`;
 		}
 		sendStarted = true;
 		if (!jobTurn) {
@@ -1608,6 +2013,8 @@ async function run(
 		}
 	} catch (err) {
 		console.error("[chat] turn failed:", err);
+		// A stop the room asked for is not a failure; an interruption is.
+		failed = !turnController.signal.aborted || !!chat.interruption;
 		if (jobTurn) {
 			outcome = chat.closed
 				? { status: "failed", reason: "The document closed." }
@@ -1714,6 +2121,11 @@ async function run(
 				Service.release(plan, server, room);
 			}, LINGER_MS);
 		}
+		// After the turn's own persistence, so a read prompted by `ended` sees its tasks.
+		if (draft) {
+			if (chat.draft === draft) chat.draft = undefined;
+			drafting(server, room, draft, "ended");
+		}
 	}
 
 	if (persistenceError) {
@@ -1721,6 +2133,23 @@ async function run(
 	}
 	if (jobTurn) {
 		finishJob(jobTurn, outcome ?? { status: "failed", reason: "The Planner turn ended." });
+	}
+
+	// Before the drain, so what it records is in place before the next turn reads anything.
+	// A failed save closes the chat, and its owner still needs to hear that the turn failed.
+	if (about?.ended && (!chat.closed || persistenceError)) {
+		// The turn is over: nothing it does can be attributed to the thread any more,
+		// and anyone joining before the drain must not read it as still working.
+		if (chat.acting === thread && chat.actingChannel === about.threadChannel) {
+			chat.acting = undefined;
+			chat.actingChannel = undefined;
+		}
+		let said = chat.entries.slice(firstEntry).findLast(entry => entry.author.kind === "agent");
+		let stopped = turnController.signal.aborted && !failed;
+		await report(about, {
+			status: failed || persistenceError ? "failed" : stopped ? "stopped" : "done",
+			...(said?.text.trim() ? { text: said.text } : {}),
+		});
 	}
 
 	if (chat.closed) return;
@@ -1750,13 +2179,15 @@ async function run(
 		let entry = next.message ? chat.entries.find(item => item.id === nextId) : undefined;
 		if (entry && !next.posted) announce(server, room, entry);
 		await DocumentProvenance.plannerTurn(run)(
-			{ ...context, invokedBy: next.invokedBy },
+			{ ...context, invokedBy: next.invokedBy, draft: next.draft },
 			next.handle,
 			next.text,
-			next.thread,
+			next,
 			next.invokedBy ? next.sessionId : next.sessionId ?? context.claimantSessionId,
 			false,
-			next.message && next.userId ? { entryId: next.id, userId: next.userId } : undefined,
+			next.message && next.userId
+				? { entryId: next.id, userId: next.userId, ...(next.focus ? { focus: next.focus } : {}) }
+				: undefined,
 			next.references,
 			next.job,
 		);
@@ -1765,6 +2196,7 @@ async function run(
 	chat.busy = false;
 	chat.turn = undefined;
 	chat.acting = undefined;
+	chat.actingChannel = undefined;
 	(jobTurn ? jobState : state)(chat, server, room);
 }
 
@@ -1772,7 +2204,7 @@ function startRun(
 	context: Room,
 	handle: string,
 	text: string,
-	thread: string | undefined,
+	about: Instruction | undefined,
 	claimantSessionId: string | undefined,
 	reserved = false,
 	member?: MemberRequest,
@@ -1787,7 +2219,7 @@ function startRun(
 		context,
 		handle,
 		text,
-		thread,
+		about,
 		claimantSessionId,
 		reserved,
 		member,
@@ -1810,7 +2242,10 @@ function startRun(
  */
 export function pending(chat: Chat): Waiting | undefined {
 	let next = chat.waiting.shift();
-	while (next?.spent?.()) next = chat.waiting.shift();
+	while (next?.spent?.()) {
+		void report(next, { status: "skipped" });
+		next = chat.waiting.shift();
+	}
 	if (next?.message && !next.posted) {
 		let entry: MemberEntry = {
 			id: next.id,
@@ -2082,6 +2517,8 @@ export async function close(chat: Chat): Promise<void> {
 	chat.activeRequest = undefined;
 	for (let waiting of chat.waiting) {
 		if (waiting.job) finishJob(waiting.job, { status: "failed", reason: "The document closed." });
+		// Whoever is waiting on a dropped turn, such as a child's comment, hears it will not run.
+		else if (waiting.ended) void report(waiting, { status: "skipped" });
 	}
 	if (chat.handoffJob) {
 		finishJob(chat.handoffJob, { status: "failed", reason: "The document closed." });

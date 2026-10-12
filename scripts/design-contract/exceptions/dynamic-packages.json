@@ -32,7 +32,7 @@
 				1
 			]
 		],
-		"sourceHash": "f8782df8726829978d4c4da7a3ab75c25bef7f0c5ebb1d8f387b636013ea0f44"
+		"sourceHash": "3f93ab499db8fcae05e3f0b6b69d770b1e03ad7c1f47af4e8ef04ce302058271"
 	},
 	{
 		"file": "packages/question/src/react/resolved-actions.tsx",
@@ -60,7 +60,7 @@
 				1
 			]
 		],
-		"sourceHash": "efda1a4921302c8c92c0eccb5cabc56b6a8967893246e2b5bc995f1f42bf755b"
+		"sourceHash": "1d0601ddb8e0ba1f301841e5c51343da3df2393fe16c7e97906b5665c7009bab"
 	},
 	{
 		"file": "packages/icons/src/system.tsx",
@@ -120,6 +120,13 @@
 				"*",
 				"props",
 				"unresolved JSX props > CodeIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > KeyboardIcon > <LineIcon>",
 				1
 			],
 			[
@@ -196,13 +203,6 @@
 				"dynamic",
 				"*",
 				"props",
-				"unresolved JSX props > WarningIcon > <LineIcon>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"props",
 				"unresolved JSX props > LinkPlusIcon > <LineIcon>",
 				1
 			],
@@ -238,6 +238,13 @@
 				"dynamic",
 				"*",
 				"props",
+				"unresolved JSX props > EllipsisIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
 				"unresolved JSX props > WrenchIcon > <LineIcon>",
 				1
 			],
@@ -260,6 +267,13 @@
 				"*",
 				"props",
 				"unresolved JSX props > TableIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ColumnsIcon > <LineIcon>",
 				1
 			],
 			[
@@ -310,9 +324,107 @@
 				"props",
 				"unresolved JSX props > PencilIcon > <LineIcon>",
 				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ArrowLeftIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ArrowRightIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > RestartIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > MinusIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > FitWidthIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ActualSizeIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > PlayIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > PauseIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ExpandIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > CollapseIcon > <LineIcon>",
+				1
 			]
 		],
-		"sourceHash": "464a7ac73e3c46a69f97381648ad09a66a71f896abcfc30394a8266a63d64f6d"
+		"sourceHash": "7f9aee6935f77a6940153f60fb9aaa7850a3e33f4dc1864614091c028a850618"
+	},
+	{
+		"file": "packages/icons/src/warning.tsx",
+		"reason": "Icon wrapper forwards SVG accessibility, sizing, and caller styling props. Literal style/class call sites are scanned; no ambient rendering code is executed.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > WarningIcon > <LineIcon>",
+				1
+			]
+		],
+		"sourceHash": "849f492e94d49ef2135dd7f00b7d9792c8d499b37bbdfbd2c4fc37b0f0207ad9"
+	},
+	{
+		"file": "packages/icons/src/list.tsx",
+		"reason": "Icon wrapper forwards SVG accessibility, sizing, and caller styling props. Literal style/class call sites are scanned; no ambient rendering code is executed.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ListIcon > <LineIcon>",
+				1
+			]
+		],
+		"sourceHash": "4f7d0232af2d03d5d8df9a226b48388c6a8011473ee53c2138568d77b8945bc3"
 	},
 	{
 		"file": "packages/visuals/src/ui/mini-bars.tsx",
@@ -466,7 +578,7 @@
 				1
 			]
 		],
-		"sourceHash": "fb8833b7ba83f22bb04ad40139753f701b4b50b3c1344a9e698b912f2b88e066"
+		"sourceHash": "15803f2c3dbfba575e2c15e7dd1aa1a627afae05cb6e6419636069d4b0100f90"
 	},
 	{
 		"file": "packages/visuals/src/ui/badge.tsx",
@@ -480,7 +592,7 @@
 				1
 			]
 		],
-		"sourceHash": "fb8833b7ba83f22bb04ad40139753f701b4b50b3c1344a9e698b912f2b88e066"
+		"sourceHash": "15803f2c3dbfba575e2c15e7dd1aa1a627afae05cb6e6419636069d4b0100f90"
 	},
 	{
 		"file": "packages/visuals/src/ui/table.tsx",
@@ -690,7 +802,7 @@
 				1
 			]
 		],
-		"sourceHash": "972a9d9783af2b4506ab6cf1c02abe553f1aad059bfc1b50f6438886f8fe90a3"
+		"sourceHash": "8acd4c0ce30f8405a1db20dd07fe274c453c0ebdb29fdaa3d37a756fec5bbd34"
 	},
 	{
 		"file": "packages/dialect/src/nodes/containers.ts",
@@ -747,5 +859,68 @@
 			]
 		],
 		"sourceHash": "5c9709fd97d4f6777205da118ce8b24123537b0ae7e56d3fa4490db8538081bf"
+	},
+	{
+		"file": "packages/visuals/src/ui/unfold.tsx",
+		"reason": "Public visual primitive forwards typed DOM props. Literal style/class call sites remain scanned; runtime caller values need browser review. UnfoldToggle spreads caller button props (aria-controls, aria-expanded, onClick, ref and type are omitted from the type) and the useUnfold trigger object, which holds only ARIA state, a click handler, a ref and type=button; neither carries style.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > UnfoldToggle > <button>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"unfold.trigger",
+				"unresolved JSX props > UnfoldToggle > <button>",
+				1
+			]
+		],
+		"sourceHash": "098bf723d102ac3e909c8ad91445adbce4d7a76a37ba324956866cdde04f4d68"
+	},
+	{
+		"file": "packages/visuals/src/ui/unfold.tsx",
+		"reason": "Public visual primitive forwards typed DOM props. Literal style/class call sites remain scanned; runtime caller values need browser review. UnfoldPanel spreads caller div props (id and ref omitted); the panel sets its own aria-hidden, inert, id and data attributes after the spread.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > UnfoldPanel > <div>",
+				1
+			]
+		],
+		"sourceHash": "098bf723d102ac3e909c8ad91445adbce4d7a76a37ba324956866cdde04f4d68"
+	},
+	{
+		"file": "packages/visuals/src/ui/unfold.tsx",
+		"reason": "Component forwards or combines caller class names; static call-site classes are scanned. Runtime/cross-module values require review at this exact component boundary. Every current caller passes a static string literal (child-provenance, experiments, research widget), which the scanner reads at the call site; classes() only joins it to a fixed cv-unfold base.",
+		"cases": [
+			[
+				"dynamic",
+				"class",
+				"classes(\"cv-unfold-toggle\", className)",
+				"class > UnfoldToggle > <button>",
+				1
+			],
+			[
+				"dynamic",
+				"class",
+				"classes(\"cv-unfold\", className)",
+				"class > UnfoldPanel > <div>",
+				1
+			],
+			[
+				"dynamic",
+				"class",
+				"className",
+				"class > UnfoldSection > <div>",
+				1
+			]
+		],
+		"sourceHash": "098bf723d102ac3e909c8ad91445adbce4d7a76a37ba324956866cdde04f4d68"
 	}
 ]

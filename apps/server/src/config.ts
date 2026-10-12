@@ -16,7 +16,7 @@ import type { StorageConfig } from "./storage/registry";
 export type Config = {
 	host: string;
 	port: number;
-	/** Planner model. */
+	/** Planner model. Empty under `HARNESS=remote` unless set, where the attached client chooses. */
 	model: string;
 	harness: string;
 	harnessAuth: string | undefined;
@@ -25,6 +25,11 @@ export type Config = {
 	 * passed to the CLI's `--extension`. Split on the platform path delimiter.
 	 */
 	harnessExtensions: string[];
+	/**
+	 * Under `HARNESS=remote`, how long a detached or dropped Planner link keeps
+	 * the document's Planner ownership for the same account to reattach.
+	 */
+	plannerAttachGraceMs: number;
 	/**
 	 * Whether to run the agent at all.
 	 *
@@ -41,6 +46,8 @@ export type Config = {
 	conversationPlan?: boolean;
 	conversationPlanModel?: string;
 	conversationPlanTimeoutMs?: number;
+	/** Explicitly enables Jev-routed foreground visual authoring. */
+	plannerVisuals?: boolean;
 	/**
 	 * Origin of a running Vite, when developing.
 	 *
@@ -57,14 +64,17 @@ export type Config = {
 };
 
 const DEFAULT_PORT = 8787;
+const DEFAULT_ATTACH_GRACE_MS = 120_000;
 const DEFAULT_MODEL = "gpt-6-luna";
 
 /** The default is a Copilot model ID. Pi and Atomic resolve IDs against their
  * own catalogs, so those deployments must name a model rather than inherit one
- * the catalog lacks. */
+ * the catalog lacks. A remote Planner's client brings its own model; a
+ * configured one is only passed along as the turn's request. */
 function model(harness: string): string {
 	let configured = process.env.MODEL;
 	if (configured) return configured;
+	if (harness === "remote") return "";
 	if (harness === "pi" || harness === "atomic") {
 		throw new Error(`MODEL is required when HARNESS=${harness}`);
 	}
@@ -113,6 +123,7 @@ export function load(): Config {
 	let agent = process.env.AGENT !== "off";
 	let backgroundJobs = process.env.BACKGROUND_JOBS !== "off";
 	let conversationPlan = process.env.CONVERSATION_PLAN === "on";
+	let plannerVisuals = process.env.PLANNER_VISUALS === "on" && agent;
 	let conversationPlanModel = process.env.JEV_MODEL || "jev-latest";
 	let timeoutRaw = process.env.JEV_TIMEOUT_MS;
 	let conversationPlanTimeoutMs = timeoutRaw === undefined ? 30_000 : Number(timeoutRaw);
@@ -126,21 +137,43 @@ export function load(): Config {
 	if (conversationPlan && !process.env.JEV_API_KEY) {
 		throw new Error("JEV_API_KEY is required when CONVERSATION_PLAN=on");
 	}
-	if (conversationPlan && !/^[A-Za-z0-9._-]{1,100}$/.test(conversationPlanModel)) {
+	if (plannerVisuals && !process.env.JEV_API_KEY) {
+		throw new Error("JEV_API_KEY is required when PLANNER_VISUALS=on");
+	}
+	if (
+		(conversationPlan || plannerVisuals) && !/^[A-Za-z0-9._-]{1,100}$/.test(conversationPlanModel)
+	) {
 		throw new Error("JEV_MODEL must be a valid model alias");
 	}
+	let graceRaw = process.env.PLANNER_ATTACH_GRACE_MS;
+	let plannerAttachGraceMs = graceRaw === undefined ? DEFAULT_ATTACH_GRACE_MS : Number(graceRaw);
+	if (
+		(graceRaw !== undefined && !/^\d+$/.test(graceRaw))
+		|| !Number.isSafeInteger(plannerAttachGraceMs) || plannerAttachGraceMs > 3_600_000
+	) {
+		throw new Error(
+			"PLANNER_ATTACH_GRACE_MS must be an integer between 0 and 3600000 milliseconds",
+		);
+	}
 	let selection = harnessSelection();
+	if (selection.harness === "remote" && backgroundJobs) {
+		throw new Error(
+			"HARNESS=remote requires BACKGROUND_JOBS=off: summary and research workers have no model on the server",
+		);
+	}
 	let serverPort = port();
 	return {
 		...selection,
 		port: serverPort,
 		model: model(selection.harness),
+		plannerAttachGraceMs,
 		agent,
 		backgroundJobs,
 		webResearch: agent && backgroundJobs && process.env.WEB_RESEARCH !== "off",
 		conversationPlan,
 		conversationPlanModel,
 		conversationPlanTimeoutMs,
+		plannerVisuals,
 		devClient: process.env.DEV_CLIENT || undefined,
 		storage: storage(),
 		auth: loadAuth(serverPort, selection.host),
@@ -166,10 +199,15 @@ export function describe(config: Config): string {
 		"chopin",
 		`http://${config.host}:${config.port}`,
 		config.devClient ? `client: vite (${config.devClient})` : "client: built",
-		config.agent ? `agent: ${config.model} (on demand)` : "agent: off",
+		config.agent
+			? `agent: ${config.model || "chosen by the attached client"} (on demand)`
+			: "agent: off",
 		`harness: ${config.harness}`,
 		...(config.harness === "atomic"
 			? ["Planner: full Atomic session (shell and filesystem access as this process's user)"]
+			: []),
+		...(config.harness === "remote"
+			? ["Planner: attached client over /planner-link (model and client tools run on its machine)"]
 			: []),
 		...(config.harnessExtensions.length
 			? [`Planner extensions: ${config.harnessExtensions.join(", ")}`]
@@ -179,6 +217,9 @@ export function describe(config: Config): string {
 		config.conversationPlan
 			? `conversation plan: ${config.conversationPlanModel}`
 			: "conversation plan: off",
+		config.plannerVisuals
+			? `Planner visuals: ${config.conversationPlanModel}`
+			: "Planner visuals: off",
 		admission,
 		`storage: ${config.storage.driver}`,
 	];

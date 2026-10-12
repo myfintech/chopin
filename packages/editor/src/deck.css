@@ -1,0 +1,61 @@
+/* packages/editor/src/deck.css */
+/*
+ * A decision deck. The top card sits in flow and sets the height; the cards
+ * behind are pinned to its box and lifted so only their header edges show.
+ */
+.decision-deck {
+	--deck-peek: 1.875rem;
+	display: grid;
+	gap: 0.625rem;
+}
+
+.decision-deck-stage {
+	/* The shuffle eases this box's measured height, padding included. */
+	box-sizing: border-box;
+	position: relative;
+	/* Slot z-indexes order cards; keep them from outranking editor overlays. */
+	isolation: isolate;
+	display: grid;
+	padding-block-start: calc(var(--deck-peek) * var(--deck-depth, 0));
+}
+
+.decision-deck-slot {
+	border-radius: var(--radius-lg);
+	transform-origin: top center;
+}
+
+.decision-deck-slot[data-deck-top] {
+	position: relative;
+}
+
+.decision-deck-slot:not([data-deck-top]) {
+	position: absolute;
+	inset: calc(var(--deck-peek) * var(--deck-depth, 0)) 0 0;
+	overflow: hidden;
+	pointer-events: none;
+}
+
+/* Back cards read as paper behind the live one. */
+.decision-deck-slot:not([data-deck-top]) > * {
+	background: var(--color-inset);
+}
+
+/* A settled line has no card of its own; the slot gives it one. */
+.decision-deck-slot[data-deck-settled] {
+	padding: 0.625rem 0.75rem;
+	background: var(--color-inset);
+	box-shadow: var(--shadow-resting);
+}
+
+.decision-deck-nav {
+	display: flex;
+	align-items: center;
+	gap: 0.25rem;
+}
+
+.decision-deck-count {
+	margin-inline-end: auto;
+	font-size: var(--text-xs);
+	font-variant-numeric: tabular-nums;
+	color: var(--color-text-secondary);
+}

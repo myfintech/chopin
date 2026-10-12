@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
 	documentPath,
 	parseChildDocumentPath,
@@ -5,6 +7,7 @@ import {
 } from "@chopin/protocol/document-url";
 
 import { documentUrl } from "../channels/document-url";
+import { notAttachedMessage } from "../harness/remote/attachments";
 import { deterministicChannelId, isChannelId } from "../channels/id";
 import { documentSlug } from "../channels/slug";
 import { GitHubError } from "../github/client";
@@ -14,6 +17,7 @@ import * as Rooms from "../rooms";
 import { claimImplementation, reportImplementationLifecycle } from "../tasks/plan-graphs";
 import { StorageError } from "../storage/errors";
 import { implementationLifecycle } from "../tasks/lifecycle";
+import { imagePath } from "../images/format";
 
 import type { Server } from "bun";
 import type { HostedAuth } from "../auth/routes";
@@ -153,73 +157,90 @@ function claimResult(value: ClaimResult) {
 		: value;
 }
 
+type LocatorAuth = Pick<HostedAuth, "config" | "github" | "storage">;
+
+async function directRepositoryFor(
+	auth: LocatorAuth,
+	caller: HostedCaller,
+	owner: string,
+	name: string,
+) {
+	try {
+		return await auth.github.repository(caller.oauthToken, owner, name);
+	} catch (err) {
+		if (err instanceof GitHubError && (err.status === 403 || err.status === 404)) {
+			return undefined;
+		}
+		throw err;
+	}
+}
+
+/**
+ * The document a locator names, by id, legacy channel URL, or document URL,
+ * with the caller's own repository access; "forbidden" when it cannot read it.
+ */
+export async function locateDocument(auth: LocatorAuth, caller: HostedCaller, locator: string) {
+	let path: URL | undefined;
+	try {
+		path = new URL(locator, auth.config.origin);
+	} catch {
+		path = undefined;
+	}
+	let local = path?.origin === auth.config.origin ? path.pathname : undefined;
+	let child = local === undefined ? undefined : parseChildDocumentPath(local);
+	if (child) {
+		let repository = await directRepositoryFor(auth, caller, child.owner, child.repository);
+		if (!repository?.permissions.pull) return "forbidden" as const;
+		let channel = await auth.storage.channels.resolve(
+			repository.id,
+			documentSlug(child.childSlug),
+		);
+		let parent = channel?.parentChannelId
+			? await auth.storage.channels.resolve(repository.id, documentSlug(child.parentSlug))
+			: undefined;
+		return channel && parent?.id === channel.parentChannelId
+			? { channel, repository }
+			: undefined;
+	}
+	let parsed = local === undefined ? undefined : parseDocumentPath(local);
+	if (parsed?.slug) {
+		let repository = await directRepositoryFor(auth, caller, parsed.owner, parsed.repository);
+		if (!repository?.permissions.pull) return "forbidden" as const;
+		let channel = await auth.storage.channels.resolve(
+			repository.id,
+			documentSlug(parsed.slug),
+		);
+		return channel ? { channel, repository } : undefined;
+	}
+
+	let legacy = path?.origin === auth.config.origin
+		? /^\/channels\/([0-9a-f-]{36})\/?$/i.exec(path.pathname)
+		: undefined;
+	let id = legacy?.[1]?.toLowerCase();
+	let channel = await auth.storage.channels.get(id && isChannelId(id) ? id : locator);
+	if (!channel) return undefined;
+	let repository = await directRepositoryFor(
+		auth,
+		caller,
+		channel.repositoryOwner,
+		channel.repositoryName,
+	);
+	if (!repository?.permissions.pull || repository.id !== channel.repositoryId) {
+		return "forbidden" as const;
+	}
+	return { channel, repository };
+}
+
 /** Bind the backend-neutral MCP surface to hosted GitHub authentication. */
 export function hosted(
 	auth: HostedAuth,
 	persistence?: ImplementationPersistence,
 	callbacks: HostedCallbacks = {},
 ): McpOptions<HostedCaller> {
-	async function directRepository(caller: HostedCaller, owner: string, name: string) {
-		try {
-			return await auth.github.repository(caller.oauthToken, owner, name);
-		} catch (err) {
-			if (err instanceof GitHubError && (err.status === 403 || err.status === 404)) {
-				return undefined;
-			}
-			throw err;
-		}
-	}
-
-	async function locatedChannel(caller: HostedCaller, locator: string) {
-		let path: URL | undefined;
-		try {
-			path = new URL(locator, auth.config.origin);
-		} catch {
-			path = undefined;
-		}
-		let local = path?.origin === auth.config.origin ? path.pathname : undefined;
-		let child = local === undefined ? undefined : parseChildDocumentPath(local);
-		if (child) {
-			let repository = await directRepository(caller, child.owner, child.repository);
-			if (!repository?.permissions.pull) return "forbidden" as const;
-			let channel = await auth.storage.channels.resolve(
-				repository.id,
-				documentSlug(child.childSlug),
-			);
-			let parent = channel?.parentChannelId
-				? await auth.storage.channels.resolve(repository.id, documentSlug(child.parentSlug))
-				: undefined;
-			return channel && parent?.id === channel.parentChannelId
-				? { channel, repository }
-				: undefined;
-		}
-		let parsed = local === undefined ? undefined : parseDocumentPath(local);
-		if (parsed?.slug) {
-			let repository = await directRepository(caller, parsed.owner, parsed.repository);
-			if (!repository?.permissions.pull) return "forbidden" as const;
-			let channel = await auth.storage.channels.resolve(
-				repository.id,
-				documentSlug(parsed.slug),
-			);
-			return channel ? { channel, repository } : undefined;
-		}
-
-		let legacy = path?.origin === auth.config.origin
-			? /^\/channels\/([0-9a-f-]{36})\/?$/i.exec(path.pathname)
-			: undefined;
-		let id = legacy?.[1]?.toLowerCase();
-		let channel = await auth.storage.channels.get(id && isChannelId(id) ? id : locator);
-		if (!channel) return undefined;
-		let repository = await directRepository(
-			caller,
-			channel.repositoryOwner,
-			channel.repositoryName,
-		);
-		if (!repository?.permissions.pull || repository.id !== channel.repositoryId) {
-			return "forbidden" as const;
-		}
-		return { channel, repository };
-	}
+	let directRepository = (caller: HostedCaller, owner: string, name: string) =>
+		directRepositoryFor(auth, caller, owner, name);
+	let locatedChannel = (caller: HostedCaller, locator: string) =>
+		locateDocument(auth, caller, locator);
 
 	async function writableChannel(caller: HostedCaller, locator: string) {
 		let located = await locatedChannel(caller, locator);
@@ -317,15 +338,17 @@ export function hosted(
 						instruction: input.instruction,
 						...(input.checkout === undefined ? {} : { checkout: input.checkout }),
 					});
+					let url =
+						new URL(await documentUrl(channel, auth.storage.channels), auth.config.origin).href;
+					if (code === "planner-not-attached") {
+						return {
+							kind: "refused",
+							code,
+							message: notAttachedMessage(url, `${repository.owner}/${repository.name}`),
+						};
+					}
 					if (code) return { kind: "refused", code };
-					return {
-						kind: "invoked",
-						document: {
-							...summary(channel),
-							url:
-								new URL(await documentUrl(channel, auth.storage.channels), auth.config.origin).href,
-						},
-					};
+					return { kind: "invoked", document: { ...summary(channel), url } };
 				},
 			}
 			: undefined,
@@ -686,6 +709,36 @@ export function hosted(
 					}
 					throw err;
 				}
+			},
+		},
+		upload: {
+			async upload(caller, input) {
+				let access = await writableChannel(caller, input.id);
+				if (access.kind !== "allowed") return access;
+				if (access.channel.archivedAt) return { kind: "archived" as const };
+				let sha256 = createHash("sha256").update(input.bytes).digest("hex");
+				try {
+					await auth.storage.users.put({
+						id: caller.user.id,
+						login: caller.user.login,
+						avatarUrl: caller.user.avatarUrl,
+						now: auth.clock(),
+					});
+					await auth.storage.images.put({
+						channelId: access.channel.id,
+						sha256,
+						mimeType: input.mimeType,
+						bytes: input.bytes,
+						uploadedBy: caller.user.id,
+						now: auth.clock(),
+					});
+				} catch (err) {
+					if (err instanceof StorageError && err.failure === "missing") {
+						return { kind: "unavailable" as const };
+					}
+					throw err;
+				}
+				return { kind: "uploaded" as const, path: imagePath(sha256, input.mimeType) };
 			},
 		},
 		...(persistence

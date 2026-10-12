@@ -43,6 +43,20 @@ export type QuestionStepRenderProps = {
 
 export type PreviousAnswer = { labels: string[]; by: string };
 
+/** Unsaved answers on an open card, for a host that saves them from outside the card. */
+export type PendingAnswers = {
+	/** Questions with a selected answer that is not saved yet. */
+	answered: number;
+	/** Every question has an answer, so Save can submit this card. */
+	complete: boolean;
+	submitting: boolean;
+	/** Why the last save or edit failed, shown on the card itself. */
+	error?: string;
+	save: () => void;
+	/** Deselect the unsaved answers in the shared draft. */
+	clear: () => void;
+};
+
 export type QuestionViewProps = {
 	definition: Definition;
 	drafts: Drafts;
@@ -101,6 +115,22 @@ export type QuestionViewProps = {
 	headerActions?: ReactNode;
 	/** Lets a host retain bounded steps for presentation without owning question state. */
 	renderStep?: (props: QuestionStepRenderProps) => ReactNode;
+	/**
+	 * The host shows Save outside the card, so the footer keeps only navigation
+	 * and the quieter discard.
+	 */
+	deferSave?: boolean;
+	/** Reports this card's unsaved answers; undefined when there is nothing to save. */
+	onPending?: (pending: PendingAnswers | undefined) => void;
+	/**
+	 * Whether this person chose answers here, when the host keeps that beyond
+	 * this view's lifetime. Without it the view remembers only while mounted.
+	 */
+	touched?: boolean;
+	/** False when this person cleared their answers here. */
+	onTouchedChange?: (touched: boolean) => void;
+	/** This person chose an answer here; the host can keep what they chose. */
+	onLocalChange?: (question: string, change: Partial<Draft>) => void;
 };
 
 export function currentQuestion(
@@ -314,7 +344,9 @@ function AddOption(
 			if (height >= previous || document.activeElement !== control || !control) return;
 			let bounds = control.getBoundingClientRect();
 			let top = viewport.offsetTop;
-			let bottom = top + viewport.height;
+			// The field's scroll margin is the room it wants below it, such as its hint.
+			let room = parseFloat(getComputedStyle(control).scrollMarginBlockEnd) || 0;
+			let bottom = top + viewport.height - room;
 			if (bounds.top >= top && bounds.bottom <= bottom) return;
 			requestAnimationFrame(() => control.scrollIntoView({ block: "nearest" }));
 		};
@@ -712,6 +744,11 @@ export function QuestionView(props: QuestionViewProps) {
 		onQuestionFocus,
 		onQuestionSelect,
 		renderStep,
+		deferSave = false,
+		onPending,
+		touched: hostTouched,
+		onTouchedChange,
+		onLocalChange,
 	} = props;
 
 	let [suggestionEdits, dispatchSuggestionEdit] = useReducer(reduceSuggestionEditState, {
@@ -726,6 +763,14 @@ export function QuestionView(props: QuestionViewProps) {
 	}, [suggested]);
 	let markHumanEdit = () => {
 		if (suggested) dispatchSuggestionEdit({ type: "answer-edited" });
+	};
+	// Which cards this person chose answers on, so a host's pane-wide Save
+	// never acts on a draft only a collaborator touched.
+	let [ownTouched, setOwnTouched] = useState(false);
+	let touched = hostTouched ?? ownTouched;
+	let setTouched = (value: boolean) => {
+		setOwnTouched(value);
+		if (!value) onTouchedChange?.(false);
 	};
 
 	let markComposerEdit = () => {
@@ -772,6 +817,54 @@ export function QuestionView(props: QuestionViewProps) {
 			suggestionEdits.answer || suggestionEdits.composer,
 		)
 		: { draft: drafts[current.id] };
+
+	// Only a draft this person chose counts. A visible suggestion is not an
+	// answer until someone accepts it on the card, and a collaborator's choice
+	// on a card this person never touched is theirs to save.
+	let answeredCount =
+		definition.questions.filter(question => answered(question, drafts[question.id])).length;
+	let complete = answeredCount === definition.questions.length;
+	let pendingEnabled = status === "open" && !disabled && !!onSubmit && !!onChange && touched;
+	let latest = useRef({ onChange, onSubmit, markHumanEdit, drafts, definition });
+	latest.current = { onChange, onSubmit, markHumanEdit, drafts, definition };
+	let reporting = useRef(onPending);
+	reporting.current = onPending;
+	useEffect(() => {
+		let report = reporting.current;
+		if (!report) return;
+		if (!pendingEnabled || (answeredCount === 0 && !submitting)) {
+			report(undefined);
+			return;
+		}
+		report({
+			answered: answeredCount,
+			complete,
+			submitting,
+			error,
+			save: () => latest.current.onSubmit?.(),
+			clear: () => {
+				let { definition, drafts, markHumanEdit, onChange } = latest.current;
+				markHumanEdit();
+				setTouched(false);
+				for (let question of definition.questions) {
+					let draft = drafts[question.id];
+					if (!draft || !answered(question, draft)) continue;
+					onChange?.(
+						question.id,
+						question.multiple
+							? {
+								mode: "choices",
+								options: Object.fromEntries(
+									Object.keys(draft.options).map(option => [option, false]),
+								),
+							}
+							: { mode: "choices", choice: null },
+					);
+				}
+			},
+		});
+	}, [answeredCount, complete, error, pendingEnabled, submitting]);
+	useEffect(() => () => reporting.current?.(undefined), []);
 
 	if (status === "discarded") {
 		return (
@@ -855,6 +948,10 @@ export function QuestionView(props: QuestionViewProps) {
 	// Nothing chosen, nothing to save or move on with. Read-only hosts have no
 	// drafts to fill, so they keep free navigation.
 	let ready = answered(current, projection.draft);
+	// Accepting a suggestion stays a deliberate choice on its own card.
+	let suggestion = projection.suggestion;
+	let acceptSuggestion = () => onSubmit?.(suggestion);
+	let saveHere = () => onSubmit?.();
 	let discard = onDiscard ?? onCancel;
 	let previousAnswer = previousFor(priorAnswers, current.id);
 	let step = (offset: number, from?: "primary") => {
@@ -942,6 +1039,8 @@ export function QuestionView(props: QuestionViewProps) {
 								name={`${base}-${current.id}`}
 								onChange={change => {
 									markHumanEdit();
+									setTouched(true);
+									onLocalChange?.(current.id, change);
 									onChange?.(current.id, change);
 								}}
 								suggestedOptionId={projection.suggestion?.optionId}
@@ -1050,9 +1149,11 @@ export function QuestionView(props: QuestionViewProps) {
 										type="button"
 										onClick={() => setConfirming(true)}
 										disabled={disabled || submitting}
-										className="btn btn-sm btn-outline"
+										className={deferSave
+											? "btn btn-sm btn-ghost question-discard-quiet"
+											: "btn btn-sm btn-outline"}
 									>
-										Discard
+										{deferSave ? "Discard decision" : "Discard"}
 									</button>
 								)}
 								{multiple && !last && (
@@ -1066,7 +1167,7 @@ export function QuestionView(props: QuestionViewProps) {
 										Next
 									</button>
 								)}
-								{(onSubmit || showActions) && (!multiple || last) && (
+								{(onSubmit || showActions) && (!multiple || last) && !deferSave && (
 									<button
 										type="button"
 										onClick={() => onSubmit?.(projection.suggestion)}
@@ -1075,6 +1176,28 @@ export function QuestionView(props: QuestionViewProps) {
 										ref={primary}
 									>
 										{submitting ? "Saving…" : error ? "Try again" : "Save"}
+									</button>
+								)}
+								{deferSave && onSubmit && !suggestion && !touched && answeredCount > 0
+									&& (!multiple || last) && (
+										// A selection the bar is not counting still needs a way to be saved.
+										<button
+											type="button"
+											onClick={saveHere}
+											disabled={disabled || submitting || !ready}
+											className="btn btn-sm btn-primary"
+										>
+											{submitting ? "Saving…" : error ? "Try again" : "Save"}
+										</button>
+									)}
+								{deferSave && onSubmit && suggestion && (
+									<button
+										type="button"
+										onClick={acceptSuggestion}
+										disabled={disabled || submitting}
+										className="btn btn-sm btn-primary"
+									>
+										{submitting ? "Saving…" : "Accept suggestion"}
 									</button>
 								)}
 							</>

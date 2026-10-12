@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { flushSync } from "react-dom";
 import { documentPath } from "@chopin/protocol/document-url";
-import { ArchiveIcon, ChevronIcon, DocumentIcon } from "@chopin/icons";
+import { ArchiveIcon, CheckIcon, ChevronIcon, DocumentIcon, PencilIcon } from "@chopin/icons";
 import { Badge } from "@chopin/visuals";
 import {
 	advanceDecisionView,
@@ -10,13 +11,17 @@ import {
 	countUnanswered,
 	cursor,
 	Decisions,
+	documentEditMode,
 	documentHasPlanningContent,
 	Face,
 	firstOpenDecision,
+	GitHubReferencesProvider,
+	opensEditing,
 	PlanEditor,
 	PlanStatus,
 	QuestionnaireStore,
 	ResearchLauncher,
+	revealDeckItem,
 	selectDecisionView,
 	ThreadStore,
 	useConnectionNotice,
@@ -25,10 +30,12 @@ import {
 	visibleDecisionView,
 } from "@chopin/editor";
 
+import { BuildView } from "./build-view";
 import { Chat } from "./chat/chat";
 import { ChildProvenance } from "./child-provenance";
 import { shouldShowResearchActionError, useResearchOfferLinks } from "./chat/research-offer";
 import type { ResearchDraftController } from "./chat/research-draft-controller";
+import { useDocumentEditing } from "./document-editing";
 import { advanceConversationAnnouncement } from "./conversation-plan/announcements";
 import type { ConversationAnnouncementSummary } from "./conversation-plan/announcements";
 import { evidenceRows, hasEvidence } from "./conversation-plan/evidence";
@@ -48,13 +55,20 @@ import {
 import { newestDocumentMetadata } from "./document-actions";
 import { DocumentActionsMenu } from "./document-actions-menu";
 import { DocumentRename } from "./document-rename";
+import { browserStorage, rememberOpened } from "./documents-sheet-model";
+import { PhoneHeader } from "./phone-header";
+import { useEditorFocus, useKeyboardOpen } from "./keyboard-open";
 import { motionContract } from "./motion-contract";
 import { motionImmediately } from "./motion-input";
 import { useNavigationDocument } from "./navigation-shell";
 import { titleEdits } from "./title-edit";
 import { peopleHere } from "./presence";
 import { ResearchRequestStore } from "./research-requests";
+import { GitHubReferenceCache } from "./github-references";
 import { Wire } from "./wire";
+import { ExperimentStore } from "./experiments/store";
+import { InlineInvestigations } from "./experiments/inline";
+import { EvidenceDecisions } from "./experiments/evidence";
 import { useWorkspaceIds, useWorkspaceLayout, useWorkspaceState, Workspace } from "./workspace";
 import { initialDocumentView, presentWorkspace, workspaceProfile } from "./workspace-model";
 
@@ -74,7 +88,7 @@ import type { HostedWorkspaceProps } from "./hosted";
 import type { Status } from "./wire";
 import type { ChatDestination } from "./conversation-plan/source";
 import type { SourceDestination } from "./conversation-plan/card-parts";
-import type { WorkspacePresentation } from "./workspace-model";
+import type { WorkspaceDocumentView } from "./workspace-model";
 
 type ManagedHello = Session.Hello & { archivedAt?: string; canManage: boolean };
 type ManagedChannel = Session.Channel & { archivedAt?: string; canManage: boolean };
@@ -98,6 +112,38 @@ const QUESTION_MOTION = {
 	immediately: settleMotionImmediately,
 };
 
+export function RoomMembers(
+	{ members, ring }: { members: Session.Member[]; ring: "ground" | "page" },
+) {
+	let people = peopleHere(members);
+	return (
+		<div
+			aria-label={`People here: ${people.join(", ")}`}
+			className="room-members ml-auto flex shrink-0 items-center"
+			role="group"
+		>
+			{people.map(handle => (
+				<span
+					className="room-member-face -ml-1.5 first:ml-0"
+					data-tooltip={handle}
+					data-tooltip-verbatim=""
+					key={handle.toLowerCase()}
+				>
+					<Face handle={handle} ring={ring} size={24} textSize="2xs" titled={false} />
+				</span>
+			))}
+			{people.length > 3 && (
+				<span
+					aria-hidden="true"
+					className="room-member-overflow ml-1 hidden text-xs text-text-tertiary"
+				>
+					+{people.length - 3}
+				</span>
+			)}
+		</div>
+	);
+}
+
 export function Header(
 	{
 		archivedAt,
@@ -108,7 +154,6 @@ export function Header(
 		onAction,
 		onEditingChange,
 		onRenamed,
-		presentation,
 		project,
 		room,
 		tools,
@@ -116,20 +161,17 @@ export function Header(
 		archivedAt?: string;
 		canManage: boolean;
 		editing?: TitleEdit;
-		members: Session.Member[];
+		members?: Session.Member[];
 		label: string;
 		onAction: (action: DocumentAction) => void;
 		onEditingChange: (editing?: TitleEdit) => void;
 		onRenamed: (channel: DocumentMetadata) => void;
-		presentation: WorkspacePresentation;
 		project?: { id: string; name: string };
 		room: string;
 		/** Document view controls beside the people here. */
 		tools?: ReactNode;
 	},
 ) {
-	let { onProjectReveal } = useNavigationDocument();
-	let people = peopleHere(members);
 	let header = useRef<HTMLElement>(null);
 	let title = useRef<HTMLButtonElement>(null);
 	let previousEdit = useRef(editing);
@@ -139,13 +181,18 @@ export function Header(
 		// Hand the caret back only when the field took it with it, not after a blur commit.
 		if (!editing && previous && document.activeElement === document.body) title.current?.focus();
 	}, [editing]);
-	let finishEdit = () => {
+	// Also runs as a save starts, not after it: keys typed while the rename travels would
+	// otherwise land in a field that is about to close.
+	let handOff = () => {
 		// Naming a new document leads into writing it, unless the user already clicked elsewhere.
 		if (editing === "new" && header.current?.contains(document.activeElement)) {
 			header.current.closest(".workspace-root")
 				?.querySelector<HTMLElement>(".plan-content[contenteditable='true']")
 				?.focus();
 		}
+	};
+	let finishEdit = () => {
+		handOff();
 		onEditingChange();
 	};
 	return (
@@ -158,88 +205,75 @@ export function Header(
 				className="flex min-w-0 flex-1 items-center gap-0.5"
 			>
 				<DocumentIcon className="shrink-0" />
-				{project && presentation.type !== "parent-with-child" && (
+				{project && (
 					<>
-						<button
-							aria-label={`Show ${project.name} in the sidebar`}
-							className="document-project-prefix"
-							onClick={() => onProjectReveal(project.id)}
-							type="button"
-						>
-							<span className="truncate">{project.name}</span>
-						</button>
-						<span aria-hidden="true" className="document-project-separator">/</span>
+						<span className="document-project-prefix truncate text-xs font-medium">
+							{project.name}
+						</span>
+						<span aria-hidden="true" className="document-project-separator text-xs">/</span>
 					</>
 				)}
-				{presentation.type === "parent-with-child"
-					? (
-						<>
+				<div className="title-control min-w-0 text-xs font-medium">
+					{editing && canManage && !archivedAt
+						? (
+							<DocumentRename
+								channel={{ id: room, title: label }}
+								inline
+								onCancel={finishEdit}
+								// The body took focus as the save started; a refusal needs the field back.
+								onErrorChange={error =>
+									error !== undefined
+									&& header.current?.querySelector<HTMLInputElement>(".document-title-input")
+										?.focus()}
+								onSavingChange={saving => saving && handOff()}
+								replay={editing === "new"}
+								onRenamed={detail => {
+									onRenamed(detail.channel);
+									finishEdit();
+								}}
+							/>
+						)
+						: canManage && !archivedAt
+						? (
 							<button
-								aria-label={`Return to ${label}`}
-								className="document-parent-breadcrumb btn btn-md btn-ghost min-w-0"
-								onClick={presentation.onChildClose}
+								aria-label={`Rename ${label}`}
+								className="title-control-label document-title-trigger"
+								onClick={() => onEditingChange("rename")}
+								onKeyDown={event => {
+									if (event.key !== "F2") return;
+									event.preventDefault();
+									onEditingChange("rename");
+								}}
+								ref={title}
 								type="button"
 							>
 								<span className="truncate">{label}</span>
 							</button>
-							<ChevronIcon
-								aria-hidden="true"
-								className="document-breadcrumb-separator shrink-0"
-							/>
-							<span
-								aria-label={`Child document: ${presentation.childLabel}`}
-								className="document-child-breadcrumb truncate"
-							>
-								{presentation.childLabel}
-							</span>
-						</>
-					)
-					: editing && canManage && !archivedAt
-					? (
-						<DocumentRename
-							channel={{ id: room, title: label }}
-							inline
-							onCancel={finishEdit}
-							replay={editing === "new"}
-							onRenamed={detail => {
-								onRenamed(detail.channel);
-								finishEdit();
-							}}
+						)
+						: <span className="title-control-label truncate">{label}</span>}
+					{canManage && (
+						<DocumentActionsMenu
+							align="start"
+							channel={{ archivedAt, title: label }}
+							className="title-control-action"
+							onAction={action =>
+								action === "rename" ? onEditingChange("rename") : onAction(action)}
+							trigger={
+								<ChevronIcon
+									aria-hidden="true"
+									className="rotate-90"
+									size={12}
+								/>
+							}
 						/>
-					)
-					: canManage && !archivedAt
-					? (
-						<button
-							aria-label={`Rename ${label}`}
-							className="document-title-trigger"
-							onClick={() => onEditingChange("rename")}
-							onKeyDown={event => {
-								if (event.key !== "F2") return;
-								event.preventDefault();
-								onEditingChange("rename");
-							}}
-							ref={title}
-							type="button"
-						>
-							<span className="truncate">{label}</span>
-						</button>
-					)
-					: <span className="document-title-label truncate">{label}</span>}
-				{canManage && presentation.type !== "parent-with-child" && (
-					<DocumentActionsMenu
-						align="start"
-						channel={{ archivedAt, title: label }}
-						className="document-title-menu"
-						onAction={action => action === "rename" ? onEditingChange("rename") : onAction(action)}
-						trigger={<ChevronIcon aria-hidden="true" className="rotate-90" />}
-					/>
-				)}
+					)}
+				</div>
 				{archivedAt && (
 					<span className="document-archived-status">
-						<Badge icon={ArchiveIcon} label="Archived" size="sm" />
+						<Badge icon={ArchiveIcon} label="Archived" size="sm" textSize="2xs" tone="warning" />
 						{canManage && (
 							<button
-								className="btn btn-sm btn-outline"
+								className="btn btn-compact btn-outline"
 								onClick={() => onAction("restore")}
 								type="button"
 							>
@@ -250,30 +284,7 @@ export function Header(
 				)}
 			</div>
 			{tools}
-			<div
-				aria-label={`People here: ${people.join(", ")}`}
-				className="room-members ml-auto flex shrink-0 items-center"
-				role="group"
-			>
-				{people.map(handle => (
-					<span
-						className="room-member-face -ml-1.5 first:ml-0"
-						data-tooltip={handle}
-						data-tooltip-verbatim=""
-						key={handle.toLowerCase()}
-					>
-						<Face handle={handle} ring="ground" size={24} titled={false} />
-					</span>
-				))}
-				{people.length > 3 && (
-					<span
-						aria-hidden="true"
-						className="room-member-overflow ml-1 hidden text-sm text-text-tertiary"
-					>
-						+{people.length - 3}
-					</span>
-				)}
-			</div>
+			{members && <RoomMembers members={members} ring="ground" />}
 		</header>
 	);
 }
@@ -330,10 +341,19 @@ export function RoomWorkspace(
 		onResearchChildOpen,
 		onResearchChildPublished,
 	} = useNavigationDocument();
+	// Phones list a project's recently opened documents in the documents sheet.
+	useEffect(() => {
+		if (!archivedAt) rememberOpened(browserStorage(), userId, repository.id, room);
+	}, [archivedAt, repository.id, room, userId]);
 	let [status, setStatus] = useState<Status>("connecting");
 	let [planState, setPlanState] = useState<PlanState>({ synced: false });
 	// Claimed while rendering, so a new document's title takes focus as soon as it mounts.
 	let [titleEdit, setTitleEdit] = useState(() => claimTitleEdit(room));
+	// A phone reads until its writer asks to edit. Local to this client and this document: it
+	// survives tab changes and reconnects, and the next document opens reading again.
+	let [editing, setEditing] = useState(() => opensEditing({ renaming: titleEdit === "new" }));
+	let [formatDock, setFormatDock] = useState<HTMLElement | null>(null);
+	let keyboardOpen = useKeyboardOpen();
 	useEffect(() => {
 		let listen = (event: Event) => {
 			if ((event as CustomEvent<string>).detail !== room) return;
@@ -373,14 +393,47 @@ export function RoomWorkspace(
 	let repositoryRef = useRef(repository);
 	repositoryRef.current = repository;
 	let user = useMemo(() => cursor(handle), [handle]);
-	let { available, frame, mode } = useWorkspaceLayout();
+	let { available, frame, mode, phone } = useWorkspaceLayout();
 	let workspaceIds = useWorkspaceIds();
 	let profile = workspaceProfile(presentation);
+	let [implementation, setImplementation] = useState<Plan.ImplementationStatus>({
+		revision: -1,
+		locked: false,
+	});
+	let [showImplementation, setShowImplementation] = useState(false);
+	useEffect(() => {
+		setImplementation({ revision: -1, locked: false });
+		let update = (value: Plan.ImplementationStatus) => {
+			setImplementation(current => value.revision >= current.revision ? value : current);
+		};
+		let offOpen = wire?.on<Plan.Open.Reply>("plan:open", message => {
+			if (message.implementation) update(message.implementation);
+		});
+		let offChanged = wire?.on<Plan.ImplementationChanged>("plan:implementation", update);
+		return () => {
+			offOpen?.();
+			offChanged?.();
+		};
+	}, [room, wire]);
 	let researchEnabled = profile.research;
 	let [workspace, dispatch] = useWorkspaceState(profile);
+	// A `#task-` link waits for Build to be available, then opens it once.
+	let [taskLink, setTaskLink] = useState(false);
+	useEffect(() => {
+		let followTask = () => {
+			if (profile.implementation && location.hash.startsWith("#task-")) setTaskLink(true);
+		};
+		followTask();
+		addEventListener("hashchange", followTask);
+		return () => removeEventListener("hashchange", followTask);
+	}, [profile.implementation]);
 	let [questions] = useState(() => new QuestionnaireStore());
+	let experiments = useMemo(() => new ExperimentStore(room), [room]);
+	useSyncExternalStore(experiments.subscribe, experiments.snapshot);
+	useEffect(() => experiments.connect(wire), [experiments, wire]);
 	let [cardMeta] = useState(() => new CardMetaStore());
-	let [threads] = useState(() => new ThreadStore());
+	let [threads] = useState(() => new ThreadStore(room));
+	let threadState = useSyncExternalStore(threads.subscribe, threads.snapshot, threads.snapshot);
 	let [authorship] = useState(() => new AuthorshipStore());
 	let [researchLauncher] = useState(() => new ResearchLauncher());
 	let research = useMemo(
@@ -392,6 +445,7 @@ export function RoomWorkspace(
 			}),
 		[onResearchChildOpen, onResearchChildPublished, room],
 	);
+	let githubReferences = useMemo(() => new GitHubReferenceCache({ channelId: room }), [room]);
 	let researchLinks = useResearchOfferLinks(
 		wire,
 		status === "connected",
@@ -422,13 +476,13 @@ export function RoomWorkspace(
 	let [researchErrors, setResearchErrors] = useState<Record<string, string>>({});
 	let [researchExecution, setResearchExecution] = useState(false);
 	let researchDrafts = useMemo(() => new Map<string, ResearchDraftController>(), [room]);
-	let [reveal, setReveal] = useState<{ widget: string; token: number }>();
+	let [reveal, setReveal] = useState<{ widget: string; token: number; resume?: boolean }>();
 	let [planScrollTop, setPlanScrollTop] = useState(0);
 	let entries = useQuestionnaires(questions);
 	let cardMetadata = useSyncExternalStore(cardMeta.subscribe, cardMeta.snapshot, cardMeta.snapshot);
 	let unanswered = countUnanswered(entries, cardMetadata);
 	let hasPlanProse = useHasPlanContent(questions);
-	let hasPlanContent = documentHasPlanningContent(hasPlanProse, entries);
+	let hasPlanContent = documentHasPlanningContent(hasPlanProse);
 	let [decisionView, setDecisionView] = useState<DecisionViewState>(() => {
 		let stored = localStorage.getItem("chopin:view:document");
 		return {
@@ -436,17 +490,22 @@ export function RoomWorkspace(
 			preferred: initialDocumentView(profile, stored),
 		};
 	});
-	let view = visibleDecisionView(decisionView, hasPlanContent, unanswered);
+	let typing = useDocumentEditing(room);
+	let view: WorkspaceDocumentView = showImplementation && profile.implementation
+		? "build"
+		: visibleDecisionView(decisionView, hasPlanContent, unanswered, typing);
 	let attention = useDecisionAttention(unanswered);
 	let latestCanEdit = useRef(canEdit);
 	let latestCanManage = useRef(canManage);
 	let workspacePresentation = presentWorkspace(workspace, mode, view);
 	let chatActive = workspacePresentation.chatVisible;
-	let [chatActivity, setChatActivity] = useState({ unread: 0, busy: false });
+	// `loaded` once this socket's transcript arrived, so `busy` reflects the room.
+	let [chatActivity, setChatActivity] = useState({ unread: 0, busy: false, loaded: false });
 	let onChatActivity = useCallback(
-		(event: { type: "message" | "working"; busy: boolean }) => {
+		(event: { type: "message" | "working"; busy: boolean; history?: true }) => {
 			setChatActivity(current => ({
 				busy: event.busy,
+				loaded: current.loaded || !!event.history,
 				unread: event.type === "message" && !chatActive
 					? current.unread + 1
 					: current.unread,
@@ -455,11 +514,16 @@ export function RoomWorkspace(
 		[chatActive],
 	);
 	let planVisible = workspacePresentation.documentVisible && view === "plan";
+	let editorFocused = useEditorFocus(frame);
 	let latestPlanVisible = useRef(planVisible);
 	latestPlanVisible.current = planVisible;
 	let latestBusy = useRef(chatActivity.busy);
 	latestBusy.current = chatActivity.busy;
 	let [documentWatch, setDocumentWatch] = useState(QUIET_DOCUMENT);
+	// Read through a ref: the host's callback changes as its route does, and the socket below must
+	// not reconnect (remounting the editor and losing its scroll) when a child opens over it.
+	let latestMetadataChanged = useRef(onMetadataChanged);
+	latestMetadataChanged.current = onMetadataChanged;
 	let updateMetadata = useCallback((next: WorkspaceMetadata) => {
 		let previous = metadataRef.current;
 		let metadata = newestDocumentMetadata(previous, next);
@@ -472,8 +536,8 @@ export function RoomWorkspace(
 			currentRepository,
 		);
 		onDocumentChanged(room, metadata);
-		if (onMetadataChanged) {
-			onMetadataChanged(metadata);
+		if (latestMetadataChanged.current) {
+			latestMetadataChanged.current(metadata);
 			return;
 		}
 		let previousPath = documentPath(
@@ -487,11 +551,40 @@ export function RoomWorkspace(
 		if (location.pathname !== path) {
 			history.replaceState(history.state, "", `${path}${location.search}${location.hash}`);
 		}
-	}, [onDocumentChanged, onMetadataChanged, room, userId]);
+	}, [onDocumentChanged, room, userId]);
+
+	// Focus alone never routes: only new decisions or new prose re-evaluate the opening.
+	useEffect(() => {
+		let next = advanceDecisionView(decisionView, hasPlanContent, unanswered, typing);
+		if (next === decisionView) return;
+		setDecisionView(state => (state === decisionView ? next : state));
+		// oxlint-disable-next-line react-hooks/exhaustive-deps -- typing and decisionView are read, not triggers
+	}, [hasPlanContent, unanswered]);
+
+	// Announce the route only once it has applied: a tab choice in the same
+	// batch makes the routing updater above a no-op.
+	let routedPhase = useRef(decisionView.phase);
+	useEffect(() => {
+		let before = routedPhase.current;
+		routedPhase.current = decisionView.phase;
+		if (before !== "initial" || decisionView.phase !== "forced") return;
+		setAnnouncement(current => ({
+			text: `Showing Decisions: ${unanswered} to answer`,
+			sequence: current.sequence + 1,
+		}));
+		// oxlint-disable-next-line react-hooks/exhaustive-deps -- the count is read when routing applies
+	}, [decisionView.phase]);
 
 	useEffect(() => {
-		setDecisionView(state => advanceDecisionView(state, hasPlanContent, unanswered));
-	}, [hasPlanContent, unanswered]);
+		if (!taskLink || !hasPlanContent) return;
+		setTaskLink(false);
+		setShowImplementation(true);
+		dispatch({ type: "set-chat", open: false });
+	}, [taskLink, hasPlanContent, dispatch]);
+
+	useEffect(() => {
+		setChatActivity(current => current.loaded ? { ...current, loaded: false } : current);
+	}, [wire]);
 
 	useEffect(() => {
 		if (!chatActive) return;
@@ -547,14 +640,22 @@ export function RoomWorkspace(
 		}
 		if (next === "decisions" && revealFirst) {
 			let first = firstOpenDecision(entries, cardMetadata);
-			setReveal({ widget: first?.id ?? "", token: Date.now() });
+			setReveal({ widget: first?.id ?? "", token: Date.now(), resume: true });
 		}
 	};
 
-	let selectDestination = (destination: "plan" | "decisions") => {
-		selectView(destination, mode === "split");
+	let selectDestination = (destination: WorkspaceDocumentView) => {
+		setShowImplementation(destination === "build");
+		if (destination !== "build") selectView(destination, mode === "split");
 		dispatch({ type: "set-chat", open: false });
 	};
+	let latestSelectDestination = useRef(selectDestination);
+	latestSelectDestination.current = selectDestination;
+	// Stable, because the editor rebuilds its plugins when a callback changes.
+	let showDecision = useCallback((questionnaireId: string) => {
+		latestSelectDestination.current("decisions");
+		setReveal({ widget: questionnaireId, token: Date.now() });
+	}, []);
 
 	useEffect(() => {
 		setSourceDestination(undefined);
@@ -698,6 +799,8 @@ export function RoomWorkspace(
 				}"]`,
 			);
 			if (!card) return;
+			// A card behind the top of a deck is inert and cannot take focus.
+			revealDeckItem(card);
 			card.tabIndex = -1;
 			card.focus();
 		});
@@ -775,7 +878,7 @@ export function RoomWorkspace(
 		setWire(socket);
 
 		let off = [
-			conversationStore.listen(socket),
+			...(profile.chat ? [conversationStore.listen(socket)] : []),
 			socket.on<ManagedHello>("session:hello", frame => {
 				let editable = frame.canEdit && !frame.archivedAt;
 				let accessChanged = latestCanEdit.current !== editable
@@ -831,6 +934,7 @@ export function RoomWorkspace(
 		research,
 		researchEnabled,
 		room,
+		profile.chat,
 		profile.surface,
 		threads,
 		cardMeta,
@@ -840,6 +944,28 @@ export function RoomWorkspace(
 
 	let workspaceArchivedAt = archivedAt ?? metadata.archivedAt;
 	let workspaceCanEdit = effectiveCanEdit && !workspaceArchivedAt;
+	let editMode = documentEditMode({
+		canEdit: !!workspaceCanEdit && !implementation.locked,
+		editing,
+		phone,
+	});
+	// An empty document has nothing to read, so it opens ready to write. Decided once, on arrival.
+	let arrived = useRef(false);
+	useEffect(() => {
+		if (!planState.synced || arrived.current) return;
+		arrived.current = true;
+		if (opensEditing({ empty: planState.empty })) setEditing(true);
+	}, [planState.synced, planState.empty]);
+	// Only the document's own keyboard gets formatting: never Chat, a comment reply, or the title.
+	let docked = editMode === "editing" && keyboardOpen && planVisible && editorFocused;
+	let toggleEditing = () => {
+		// Synchronous, so the editor takes focus inside the tap and iOS raises the keyboard.
+		flushSync(() => {
+			setEditing(!editing);
+			// Chat opens over the document without changing `view`, so ask what is on screen.
+			if (!editing && !planVisible) selectDestination("plan");
+		});
+	};
 	let actOnResearchOffer = (
 		offerId: string,
 		choice: "research" | "dismiss" | "resume",
@@ -904,6 +1030,136 @@ export function RoomWorkspace(
 			</div>
 		);
 	}
+	let acceptedComments =
+		threadState.threads.filter(item => item.thread.status === "accepted" && !item.applied).length;
+
+	let statusNotices = (
+		<>
+			{!!planState.lost && planState.lost !== lostSeen && (
+				<div className="plan-status" data-level="alert" role="alert">
+					<span className="plan-status-text">
+						<span
+							aria-hidden="true"
+							className="plan-status-label"
+							data-tooltip={LOST_EDITS}
+							data-tooltip-verbatim=""
+						>
+							Edits not saved
+						</span>
+						<span aria-hidden="true" className="plan-status-detail">{LOST_EDITS}</span>
+						<span className="sr-only">{LOST_EDITS}</span>
+					</span>
+					<button
+						className="btn btn-sm btn-ghost"
+						onClick={() =>
+							setLostSeen(planState.lost ?? 0)}
+						type="button"
+					>
+						Dismiss
+					</button>
+				</div>
+			)}
+			{/* Apart from PlanStatus, which would announce its end as "Reconnected". */}
+			{planState.refused && (
+				<div className="plan-status" data-level="notice">
+					<span aria-hidden="true" className="plan-status-dot" />
+					<span aria-hidden="true" className="plan-status-text">
+						<span
+							className="plan-status-label"
+							data-tooltip={UNDO_REFUSALS[planState.refused.reason]}
+							data-tooltip-verbatim=""
+						>
+							Can't undo
+						</span>
+						<span className="plan-status-detail">
+							{UNDO_REFUSALS[planState.refused.reason]}
+						</span>
+					</span>
+				</div>
+			)}
+			<span aria-atomic="true" aria-live="polite" className="sr-only" role="status">
+				{planState.refused && `Can't undo. ${UNDO_REFUSALS[planState.refused.reason]}`}
+			</span>
+			<PlanStatus
+				connection={status === "deleted" ? "closed" : treatAsConnected ? undefined : status}
+				failed={planState.failed}
+				onReconnect={wire && reconnects < RECONNECTS_BEFORE_RELOAD
+					? () => {
+						setReconnects(count => count + 1);
+						wire.reconnect();
+					}
+					: undefined}
+				synced={planState.synced}
+			/>
+		</>
+	);
+	// A child room renders its document alone, with no tab bar for the edit toggle.
+	let childRoom = presentation.type === "child";
+	let plan = (
+		<GitHubReferencesProvider value={githubReferences}>
+			<PlanEditor
+				experiments={experiments}
+				afterword={
+					<InlineInvestigations
+						store={experiments}
+						userId={userId}
+						canEdit={!!workspaceCanEdit && status === "connected"}
+						locked={implementation.locked}
+					/>
+				}
+				cardMeta={cardMeta}
+				evidence={showEvidence}
+				onCardSource={showCardSource}
+				hasCardSource={hasCardSource}
+				// A child has no Decisions pane to open, so its decisions stay inline.
+				onShowDecision={presentation.type === "child" ? undefined : showDecision}
+				planner={agent}
+				commentPresentation={mode === "split" ? "popover" : "sheet"}
+				connection={status === "deleted" ? "closed" : status}
+				key={workspaceArchivedAt ? "archived" : "active"}
+				disclosureMotion={motionContract("collapse")}
+				editMode={childRoom ? undefined : editMode}
+				formatDock={!childRoom && docked ? formatDock : undefined}
+				motionImmediately={settleMotionImmediately}
+				onScrollTop={setPlanScrollTop}
+				onState={setPlanState}
+				preface={presentation.type === "child" && presentation.parent
+					? <ChildProvenance channelId={room} parent={presentation.parent} />
+					: undefined}
+				questionMotion={QUESTION_MOTION}
+				questions={questions}
+				readOnly={!workspaceCanEdit || implementation.locked}
+				research={profile.research ? research : undefined}
+				researchLauncher={researchLauncher}
+				scrollTop={planScrollTop}
+				threads={threads}
+				authorship={authorship}
+				user={user}
+				wire={wire}
+			/>
+		</GitHubReferencesProvider>
+	);
+	if (presentation.type === "child") {
+		return (
+			<div
+				className="child-document flex h-full min-h-0 flex-col bg-page"
+				data-workspace-room={room}
+				data-workspace-surface="child"
+			>
+				<p aria-live="polite" className="sr-only" role="status">
+					<span key={announcement.sequence}>{announcement.text}</span>
+				</p>
+				<div className="child-document-status">{statusNotices}</div>
+				<section
+					aria-label="Document"
+					className="child-document-scroll min-h-0 flex-1"
+					data-document-view="plan"
+				>
+					{plan}
+				</section>
+			</div>
+		);
+	}
 
 	return (
 		<>
@@ -912,11 +1168,14 @@ export function RoomWorkspace(
 			</p>
 			<Workspace
 				available={available}
+				buildEnabled={hasPlanContent}
 				frame={frame}
 				chat={
 					<Chat
 						active={chatActive}
 						agent={agent}
+						focus={presentation.type === "parent-with-child" ? presentation.childId : undefined}
+						onOpenChild={presentation.onChildOpen}
 						connected={status === "connected"}
 						readonly={!workspaceCanEdit}
 						archived={!!workspaceArchivedAt}
@@ -928,9 +1187,6 @@ export function RoomWorkspace(
 								: "This document is archived."
 							: !workspaceCanEdit
 							? "You have read-only access to this document."
-							: undefined}
-						emptyNotice={presentation.type === "child"
-							? "Discuss this report here. Messages stay with the report."
 							: undefined}
 						onShowDecisions={() => selectDestination("decisions")}
 						onResearch={researchEnabled ? startResearch : undefined}
@@ -978,99 +1234,97 @@ export function RoomWorkspace(
 				}
 				chatActivity={chatActivity}
 				documentActivity={documentActivity(documentWatch, chatActivity.busy)}
-				header={
-					<Header
-						archivedAt={workspaceArchivedAt}
-						canManage={effectiveCanManage}
-						editing={titleEdit}
-						members={members}
-						label={metadata.title}
-						onAction={action => onDocumentAction(room, action)}
-						onEditingChange={setTitleEdit}
-						onRenamed={updateMetadata}
-						presentation={presentation}
-						project={{ id: repository.id, name: repository.name }}
-						room={room}
-						tools={<AuthorshipToggle store={authorship} />}
-					/>
-				}
+				header={phone
+					? (
+						<PhoneHeader
+							archivedAt={workspaceArchivedAt}
+							canManage={effectiveCanManage}
+							editing={titleEdit}
+							editingDocument={editMode === "editing"}
+							label={metadata.title}
+							onAction={action => onDocumentAction(room, action)}
+							onEditingChange={setTitleEdit}
+							onRenamed={updateMetadata}
+							presentation={presentation}
+							room={room}
+						/>
+					)
+					: (
+						<Header
+							archivedAt={workspaceArchivedAt}
+							canManage={effectiveCanManage}
+							editing={titleEdit}
+							members={mode === "split" ? undefined : members}
+							label={metadata.title}
+							onAction={action => onDocumentAction(room, action)}
+							onEditingChange={setTitleEdit}
+							onRenamed={updateMetadata}
+							project={{ id: repository.id, name: repository.name }}
+							room={room}
+							tools={<AuthorshipToggle store={authorship} />}
+						/>
+					)}
 				controls={
-					<DecisionViewControl
-						attention={attention}
-						documentActivity={documentActivity(documentWatch, chatActivity.busy)}
-						onView={selectDestination}
-						unanswered={unanswered}
-						view={view}
-					/>
-				}
-				status={
 					<>
-						{!!planState.lost && planState.lost !== lostSeen && (
-							<div className="plan-status" data-level="alert" role="alert">
-								<span className="plan-status-text">
-									<span
-										aria-hidden="true"
-										className="plan-status-label"
-										data-tooltip={LOST_EDITS}
-										data-tooltip-verbatim=""
-									>
-										Edits not saved
-									</span>
-									<span aria-hidden="true" className="plan-status-detail">{LOST_EDITS}</span>
-									<span className="sr-only">{LOST_EDITS}</span>
-								</span>
-								<button
-									className="btn btn-sm btn-ghost"
-									onClick={() =>
-										setLostSeen(planState.lost ?? 0)}
-									type="button"
-								>
-									Dismiss
-								</button>
-							</div>
-						)}
-						{/* Apart from PlanStatus, which would announce its end as "Reconnected". */}
-						{planState.refused && (
-							<div className="plan-status" data-level="notice">
-								<span aria-hidden="true" className="plan-status-dot" />
-								<span aria-hidden="true" className="plan-status-text">
-									<span
-										className="plan-status-label"
-										data-tooltip={UNDO_REFUSALS[planState.refused.reason]}
-										data-tooltip-verbatim=""
-									>
-										Can't undo
-									</span>
-									<span className="plan-status-detail">
-										{UNDO_REFUSALS[planState.refused.reason]}
-									</span>
-								</span>
-							</div>
-						)}
-						<span aria-atomic="true" aria-live="polite" className="sr-only" role="status">
-							{planState.refused && `Can't undo. ${UNDO_REFUSALS[planState.refused.reason]}`}
-						</span>
-						<PlanStatus
-							connection={status === "deleted" ? "closed" : treatAsConnected ? undefined : status}
-							failed={planState.failed}
-							onReconnect={wire && reconnects < RECONNECTS_BEFORE_RELOAD
-								? () => {
-									setReconnects(count => count + 1);
-									wire.reconnect();
-								}
-								: undefined}
-							synced={planState.synced}
+						<DecisionViewControl
+							attention={attention}
+							buildEnabled={profile.implementation ? hasPlanContent : undefined}
+							documentActivity={documentActivity(documentWatch, chatActivity.busy)}
+							onView={selectDestination}
+							unanswered={unanswered}
+							view={view}
 						/>
 					</>
 				}
+				status={statusNotices}
 				ids={workspaceIds}
+				phoneAction={editMode && (
+					<button
+						aria-label={editing ? "Done editing" : "Edit document"}
+						className="phone-tab-action"
+						data-editing={editing || undefined}
+						onClick={toggleEditing}
+						type="button"
+					>
+						<PencilIcon aria-hidden="true" data-edit-icon="edit" size={24} />
+						<CheckIcon aria-hidden="true" data-edit-icon="done" size={24} />
+					</button>
+				)}
+				// Formatting rides above the keyboard while typing. With the keyboard down the tabs
+				// return, and a selection gets the ordinary bubble instead.
+				phoneToolbar={docked && <div className="h-full" ref={setFormatDock} />}
 				identity={room}
 				mode={mode}
+				presence={<RoomMembers members={members} ring="page" />}
+				phone={phone}
 				onDesktopChatOpen={setDesktopChatOpen}
 				onChatOpen={open => dispatch({ type: "set-chat", open })}
 				onDestination={selectDestination}
+				build={profile.implementation && (
+					<BuildView
+						active={workspacePresentation.documentVisible && view === "build"}
+						canEdit={!!workspaceCanEdit && status === "connected"}
+						chatLoaded={chatActivity.loaded}
+						comments={acceptedComments}
+						onShowDecisions={() => selectDestination("decisions")}
+						onShowDocument={() => selectDestination("plan")}
+						planner={agent}
+						plannerBusy={chatActivity.busy}
+						room={room}
+						unanswered={unanswered}
+						userId={userId}
+						wire={wire}
+					/>
+				)}
 				decisions={
 					<Decisions
+						additional={
+							<EvidenceDecisions
+								store={experiments}
+								canEdit={!!workspaceCanEdit && status === "connected"}
+							/>
+						}
+						hasAdditional={[...experiments.values.values()].some(item => item.decisions.length > 0)}
 						cardMeta={cardMeta}
 						canEdit={workspaceCanEdit}
 						connected={treatAsConnected && workspaceCanEdit}
@@ -1086,35 +1340,7 @@ export function RoomWorkspace(
 						wire={wire}
 					/>
 				}
-				plan={
-					<PlanEditor
-						cardMeta={cardMeta}
-						evidence={showEvidence}
-						onCardSource={showCardSource}
-						hasCardSource={hasCardSource}
-						planner={agent}
-						commentPresentation={mode === "split" ? "popover" : "sheet"}
-						connection={status === "deleted" ? "closed" : status}
-						key={workspaceArchivedAt ? "archived" : "active"}
-						disclosureMotion={motionContract("collapse")}
-						motionImmediately={settleMotionImmediately}
-						onScrollTop={setPlanScrollTop}
-						onState={setPlanState}
-						preface={presentation.type === "child" && presentation.parent
-							? <ChildProvenance channelId={room} parent={presentation.parent} />
-							: undefined}
-						questionMotion={QUESTION_MOTION}
-						questions={questions}
-						readOnly={!workspaceCanEdit}
-						research={profile.research ? research : undefined}
-						researchLauncher={researchLauncher}
-						scrollTop={planScrollTop}
-						threads={threads}
-						authorship={authorship}
-						user={user}
-						wire={wire}
-					/>
-				}
+				plan={plan}
 				state={workspace}
 				presentation={presentation}
 				unanswered={unanswered}

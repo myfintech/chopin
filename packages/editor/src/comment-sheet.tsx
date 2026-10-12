@@ -1,107 +1,183 @@
 import { useEffect, useRef, useState } from "react";
 import { Drawer } from "@base-ui/react/drawer";
-import { CloseIcon } from "@chopin/icons";
-
+import { ChevronIcon, CloseIcon } from "@chopin/icons";
 import { currentViewport, listenToViewportChanges } from "@chopin/viewport";
 
 import type { ReactNode } from "react";
 
-/** The medium detent fits the content between these fractions of the viewport. */
-export const COMMENT_SHEET_FIT_RANGE = [0.2, 0.85] as const;
+/** The tallest the sheet grows, as a fraction of the space above the keyboard. */
 export const COMMENT_SHEET_LARGE = 0.92;
-export const COMMENT_SHEET_SNAP_POINTS = [COMMENT_SHEET_FIT_RANGE[1], COMMENT_SHEET_LARGE] as const;
-export const COMMENT_SHEET_MAX_WIDTH = 430;
+/** Where the sheet opens, as a fraction of the space above the keyboard, so its passage shows above it. */
+export const COMMENT_SHEET_MEDIUM = 0.5;
 
-export function usesCommentSheet({
-	coarse,
-	width,
-}: {
-	coarse: boolean;
-	width: number;
-}): boolean {
-	return coarse && width <= COMMENT_SHEET_MAX_WIDTH;
+/** How much of a sheet's scrolling notes the medium detent keeps in view beneath its header. */
+export const COMMENT_SHEET_PEEK = 64;
+
+/**
+ * The medium detent's height in pixels of the space the keyboard leaves: half
+ * of it, but never less than the header, a peek of the notes and the composer
+ * need, and never past the large detent.
+ */
+export function commentSheetMedium(availableHeight: number, floor = 0): number {
+	if (!(availableHeight > 0)) return 0;
+	let half = availableHeight * COMMENT_SHEET_MEDIUM;
+	return Math.round(Math.min(Math.max(half, floor), availableHeight * COMMENT_SHEET_LARGE));
 }
 
+/** What a sheet's medium detent must show: everything but the part of its notes that scrolls. */
+function sheetFloor(popup: HTMLElement): number {
+	let scroller = popup.querySelector<HTMLElement>(".plan-comment-thread-scroll");
+	let content = popup.querySelector<HTMLElement>(".plan-comment-sheet-content");
+	// A draft is header and composer only, and shows whole.
+	if (!scroller && popup.querySelector("textarea")) return popup.offsetHeight;
+	let scrolls = scroller ?? content;
+	if (!scrolls) return popup.offsetHeight;
+	return popup.offsetHeight - scrolls.offsetHeight
+		+ Math.min(scrolls.scrollHeight, COMMENT_SHEET_PEEK);
+}
+
+export type CommentSheetDetent = "medium" | "large";
+
+/**
+ * How tall the sheet stands: as tall as its content, up to the large detent of
+ * the space the keyboard leaves. A taller thread scrolls inside it instead.
+ */
+export function commentSheetHeight(contentHeight: number, availableHeight: number): number {
+	if (!(availableHeight > 0)) return 0;
+	let cap = availableHeight * COMMENT_SHEET_LARGE;
+	if (!(contentHeight > 0)) return cap;
+	return Math.min(cap, contentHeight);
+}
+
+/** Where the sheet's top edge sits in the visual viewport, so a passage can stay above it. */
 export function commentSheetTop(
-	viewportHeight: number,
-	fit: number = COMMENT_SHEET_FIT_RANGE[1],
+	viewport: { top: number; height: number },
+	sheetHeight: number,
 ): number {
-	return viewportHeight * (1 - fit);
+	return viewport.top + viewport.height - commentSheetHeight(sheetHeight, viewport.height);
 }
 
-/** The medium detent: as tall as the content needs, within the fit range. */
-export function commentSheetFitSnapPoint(contentHeight: number, viewportHeight: number): number {
-	if (!(viewportHeight > 0) || !(contentHeight > 0)) return COMMENT_SHEET_FIT_RANGE[1];
-	return Math.min(
-		COMMENT_SHEET_FIT_RANGE[1],
-		Math.max(COMMENT_SHEET_FIT_RANGE[0], contentHeight / viewportHeight),
-	);
-}
+/**
+ * What one header row says, so no title repeats what the content shows.
+ *
+ * A thread quotes its passage; a block's list counts its threads; a thread
+ * opened from that list leads back to it. Anything else gets a plain title.
+ */
+export type CommentSheetHeading =
+	| { kind: "quote"; quote: string }
+	| { kind: "count"; count: number }
+	| { kind: "back"; count: number }
+	| { kind: "title"; title: string };
 
-export function nextCommentSheetSnapPoint(current: number, fit: number): number {
-	return current === fit ? COMMENT_SHEET_LARGE : fit;
+export function commentSheetHeading(
+	input:
+		| { kind: "draft"; quote: string }
+		| { kind: "thread"; quote: string; siblings: number }
+		| { kind: "list"; count: number }
+		| { kind: "other"; title: string },
+): CommentSheetHeading {
+	switch (input.kind) {
+		case "draft":
+			return input.quote.trim()
+				? { kind: "quote", quote: input.quote }
+				: { kind: "title", title: "New comment" };
+		case "thread":
+			if (input.siblings > 1) return { kind: "back", count: input.siblings };
+			return input.quote.trim()
+				? { kind: "quote", quote: input.quote }
+				: { kind: "title", title: "Comment" };
+		case "list":
+			return { kind: "count", count: input.count };
+		case "other":
+			return { kind: "title", title: input.title };
+	}
 }
 
 export type CommentSheetProps = {
 	children: ReactNode;
 	id: string;
 	label: string;
-	/** Visible heading, hidden from assistive tech; defaults to the label. */
-	title?: string;
+	heading: CommentSheetHeading;
+	/** Leave the thread for its block's list; shown when the heading is `back`. */
+	onBack?: () => void;
 	onClose: () => void;
-	/** Show the close beside the grabber, for content with no header of its own. */
-	closeVisible?: boolean;
+	/** The sheet's surface once it is mounted, for anything that keeps clear of it. */
+	onSurface?: (element: HTMLDivElement | null) => void;
+	/** A draft focuses its field; everything else focuses the close, so no keyboard springs up. */
+	focus?: "field" | "close";
+	/** Where this thread stands among the document's open threads, to step between them. */
+	pager?: CommentSheetPager;
+	/** How tall the sheet shows while it rests at the medium detent; undefined when it is large. */
+	onDetentHeight?: (height: number | undefined) => void;
+	/** What the sheet is showing; another thread opens at the medium detent again. */
+	contentKey?: string;
+};
+
+export type CommentSheetPager = {
+	index: number;
+	count: number;
+	/** Absent at the first thread: the pager stops at its ends rather than wrapping. */
+	onPrevious?: () => void;
+	onNext?: () => void;
 };
 
 export function CommentSheet(
-	{ children, closeVisible, id, label, onClose, title }: CommentSheetProps,
+	{
+		children,
+		contentKey,
+		focus = "close",
+		heading,
+		id,
+		label,
+		onBack,
+		onClose,
+		onDetentHeight,
+		onSurface,
+		pager,
+	}: CommentSheetProps,
 ) {
 	let [open, setOpen] = useState(false);
-	let [large, setLarge] = useState(false);
-	let [fit, setFit] = useState<number>(COMMENT_SHEET_FIT_RANGE[1]);
-	let snapPoint = large ? COMMENT_SHEET_LARGE : fit;
-	let viewportRef = useRef<HTMLDivElement>(null);
-	let [content, setContent] = useState<HTMLDivElement | null>(null);
-	let [body, setBody] = useState<HTMLDivElement | null>(null);
-
-	useEffect(() => {
-		if (!content || !body) return;
-		let measure = () => {
-			let padding = parseFloat(getComputedStyle(content).paddingBottom) || 0;
-			setFit(
-				commentSheetFitSnapPoint(
-					body.offsetHeight + content.offsetTop + padding,
-					currentViewport().height,
-				),
-			);
-		};
-		measure();
-		let observer = new ResizeObserver(measure);
-		observer.observe(body);
-		return () => observer.disconnect();
-	}, [content, body]);
+	let [detent, setDetent] = useState<CommentSheetDetent>("medium");
+	let [available, setAvailable] = useState(() => currentViewport().height);
+	let [floor, setFloor] = useState(0);
+	let medium = commentSheetMedium(available, floor);
+	/** Whether the content is taller than the medium detent, so there is a large one to pull up to. */
+	let [tall, setTall] = useState(false);
+	let [surface, setSurface] = useState<HTMLDivElement | null>(null);
+	let popup = useRef<HTMLDivElement>(null);
+	let close = useRef<HTMLButtonElement>(null);
 
 	useEffect(() => {
 		let frame = requestAnimationFrame(() => setOpen(true));
 		return () => cancelAnimationFrame(frame);
 	}, []);
 
+	// The medium detent follows the space above the keyboard as it opens and closes.
 	useEffect(() => {
-		let expandForKeyboard = () => {
-			let viewport = currentViewport();
-			let keyboardInset = window.innerHeight - viewport.top - viewport.height;
-			let active = document.activeElement;
-			if (
-				keyboardInset > 60
-				&& active instanceof HTMLElement
-				&& viewportRef.current?.contains(active)
-			) {
-				setLarge(true);
-			}
-		};
-
-		return listenToViewportChanges(expandForKeyboard);
+		let update = () => setAvailable(currentViewport().height);
+		update();
+		return listenToViewportChanges(update);
 	}, []);
+
+	useEffect(() => {
+		let element = surface;
+		if (!element) return;
+		let measure = () => {
+			setFloor(sheetFloor(element));
+			setTall(element.offsetHeight > medium + 1);
+		};
+		measure();
+		let observer = new ResizeObserver(measure);
+		observer.observe(element);
+		return () => observer.disconnect();
+	}, [medium, surface]);
+
+	useEffect(() => setDetent("medium"), [contentKey]);
+
+	useEffect(() => {
+		onDetentHeight?.(detent === "medium" ? medium : undefined);
+	}, [detent, medium, onDetentHeight]);
+	useEffect(() => () => onDetentHeight?.(undefined), [onDetentHeight]);
 
 	return (
 		<Drawer.Root
@@ -109,64 +185,104 @@ export function CommentSheet(
 			onOpenChangeComplete={next => {
 				if (!next) onClose();
 			}}
-			onSnapPointChange={next => setLarge(typeof next === "number" && next > fit)}
+			// A sheet shorter than its medium detent has one snap point, which the drawer names
+			// as the large one; even a tap on its header settles there. It is still medium.
+			onSnapPointChange={point => {
+				if (point !== null) setDetent(point === 1 && tall ? "large" : "medium");
+			}}
 			open={open}
-			snapPoint={snapPoint}
-			snapPoints={[fit, COMMENT_SHEET_LARGE]}
-			snapToSequentialPoints
+			snapPoint={detent === "large" ? 1 : medium}
+			// Pixels above 1, a fraction at 1: the large detent is as tall as the content allows.
+			snapPoints={medium > 1 ? [medium, 1] : [1]}
 		>
 			<Drawer.VirtualKeyboardProvider>
 				<Drawer.Portal>
 					<Drawer.Backdrop
 						className="plan-comment-sheet-backdrop"
 						data-plan-comment-sheet-backdrop
+						data-plan-comment-sheet-detents={tall || undefined}
+						data-plan-comment-sheet-large={(tall && detent === "large") || undefined}
 						onClick={() => setOpen(false)}
 					/>
-					<Drawer.Viewport className="plan-comment-sheet-viewport" ref={viewportRef}>
+					<Drawer.Viewport className="plan-comment-sheet-viewport">
 						<Drawer.Popup
 							aria-modal="true"
 							className="plan-comment-sheet-popup"
-							data-fit={fit}
 							data-plan-comment-sheet
 							finalFocus={false}
 							id={id}
-							initialFocus
+							initialFocus={() =>
+								(focus === "field"
+									? popup.current?.querySelector<HTMLElement>("textarea")
+									: undefined) ?? close.current ?? true}
+							ref={element => {
+								popup.current = element;
+								setSurface(element);
+								onSurface?.(element);
+							}}
 						>
-							<button
-								aria-label="Resize comment sheet"
-								className="plan-comment-sheet-grabber"
-								data-tooltip="Resize sheet"
-								onClick={() => setLarge(nextCommentSheetSnapPoint(snapPoint, fit) > fit)}
-								type="button"
-							>
-								<span aria-hidden="true" />
-							</button>
-							{closeVisible && (
+							<span aria-hidden="true" className="plan-comment-sheet-grabber" />
+							<Drawer.Title className="sr-only">{label}</Drawer.Title>
+							<div className="plan-comment-sheet-head">
+								{pager && pager.count > 1 && heading.kind !== "back" && (
+									<div className="plan-comment-sheet-pager" data-plan-comment-pager="">
+										<button
+											aria-label="Previous comment"
+											className="plan-comment-sheet-step btn btn-icon btn-ghost"
+											disabled={!pager.onPrevious}
+											onClick={pager.onPrevious}
+											type="button"
+										>
+											<ChevronIcon aria-hidden="true" className="rotate-180" size={16} />
+										</button>
+										<span aria-live="polite">{pager.index + 1} of {pager.count}</span>
+										<button
+											aria-label="Next comment"
+											className="plan-comment-sheet-step btn btn-icon btn-ghost"
+											disabled={!pager.onNext}
+											onClick={pager.onNext}
+											type="button"
+										>
+											<ChevronIcon aria-hidden="true" size={16} />
+										</button>
+									</div>
+								)}
+								{heading.kind === "quote" && (
+									<blockquote className="plan-comment-sheet-quote" data-plan-comment-sheet-quote>
+										{heading.quote}
+									</blockquote>
+								)}
+								{heading.kind === "count" && (
+									<p className="plan-comment-sheet-heading">{heading.count} comments</p>
+								)}
+								{heading.kind === "title" && (
+									<p className="plan-comment-sheet-heading">{heading.title}</p>
+								)}
+								{heading.kind === "back" && (
+									<button
+										className="plan-comment-sheet-back btn btn-md btn-ghost"
+										data-plan-comment-back
+										onClick={onBack}
+										type="button"
+									>
+										<ChevronIcon aria-hidden="true" className="rotate-180" size={16} />
+										All {heading.count} comments
+									</button>
+								)}
 								<Drawer.Close
 									aria-label="Close comment"
 									className="plan-comment-close plan-comment-sheet-close btn btn-icon btn-ghost"
+									ref={close}
 									title="Close comment"
 								>
-									<CloseIcon aria-hidden="true" size={14} />
+									<CloseIcon aria-hidden="true" size={16} />
 								</Drawer.Close>
-							)}
-							<Drawer.Title className="sr-only">{label}</Drawer.Title>
-							<div aria-hidden="true" className="plan-comment-sheet-title">
-								{title ?? label}
 							</div>
 							<Drawer.Content
 								className="plan-comment-sheet-content"
 								data-base-ui-swipe-ignore
-								ref={setContent}
 							>
-								<div ref={setBody}>{children}</div>
-								{!closeVisible && (
-									<Drawer.Close
-										aria-label="Close comment"
-										className="sr-only"
-										tabIndex={-1}
-									/>
-								)}
+								{children}
 							</Drawer.Content>
 						</Drawer.Popup>
 					</Drawer.Viewport>

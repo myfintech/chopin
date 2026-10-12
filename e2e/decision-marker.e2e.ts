@@ -125,7 +125,7 @@ function prose(page: Page, text: string) {
 
 async function open(page: Page, answer = "Team by team") {
 	await page.setViewportSize({ width: 1_440, height: 900 });
-	await page.getByRole("button", { name: "Hide chat" }).click();
+	await page.getByRole("button", { name: "Expand document" }).click();
 	await page.getByRole("button", { name: "Hide sidebar" }).click();
 	// The panes animate; a marker under a still-moving pointer would be left behind.
 	let last = "";
@@ -155,7 +155,7 @@ test("a linked decision is a gutter marker on its first line, with no card in th
 	expect(box.x + box.width).toBeLessThanOrEqual(line.x);
 	let lineCentre = line.y + 16;
 	expect(Math.abs(box.y + box.height / 2 - lineCentre)).toBeLessThan(14);
-	expect(box.width).toBe(20);
+	expect(box.width).toBe(24);
 });
 
 test("hovering the marker washes the prose and previews the decision", async ({ join, seed }) => {

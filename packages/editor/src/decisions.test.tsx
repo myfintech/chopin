@@ -42,7 +42,7 @@ function markup(stored?: string, entries = [RESOLVED], failed = false): string {
 	});
 
 	let store = new QuestionnaireStore();
-	store.set({ entries, hasPlanContent: true });
+	store.set({ entries, hasPlanContent: true, runs: [] });
 	if (failed) store.failOpen();
 	let motion: MotionDisclosureContract = {
 		className: "motion-collapse",
@@ -83,7 +83,7 @@ test("an expired card is listed with the resolved cards and says nobody answered
 		},
 	};
 	let history = markup("true", [expired, RESOLVED]);
-	expect(history).toMatch(/<span class="tabular-nums">2<\/span><span>resolved<\/span>/);
+	expect(history).toContain('<span class="tabular-nums">2 resolved</span>');
 	expect(history).toContain('data-plan-sidecar-questionnaire="expired"');
 	expect(history).toContain("Ship the migration?");
 	expect(history).toContain(
@@ -107,4 +107,27 @@ test("a failed document open offers a retry instead of indefinite loading", () =
 	expect(failed).toContain("Decisions unavailable");
 	expect(failed).toContain("Try again");
 	expect(failed).not.toContain("Loading decisions…");
+});
+
+function openEntry(id: string, header: string): QuestionnaireEntry {
+	return {
+		id,
+		value: {
+			id,
+			questions: [{ id: `${id}-q`, header, prompt: `${header}?`, multiple: false, options: [] }],
+		},
+	};
+}
+
+test("two open decisions render as a desktop deck above resolved history", () => {
+	let html = markup(undefined, [openEntry("a", "Storage"), openEntry("b", "Scope"), RESOLVED]);
+	expect(html).toContain('aria-roledescription="carousel"');
+	expect(html).toContain('aria-label="2 open decisions"');
+	expect(html).toContain("1 of 2");
+	expect(html.indexOf("data-deck=")).toBeLessThan(html.indexOf("resolved</span>"));
+	expect(html).not.toContain("decision-save-bar");
+});
+
+test("one open decision renders without a deck", () => {
+	expect(markup(undefined, [openEntry("a", "Storage")])).not.toContain("data-deck");
 });

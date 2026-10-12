@@ -12,12 +12,12 @@
 
 import { describe, expect, it } from "bun:test";
 
-import { ThreadStore } from "./threads";
+import { handlesOpenComment, openOutcome, openRequest, ThreadStore } from "./threads";
 
 import type { Comment, Plan } from "@chopin/protocol";
 
 function note(handle: string, text: string, id = `${handle}-${text}`): Comment.Note {
-	return { id, handle, text, ts: 1 };
+	return { id, author: "member", handle, text, ts: 1 };
 }
 
 function thread(over: Partial<Comment.Thread> = {}): Comment.Thread {
@@ -93,7 +93,11 @@ describe("holding what threads say", () => {
 		subject.sync([value]);
 		subject.said(value.id, note("kris", "Agreed."));
 
-		expect(subject.snapshot().threads[0]?.thread.notes.map(each => each.handle))
+		expect(
+			subject.snapshot().threads[0]?.thread.notes.map(each =>
+				each.author === "member" ? each.handle : "chopin"
+			),
+		)
 			.toEqual(["ana", "kris"]);
 	});
 
@@ -120,7 +124,7 @@ describe("holding what threads say", () => {
 		expect(subject.snapshot().threads).toHaveLength(0);
 	});
 
-	it("never shows a dismissed thread", () => {
+	it("never shows a resolved or dismissed thread", () => {
 		let subject = store();
 		let value = thread();
 		subject.sync([value]);
@@ -133,7 +137,18 @@ describe("holding what threads say", () => {
 			at: 2,
 			quote: "q",
 		});
+		expect(subject.snapshot().threads).toHaveLength(0);
 
+		subject.sync([value]);
+		subject.resolved({
+			kind: "comment:resolved",
+			ts: 0,
+			id: value.id,
+			status: "resolved",
+			resolver: "kris",
+			at: 2,
+			quote: "q",
+		});
 		expect(subject.snapshot().threads).toHaveLength(0);
 	});
 
@@ -182,32 +197,114 @@ describe("what an accepted thread still owes", () => {
 
 		expect(subject.snapshot().threads[0]?.applied).toBe(true);
 	});
+});
 
-	it("asks the Planner to retry an unapplied accepted comment without composer syntax", () => {
-		let sent: Array<{ kind: string; payload?: Record<string, unknown> }> = [];
-		let subject = store();
-		subject.listen({
+/** A wire that answers each ask with whatever the test says the server would. */
+function wire(answer: (kind: string, payload?: Record<string, unknown>) => unknown) {
+	let sent: Array<{ kind: string; payload?: Record<string, unknown> }> = [];
+	return {
+		sent,
+		transport: {
 			on: () => () => {},
 			send: () => {},
 			ask: async <T>(kind: string, payload?: Record<string, unknown>) => {
 				sent.push({ kind, payload });
-				return { kind: "chat:send", ts: 0, id: "entry", queued: false } as T;
+				let value = answer(kind, payload);
+				if (value instanceof Error) throw value;
+				return value as T;
 			},
-		});
-		subject.sync([thread({ id: "t1", status: "accepted", quote: "shorten this" })]);
+		},
+	};
+}
 
-		subject.retry("t1");
+describe("resolving and reopening", () => {
+	it("hides a thread the moment it is resolved", () => {
+		let subject = store();
+		let { sent, transport } = wire(() => new Promise(() => {}));
+		subject.listen(transport);
+		subject.sync([thread({ id: "t1" })]);
 
-		expect(sent).toEqual([{
-			kind: "chat:send",
-			payload: {
-				requestId: expect.stringMatching(
-					/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-				),
-				text: 'apply the accepted comment on "shorten this" — it has not been actioned yet.',
-				to: "planner",
-			},
-		}]);
+		void subject.resolve("t1");
+
+		expect(sent).toEqual([{ kind: "comment:resolve", payload: { id: "t1" } }]);
+		expect(subject.snapshot().threads).toHaveLength(0);
+	});
+
+	it("puts it back when the server refuses", async () => {
+		let subject = store();
+		let { transport } = wire(() => new Error("disk full"));
+		subject.listen(transport);
+		subject.sync([thread({ id: "t1" })]);
+
+		expect(await subject.resolve("t1")).toBe(false);
+
+		expect(subject.snapshot().threads.map(view => view.thread.status)).toEqual(["open"]);
+	});
+
+	it("leaves it hidden when somebody else resolved it first", async () => {
+		let subject = store();
+		let { transport } = wire((_kind, payload) => ({
+			kind: "comment:resolve",
+			ts: 0,
+			id: payload?.id,
+			ok: false,
+			reason: "resolved",
+			status: "resolved",
+			resolver: "kris",
+		}));
+		subject.listen(transport);
+		subject.sync([thread({ id: "t1" })]);
+
+		expect(await subject.resolve("t1")).toBe(true);
+
+		expect(subject.snapshot().threads).toHaveLength(0);
+	});
+
+	it("shows a reopened thread again, and keeps an unrelated draft", async () => {
+		let subject = store();
+		let reopened = thread({ id: "t1" });
+		let { sent, transport } = wire(() => ({
+			kind: "comment:reopen",
+			ts: 0,
+			id: "t1",
+			ok: true,
+			thread: reopened,
+		}));
+		subject.listen(transport);
+		subject.sync([thread({ id: "t1", status: "resolved", resolver: "ana", at: 2 })]);
+		subject.draft({ blocks: [1], quote: "the phrase", offset: 3, length: 10 });
+		expect(subject.snapshot().threads).toHaveLength(0);
+
+		expect(await subject.reopen("t1")).toEqual({ ok: true });
+
+		expect(sent).toEqual([{ kind: "comment:reopen", payload: { id: "t1" } }]);
+		expect(subject.snapshot().threads.map(view => view.thread.status)).toEqual(["open"]);
+		expect(subject.snapshot().draft).toBeDefined();
+	});
+
+	it("says so when a reopen fails", async () => {
+		let subject = store();
+		let { transport } = wire(() => new Error("gone"));
+		subject.listen(transport);
+
+		expect(await subject.reopen("t1")).toEqual({ ok: false });
+	});
+
+	it("passes on why the server refused a reopen", async () => {
+		let subject = store();
+		let { transport } = wire(() => ({
+			kind: "comment:reopen",
+			ts: 0,
+			id: "t1",
+			ok: false,
+			reason: "full",
+			message: "Too many.",
+		}));
+		subject.listen(transport);
+		subject.sync([thread({ id: "t1", status: "resolved", resolver: "ana", at: 2 })]);
+
+		expect(await subject.reopen("t1")).toEqual({ ok: false, reason: "full" });
+		expect(subject.snapshot().threads).toHaveLength(0);
 	});
 });
 
@@ -275,7 +372,7 @@ describe("who is writing", () => {
 			kind: "comment:resolved",
 			ts: 0,
 			id: value.id,
-			status: "accepted",
+			status: "resolved",
 			resolver: "ana",
 			at: 2,
 			quote: "q",
@@ -406,5 +503,143 @@ describe("publishing", () => {
 		subject.said(value.id, note("kris", "Agreed."));
 
 		expect(seen).toBe(1);
+	});
+});
+
+describe("Chopin's turn on a thread", () => {
+	it("sends the destination, never a mention, and shows Chopin working at once", async () => {
+		let subject = store();
+		let { sent, transport } = wire(() => ({
+			kind: "comment:reply",
+			id: "t1",
+			ok: true,
+			note: { ...note("ana", "Shorter, please."), to: "planner" },
+			planner: "queued",
+		}));
+		subject.listen(transport);
+		subject.sync([thread({ id: "t1" })]);
+
+		subject.reply("t1", "Shorter, please.", "planner");
+		await Bun.sleep(0);
+
+		expect(sent).toEqual([{
+			kind: "comment:reply",
+			payload: { id: "t1", text: "Shorter, please.", to: "planner" },
+		}]);
+		expect(subject.snapshot().threads[0]?.planner).toBe("working");
+	});
+
+	it("says when no Chopin is running to read it", async () => {
+		let subject = store();
+		let { transport } = wire(() => ({
+			kind: "comment:reply",
+			id: "t1",
+			ok: true,
+			note: note("ana", "Hello?"),
+			planner: "off",
+		}));
+		subject.listen(transport);
+		subject.sync([thread({ id: "t1" })]);
+
+		subject.reply("t1", "Hello?", "planner");
+		await Bun.sleep(0);
+
+		expect(subject.snapshot().threads[0]?.planner).toBe("off");
+	});
+
+	it("follows the room's working frames, keeping why a turn stopped", () => {
+		let subject = store();
+		subject.sync([thread({ id: "t1", working: true })]);
+		expect(subject.snapshot().threads[0]?.planner).toBe("working");
+
+		subject.working({
+			kind: "comment:working",
+			ts: 0,
+			id: "t1",
+			working: false,
+			reason: "stopped",
+		});
+		expect(subject.snapshot().threads[0]?.planner).toBe("stopped");
+
+		subject.working({ kind: "comment:working", ts: 0, id: "t1", working: true });
+		subject.working({ kind: "comment:working", ts: 0, id: "t1", working: false });
+		expect(subject.snapshot().threads[0]).not.toHaveProperty("planner");
+	});
+
+	it("shows the Planner's note in the thread", () => {
+		let subject = store();
+		subject.sync([thread({ id: "t1" })]);
+
+		subject.said("t1", { id: "p1", author: "planner", text: "Done.", ts: 2 });
+
+		expect(subject.snapshot().threads[0]?.thread.notes.at(-1)).toMatchObject({
+			author: "planner",
+		});
+	});
+});
+
+describe("a send that is refused", () => {
+	it("keeps the draft open and says why", async () => {
+		let subject = store();
+		let { transport } = wire(() => ({
+			kind: "comment:start",
+			ok: false,
+			reason: "busy",
+			message: "Chopin has too much waiting already.",
+		}));
+		subject.listen(transport);
+		subject.draft({ blocks: [1], quote: "the phrase", offset: 3, length: 10 });
+
+		expect(await subject.start("Shorter.", "planner")).toEqual({
+			ok: false,
+			message: "Chopin has too much waiting already.",
+		});
+		expect(subject.snapshot().draft).toMatchObject({ quote: "the phrase" });
+	});
+
+	it("passes on why a reply failed rather than swallowing it", async () => {
+		let subject = store();
+		let { transport } = wire(() => new Error("repository write access is required"));
+		subject.listen(transport);
+		subject.sync([thread({ id: "t1" })]);
+
+		expect(await subject.reply("t1", "Hello", "planner")).toEqual({
+			ok: false,
+			message: "repository write access is required",
+		});
+		expect(subject.snapshot().threads[0]?.thread.notes).toHaveLength(1);
+	});
+});
+
+describe("opening a thread from elsewhere", () => {
+	it("belongs to the document it names, and to any when it names none", () => {
+		expect(handlesOpenComment("root", "child")).toBe(false);
+		expect(handlesOpenComment("child", "child")).toBe(true);
+		expect(handlesOpenComment("root", undefined)).toBe(true);
+		expect(handlesOpenComment(undefined, "child")).toBe(true);
+	});
+
+	it("reads the request's document", () => {
+		expect(openRequest("t1")).toEqual({ thread: "t1", focus: false });
+		expect(openRequest({ thread: "t1", focus: true, channel: "c" })).toEqual({
+			thread: "t1",
+			focus: true,
+			channel: "c",
+		});
+		expect(openRequest({ nope: 1 })).toBeUndefined();
+	});
+
+	it("waits for a thread that has not arrived, then says it is gone", () => {
+		expect(openOutcome(undefined, undefined, false)).toEqual({ wait: true });
+		expect(openOutcome(undefined, undefined, true)).toEqual({
+			gone: "This comment is no longer here",
+		});
+		expect(openOutcome(undefined, "open", false)).toEqual({ open: true });
+		expect(openOutcome(undefined, "resolved", false)).toEqual({
+			gone: "This comment was resolved",
+		});
+		expect(openOutcome({ orphaned: true }, "open", false)).toEqual({
+			gone: "This comment's passage has changed",
+		});
 	});
 });

@@ -34,7 +34,7 @@ let astro = {
 };
 
 test(
-	"a saved wide diagram keeps native label scale inside its own scroller",
+	"a wide diagram derives a readable narrower view with bounded zoom and unchanged source",
 	async ({ join, room, seed }, testInfo) => {
 		let source =
 			`# Astro runtime\n\nThe build and release stages have different dependencies.\n\n\`\`\`seecode\n${
@@ -51,6 +51,13 @@ test(
 			await page.setViewportSize(viewport);
 			await expect(svg).toBeVisible();
 			await expect(svg.locator("[data-sc-node]")).toHaveCount(7);
+			await expect(content(page).getByRole("button", { name: "Show source" })).toHaveCount(0);
+			await expect(preview.getByText(/Scroll sideways/)).toHaveCount(0);
+			await expect(stage).toHaveCSS("border-width", "0px");
+			await expect(content(page).locator('[data-plan-presentation="diagram"]')).toHaveCSS(
+				"border-width",
+				"0px",
+			);
 			await expect(svg.getByRole("button", { name: "Astro project", exact: true }))
 				.toBeVisible();
 			let geometry = await stage.evaluate(element => {
@@ -75,17 +82,29 @@ test(
 					documentRight: documentBounds?.right ?? 0,
 				};
 			});
-			expect(geometry.viewBoxWidth).toBe(1204);
+			expect(geometry.viewBoxWidth).toBeLessThanOrEqual(1100);
 			expect(geometry.scale).toBeGreaterThanOrEqual(1);
-			expect(geometry.scrollWidth).toBeGreaterThan(geometry.stageWidth);
+			if (geometry.viewBoxWidth <= geometry.stageWidth) {
+				expect(geometry.scrollWidth).toBeLessThanOrEqual(geometry.stageWidth + 1);
+			} else {
+				expect(geometry.scrollWidth).toBeGreaterThan(geometry.stageWidth);
+			}
 			expect(geometry.pageScrollWidth).toBeLessThanOrEqual(geometry.pageWidth + 1);
 			expect(geometry.documentScrollWidth).toBeLessThanOrEqual(geometry.documentWidth + 1);
 			expect(geometry.stageLeft).toBeGreaterThanOrEqual(geometry.documentLeft - 1);
 			expect(geometry.stageRight).toBeLessThanOrEqual(geometry.documentRight + 1);
+			if (geometry.scrollWidth <= geometry.stageWidth + 1) continue;
 			await expect(stage).toHaveAttribute("tabindex", "0");
 			await stage.focus();
+			await stage.evaluate(element => {
+				element.setAttribute("data-keyboard-scroll-complete", "false");
+				element.addEventListener("scrollend", () => {
+					element.setAttribute("data-keyboard-scroll-complete", "true");
+				}, { once: true });
+			});
 			await stage.press("ArrowRight");
 			await expect.poll(() => stage.evaluate(element => element.scrollLeft)).toBeGreaterThan(0);
+			await expect(stage).toHaveAttribute("data-keyboard-scroll-complete", "true");
 			let end = await stage.evaluate(element => {
 				element.scrollLeft = element.scrollWidth;
 				return { actual: element.scrollLeft, maximum: element.scrollWidth - element.clientWidth };
@@ -96,8 +115,33 @@ test(
 			await page.screenshot({ path: testInfo.outputPath(`astro-${viewport.width}.png`) });
 		}
 
+		await svg.getByRole("button", { name: "Astro project", exact: true }).click();
+		await expect(preview.getByRole("complementary", { name: "Diagram details" }))
+			.toBeVisible();
+		let nativeWidth = await svg.evaluate(element => element.getBoundingClientRect().width);
+		await preview.getByRole("button", { name: "Fit to width", exact: true }).click();
+		await expect(preview.getByLabel("Diagram zoom", { exact: true })).toHaveText("85%");
+		await expect.poll(() => svg.evaluate(element => element.getBoundingClientRect().width))
+			.toBeCloseTo(nativeWidth * 0.85, 0);
+		await preview.getByRole("button", { name: "Zoom in diagram", exact: true }).click();
+		await expect(preview.getByLabel("Diagram zoom", { exact: true })).toHaveText("100%");
+		await preview.getByRole("button", { name: "Zoom in diagram", exact: true }).click();
+		await expect(preview.getByLabel("Diagram zoom", { exact: true })).toHaveText("115%");
+		await page.setViewportSize({ width: 1452, height: 895 });
+		await expect(
+			preview.getByRole("complementary", { name: "Diagram details" })
+				.getByRole("heading", { name: "Astro project", exact: true }),
+		).toBeVisible();
+		await expect(preview.getByLabel("Diagram zoom", { exact: true })).toHaveText("115%");
+		await preview.getByRole("button", { name: "Actual size", exact: true }).click();
+		await expect.poll(() =>
+			svg.evaluate(element =>
+				element.getBoundingClientRect().width / (element as SVGSVGElement).viewBox.baseVal.width
+			)
+		)
+			.toBeCloseTo(1, 2);
 		await page.reload();
-		await expect(preview.locator("svg")).toBeVisible();
+		await expect(preview.locator("svg.sc-svg")).toBeVisible();
 		await written(page, room, /production install may include CLI deps/);
 	},
 );
@@ -117,8 +161,11 @@ test("a saved SeeCode block renders for two readers and revises through shared s
 		});
 
 	for (let page of [ana, bo]) {
-		await expect(preview(page).locator("svg")).toBeVisible();
-		await expect(preview(page).locator("svg")).toHaveAttribute("data-sc-type", "architecture");
+		await expect(preview(page).locator("svg.sc-svg")).toBeVisible();
+		await expect(preview(page).locator("svg.sc-svg")).toHaveAttribute(
+			"data-sc-type",
+			"architecture",
+		);
 		await expect(preview(page).getByRole("button", { name: "API", exact: true }))
 			.toBeVisible();
 		await expect(content(page).locator("[data-plan-source]")).toBeHidden();
@@ -144,11 +191,11 @@ test("a saved SeeCode block renders for two readers and revises through shared s
 	await expect(content(ana).locator("[data-plan-source]")).toBeHidden();
 	await expect(preview(bo).getByRole("complementary", { name: "Diagram details" }))
 		.toHaveCount(0);
-	await expect(content(ana).getByRole("button", { name: "Show source" })).toBeVisible();
+	await expect(content(ana).getByRole("button", { name: "Show source" })).toHaveCount(0);
 	if (process.env.SEECODE_INTERACTION_EVIDENCE_PATH) {
 		await ana.screenshot({ path: process.env.SEECODE_INTERACTION_EVIDENCE_PATH });
 	}
-	await preview(ana).getByRole("button", { name: "Reset diagram" }).click();
+	await preview(ana).getByRole("button", { name: "Close diagram details", exact: true }).click();
 	await expect(preview(ana).getByRole("complementary", { name: "Diagram details" }))
 		.toHaveCount(0);
 	await expect(content(ana).locator("[data-plan-source]")).toBeHidden();
@@ -159,7 +206,8 @@ test("a saved SeeCode block renders for two readers and revises through shared s
 		.toBeVisible();
 	await expect(content(ana).locator("[data-plan-source]")).toBeHidden();
 
-	await content(ana).getByRole("button", { name: "Show source" }).click();
+	await preview(ana).focus();
+	await preview(ana).press("Enter");
 	let source = content(ana).locator("[data-plan-source]");
 	await source.selectText();
 	await ana.keyboard.insertText(JSON.stringify({ ...first, title: "Revised request path" }));
@@ -178,7 +226,10 @@ test("malformed source shows a bounded error while prose remains usable", async 
 		}\n\`\`\`\n`,
 	);
 	let page = await join("ana");
-	await content(page).getByRole("button", { name: "Show source" }).click();
+	let preview = content(page).getByRole("region", { name: "Diagram preview", exact: true });
+	await expect(preview.locator("svg.sc-svg")).toBeVisible();
+	await preview.focus();
+	await preview.press("Enter");
 	await content(page).locator("[data-plan-source]").selectText();
 	await page.keyboard.insertText("{broken");
 	await written(page, room, /```seecode\n\{broken\n```/);
@@ -190,6 +241,78 @@ test("malformed source shows a bounded error while prose remains usable", async 
 	await content(page).locator("[data-plan-source]").selectText();
 	await page.keyboard.insertText(JSON.stringify(first));
 	await written(page, room, /```seecode\n\{"type":"architecture"/);
-	await expect(content(page).getByRole("region", { name: "Diagram preview" }).locator("svg"))
+	await expect(content(page).getByRole("region", { name: "Diagram preview" }).locator("svg.sc-svg"))
 		.toBeVisible();
+});
+
+test("diagram controls never move the document, and Restart replays from the first step", async ({ join, seed }) => {
+	let prose = Array.from(
+		{ length: 12 },
+		(_, index) => `Paragraph ${index + 1} keeps the document taller than the window.`,
+	).join("\n\n");
+	await seed(
+		`# Diagram controls\n\n${prose}\n\n\`\`\`seecode\n${
+			JSON.stringify(astro)
+		}\n\`\`\`\n\nAfter the diagram.\n\n${prose}\n`,
+	);
+	let page = await join("ana");
+	let preview = content(page).getByRole("region", { name: "Diagram preview", exact: true });
+	let controls = preview.getByRole("group", { name: "Diagram controls", exact: true });
+	let button = (name: string) => controls.getByRole("button", { name, exact: true });
+	let svg = preview.locator("svg.sc-svg");
+	await expect(svg).toBeVisible();
+	let total = Number(await svg.getAttribute("data-sc-steps"));
+	expect(total).toBeGreaterThan(2);
+	let counter = (step: number) => controls.getByText(`${step} / ${total}`, { exact: true });
+
+	// An author reading the diagram has left the caret in nearby prose.
+	await content(page).getByText("After the diagram.", { exact: true }).click();
+	// The document keeps its lower 30% clear for the caret (scroll-padding), so a
+	// control there is exactly where any scroll-into-view would move the page.
+	let scroller = page.locator("[data-plan-scroll]");
+	let bar = (await controls.boundingBox())!;
+	let frame = (await scroller.boundingBox())!;
+	await scroller.evaluate(
+		(element, delta) => element.scrollTop += delta,
+		bar.y - (frame.y + frame.height * 0.8),
+	);
+	let position = () =>
+		scroller.evaluate(element => ({ document: element.scrollTop, window: window.scrollY }));
+	let start = await position();
+	expect(start.document).toBeGreaterThan(0);
+	let unmoved = async () => expect(await position()).toEqual(start);
+	// A pointer click at the control, as a reader makes it. Locator clicks first
+	// scroll their target into view, which would hide the very movement under test.
+	let press = async (name: string) => {
+		let box = (await button(name).boundingBox())!;
+		await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+	};
+
+	await expect(button("Play diagram")).toBeVisible({ timeout: 10_000 });
+	await expect(counter(total)).toBeVisible();
+	await press("Previous step");
+	await expect(counter(total - 1)).toBeVisible();
+	await unmoved();
+	await press("Next step");
+	await expect(counter(total)).toBeVisible();
+	await expect(button("Next step")).toBeDisabled();
+	await expect(button("Next step")).toBeFocused();
+	await unmoved();
+
+	await press("Restart diagram");
+	await expect(counter(1)).toBeVisible();
+	await expect(button("Pause diagram")).toBeVisible();
+	// The last step waits for its turn again, so the entrance really replays.
+	let last = svg.locator(
+		`[data-sc-node][data-sc-step="${total}"], [data-sc-edge][data-sc-step="${total}"]`,
+	).first();
+	expect(await last.evaluate(element => getComputedStyle(element).opacity)).toBe("0");
+	await unmoved();
+	await press("Pause diagram");
+	await expect(button("Play diagram")).toBeVisible();
+	await unmoved();
+	await press("Play diagram");
+	await expect(counter(total)).toBeVisible({ timeout: 10_000 });
+	await unmoved();
+	await expect(content(page).locator("[data-plan-source]")).toBeHidden();
 });

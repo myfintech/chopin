@@ -7,6 +7,7 @@
  */
 
 @import "./callout.css";
+@import "./github-references.css";
 
 /* Evidence can extend beyond the clipped document column; only its panel takes hits. */
 .plan-evidence-popover {
@@ -29,12 +30,10 @@
 	outline-offset: calc(-1 * var(--edge-width));
 }
 
-.plan-content [data-research-draft-anchor] {
-	margin-block-end: var(--research-draft-space, 0);
-}
-
+.plan-research-draft-host,
 .plan-research-draft {
-	width: min(28.125rem, var(--plan-content-width, 48rem), calc(100vw - 2rem));
+	width: 100%;
+	max-width: var(--document-prose-measure);
 }
 
 .motion-research-draft {
@@ -44,10 +43,6 @@
 	transition:
 		opacity var(--dropdown-open-dur) var(--dropdown-ease),
 		transform var(--dropdown-open-dur) var(--dropdown-ease);
-}
-
-.motion-research-draft[data-side="above"] {
-	transform-origin: bottom left;
 }
 
 .motion-research-draft[data-motion="is-open"] {
@@ -82,11 +77,66 @@
 	background: transparent;
 }
 
-/* Research widgets never exceed 450px and shrink with their container. */
+/* The preview sits above the whole-card open button; only its links take the pointer. */
+.plan-research-preview-toggle {
+	position: relative;
+	z-index: 2;
+}
+
+.plan-research-card .plan-research-preview {
+	position: relative;
+	z-index: 2;
+	margin-block-start: -0.5rem;
+	pointer-events: none;
+}
+
+.plan-research-preview a {
+	pointer-events: auto;
+	color: var(--color-brand);
+	text-decoration: underline;
+	text-decoration-color: color-mix(in oklch, var(--color-brand) 30%, transparent);
+	text-underline-offset: 0.15em;
+}
+
+.plan-research-preview-body {
+	display: grid;
+	gap: 0.5rem;
+	padding-block-start: 1rem;
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
+	color: var(--color-text-secondary);
+}
+
+.plan-research-preview .plan-research-preview-body p,
+.plan-research-preview .plan-research-preview-sources,
+.plan-research-preview .plan-research-preview-sources li {
+	margin: 0;
+}
+
+.plan-research-preview-question {
+	display: grid;
+	gap: 0.125rem;
+}
+
+.plan-research-preview-question > :last-child {
+	display: -webkit-box;
+	overflow: hidden;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 3;
+}
+
+.plan-research-preview .plan-research-preview-sources {
+	display: grid;
+	gap: 0.25rem;
+	padding: 0;
+	list-style: none;
+}
+
+/* Composer, progress and result share the document's prose column. */
 .plan-research-composer,
 .plan-research-tracked {
 	width: 100%;
-	max-width: 28.125rem;
+	max-width: var(--document-prose-measure);
 }
 
 /* One surface: the composer is the field, so focus rings the whole card. */
@@ -97,10 +147,6 @@
 	border-radius: var(--radius-lg);
 	background: var(--color-page);
 	box-shadow: var(--shadow-resting);
-}
-
-.plan-research-draft:is([data-side="above"], [data-side="pinned"]) .plan-research-composer {
-	box-shadow: var(--shadow-raised);
 }
 
 .plan-research-composer textarea {
@@ -443,14 +489,13 @@
 
 .plan,
 .plan-decisions {
-	--plan-gutter: 4rem;
+	--plan-gutter: var(--document-gutter);
 	/*
 	 * A comfortable measure. The panel is resizable and a plan is read far more
 	 * often than it is written, so the text stops widening well before the pane
-	 * does. At the body size below this is roughly 85 characters a line, near
-	 * the top of the range a reader can track back from without losing the row.
+	 * does.
 	 */
-	--plan-measure: 43.75rem;
+	--plan-measure: var(--document-prose-measure);
 	/*
 	 * Document body text, one step down from the old 17px so prose sits
 	 * closer to chrome and chat sizes. Resolved out here because MDXEditor
@@ -485,17 +530,20 @@
 	box-shadow: var(--shadow-raised);
 }
 
-/* A narrow document needs breathing room, but never a 32px tax on each side. */
-@container (max-width: 40rem) {
-	.plan-content,
-	.plan-preface,
-	.plan-decisions-content {
-		--plan-gutter: 1rem;
+@media (max-width: 600px) {
+	.plan,
+	.plan-decisions {
+		--plan-gutter: var(--document-gutter-compact);
 	}
+}
 
+@container (max-width: 40rem) {
 	/* Anchor state keeps this lane stable when its marker leaves the viewport. */
-	.plan-document[data-plan-decision-lane] :is(.plan-content, .plan-preface) {
-		--plan-leading-gutter: 2rem;
+	.plan-document[data-plan-decision-lane] :is(.plan-content, .plan-preface, .plan-afterword) {
+		--plan-leading-gutter: max(
+			calc(var(--decision-marker-size) + var(--spacing) * 2),
+			var(--plan-gutter)
+		);
 	}
 
 	/* Wide authored surfaces keep their own visible, keyboard-operable lane. */
@@ -518,6 +566,91 @@
 	}
 }
 
+/* Rendered only on a phone, and shown only where the document is narrow too. */
+.plan-content .plan-diagram-actions {
+	display: none;
+	justify-content: flex-end;
+	padding-block-start: calc(var(--spacing) * 1);
+	padding-inline: calc(var(--spacing) * 1.5);
+}
+
+/*
+ * Wide authored blocks on a phone: a coarse pointer on a small screen, and a
+ * narrow document. The media query is the phone class, kept identical to
+ * `isPhone` in pointer.ts, so it also holds where no shell sets
+ * `:root[data-phone]`. Narrow desktop windows keep their scroll lanes untouched.
+ */
+@media (pointer: coarse) and (max-width: 600px), (pointer: coarse) and (max-height: 500px) {
+	@container (max-width: 40rem) {
+		/* A wide table fades the side that still hides columns, as a drawn diagram does. */
+		.plan-content table {
+			--plan-table-fade: calc(var(--spacing) * 8);
+		}
+
+		.plan-content table[data-more="end"] {
+			mask-image: linear-gradient(to right, black calc(100% - var(--plan-table-fade)), transparent);
+		}
+
+		.plan-content table[data-more="start"] {
+			mask-image: linear-gradient(to right, transparent, black var(--plan-table-fade));
+		}
+
+		.plan-content table[data-more="both"] {
+			mask-image: linear-gradient(
+				to right,
+				transparent,
+				black var(--plan-table-fade),
+				black calc(100% - var(--plan-table-fade)),
+				transparent
+			);
+		}
+
+		/*
+		 * Code wraps rather than scrolling a few characters at a time. The
+		 * coloured copy is drawn in a shadow root, so it reads this switch
+		 * instead of the rule; a plain-text fence is laid out by hand and
+		 * keeps its lines.
+		 */
+		.plan-content .planCode:not([data-plan-text]) .plan-code-view {
+			--plan-code-overflow: wrap;
+		}
+
+		.plan-content .planCode:not([data-plan-text]) .plan-code-view > diffs-container {
+			min-inline-size: 0;
+		}
+
+		.plan-content .planCode:not([data-plan-text]) [data-plan-source] {
+			overflow-wrap: anywhere;
+		}
+
+		/* A diagram below its readability floor offers a full-screen reading. */
+		.plan-content .plan-diagram-actions {
+			display: flex;
+		}
+	}
+}
+
+.agent-mark {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+	width: 0.875rem;
+	height: 0.875rem;
+	color: var(--color-brand);
+}
+.agent-mark svg {
+	width: 0.875rem;
+	height: 0.875rem;
+}
+.agent-mark[data-circle] {
+	width: 1.5rem;
+	height: 1.5rem;
+	border-radius: var(--radius-full);
+	background: var(--color-brand);
+	color: var(--color-page);
+}
+
 /* Reader-local comment chrome must not move collaborative line boxes. */
 .plan-comment-layer {
 	pointer-events: none;
@@ -526,7 +659,6 @@
 	z-index: 2;
 }
 
-.plan-comment-chip,
 .plan-comment-orphan-button {
 	z-index: 1;
 	pointer-events: auto;
@@ -544,26 +676,51 @@
 	transition: opacity var(--duration-fast) var(--ease-out);
 }
 
+/* Quiet at rest: an icon and a count in the margin, lit with its passage. */
 .plan-comment-chip {
+	--color-icon: currentColor;
+	z-index: 1;
+	pointer-events: auto;
 	position: absolute;
 	display: inline-flex;
-	height: 24px;
+	height: var(--control-height-compact);
 	align-items: center;
 	justify-content: center;
-	gap: 0.125rem;
+	gap: 0.1875rem;
 	border-radius: var(--radius-md);
+	background: transparent;
 	font-size: var(--text-xs);
+	font-weight: 500;
 	font-variant-numeric: tabular-nums;
 	line-height: 1;
+	color: var(--color-text-tertiary);
+	transition:
+		background-color var(--duration-fast) var(--ease-out),
+		color var(--duration-fast) var(--ease-out);
 }
 
 .plan-comment-button[data-slim] .plan-comment-chip {
 	border-radius: var(--radius-sm);
 }
 
-.plan-comment-button[data-replies] .plan-comment-chip {
-	background: var(--color-brand-wash);
-	color: var(--color-brand-ink);
+/*
+ * Touch has no hover to find a quiet chip by, so at rest it carries the
+ * passage's amber and a darker ink, and keeps its icon beside the count.
+ */
+:root[data-plan-coarse-pointer] .plan-comment-chip {
+	background: var(--color-comment-wash-strong);
+	color: var(--color-comment-marker-ink);
+}
+
+:root[data-plan-coarse-pointer] .plan-comment-button[data-slim] .plan-comment-chip {
+	gap: 0.0625rem;
+	font-size: var(--text-2xs);
+	letter-spacing: -0.01em;
+}
+
+/* A touch marker's reach into the empty margin, where a taller target covers no text. */
+.plan-comment-reach {
+	position: absolute;
 }
 
 /* Another thread's card is open: this marker steps back and cannot be pressed. */
@@ -577,13 +734,20 @@
 	position: absolute;
 }
 
-.plan-comment-button:hover .plan-comment-chip,
-.plan-comment-button:focus-visible .plan-comment-chip,
-.plan-comment-button[aria-expanded="true"] .plan-comment-chip,
+.plan-comment-button:is(:hover, :focus-visible, [data-lit]) .plan-comment-chip {
+	background: var(--color-hover);
+	color: var(--color-text-primary);
+}
+
+.plan-comment-button[aria-expanded="true"] .plan-comment-chip {
+	background: var(--color-selected);
+	color: var(--color-text-primary);
+}
+
 .plan-comment-orphan-button:hover,
 .plan-comment-orphan-button:focus-visible {
-	background: var(--color-brand-wash);
-	color: var(--color-brand-ink);
+	background: var(--color-hover);
+	color: var(--color-text-primary);
 }
 
 .plan-comment-preview,
@@ -603,7 +767,7 @@
 	box-shadow: var(--shadow-overlay);
 	outline: var(--edge-width) solid var(--color-edge);
 	outline-offset: calc(-1 * var(--edge-width));
-	font-size: var(--text-sm);
+	font-size: var(--text-xs);
 	color: var(--color-text-primary);
 }
 
@@ -630,6 +794,8 @@
 	overflow: auto;
 	border-radius: var(--radius-lg);
 	box-shadow: var(--shadow-overlay);
+	outline: var(--edge-width) solid var(--color-edge);
+	outline-offset: calc(-1 * var(--edge-width));
 	--enter-x: 0;
 	--enter-y: 0;
 	animation: plan-comment-enter var(--duration-fast) var(--ease-out);
@@ -651,40 +817,231 @@
 	transform-origin: bottom left;
 }
 
-[data-plan-comment-card] {
+/*
+ * A thread, a draft or a block's list of threads.
+ *
+ * The popover around it carries the radius, hairline and shadow, so a sheet
+ * can hold the same card edge to edge. No ring marks the card as active:
+ * keyboard focus is shown on the control that has it.
+ */
+.plan-comment-thread {
+	position: relative;
+	display: grid;
+	gap: 0.75rem;
+	min-width: 0;
+	padding: 0.75rem;
+	border-radius: var(--radius-lg);
 	background: var(--color-page);
-	box-shadow: none;
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
 }
 
-.plan-comment-close {
-	margin: -0.25rem -0.25rem -0.25rem 0;
+.plan-comment-notes {
+	display: grid;
+	gap: 1rem;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+.plan-comment-note {
+	display: grid;
+	gap: 0.25rem;
+	min-width: 0;
+}
+
+.plan-comment-note-head {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	min-width: 0;
+	min-height: 1.5rem;
+}
+
+/* Flush with the avatar's left edge: the name row says who, the body needs no indent to belong. */
+.plan-comment-note-body {
+	margin: 0;
+	color: var(--color-text-primary);
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	text-wrap: pretty;
+}
+
+/* Revealed on hover or focus, always on touch; inset equally from the card's top and right. */
+.plan-comment-actions {
+	display: flex;
+	flex: none;
+	align-items: center;
+	align-self: flex-start;
+	gap: 0.125rem;
+	margin: -0.375rem -0.375rem 0 auto;
+	opacity: 0;
+	transition: opacity var(--duration-fast) var(--ease-out);
+}
+
+.plan-comment-thread:is(:hover, :focus-within) .plan-comment-actions,
+.plan-comment-actions[data-open] {
+	opacity: 1;
+}
+
+@media (hover: none) {
+	.plan-comment-actions {
+		opacity: 1;
+	}
+}
+
+.plan-comment-action {
+	width: var(--control-height-compact);
+	height: var(--control-height-compact);
+	padding: 0;
 	color: var(--color-text-tertiary);
+}
+
+.plan-comment-action:hover,
+.plan-comment-action[aria-expanded="true"] {
+	color: var(--color-text-primary);
+}
+
+.plan-comment-action[aria-expanded="true"] {
+	background: var(--color-hover);
+}
+
+:root[data-plan-coarse-pointer] .plan-comment-action {
+	width: var(--control-target-coarse);
+	height: var(--control-target-coarse);
+}
+
+.plan-comment-menu-anchor {
+	position: relative;
+	display: inline-flex;
+}
+
+.plan-comment-menu {
+	position: absolute;
+	top: calc(100% + 0.25rem);
+	right: 0;
+	z-index: 3;
+	display: grid;
+	min-width: 9rem;
+	padding: var(--menu-padding);
+	border-radius: var(--radius-lg);
+	background: var(--color-page);
+	box-shadow: var(--shadow-raised);
+	outline: var(--edge-width) solid var(--color-edge);
+	outline-offset: calc(-1 * var(--edge-width));
+	transform-origin: top right;
+	transition:
+		opacity var(--duration-fast) var(--ease-out),
+		scale var(--duration-fast) var(--ease-out);
+}
+
+@starting-style {
+	.plan-comment-menu {
+		opacity: 0;
+		scale: 0.97;
+	}
+}
+
+.plan-comment-menu-item {
+	--color-icon: currentColor;
+	display: flex;
+	width: 100%;
+	min-height: var(--menu-item-height-compact);
+	align-items: center;
+	gap: var(--menu-item-gap-compact);
+	padding: var(--menu-item-padding-block-compact) var(--menu-item-padding-inline-compact);
+	border-radius: var(--radius-sm);
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
+	text-align: left;
+	color: var(--color-text-secondary);
+}
+
+.plan-comment-menu-item:is(:hover, :focus-visible) {
+	background: var(--color-hover);
+	color: var(--color-text-primary);
+}
+
+/* "Show 2 replies": a rule-flanked divider, so it reads as a fold rather than a button row. */
+.plan-comment-more {
+	display: flex;
+	width: 100%;
+	align-items: center;
+	gap: 0.5rem;
+	padding: 0.125rem 0;
+	font-size: var(--text-xs);
+	font-weight: 500;
+	color: var(--color-text-tertiary);
+	transition: color var(--duration-fast) var(--ease-out);
+}
+
+.plan-comment-more:hover {
+	color: var(--color-brand-ink);
+}
+
+.plan-comment-more-rule {
+	flex: 1;
+	height: var(--edge-width);
+	background: var(--color-edge);
 }
 
 .plan-comment-back {
-	margin-left: -0.5rem;
+	justify-self: start;
+	margin: -0.25rem 0 -0.25rem -0.5rem;
 	color: var(--color-text-tertiary);
 }
 
-.plan-comment-group-item {
+.plan-comment-list {
+	gap: 0.25rem;
+	padding: 0.25rem;
+}
+
+.plan-comment-list-head {
 	display: flex;
-	width: 100%;
-	flex-direction: column;
+	align-items: center;
+	min-height: 2rem;
+	padding: 0 0.5rem;
+	font-size: var(--text-xs);
+	font-weight: 500;
+	color: var(--color-text-tertiary);
+	font-variant-numeric: tabular-nums;
+}
+
+.plan-comment-list-items {
+	display: grid;
 	gap: 0.125rem;
-	padding: 0.375rem 0.5rem;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+.plan-comment-group-item {
+	display: grid;
+	width: 100%;
+	gap: 0.125rem;
+	padding: 0.5rem;
 	border-radius: var(--radius-md);
 	text-align: left;
+	transition: background-color var(--duration-fast) var(--ease-out);
 }
 
 .plan-comment-group-item:hover {
 	background: var(--color-hover);
 }
 
+.plan-comment-group-replies {
+	margin-left: auto;
+	font-size: var(--text-xs);
+	color: var(--color-text-tertiary);
+	font-variant-numeric: tabular-nums;
+}
+
 .plan-comment-group-note {
 	display: -webkit-box;
 	overflow: hidden;
 	-webkit-box-orient: vertical;
-	-webkit-line-clamp: 1;
+	-webkit-line-clamp: 2;
+	color: var(--color-text-secondary);
 }
 
 .plan-content [data-plan-comment-card] :is(p, ul, li, blockquote) {
@@ -700,6 +1057,8 @@
 }
 
 .plan-comment-context {
+	display: grid;
+	gap: 0.25rem;
 	padding: 0.5rem 0.625rem;
 	border-radius: var(--radius-md);
 	background: var(--color-inset);
@@ -713,20 +1072,330 @@
 	line-height: var(--text-sm--line-height);
 }
 
-.plan-comment-composer[data-inset-send] {
-	border-radius: var(--radius-md);
-	background: var(--color-page);
+.plan-comment-composer {
+	display: grid;
+	min-width: 0;
 }
 
-.plan-comment-composer[data-inset-send] .plan-comment-composer-field {
-	padding-right: 3rem;
-	padding-bottom: 2.75rem;
+/*
+ * A reply is one quiet line in a field frame until it is focused; the frame's
+ * border, not a ring on the textarea, shows focus, and the footer folds open
+ * inside it. A new comment is the card's whole content, so its frame is not drawn.
+ */
+.plan-comment-composer[data-mode="reply"] {
+	padding: 0.3125rem 0.5rem;
+	box-shadow: none;
+	transition: border-color var(--duration-fast) var(--ease-out);
 }
 
-.plan-comment-confirm {
-	padding: 0.625rem;
+.plan-comment-composer[data-mode="reply"]:focus-within {
+	border-color: var(--color-brand);
+}
+
+.plan-comment-composer[data-mode="new"] {
+	border-color: transparent;
+	box-shadow: none;
+}
+
+/* The chip sits over the first line; the field indents its text past it. */
+.plan-comment-composer-input {
+	position: relative;
+	min-width: 0;
+}
+
+.plan-comment-address-chip {
+	position: absolute;
+	top: 0;
+	left: 0;
+	display: inline-flex;
+	height: var(--text-sm--line-height);
+	align-items: center;
+	padding-inline: 0.3125rem;
+	border-radius: var(--radius-sm);
+	background: var(--color-brand-wash);
+	font-size: var(--text-sm);
+	font-weight: 600;
+	color: var(--color-brand-ink);
+	pointer-events: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	.plan-comment-address-chip {
+		transition:
+			opacity var(--duration-fast) var(--ease-out),
+			scale var(--duration-fast) var(--ease-out);
+	}
+
+	@starting-style {
+		.plan-comment-address-chip {
+			opacity: 0;
+			scale: 0.9;
+		}
+	}
+}
+
+.plan-comment-composer-field {
+	display: block;
+	width: 100%;
+	min-width: 0;
+	flex: 1;
+	min-height: var(--text-sm--line-height);
+	padding: 0;
+	border: 0;
+	background: transparent;
+	font: inherit;
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
+	color: var(--color-text-primary);
+	resize: none;
+}
+
+.plan-comment-composer[data-mode="new"] .plan-comment-composer-field {
+	min-height: calc(var(--text-sm--line-height) * 2);
+}
+
+.plan-comment-composer-field::placeholder {
+	color: var(--color-text-quaternary);
+}
+
+/* The footer folds open with the field, so nothing jumps. */
+.plan-comment-composer-fold {
+	display: grid;
+	grid-template-rows: 0fr;
+	transition: grid-template-rows var(--duration-fast) var(--ease-out);
+}
+
+.plan-comment-composer[data-open] .plan-comment-composer-fold {
+	grid-template-rows: 1fr;
+}
+
+.plan-comment-composer-footer {
+	display: flex;
+	min-height: 0;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.5rem;
+	overflow: hidden;
+	opacity: 0;
+	transition: opacity var(--duration-fast) var(--ease-out);
+}
+
+.plan-comment-composer[data-open] .plan-comment-composer-footer {
+	padding-top: 0.5rem;
+	overflow: visible;
+	opacity: 1;
+}
+
+.plan-comment-composer[data-mode="new"][data-open] .plan-comment-composer-footer {
+	padding-top: 0.75rem;
+}
+
+.plan-comment-address {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.5rem;
+	margin-left: -0.25rem;
+	padding: 0.125rem 0.25rem;
+	border-radius: var(--radius-sm);
+	font-size: var(--text-xs);
+	color: var(--color-text-secondary);
+	cursor: pointer;
+	user-select: none;
+	transition: color var(--duration-fast) var(--ease-out);
+}
+
+.plan-comment-address:hover {
+	color: var(--color-text-primary);
+}
+
+.plan-comment-address-box {
+	width: 0.875rem;
+	height: 0.875rem;
+	flex: none;
+	margin: 0;
+	background-position: center;
+	background-size: 100%;
+	cursor: pointer;
+	transition:
+		background-color var(--duration-fast) var(--ease-out),
+		border-color var(--duration-fast) var(--ease-out);
+}
+
+/* Why a send was refused, under the field it can be retried from. */
+.plan-comment-refusal {
+	margin: 0.375rem 0 0;
+	font-size: var(--text-xs);
+	line-height: var(--text-xs--line-height);
+	color: var(--color-warning-ink);
+	text-wrap: pretty;
+}
+
+/* A finger needs the whole row, not the 14px box. */
+@media (pointer: coarse) {
+	.plan-comment-address {
+		min-height: 2.75rem;
+	}
+}
+
+/* A note sent to Chopin leads with the address it was sent to. */
+.plan-comment-mention {
+	font-weight: 600;
+	color: var(--color-brand);
+}
+
+/* Chat's Chopin mark, at the 20px note-avatar size. */
+.plan-comment-agent {
+	display: inline-flex;
+	flex: none;
+}
+
+.plan-comment-agent .agent-mark[data-circle] {
+	width: 1.25rem;
+	height: 1.25rem;
+}
+
+.plan-comment-agent .agent-mark svg {
+	width: 0.75rem;
+	height: 0.75rem;
+}
+
+/* Chopin's turn: dots in the avatar column, so the words align with names. */
+.plan-comment-planner {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	min-height: 1.5rem;
+	color: var(--color-text-secondary);
+}
+
+.plan-comment-planner:not([data-plan-comment-planner="working"]) {
+	min-height: 0;
+	font-size: var(--text-xs);
+	color: var(--color-text-tertiary);
+}
+
+.plan-comment-dots {
+	display: inline-flex;
+	width: 1.25rem;
+	flex: none;
+	justify-content: center;
+	gap: 0.1875rem;
+}
+
+.plan-comment-dots i {
+	width: 0.25rem;
+	height: 0.25rem;
+	border-radius: var(--radius-full);
+	background: var(--color-brand);
+	opacity: 0.35;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	.plan-comment-dots i {
+		animation: plan-comment-dot calc(var(--duration-linger) * 2) var(--ease-out) infinite;
+	}
+
+	.plan-comment-dots i:nth-child(2) {
+		animation-delay: var(--duration-fast);
+	}
+
+	.plan-comment-dots i:nth-child(3) {
+		animation-delay: var(--duration-base);
+	}
+}
+
+@keyframes plan-comment-dot {
+	0%,
+	60%,
+	100% {
+		opacity: 0.35;
+		translate: 0 0;
+	}
+
+	30% {
+		opacity: 1;
+		translate: 0 -0.125rem;
+	}
+}
+
+/* The shared primary icon button, as a smaller filled disc. */
+.plan-comment-send {
+	--color-icon: var(--color-page);
+	position: relative;
+	width: var(--control-height-compact);
+	height: var(--control-height-compact);
+	flex: none;
+	box-shadow: none;
+	transition:
+		background-color var(--duration-fast) var(--ease-out),
+		color var(--duration-fast) var(--ease-out);
+}
+
+.plan-comment-send:disabled {
+	--color-icon: var(--color-text-quaternary);
+	background: var(--color-selected);
+	color: var(--color-text-quaternary);
+}
+
+/* A 40px hit area around the 24px disc. */
+.plan-comment-send::before {
+	position: absolute;
+	inset: -0.5rem;
+	content: "";
+}
+
+/* Viewport-fixed and centred under the document; only the toast itself takes pointers. */
+.plan-comment-toast-region {
+	pointer-events: none;
+	position: fixed;
+	bottom: calc(1.5rem + env(safe-area-inset-bottom, 0px));
+	z-index: 72;
+	translate: -50% 0;
+}
+
+.plan-comment-toast {
+	pointer-events: auto;
+	display: inline-flex;
+	align-items: center;
+	gap: 0.5rem;
+	height: 2.25rem;
+	padding: 0 0.375rem 0 0.75rem;
+	border: var(--edge-width) solid var(--color-gray-750);
+	border-radius: var(--radius-lg);
+	background: var(--color-gray-800);
+	box-shadow: var(--shadow-overlay);
+	font-size: var(--text-sm);
+	white-space: nowrap;
+	color: var(--color-white);
+	--color-icon: var(--color-white);
+	transition:
+		opacity var(--toast-open) var(--motion-smooth-out),
+		translate var(--toast-open) var(--motion-smooth-out);
+}
+
+@starting-style {
+	.plan-comment-toast {
+		opacity: 0;
+		translate: 0 0.25rem;
+	}
+}
+
+.plan-comment-toast-undo {
+	height: var(--control-height-compact);
+	margin-left: 0.25rem;
+	padding: 0 0.5rem;
 	border-radius: var(--radius-md);
-	background: var(--color-inset);
+	font-weight: 600;
+	color: var(--color-white);
+	transition: background-color var(--duration-fast) var(--ease-out);
+}
+
+.plan-comment-toast-undo:hover {
+	background: var(--color-gray-750);
+}
+
+:root[data-plan-coarse-pointer] .plan-comment-toast-undo {
+	height: var(--control-target-coarse);
 }
 
 @keyframes plan-comment-enter {
@@ -825,14 +1494,44 @@
 
 .plan-comment-sheet-backdrop {
 	--backdrop-opacity: 0.24;
+	--backdrop-opacity-large: 0.36;
 	position: fixed;
 	inset: 0;
 	z-index: 70;
 	background: rgb(var(--shadow-color));
-	opacity: calc(var(--backdrop-opacity) * (1 - var(--drawer-swipe-progress, 0)));
+	opacity: var(--backdrop-opacity);
 	transition: opacity var(--duration-base) var(--ease-out);
 }
 
+/* Pulled up to the large detent, the sheet sets the document further back. */
+.plan-comment-sheet-backdrop[data-plan-comment-sheet-large] {
+	opacity: var(--backdrop-opacity-large);
+}
+
+/*
+ * The drawer's progress is read only while a finger drags the sheet: it keeps
+ * its last value when the sheet's detents change underneath it. With one detent
+ * it runs from 0 open to 1 dismissed; with two, from 0 at the large detent to 1
+ * at the medium one.
+ */
+body:has(.plan-comment-sheet-popup[data-swiping]) .plan-comment-sheet-backdrop {
+	opacity: calc(var(--backdrop-opacity) * (1 - var(--drawer-swipe-progress, 0)));
+}
+
+body:has(.plan-comment-sheet-popup[data-swiping])
+	.plan-comment-sheet-backdrop[data-plan-comment-sheet-detents] {
+	opacity: calc(
+		var(--backdrop-opacity) +
+			(
+			var(--backdrop-opacity-large) - var(--backdrop-opacity)
+		) *
+			(
+			1 - var(--drawer-swipe-progress, 0)
+		)
+	);
+}
+
+/* Stands on the keyboard: the inset is what the visual viewport loses beneath it. */
 .plan-comment-sheet-viewport {
 	pointer-events: none;
 	position: fixed;
@@ -840,75 +1539,281 @@
 	z-index: 71;
 	display: flex;
 	align-items: flex-end;
+	padding-bottom: var(--drawer-keyboard-inset, 0px);
 }
 
+/*
+ * As tall as its content, up to the large detent of the space above the
+ * keyboard. The header and a thread's composer stay put; only the notes scroll.
+ */
 .plan-comment-sheet-popup {
+	/*
+	 * The drawer registers its offsets as non-inheriting, so the composer's lift
+	 * is worked out here, where they resolve, and inherited from this property.
+	 */
+	--plan-comment-sheet-lift: max(
+		0px,
+		var(--drawer-snap-point-offset, 0px) + min(0px, var(--drawer-swipe-movement-y, 0px))
+	);
 	pointer-events: auto;
 	display: flex;
 	width: 100%;
+	max-height: calc((100dvh - var(--drawer-keyboard-inset, 0px)) * 0.92);
 	flex-direction: column;
-	height: calc(100dvh - 0.5rem);
 	overflow: hidden;
+	padding-right: env(safe-area-inset-right, 0px);
+	padding-left: env(safe-area-inset-left, 0px);
 	border-radius: var(--radius-xl) var(--radius-xl) 0 0;
 	background: var(--color-page);
 	box-shadow: 0 -1rem 3rem rgb(var(--shadow-color) / 22%);
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
 	transform: translateY(
-		calc(var(--drawer-snap-point-offset, 100%) + var(--drawer-swipe-movement-y, 0px))
+		calc(var(--drawer-snap-point-offset, 0px) + var(--drawer-swipe-movement-y, 0px))
 	);
 	transition: transform calc(var(--drawer-swipe-strength, 1) * var(--duration-base))
 		var(--ease-out);
 }
 
+/* The finger owns the sheet while it drags; the spring takes over on release. */
+.plan-comment-sheet-popup[data-swiping] {
+	transition: none;
+}
+
 .plan-comment-sheet-grabber {
-	display: grid;
-	width: 100%;
-	height: 2rem;
-	flex: none;
-	place-items: center;
-	border: 0;
-	background: transparent;
-	color: var(--color-text-tertiary);
-	touch-action: none;
-}
-
-.plan-comment-sheet-grabber span {
+	display: block;
 	width: 2.25rem;
-	height: 0.3rem;
+	height: 0.25rem;
+	flex: none;
+	margin: 0.5rem auto 0;
 	border-radius: var(--radius-full);
-	background: var(--color-text-tertiary);
+	background: var(--color-gray-300);
 }
 
-/* Sits in the grabber row, so a draft needs no header row; the sheet is touch-only, so 44px. */
+/* One row: what the sheet is about, and its close, with no title above it. */
+.plan-comment-sheet-head {
+	display: flex;
+	min-height: 2.75rem;
+	flex: none;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.5rem;
+	padding: 0 0.25rem 0 1rem;
+	touch-action: none;
+	cursor: grab;
+}
+
+/* With a pager the passage takes its own row beneath it. */
+.plan-comment-sheet-head:has(.plan-comment-sheet-pager) .plan-comment-sheet-quote {
+	flex-basis: 100%;
+	order: 1;
+	margin: 0 0.75rem 0.5rem 0;
+}
+
+.plan-comment-sheet-pager {
+	display: flex;
+	align-items: center;
+	margin-left: -0.75rem;
+	font-variant-numeric: tabular-nums;
+	color: var(--color-text-tertiary);
+	white-space: nowrap;
+}
+
+.plan-comment-sheet-step {
+	width: var(--control-target-coarse);
+	height: var(--control-target-coarse);
+	color: var(--color-text-secondary);
+}
+
+.plan-comment-sheet-quote {
+	display: -webkit-box;
+	min-width: 0;
+	flex: 1;
+	margin: 0;
+	padding: 0.125rem 0 0.125rem 0.75rem;
+	overflow: hidden;
+	border-left-width: calc(var(--edge-width) * 2);
+	border-left-style: solid;
+	border-left-color: var(--color-comment-underline);
+	color: var(--color-text-secondary);
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+	overflow-wrap: anywhere;
+}
+
+.plan-comment-sheet-heading {
+	min-width: 0;
+	flex: 1;
+	margin: 0;
+	font-weight: 600;
+	font-variant-numeric: tabular-nums;
+	color: var(--color-text-primary);
+}
+
+.plan-comment-sheet-back {
+	height: 2.75rem;
+	gap: 0.25rem;
+	margin-left: -0.75rem;
+	padding-inline: 0.5rem 0.75rem;
+	font-size: var(--text-sm);
+	font-weight: 500;
+	font-variant-numeric: tabular-nums;
+	color: var(--color-text-secondary);
+}
+
 .plan-comment-sheet-close {
-	position: absolute;
-	top: 0;
-	right: 0.25rem;
 	width: 2.75rem;
 	height: 2.75rem;
-	margin: 0;
+	flex: none;
+	margin: 0 0 0 auto;
+	align-self: flex-start;
+	color: var(--color-text-tertiary);
 }
 
-.plan-comment-sheet-title {
-	margin: 0;
-	padding: 0 1rem 0.5rem;
-	color: var(--color-text-primary);
-	font-size: var(--text-sm);
-	font-weight: 600;
-}
-
+/* A draft and a thread fill it; a list or a stack of orphaned threads scrolls here. */
 .plan-comment-sheet-content {
+	display: flex;
 	min-height: 0;
-	flex: 1;
+	flex: 1 1 auto;
+	flex-direction: column;
 	overflow: auto;
-	padding-right: env(safe-area-inset-right, 0px);
-	padding-bottom: calc(env(safe-area-inset-bottom, 0px) + var(--drawer-keyboard-inset, 0px));
-	padding-left: env(safe-area-inset-left, 0px);
+	padding-bottom: env(safe-area-inset-bottom, 0px);
 	overscroll-behavior: contain;
 }
 
-.plan-comment-sheet-content > [data-plan-comment-card] {
+/* The thread sits on the sheet itself: no second edge, radius or inset of its own. */
+.plan-comment-sheet-content [data-plan-comment-card] {
+	padding: 0.25rem 1rem 1rem;
 	border-radius: 0;
 	box-shadow: none;
+}
+
+.plan-comment-sheet-content .plan-comment-list {
+	padding: 0 0.5rem 0.5rem;
+}
+
+.plan-comment-sheet-content .plan-comment-thread:has(> .plan-comment-thread-scroll) {
+	display: flex;
+	min-height: 0;
+	flex: 1 1 auto;
+	flex-direction: column;
+	gap: 0;
+	padding: 0;
+}
+
+.plan-comment-thread-scroll {
+	display: grid;
+	min-height: 0;
+	flex: 0 1 auto;
+	gap: 0.75rem;
+	padding: 0.25rem 1rem 1rem;
+	overflow: auto;
+	overscroll-behavior: contain;
+}
+
+/*
+ * Pinned under the notes, its Send to Chopin row always in reach. At the
+ * medium detent the sheet's foot is below the screen, so the composer lifts by
+ * the same distance and stays on the visible edge; dragged down, it goes with
+ * the sheet.
+ */
+.plan-comment-sheet-content .plan-comment-thread-compose {
+	position: relative;
+	z-index: 1;
+	flex: none;
+	padding: 0.5rem 1rem 0.75rem;
+	border-top: var(--edge-width) solid var(--color-edge);
+	background: var(--color-page);
+	transform: translateY(calc(-1 * var(--plan-comment-sheet-lift)));
+	transition: transform var(--duration-base) var(--ease-out);
+}
+
+.plan-comment-sheet-popup[data-swiping] .plan-comment-thread-compose {
+	transition: none;
+}
+
+.plan-comment-sheet-content [data-plan-comment-draft] {
+	padding: 0;
+}
+
+.plan-comment-sheet-content [data-plan-comment-draft] .plan-comment-thread-compose {
+	border-top: 0;
+	padding-top: 0.25rem;
+}
+
+/* In a sheet both composers are framed fields, and say they have focus by their border. */
+.plan-comment-sheet-content .plan-comment-composer {
+	padding: 0.25rem 0.75rem;
+	border: var(--edge-width) solid var(--color-control-edge);
+	border-radius: var(--radius-lg);
+	box-shadow: none;
+	transition: border-color var(--duration-fast) var(--ease-out);
+}
+
+.plan-comment-sheet-content .plan-comment-composer:focus-within {
+	border-color: var(--color-brand);
+}
+
+.plan-comment-sheet-content .plan-comment-composer-input {
+	padding-top: 0.5rem;
+}
+
+.plan-comment-sheet-content .plan-comment-composer[data-open] .plan-comment-composer-footer {
+	padding-top: 0;
+}
+
+/* Send to Chopin is a 44px chip: the whole pill toggles it, and it fills when on. */
+.plan-comment-sheet-content .plan-comment-address {
+	min-height: var(--control-target-coarse);
+	margin-left: -0.375rem;
+	padding: 0 0.875rem 0 0.625rem;
+	border-radius: var(--radius-full);
+	font-size: var(--text-sm);
+	transition:
+		background-color var(--duration-fast) var(--ease-out),
+		color var(--duration-fast) var(--ease-out);
+}
+
+.plan-comment-sheet-content .plan-comment-address:active {
+	background: var(--color-selected);
+}
+
+.plan-comment-sheet-content .plan-comment-address:has(:checked) {
+	background: var(--color-brand-wash);
+	color: var(--color-brand-ink);
+}
+
+.plan-comment-sheet-content .plan-comment-address-box {
+	width: 1.125rem;
+	height: 1.125rem;
+}
+
+/* A full 44px disc, on the composer's edge. */
+.plan-comment-sheet-content .plan-comment-send {
+	width: var(--control-target-coarse);
+	height: var(--control-target-coarse);
+	margin-right: -0.5rem;
+}
+
+.plan-comment-sheet-content .plan-comment-send svg {
+	width: 1.125rem;
+	height: 1.125rem;
+}
+
+/* Actions are always shown in a sheet, each a full 44px target that keeps the note head's line. */
+.plan-comment-sheet-content .plan-comment-actions {
+	margin: -0.625rem -0.75rem -0.625rem auto;
+	opacity: 1;
+}
+
+.plan-comment-sheet-content .plan-comment-action {
+	width: var(--control-target-coarse);
+	height: var(--control-target-coarse);
+}
+
+.plan-comment-sheet-content .plan-comment-action svg {
+	width: 1.125rem;
+	height: 1.125rem;
 }
 
 .plan-comment-sheet-popup[data-starting-style],
@@ -926,8 +1831,17 @@
 		animation: none;
 	}
 
+	.plan-comment-actions,
+	.plan-comment-composer-fold,
+	.plan-comment-composer-footer,
+	.plan-comment-menu,
+	.plan-comment-toast {
+		transition: none;
+	}
+
 	.plan-comment-sheet-backdrop,
-	.plan-comment-sheet-popup {
+	.plan-comment-sheet-popup,
+	.plan-comment-sheet-content .plan-comment-thread-compose {
 		transition-duration: 0ms;
 	}
 }
@@ -953,7 +1867,7 @@
 
 .plan-decisions-content {
 	width: 100%;
-	padding: 1.5rem var(--plan-gutter) 60vh;
+	padding: var(--document-decisions-top-inset) var(--plan-gutter) var(--document-trailing-space);
 	margin-inline: auto;
 	max-width: calc(var(--plan-measure) + var(--plan-gutter) * 2);
 }
@@ -964,46 +1878,251 @@
 	max-width: none;
 	align-items: safe center;
 	justify-content: center;
-	padding: 3rem var(--plan-gutter);
+	padding: var(--document-decisions-top-inset) var(--plan-gutter);
 }
 
-.plan-decisions-empty {
+/* Decisions on a phone -------------------------------------------------- */
+
+/* `data-phone` is set from the one phone-class query in phone.ts. */
+.plan-decisions[data-phone] {
+	position: relative;
+	--plan-gutter: calc(var(--spacing) * 4);
+}
+
+.plan-decisions[data-phone] .plan-decisions-content {
+	padding-block-start: calc(var(--spacing) * 4);
+}
+
+/* Save lives in the bar, so the card footer keeps only a quiet way out. */
+.plan-decisions[data-phone] .question-discard-quiet {
+	margin-inline: calc(var(--spacing) * -2) auto;
+	color: var(--color-text-tertiary);
+	font-size: var(--text-xs);
+	font-weight: 400;
+}
+
+/* Leave the hint and the next row visible above the keyboard. */
+.plan-decisions[data-phone] .question-field {
+	scroll-margin-block-end: calc(var(--keyboard-inset, 0px) + var(--spacing) * 20);
+}
+
+.decision-save-bar {
+	display: none;
+}
+
+/* `--phone-bottom-chrome` is the height of any bar below this one, above the safe area. */
+.plan-decisions[data-phone] .decision-save-bar {
+	position: absolute;
+	z-index: 2;
+	inset-inline: calc(var(--spacing) * 3);
+	bottom: calc(
+		var(--phone-bottom-chrome, 0px) + env(safe-area-inset-bottom, 0px) + var(--spacing) * 3
+	);
 	display: flex;
-	width: min(100%, 42rem);
-	min-height: 19rem;
-	flex-direction: column;
 	align-items: center;
-	justify-content: center;
-	padding: 2.5rem 1.5rem;
-	border: var(--edge-width) dashed var(--color-control-edge);
-	border-radius: var(--radius-lg);
-	text-align: center;
+	gap: calc(var(--spacing) * 1);
+	padding: calc(var(--spacing) * 1.5);
+	padding-inline-start: calc(var(--spacing) * 4);
+	border-radius: var(--radius-panel);
+	background: var(--color-page);
+	border: var(--edge-width) solid var(--color-edge);
+	box-shadow: var(--shadow-overlay);
+	opacity: 0;
+	pointer-events: none;
+	transform: translateY(calc(100% + var(--spacing) * 6));
+	transition:
+		transform var(--save-bar-close-dur) var(--ease-out),
+		opacity var(--save-bar-close-dur) var(--ease-out);
 }
 
-.plan-decisions-empty-icon {
+.plan-decisions[data-phone] .decision-save-bar[data-open] {
+	opacity: 1;
+	pointer-events: auto;
+	transform: none;
+	transition:
+		transform var(--save-bar-open-dur) var(--motion-smooth-out),
+		opacity var(--save-bar-open-dur) var(--motion-smooth-out);
+}
+
+/* A text field has the keyboard up; the bar would only crowd it. */
+.plan-decisions[data-phone]:has(.question-field:focus) .decision-save-bar[data-open] {
+	opacity: 0;
+	pointer-events: none;
+	transform: translateY(calc(100% + var(--spacing) * 6));
+}
+
+.decision-save-bar-count {
+	flex: 1;
+	min-width: 0;
+	font-size: var(--text-sm);
+	color: var(--color-text-secondary);
+	font-variant-numeric: tabular-nums;
+}
+
+.decision-save-bar-count[data-failed] {
+	color: var(--color-danger-text);
+}
+
+.plan-decisions[data-phone] .decision-save-bar-button {
+	min-height: var(--control-target-coarse);
+	padding-inline: calc(var(--spacing) * 4);
+	font-size: var(--text-sm);
+}
+
+/* A decided card holds a confirmation, then folds into the resolved group. */
+.decision-confirmed-collapse {
 	display: grid;
-	width: 3.5rem;
-	height: 3.5rem;
-	place-items: center;
-	margin-block-end: 1.5rem;
-	border-radius: var(--radius-lg);
+	grid-template-rows: 1fr;
+	transition:
+		grid-template-rows var(--decision-closure-dur) var(--motion-move),
+		opacity var(--decision-closure-dur) var(--ease-out);
+}
+
+.decision-confirmed-collapse.is-closing {
+	grid-template-rows: 0fr;
+	opacity: 0;
+}
+
+/* The list's gap would otherwise outlive the card it separated. */
+.decision-confirmed-collapse.is-closing:not(:first-child) {
+	margin-block-start: calc(var(--spacing) * -3);
+	transition:
+		grid-template-rows var(--decision-closure-dur) var(--motion-move),
+		opacity var(--decision-closure-dur) var(--ease-out),
+		margin var(--decision-closure-dur) var(--motion-move);
+}
+
+.decision-confirmed {
+	display: flex;
+	align-items: center;
+	gap: calc(var(--spacing) * 3);
+	padding: calc(var(--spacing) * 3.5) calc(var(--spacing) * 4);
+	border-radius: var(--radius-md);
+	background: var(--color-success-wash);
+	border: var(--edge-width) solid var(--color-success-outline-subtle);
+}
+
+/* Someone else's decision folds away without claiming the reader's attention. */
+.decision-confirmed-collapse:not([data-mine]) .decision-confirmed {
+	border-color: var(--color-edge);
 	background: var(--color-inset);
-	color: var(--color-text-primary);
+	animation: none;
 }
 
-.plan-decisions-empty h3 {
-	margin: 0;
-	font-size: var(--text-xl);
+.decision-confirmed-collapse:not([data-mine]) .decision-confirmed-mark {
+	background: var(--color-text-tertiary);
+}
+
+.decision-confirmed-collapse:not([data-mine]) .decision-confirmed-label {
+	color: var(--color-text-tertiary);
+}
+
+.decision-confirmed-mark {
+	display: grid;
+	flex: none;
+	width: var(--icon-button-size);
+	height: var(--icon-button-size);
+	place-items: center;
+	border-radius: var(--radius-full);
+	background: var(--color-success);
+	color: var(--color-page);
+}
+
+/* A coloured holder: the global icon colour would otherwise win. */
+.decision-confirmed-mark [data-nucleo-icon] {
+	color: inherit;
+}
+
+.decision-confirmed-text {
+	display: flex;
+	min-width: 0;
+	flex-direction: column;
+	gap: calc(var(--spacing) / 2);
+}
+
+.decision-confirmed-label {
+	font-size: var(--text-xs);
 	font-weight: 600;
-	line-height: 1.25;
+	color: var(--color-success-ink);
+}
+
+.decision-confirmed-question {
+	font-size: var(--text-sm);
+	font-weight: 500;
 	color: var(--color-text-primary);
 }
 
-.plan-decisions-empty p {
-	max-width: 27rem;
-	margin: 0.5rem 0 0;
-	font-size: var(--text-base);
-	line-height: 1.5;
+.decision-confirmed-answer {
+	font-size: var(--text-sm);
+	color: var(--color-text-secondary);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	.decision-confirmed {
+		animation: decision-confirm var(--save-bar-open-dur) var(--motion-smooth-out);
+	}
+}
+
+@keyframes decision-confirm {
+	from {
+		opacity: 0.4;
+		transform: scale(0.98);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.plan-decisions[data-phone] .decision-save-bar,
+	.plan-decisions[data-phone] .decision-save-bar[data-open],
+	.plan-decisions[data-phone]:has(.question-field:focus) .decision-save-bar[data-open] {
+		transform: none;
+		transition: opacity var(--duration-fast) var(--ease-out);
+	}
+
+	.decision-confirmed-collapse {
+		transition: none;
+	}
+}
+
+/* An open decision in the document on a phone: one line into Decisions. */
+.decision-chip {
+	display: flex;
+	width: 100%;
+	min-height: var(--control-target-coarse);
+	align-items: center;
+	gap: calc(var(--spacing) * 2);
+	padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3);
+	border: var(--edge-width) solid var(--color-edge);
+	border-radius: var(--radius-md);
+	background: var(--color-inset);
+	color: var(--color-text-secondary);
+	font: inherit;
+	font-size: var(--text-sm);
+	text-align: left;
+	cursor: pointer;
+}
+
+.decision-chip:active {
+	background: var(--color-selected);
+}
+
+.decision-chip-icon {
+	flex: none;
+	color: var(--color-brand-ink);
+}
+
+.decision-chip-question {
+	display: -webkit-box;
+	min-width: 0;
+	flex: 1;
+	overflow: hidden;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+	line-clamp: 2;
+	color: var(--color-text-primary);
+}
+
+.decision-chip-chevron {
+	flex: none;
 	color: var(--color-text-tertiary);
 }
 
@@ -1065,6 +2184,21 @@
 	margin-block: 0;
 }
 
+/* A deck member drawn by its run's lead takes no room of its own. */
+.plan .plan-content [data-plan-questionnaire]:has(> [data-deck-follower]) {
+	display: none;
+	margin-block: 0;
+}
+
+/* The caret paragraph before a deck follower stays reachable but takes no room. */
+.plan
+	.plan-content
+	> p:has(> br:only-child):has(+ [data-plan-questionnaire] > [data-deck-follower]) {
+	block-size: 0;
+	margin-block: 0;
+	overflow: visible;
+}
+
 .plan .plan-content :is([data-plan-questionnaire], [data-plan-decision]) article {
 	width: 100%;
 }
@@ -1113,6 +2247,29 @@
 ::highlight(plan-related) {
 	/* #d8eaee */
 	background-color: var(--color-brand-wash);
+}
+
+/*
+ * Commented prose, in the comment's warm wash: faint at rest, stronger while
+ * its passage or chip is pointed at (and while a draft or a resolved marker
+ * points at it), underlined while its card is open.
+ */
+::highlight(plan-comment) {
+	background-color: var(--color-comment-wash);
+}
+
+::highlight(plan-comment-hover),
+::highlight(plan-comment-pin),
+::highlight(plan-comment-resolved) {
+	background-color: var(--color-comment-wash-strong);
+}
+
+::highlight(plan-comment-open) {
+	background-color: var(--color-comment-wash-strong);
+	text-decoration-line: underline;
+	text-decoration-color: var(--color-comment-underline);
+	text-decoration-thickness: calc(var(--edge-width) * 1.5);
+	text-underline-offset: 0.22em;
 }
 
 /* The passage a link is being added to, while its field holds the selection. */
@@ -1210,27 +2367,23 @@
 	 * The trailing space is deliberate and large: the caret should never sit
 	 * against the bottom of the pane, and a plan is usually appended to.
 	 */
-	padding: 2rem var(--plan-gutter) 60vh;
+	padding: var(--document-top-inset) var(--plan-gutter) var(--document-trailing-space);
 	padding-inline-start: var(--plan-leading-gutter);
 	margin-inline: auto;
 	max-width: calc(var(--plan-measure) + var(--plan-gutter) * 2);
 	font-size: var(--plan-body);
 	/* Prose wants looser leading than the UI rhythm the token pairs with. */
-	line-height: 1.6;
+	line-height: var(--document-line-height);
 	color: var(--color-text-primary);
 }
 
 /* Host context above the document shares the prose column and pulls the title up under it. */
 .plan .plan-preface {
 	--plan-leading-gutter: var(--plan-gutter);
-	padding: 2rem var(--plan-gutter) 0;
+	padding: var(--document-top-inset) var(--plan-gutter) 0;
 	padding-inline-start: var(--plan-leading-gutter);
 	margin-inline: auto;
 	max-width: calc(var(--plan-measure) + var(--plan-gutter) * 2);
-}
-
-.plan [data-plan-scroll]:has(> .plan-preface) .plan-content {
-	padding-block-start: 1rem;
 }
 
 /*
@@ -1257,7 +2410,40 @@
 /* The bubble's block trigger carries a label, and its seams cost width a phone lacks. */
 :root[data-plan-coarse-pointer] .plan-bubble-trigger {
 	width: auto;
-	padding-inline: 0.5rem 0.25rem;
+	padding-inline: 0.75rem 0.5rem;
+}
+
+/*
+ * A touch bubble is one row of 44px targets, its glyphs sized to match and its
+ * seams running the full height. Sized to its content, so a selection near the
+ * right edge moves the bubble rather than wrapping it.
+ */
+:root[data-plan-coarse-pointer] .plan-formatting-toolbar:not(.flex-col) {
+	width: max-content;
+	flex-wrap: nowrap;
+	align-items: stretch;
+}
+
+:root[data-plan-coarse-pointer] .plan-formatting-toolbar .plan-menu-cell {
+	font-size: var(--text-lg);
+}
+
+:root[data-plan-coarse-pointer]
+	.plan-formatting-toolbar
+	.plan-menu-cell:not(.plan-bubble-trigger)
+	svg {
+	width: 1.25rem;
+	height: 1.25rem;
+}
+
+:root[data-plan-coarse-pointer] .plan-formatting-toolbar .plan-bubble-trigger svg {
+	width: 1rem;
+	height: 1rem;
+}
+
+:root[data-plan-coarse-pointer] .plan-bubble-seam {
+	height: auto;
+	margin-block: -0.25rem;
 }
 
 /*
@@ -1268,12 +2454,25 @@
  * A plan is prose, so the document elements are given their meaning back here.
  */
 .plan-content :is(h1, h2, h3, h4, h5, h6) {
-	font-weight: 600;
 	line-height: 1.3;
 	margin-block: 1.5em 0.5em;
 	color: var(--color-text-primary);
 	/* Short enough to weigh every break at once, and an 8/1 split reads as a mistake. */
 	text-wrap: balance;
+}
+
+.plan-content :is(h1, h2, h3) {
+	font-family: var(--font-document-heading);
+	font-weight: var(--font-weight-document-heading);
+}
+
+.plan-content h4 {
+	font-family: var(--font-sans);
+	font-weight: var(--font-weight-bold);
+}
+
+.plan-content :is(h5, h6) {
+	font-weight: var(--font-weight-semibold);
 }
 
 .plan-content :is(h1, h2, h3, h4, h5, h6):first-child {
@@ -1377,6 +2576,10 @@
 	color: var(--color-text-primary);
 }
 
+.plan-content h4 :is(strong, b) {
+	font-weight: inherit;
+}
+
 /* Structural components ------------------------------------------------- */
 
 .plan-content pre {
@@ -1402,8 +2605,8 @@
  * Tables scroll independently so a wide one never widens the document.
  *
  * `display: block` turns the table itself into the scrollport. Its inline size
- * is the readable width, while the cells' minimum widths preserve usable
- * columns and create overflow inside that scrollport when necessary.
+ * is bounded by the document gutter, while the cells' minimum widths preserve
+ * usable columns and create overflow inside that scrollport when necessary.
  */
 .plan-content table {
 	display: block;
@@ -1448,6 +2651,311 @@
 	block-size: auto;
 }
 
+.plan-content [data-plan-src] {
+	position: relative;
+	display: inline-block;
+	min-inline-size: 0;
+	max-inline-size: 100%;
+	vertical-align: middle;
+}
+
+.plan-content .plan-image-frame {
+	position: relative;
+	display: inline-block;
+	max-inline-size: 100%;
+	vertical-align: middle;
+}
+
+.plan-content .plan-image-view {
+	display: block;
+	inline-size: 100%;
+	max-inline-size: 100%;
+	padding: 0;
+	border: 0;
+	background: transparent;
+	cursor: zoom-in;
+}
+
+.plan-content .plan-image {
+	display: block;
+	inline-size: 100%;
+	outline: var(--edge-width) solid var(--color-edge);
+}
+
+.plan-content .plan-image-toolbar {
+	position: absolute;
+	inset-block-start: 0.5rem;
+	inset-inline-end: 0.5rem;
+	display: flex;
+	gap: 0.25rem;
+	border-radius: var(--radius-md);
+	box-shadow: var(--shadow-resting);
+}
+
+.plan-content :is(.plan-image-toolbar, .plan-image-resize) {
+	opacity: 0;
+	pointer-events: none;
+	transition: opacity var(--duration-fast) var(--ease-out);
+}
+
+.plan-content
+	.plan-image-frame:is(:hover, :focus-within, [data-resizing])
+	:is(.plan-image-toolbar, .plan-image-resize) {
+	opacity: 1;
+	pointer-events: auto;
+}
+
+.plan-content .plan-image-resize {
+	position: absolute;
+	inline-size: 1.5rem;
+	block-size: 1.5rem;
+	padding: 0;
+	border: 0;
+	border-radius: var(--radius-sm);
+	background: transparent;
+	touch-action: none;
+}
+
+.plan-content .plan-image-resize::after {
+	position: absolute;
+	inset: 0.5rem;
+	border: var(--edge-width) solid var(--color-brand);
+	border-radius: var(--radius-sm);
+	background: var(--color-page);
+	box-shadow: var(--shadow-resting);
+	content: "";
+}
+
+.plan-content .plan-image-resize[data-corner^="top"] {
+	inset-block-start: -0.75rem;
+}
+
+.plan-content .plan-image-resize[data-corner^="bottom"] {
+	inset-block-end: -0.75rem;
+}
+
+.plan-content .plan-image-resize[data-corner$="left"] {
+	inset-inline-start: -0.75rem;
+}
+
+.plan-content .plan-image-resize[data-corner$="right"] {
+	inset-inline-end: -0.75rem;
+}
+
+.plan-content .plan-image-resize:is([data-corner="top left"], [data-corner="bottom right"]) {
+	cursor: nwse-resize;
+}
+
+.plan-content .plan-image-resize:is([data-corner="top right"], [data-corner="bottom left"]) {
+	cursor: nesw-resize;
+}
+
+@media (hover: none) {
+	.plan-content :is(.plan-image-toolbar, .plan-image-resize) {
+		opacity: 1;
+		pointer-events: auto;
+	}
+}
+
+.plan-image-editor {
+	position: fixed;
+	inset: 0;
+	inline-size: min(24rem, calc(100vw - 2rem));
+	max-inline-size: 100%;
+	max-block-size: calc(100dvh - 2rem);
+	margin: auto;
+	overflow: auto;
+	padding: 1rem;
+	border: var(--edge-width) solid var(--color-control-edge);
+	border-radius: var(--radius-lg);
+	background: var(--color-page);
+	box-shadow: var(--shadow-overlay);
+	color: var(--color-text-primary);
+	font-family: var(--font-sans);
+}
+
+.plan-image-editor::backdrop {
+	background: color-mix(in srgb, var(--color-text-primary) 20%, transparent);
+}
+
+.plan-image-editor form {
+	display: grid;
+	gap: 0.75rem;
+}
+
+.plan-image-editor :is(h2, p) {
+	margin: 0;
+}
+
+.plan-image-editor-field {
+	display: grid;
+	gap: 0.375rem;
+}
+
+.plan-image-editor-field input {
+	inline-size: 100%;
+	min-inline-size: 0;
+	padding: 0.5rem 0.75rem;
+}
+
+.plan-image-editor-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 0.5rem;
+	margin-block-start: 0.25rem;
+}
+
+.plan-image-lightbox {
+	position: fixed;
+	inset: 0;
+	inline-size: 100%;
+	block-size: 100dvh;
+	max-inline-size: none;
+	max-block-size: none;
+	margin: 0;
+	padding: 4rem 1.5rem 1.5rem;
+	border: 0;
+	background: var(--color-text-primary);
+	color: var(--color-page);
+	font-family: var(--font-sans);
+}
+
+.plan-image-lightbox-toolbar {
+	position: absolute;
+	inset-block-start: 1rem;
+	inset-inline-end: 1rem;
+	display: flex;
+	gap: 0.5rem;
+}
+
+.plan-image-lightbox-scroll {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	inline-size: 100%;
+	block-size: 100%;
+	overflow: auto;
+	overscroll-behavior: contain;
+}
+
+.plan-image-lightbox-scroll img {
+	display: block;
+	max-inline-size: 100%;
+	max-block-size: 100%;
+	object-fit: contain;
+}
+
+.plan-image-lightbox-scroll[data-zoomed] {
+	display: block;
+}
+
+.plan-image-lightbox-scroll[data-zoomed] img {
+	max-inline-size: none;
+	max-block-size: none;
+	block-size: auto;
+	margin-inline: auto;
+}
+
+/*
+ * A dense diagram's full-screen reading. It rises from the bottom edge and
+ * settles; reduced motion only fades it in. The drawing keeps its authored
+ * size and scrolls natively, so it pans under a finger and pinches like the
+ * page does.
+ */
+.plan-diagram-sheet {
+	position: fixed;
+	inset: 0;
+	display: flex;
+	flex-direction: column;
+	inline-size: 100%;
+	block-size: 100dvh;
+	max-inline-size: none;
+	max-block-size: none;
+	margin: 0;
+	padding: 0;
+	border: 0;
+	background: var(--color-page);
+	color: var(--color-text-primary);
+	font-family: var(--font-sans);
+	overscroll-behavior: contain;
+}
+
+.plan-diagram-sheet::backdrop {
+	background: transparent;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	.plan-diagram-sheet[open] {
+		animation: plan-sheet-up var(--drawer-open-dur) var(--motion-smooth-out);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.plan-diagram-sheet[open] {
+		animation: plan-source-in var(--duration-base) var(--ease-out);
+	}
+}
+
+@keyframes plan-sheet-up {
+	from {
+		transform: translateY(100%);
+	}
+}
+
+.plan-diagram-sheet-bar {
+	display: flex;
+	flex-shrink: 0;
+	justify-content: flex-end;
+	gap: calc(var(--spacing) * 2);
+	padding-block-start: calc(env(safe-area-inset-top, 0px) + var(--spacing) * 2);
+	padding-inline: calc(env(safe-area-inset-left, 0px) + var(--spacing) * 2)
+		calc(env(safe-area-inset-right, 0px) + var(--spacing) * 2);
+}
+
+.plan-diagram-sheet .plan-diagram-sheet-button {
+	inline-size: var(--control-target-coarse);
+	block-size: var(--control-target-coarse);
+	border-radius: var(--radius-full);
+}
+
+.plan-diagram-sheet-scroll {
+	display: flex;
+	flex-direction: column;
+	flex: 1;
+	min-block-size: 0;
+	overflow: auto;
+	overscroll-behavior: contain;
+	padding-block: calc(var(--spacing) * 4)
+		calc(env(safe-area-inset-bottom, 0px) + var(--spacing) * 4);
+	padding-inline: calc(env(safe-area-inset-left, 0px) + var(--spacing) * 4)
+		calc(env(safe-area-inset-right, 0px) + var(--spacing) * 4);
+}
+
+/*
+ * Centred both ways when it is smaller than the sheet. Auto margins rather
+ * than centring, so a larger drawing still scrolls from its top-start corner.
+ */
+.plan-diagram-sheet-drawing {
+	inline-size: max-content;
+	margin: auto;
+}
+
+.plan-diagram-sheet-drawing svg {
+	display: block;
+	max-inline-size: none;
+	block-size: auto;
+}
+
+/* Fitted: the whole shape at once. */
+.plan-diagram-sheet-scroll[data-fit] .plan-diagram-sheet-drawing {
+	inline-size: auto;
+	max-inline-size: 100%;
+}
+
+.plan-diagram-sheet-scroll[data-fit] .plan-diagram-sheet-drawing svg {
+	max-inline-size: 100%;
+}
+
 /* Visual top-level blocks can use the document beyond the prose measure. */
 .plan-content
 	> :is(p:has(> [data-plan-src]:first-child
@@ -1459,12 +2967,13 @@
 
 /*
  * A compact table shrink-wraps around its columns from the prose's start edge,
- * like every other block; a wide one scrolls inside the prose measure. The row
- * and column rails are fixed overlays and sit in the gutter outside it.
+ * like every other block; a wide one grows to the trailing document gutter
+ * before scrolling. The row and column rails are fixed overlays and sit in
+ * the gutter outside it.
  */
 .plan-content > table {
 	inline-size: max-content;
-	max-inline-size: 100%;
+	max-inline-size: calc((100% + var(--plan-wide-inline-size)) / 2);
 }
 
 /* Name an empty header for what it holds. Counted per header cell, out of flow. */
@@ -1493,6 +3002,7 @@
 .plan-content
 	> p:has(> [data-plan-src]:first-child + br[data-lexical-managed-linebreak]:last-child) {
 	display: grid;
+	grid-template-columns: minmax(0, 1fr);
 	place-items: center;
 }
 
@@ -1533,13 +3043,16 @@
 
 .plan-content
 	p:has(> [data-plan-src]:first-child + br[data-lexical-managed-linebreak]:last-child)
-	> [data-plan-src]:has(> .plan-image-missing) {
+	> [data-plan-src]:has(.plan-image-missing),
+.plan-content
+	p:has(> [data-plan-src]:first-child + br[data-lexical-managed-linebreak]:last-child)
+	.plan-image-frame:has(.plan-image-missing) {
 	display: block;
 }
 
 /* The managed break after a block frame would add an empty line beneath it. */
 .plan-content
-	p:has(> [data-plan-src]:first-child > .plan-image-missing)
+	p:has(> [data-plan-src]:first-child .plan-image-missing)
 	> br[data-lexical-managed-linebreak]:last-child {
 	display: none;
 }
@@ -1996,7 +3509,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-	.plan * {
+	.plan *:not(.cv-unfold-content) {
 		transition: none !important;
 		animation: none !important;
 	}
@@ -2203,6 +3716,12 @@
 	opacity: 0.4;
 }
 
+/* A drawing and its controls end a passage; the next paragraph starts a new one. */
+.plan-content
+	.planCode:is([data-plan-presentation="diagram"], [data-plan-language="mermaid"][data-plan-collapsed]) {
+	margin-block-end: calc(var(--spacing) * 10);
+}
+
 /*
  * A code block is one box: header, rendered code, source. A border rather than
  * an outline, because the renderer paints over an inset outline.
@@ -2212,6 +3731,9 @@
 	display: flex;
 	flex-direction: column;
 	margin-block: 1em;
+}
+
+.plan-content .planCode:not([data-plan-presentation]) {
 	overflow: hidden;
 	border: var(--edge-width) solid var(--color-edge);
 	border-radius: var(--radius-lg);
@@ -2296,7 +3818,7 @@
  * own above the content instead of sitting on its first line.
  */
 @media not ((hover: hover) and (pointer: fine)) {
-	.plan-content .planCode {
+	.plan-content .planCode:not([data-plan-presentation], [data-plan-language="wireframe"]) {
 		padding-block-start: calc(var(--spacing) * 9);
 	}
 
@@ -2449,6 +3971,121 @@
 	content: "Mermaid, e.g. flowchart TD; A-->B";
 }
 
+/*
+ * A fence named as plain text is laid out by hand, usually an ASCII drawing,
+ * so its lines never wrap; a wide one scrolls inside the block instead.
+ */
+.plan-content .planCode[data-plan-text] [data-plan-source] {
+	white-space: pre;
+}
+
+.plan-content
+	.planCode[data-plan-text]
+	[data-plan-source]:has(> br[data-lexical-managed-linebreak]:only-child)::before {
+	content: "Text";
+}
+
+/*
+ * Its name already answers the language menu's question, so the corner stays
+ * empty, even on hover. The menu returns only while a writer's caret is in the
+ * block, or the menu itself is open or focused, so the text can still become
+ * code. Hidden rather than transparent, so it is neither clickable nor
+ * announced while out of sight.
+ */
+.plan-content
+	.planCode[data-plan-text]:not(:has(.plan-code-chrome:is([data-editing], :focus-within), .plan-code-chrome
+		[aria-expanded="true"])) {
+	& .plan-code-chrome {
+		visibility: hidden;
+	}
+
+	/* With nothing in the corner, touch needs no band to hold it. */
+	@media not ((hover: hover) and (pointer: fine)) {
+		padding-block-start: 0;
+	}
+}
+
+.plan-content
+	.planCode[data-plan-language="wireframe"]
+	[data-plan-source]:has(> br[data-lexical-managed-linebreak]:only-child)::before {
+	content: "Wireframe, e.g. panel \"Settings\"";
+}
+
+/*
+ * A wireframe has no chrome: a quiet stage, and its source folds open below it
+ * only while the caret is inside. Hover deepens the stage's hairline and
+ * nothing more; writing in the source rings the drawing it changes.
+ *
+ * The preview slot steps out of the layout so an error can follow the source,
+ * where the author is looking, even while the last drawing stays above it.
+ */
+.plan-content .planCode[data-plan-language="wireframe"] [data-plan-preview] {
+	display: contents;
+}
+
+.plan-content .planCode[data-plan-language="wireframe"] [data-plan-preview] > [data-plan-error] {
+	order: 1;
+}
+
+.plan-content
+	.planCode[data-plan-presentation="wireframe"]
+	[data-plan-preview]
+	> [data-plan-error] {
+	padding-inline: calc(var(--spacing) * 1);
+}
+
+/* One that does not parse is plain code, with what is wrong under it. */
+.plan-content
+	.planCode[data-plan-language="wireframe"]:not([data-plan-presentation])
+	[data-plan-preview]:not(:empty)
+	~ [data-plan-source] {
+	border-block-start: 0;
+	background: var(--color-page);
+	opacity: 1;
+}
+
+.plan-content
+	.planCode[data-plan-language="wireframe"]:not([data-plan-presentation])
+	[data-plan-preview]
+	> [data-plan-error] {
+	border-block-start: var(--edge-width) solid var(--color-edge);
+}
+
+.plan-content .plan-wireframe .wf-stage {
+	transition:
+		border-color var(--duration-fast) var(--ease-out),
+		opacity var(--duration-base) var(--ease-out);
+}
+
+@media (hover: hover) and (pointer: fine) {
+	.plan-content .planCode[data-plan-presentation="wireframe"]:hover .plan-wireframe .wf-stage {
+		border-color: var(--color-control-edge);
+	}
+}
+
+/* The last drawing that parsed, kept while its source is mid-edit. */
+.plan-content .plan-wireframe[data-stale] .wf-stage {
+	opacity: 0.4;
+}
+
+.plan-content
+	.planCode[data-plan-presentation="wireframe"]
+	[data-plan-preview]:not(:empty)
+	~ [data-plan-source] {
+	margin-block-start: calc(var(--spacing) * 2);
+	padding: calc(var(--spacing) * 3);
+	border: var(--edge-width) solid var(--color-edge);
+	border-radius: var(--radius-md);
+	background: var(--color-inset);
+	opacity: 1;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	.plan-content .planCode[data-plan-presentation="wireframe"] [data-plan-source] {
+		animation: plan-source-in var(--duration-fast) var(--ease-out);
+	}
+}
+
 .plan-content .planCode [data-plan-preview]:not(:empty) ~ [data-plan-source] {
 	border-block-start: var(--edge-width) solid var(--color-edge);
 	background: var(--color-inset);
@@ -2481,7 +4118,7 @@
 	}
 }
 
-.plan-content .planCode [data-plan-preview] :is(.plan-diagram, .plan-seecode, [data-plan-error]) {
+.plan-content .planCode [data-plan-preview] :is(.plan-diagram, [data-plan-error]) {
 	padding-inline: 0.75rem;
 }
 
@@ -2571,6 +4208,106 @@
 	content: "·";
 	margin-inline: 0.375rem 0.125rem;
 	color: var(--color-text-quaternary);
+}
+
+/* Columns ---------------------------------------------------------------- */
+
+.plan-content > .planColumns {
+	position: relative;
+	inline-size: var(--plan-wide-inline-size);
+	max-inline-size: var(--plan-wide-inline-size);
+	margin-block: 2.5rem 1.5rem;
+	margin-inline: var(--plan-wide-inline-offset);
+}
+
+.plan-content [data-plan-columns-content] {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 2rem;
+}
+
+.plan-content .planColumn {
+	min-inline-size: 0;
+}
+
+.plan-content .planColumn > :first-child {
+	margin-block-start: 0;
+}
+
+.plan-content .planColumn > :last-child {
+	margin-block-end: 0;
+}
+
+.plan-content .planColumn > p:has(> [data-plan-src]:first-child) {
+	margin-block: 0;
+}
+
+.plan-content .planColumn > p:has(> [data-plan-src]:first-child) > [data-plan-src] {
+	display: block;
+	inline-size: 100%;
+}
+
+.plan-content .planColumn .plan-image {
+	display: block;
+	inline-size: 100%;
+}
+
+.plan-content .planColumn > p:has(> [data-plan-src]:first-child) + p {
+	margin-block: 0.5rem 0;
+	color: var(--color-text-secondary);
+	font-size: var(--text-sm);
+	line-height: 1.5;
+}
+
+.plan-content [data-plan-chrome="columns"] {
+	position: absolute;
+	inset-block-start: -2rem;
+	inset-inline-end: 0;
+}
+
+.plan-content .plan-columns-unwrap {
+	opacity: 0;
+	pointer-events: none;
+	transition: opacity var(--duration-fast) var(--ease-out);
+}
+
+.plan-content .planColumns:hover .plan-columns-unwrap,
+.plan-content .plan-columns-unwrap:focus-visible {
+	opacity: 1;
+	pointer-events: auto;
+}
+
+@media (hover: none) {
+	.plan-content .plan-columns-unwrap {
+		opacity: 1;
+		pointer-events: auto;
+	}
+}
+
+@container (max-width: 48rem) {
+	.plan-content [data-plan-columns-content] {
+		grid-template-columns: minmax(0, 1fr);
+		gap: 1.5rem;
+	}
+}
+
+.plan-content[contenteditable="true"] .planColumn:not(:has(> :not(br)))::before {
+	content: "Write in this column…";
+	display: block;
+	color: var(--color-text-quaternary);
+	pointer-events: none;
+}
+
+.plan-content[contenteditable="true"] .planColumn > p:only-child:has(> br:only-child) {
+	position: relative;
+}
+
+.plan-content[contenteditable="true"] .planColumn > p:only-child:has(> br:only-child)::before {
+	content: "Write in this column…";
+	position: absolute;
+	inset-inline-start: 0;
+	color: var(--color-text-quaternary);
+	pointer-events: none;
 }
 
 /* Tabs ------------------------------------------------------------------- */
@@ -2669,6 +4406,34 @@
 	content: "";
 	position: absolute;
 	inset: calc(50% - 22px);
+}
+
+/*
+ * And around each tab, grown into a band the strip makes room for: the strip
+ * scrolls, so anything reaching past its box would be clipped.
+ */
+:root[data-plan-coarse-pointer] .plan-content .plan-tab-strip [role="tablist"] {
+	padding-block: calc((var(--control-target-coarse) - var(--icon-button-size)) / 2);
+	margin-block: calc((var(--control-target-coarse) - var(--icon-button-size)) / -2);
+}
+
+:root[data-plan-coarse-pointer] .plan-content .plan-tab > [role="tab"] {
+	position: relative;
+}
+
+:root[data-plan-coarse-pointer] .plan-content .plan-tab > [role="tab"]::after {
+	content: "";
+	position: absolute;
+	inset-block: calc(50% - var(--control-target-coarse) / 2);
+	inset-inline: 0;
+}
+
+/* The source toggle grows away from the language menu beside it, toward empty space. */
+:root[data-plan-coarse-pointer] .plan-content .plan-code-chrome .plan-code-toggle::after {
+	left: auto;
+	right: 0;
+	width: var(--control-target-coarse);
+	transform: translateY(-50%);
 }
 
 .plan-content .plan-tab-add {
@@ -3208,13 +4973,17 @@
 	z-index: 2;
 }
 
+.plan-document [data-plan-scroll] {
+	position: relative;
+}
+
 .plan-decision-marker {
 	pointer-events: auto;
 	position: absolute;
 	display: grid;
 	place-items: center;
-	inline-size: 1.25rem;
-	block-size: 1.25rem;
+	inline-size: var(--decision-marker-size);
+	block-size: var(--decision-marker-size);
 	padding: 0;
 	border-radius: var(--radius-full);
 }
@@ -3236,11 +5005,19 @@
 	--color-icon: var(--color-success);
 	display: grid;
 	place-items: center;
-	inline-size: 1.25rem;
-	block-size: 1.25rem;
+	inline-size: var(--decision-marker-size);
+	block-size: var(--decision-marker-size);
 	border-radius: var(--radius-full);
 	background: var(--color-success-wash);
 	color: var(--color-success);
+}
+
+.plan-decision-size-probe {
+	position: absolute;
+	inset-block-start: 0;
+	inset-inline-start: 0;
+	visibility: hidden;
+	pointer-events: none;
 }
 
 /* Too narrow a gutter for a disc: a slim bar the height of the first line. */
@@ -3266,8 +5043,119 @@
 	outline: var(--edge-width) solid var(--color-success);
 }
 
+.plan-decision-marker:hover:not([aria-expanded="true"]) .plan-decision-disc {
+	outline-color: var(--color-success-outline-subtle);
+}
+
 .plan-decision-marker:focus-visible .plan-decision-disc {
 	--color-icon: var(--color-success-ink);
+}
+
+/* A resolved comment that led to edits: the same disc, in the comment's amber. */
+.plan-decision-marker[data-kind="comment"] .plan-decision-disc {
+	--color-icon: var(--color-comment-marker-icon);
+	background: var(--color-comment-marker);
+	color: var(--color-comment-marker-icon);
+}
+
+.plan-decision-marker[data-kind="comment"][data-compact] .plan-decision-disc {
+	background: var(--color-comment-marker-outline);
+}
+
+.plan-decision-marker[data-kind="comment"]:is(:hover, [aria-expanded="true"]) .plan-decision-disc {
+	--color-icon: var(--color-comment-marker-ink);
+	outline: var(--edge-width) solid var(--color-comment-marker-outline);
+}
+
+.plan-decision-marker[data-kind="comment"]:hover:not([aria-expanded="true"]) .plan-decision-disc {
+	outline-color: var(--color-comment-marker-outline-subtle);
+}
+
+.plan-decision-marker[data-kind="comment"]:focus-visible .plan-decision-disc {
+	--color-icon: var(--color-comment-marker-ink);
+}
+
+/* Its discussion, read back: the thread card's notes, with no composer. */
+.plan-decision-pop[data-kind="comment"] {
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
+}
+
+.plan-resolved-comment {
+	display: grid;
+	gap: 0.375rem;
+}
+
+.plan-resolved-comment[data-pinned] {
+	gap: 0.75rem;
+}
+
+.plan-resolved-comment:not([data-pinned]) .plan-comment-note-body {
+	display: -webkit-box;
+	overflow: hidden;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 3;
+}
+
+:is(.plan-decision-pop, .plan-resolved-comment-sheet) .plan-resolved-comment-meta {
+	font-size: var(--text-xs);
+	line-height: var(--text-xs--line-height);
+	color: var(--color-text-tertiary);
+}
+
+.plan-resolved-comment-head {
+	display: flex;
+	align-items: center;
+	gap: 0.25rem;
+	margin: -0.25rem -0.375rem -0.25rem 0;
+}
+
+:is(.plan-decision-pop, .plan-resolved-comment-sheet) .plan-resolved-comment-status {
+	display: inline-flex;
+	flex: 1;
+	align-items: center;
+	gap: 0.375rem;
+	min-width: 0;
+	font-size: var(--text-xs);
+	line-height: var(--text-xs--line-height);
+	color: var(--color-text-tertiary);
+	font-variant-numeric: tabular-nums;
+}
+
+.plan-resolved-comment-status svg {
+	--color-icon: var(--color-comment-marker-icon);
+	flex: none;
+}
+
+.plan-resolved-comment-head .btn-outline {
+	color: var(--color-text-secondary);
+}
+
+/* A resolved thread on a phone: read-only, on the sheet itself, Reopen a full touch target. */
+.plan-resolved-comment-sheet {
+	padding: 0.25rem 1rem 1rem;
+}
+
+.plan-resolved-comment-sheet .plan-resolved-comment-head {
+	margin: 0;
+}
+
+.plan-resolved-comment-sheet .plan-resolved-comment-head .btn-outline {
+	position: relative;
+}
+
+.plan-resolved-comment-sheet .plan-resolved-comment-head .btn-outline::after {
+	content: "";
+	position: absolute;
+	inset: -0.375rem;
+}
+
+.plan-resolved-comment-close {
+	inline-size: 1.5rem;
+	block-size: 1.5rem;
+	min-inline-size: 1.5rem;
+	min-block-size: 1.5rem;
+	padding: 0;
 }
 
 .plan-decision-pop {
@@ -3280,6 +5168,20 @@
 
 .plan-decision-pop[data-pinned] {
 	pointer-events: auto;
+}
+
+.plan-decision-pop[role="tooltip"] {
+	font-size: var(--text-xs);
+	line-height: var(--text-xs--line-height);
+}
+
+.plan-decision-pop[role="tooltip"] .plan-decision-answer {
+	font-size: var(--text-xs);
+}
+
+.plan-decision-pop[role="tooltip"] .plan-decision-meta {
+	font-size: var(--text-2xs);
+	line-height: var(--text-2xs--line-height);
 }
 
 .plan-decision-pop p {
@@ -3414,6 +5316,8 @@
 /* Keep the caret off the bottom edge while typing: browsers honour this when
    they scroll a selection into view. */
 .plan [data-plan-scroll] {
+	/* Wide blocks measure the usable scrollport, excluding a consuming scrollbar. */
+	container-type: inline-size;
 	scroll-padding-block: 4rem 30%;
 }
 
@@ -3464,6 +5368,19 @@
 	animation: plan-check-in var(--duration-fast) var(--ease-out);
 }
 
+/* A phone reader cannot tick a task, so the box drops its pressable look until editing. */
+.plan[data-plan-reading]
+	.plan-content
+	:is([class*="_listItemUnchecked"], [class*="_listItemChecked"]):before {
+	border-style: dashed;
+	box-shadow: none;
+	cursor: default;
+}
+
+.plan[data-plan-reading] .plan-content [class*="_listItemUnchecked"]:hover:before {
+	background-color: var(--color-page);
+}
+
 @keyframes plan-check-in {
 	from {
 		opacity: 0;
@@ -3501,4 +5418,194 @@
 	.plan-formatting-toolbar {
 		animation: none;
 	}
+}
+
+/*
+ * A phone's selection actions, docked in the thumb zone: clear of the system
+ * callout over the selection and of the lines under it. It stands on the
+ * keyboard when one is open, and above any bottom chrome the app adds.
+ */
+.plan-selection-bar {
+	position: fixed;
+	left: 50%;
+	bottom: calc(
+		var(--plan-selection-bar-keyboard, 0px) + var(--phone-bottom-chrome, 0px) +
+			env(safe-area-inset-bottom, 0px) +
+			calc(var(--spacing) * 3)
+	);
+	z-index: 50;
+	display: flex;
+	align-items: stretch;
+	max-width: calc(100vw - calc(var(--spacing) * 4));
+	padding: var(--spacing);
+	border-radius: var(--radius-full);
+	background: var(--color-page);
+	border: var(--edge-width) solid var(--color-edge);
+	box-shadow: var(--shadow-overlay);
+	transform: translateX(-50%);
+	transition:
+		transform var(--panel-open-dur) var(--motion-smooth-out),
+		opacity var(--duration-fast) var(--ease-out);
+}
+
+@starting-style {
+	.plan-selection-bar {
+		opacity: 0;
+		transform: translate(-50%, calc(var(--spacing) * 4)) scale(var(--modal-scale));
+	}
+}
+
+/* While the bar shows, anything scrolled into view stops short of it. */
+[data-plan-scroll]:has([data-plan-selection-bar]) {
+	scroll-padding-bottom: calc(
+		var(--control-target-coarse) + var(--phone-bottom-chrome, 0px) +
+			env(safe-area-inset-bottom, 0px) +
+			calc(var(--spacing) * 6)
+	);
+}
+
+.plan-selection-bar-action {
+	display: inline-flex;
+	min-width: var(--control-target-coarse);
+	height: var(--control-target-coarse);
+	flex: none;
+	align-items: center;
+	justify-content: center;
+	gap: calc(var(--spacing) * 2);
+	padding-inline: calc(var(--spacing) * 3.5);
+	border-radius: var(--radius-full);
+	color: var(--color-text-primary);
+	font-size: var(--text-base);
+	font-weight: var(--font-weight-medium);
+	white-space: nowrap;
+}
+
+.plan-selection-bar-action svg {
+	width: 1.25rem;
+	height: 1.25rem;
+	color: var(--color-text-secondary);
+}
+
+.plan-selection-bar-action:active {
+	background: var(--color-selected);
+}
+
+.plan-selection-bar-seam {
+	width: var(--edge-width);
+	margin-block: calc(var(--spacing) * 2.5);
+	background: var(--color-divider);
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.plan-selection-bar {
+		transition: opacity var(--duration-fast) var(--ease-out);
+	}
+
+	@starting-style {
+		.plan-selection-bar {
+			transform: translateX(-50%);
+		}
+	}
+}
+
+.plan .plan-afterword {
+	--plan-leading-gutter: var(--plan-gutter);
+	padding: 0 var(--plan-gutter) var(--document-trailing-space);
+	padding-inline-start: var(--plan-leading-gutter);
+	margin-inline: auto;
+	max-width: calc(var(--plan-measure) + var(--plan-gutter) * 2);
+}
+
+.plan[data-plan-afterword]
+	> .plan-workspace
+	> .plan-document
+	> [data-plan-scroll]
+	> .mdxeditor
+	.plan-content {
+	padding-bottom: calc(var(--spacing) * 6);
+}
+
+/* Formatting docked above a phone's keyboard while editing; the host supplies the surface. */
+.plan-format-dock {
+	display: flex;
+	align-items: center;
+	gap: calc(var(--spacing) / 2);
+	min-width: 0;
+	height: 100%;
+	padding-inline: var(--spacing);
+	-webkit-user-select: none;
+	user-select: none;
+}
+
+/* The commands scroll when a narrow phone cannot show them all; Hide keyboard stays pinned. */
+.plan-format-dock-scroll {
+	display: flex;
+	flex: 1;
+	align-items: center;
+	justify-content: space-between;
+	gap: calc(var(--spacing) / 2);
+	min-width: 0;
+	overflow-x: auto;
+	overscroll-behavior-x: contain;
+	scrollbar-width: none;
+}
+
+.plan-format-dock-scroll::-webkit-scrollbar {
+	display: none;
+}
+
+/* Buttons scrolled past an edge: fade that edge so the row reads as scrollable. */
+.plan-format-dock-scroll {
+	--dock-fade: calc(var(--spacing) * 8);
+	--dock-fade-start: #000;
+	--dock-fade-end: #000;
+	-webkit-mask-image: linear-gradient(
+		to right,
+		var(--dock-fade-start),
+		#000 var(--dock-fade),
+		#000 calc(100% - var(--dock-fade)),
+		var(--dock-fade-end)
+	);
+	mask-image: linear-gradient(
+		to right,
+		var(--dock-fade-start),
+		#000 var(--dock-fade),
+		#000 calc(100% - var(--dock-fade)),
+		var(--dock-fade-end)
+	);
+}
+
+.plan-format-dock-scroll[data-more-start] {
+	--dock-fade-start: transparent;
+}
+
+.plan-format-dock-scroll[data-more-end] {
+	--dock-fade-end: transparent;
+}
+
+.plan-format-dock-button {
+	display: grid;
+	flex: none;
+	place-items: center;
+	width: var(--control-target-coarse);
+	height: var(--control-target-coarse);
+	border-radius: var(--radius-full);
+	color: var(--color-text-secondary);
+	font-size: var(--text-lg);
+	line-height: 1;
+	touch-action: manipulation;
+	-webkit-touch-callout: none;
+	transition:
+		background-color var(--duration-fast) var(--ease-out),
+		color var(--duration-fast) var(--ease-out);
+}
+
+.plan-format-dock-button:active:not(:disabled),
+.plan-format-dock-button[aria-pressed="true"] {
+	background: var(--color-selected);
+	color: var(--color-text-primary);
+}
+
+.plan-format-dock-button:disabled {
+	opacity: var(--opacity-quiet);
 }

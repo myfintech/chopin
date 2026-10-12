@@ -1,7 +1,24 @@
 export { GitHubIcon } from "./brand";
+export { CopyIcon } from "./copy";
+export { DocumentsIcon } from "./documents";
 export { ChopinIcon } from "./filled";
-export type { IconProps } from "./icon";
 export {
+	IssueCompletedIcon,
+	IssueNotPlannedIcon,
+	IssueOpenIcon,
+	PendingIcon,
+	PrivateIcon,
+	PullRequestClosedIcon,
+	PullRequestDraftIcon,
+	PullRequestMergedIcon,
+	PullRequestOpenIcon,
+} from "./github";
+export type { IconProps, IconSize } from "./icon";
+export { iconSizes } from "./icon";
+export {
+	ActualSizeIcon,
+	ArrowLeftIcon,
+	ArrowRightIcon,
 	ArrowUpIcon,
 	CheckIcon,
 	ChevronIcon,
@@ -9,12 +26,18 @@ export {
 	ClockIcon,
 	CloseIcon,
 	CodeIcon,
+	CollapseIcon,
+	ColumnsIcon,
 	DecisionIcon,
 	DiagramIcon,
 	DiffIcon,
+	EllipsisIcon,
+	ExpandIcon,
+	FitWidthIcon,
 	FormulaIcon,
 	ImageIcon,
 	InfoIcon,
+	KeyboardIcon,
 	LightbulbIcon,
 	LinkIcon,
 	LinkPlusIcon,
@@ -23,15 +46,20 @@ export {
 	MessageForwardIcon,
 	MessageIcon,
 	MessagePlusIcon,
+	MinusIcon,
+	PauseIcon,
 	PencilIcon,
+	PlayIcon,
 	PlusIcon,
+	RestartIcon,
 	SignInIcon,
 	SirenIcon,
 	SparkleIcon,
 	TableIcon,
 	TabsIcon,
-	WarningIcon,
 	WrenchIcon,
 } from "./line";
+export { ListIcon } from "./list";
 export { ArchiveIcon, DocumentIcon, LoaderIcon, SearchIcon } from "./system";
+export { WarningIcon } from "./warning";
 export { MonitorIcon, MoonIcon, SunIcon } from "./theme";

@@ -40,6 +40,7 @@ import type {
 	PublishChannelDescriptionResult,
 	PublishInitialResearchReport,
 	PublishInitialResearchReportResult,
+	PutImage,
 	PutUser,
 	RecordNavigationVisit,
 	RenameChannel,
@@ -62,6 +63,7 @@ import type {
 	StartResearchWorkspace,
 	StartResearchWorkspaceResult,
 	StoredChannel,
+	StoredImage,
 	StoredWebSession,
 	SupersedeBackgroundJob,
 	UpdateAgentContext,
@@ -70,6 +72,7 @@ import type {
 	UserProject,
 	UserRecord,
 } from "./model";
+import type { ExperimentStore } from "./experiments";
 import type { PreferenceStore } from "../user-preferences/model";
 import type { ProvenanceStore } from "../document-provenance/model";
 
@@ -90,6 +93,14 @@ export interface SessionStore {
 		lease: Lease,
 		leaseTtlMs: number,
 	): Promise<{ deleted: number; lease: Lease }>;
+}
+
+export interface ImageStore {
+	/** Idempotent: repeating an upload of the same bytes to a document keeps the first. */
+	put(image: PutImage): Promise<void>;
+	get(channelId: string, sha256: string): Promise<StoredImage | undefined>;
+	/** Every document these bytes were uploaded to, oldest upload first. */
+	channels(sha256: string): Promise<string[]>;
 }
 
 export interface NavigationStore {
@@ -116,6 +127,8 @@ export interface ChannelStore {
 	/** Creates a top-level channel or one repository-local, non-recursive child. */
 	create(input: CreateChannel): Promise<ChannelRecord>;
 	get(id: string): Promise<ChannelRecord | undefined>;
+	/** Unarchived direct children of one channel, oldest first, at most `limit`. */
+	children(parentId: string, limit: number): Promise<ChannelRecord[]>;
 	resolve(repositoryId: string, slug: string): Promise<ChannelRecord | undefined>;
 	rename(channel: RenameChannel): Promise<RenameResult>;
 	archive(input: ChannelArchiveInput): Promise<ChannelArchiveResult>;
@@ -161,6 +174,12 @@ export interface CollaborationStore {
 	commit(input: CommitChannel): Promise<CommitResult>;
 	replace(input: ReplaceChannel): Promise<CommitResult>;
 	checkpoint(input: SaveCheckpoint): Promise<void>;
+	/**
+	 * Clear stored conversation state from every child channel. Fenced by the writer
+	 * lease, run at startup before any room opens, and idempotent. A child whose
+	 * decision records cite its Chat is kept unchanged and reported.
+	 */
+	dropChildConversations(lease: Lease): Promise<{ cleared: string[]; kept: string[] }>;
 }
 
 export interface LeaseStore {
@@ -245,6 +264,7 @@ export interface ResearchWorkspaceStore {
 
 /** The complete durable boundary. No provider-specific primitive crosses it. */
 export interface StorageAdapter {
+	readonly experiments: ExperimentStore;
 	readonly driver: string;
 	readonly users: UserStore;
 	readonly sessions: SessionStore;
@@ -254,6 +274,7 @@ export interface StorageAdapter {
 	readonly leases: LeaseStore;
 	readonly jobs: BackgroundJobStore;
 	readonly research: ResearchWorkspaceStore;
+	readonly images: ImageStore;
 	readonly preferences: PreferenceStore;
 	readonly provenance: ProvenanceStore;
 

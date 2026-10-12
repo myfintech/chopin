@@ -71,6 +71,12 @@ const MIGRATIONS = [{
 	checksumTag: "apply:backfillUnansweredDecisions:v1",
 	apply: backfillUnansweredDecisions,
 }, {
+	id: "017_experiments",
+	path: join(import.meta.dir, "migrations/017_experiments.sql"),
+}, {
+	id: "018_plan_images",
+	path: join(import.meta.dir, "migrations/018_plan_images.sql"),
+}, {
 	id: "mantl_user_preferences",
 	path: join(import.meta.dir, "migrations/mantl_user_preferences.sql"),
 }, {

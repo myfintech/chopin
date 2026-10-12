@@ -8,15 +8,20 @@
 import { readOnly$ } from "@mdxeditor/editor";
 import { useCellValue } from "@mdxeditor/gurx";
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
-import { $getSelection } from "lexical";
+import { $getSelection, $isRangeSelection } from "lexical";
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 
+import { selectionOffer } from "../edit-mode";
 import { $describe } from "../passage";
 import { widgets$ } from "../widgets-plugin";
+import { usePhone } from "../pointer";
 import { SelectionBubble } from "./bubble";
+import { FormatDock } from "./dock";
 import { LinkSurface } from "./link";
 import { ResearchComposerSurface } from "./research";
 import { ResearchLaunchRegistration } from "./research-launch";
+import { SelectionBar } from "./selection-bar";
 import { SlashMenu } from "./slash";
 import { registerTaskRule } from "./task-rule";
 
@@ -33,8 +38,17 @@ export function Toolbar() {
 	let [editor] = useLexicalComposerContext();
 	// The link editor sits where the bubble would, so only one shows.
 	let [linking, setLinking] = useState(false);
+	let phone = usePhone();
 
 	useEffect(() => (disabled ? undefined : registerTaskRule(editor)), [editor, disabled]);
+
+	// A phone reader's lock is not a permission lock: the selection can still comment.
+	let offer = selectionOffer({
+		docked: !!options.formatDock,
+		locked: options.editMode ? !!options.blocked : disabled,
+		mode: options.editMode,
+	});
+	let dock = options.editMode === "editing" ? options.formatDock : undefined;
 
 	let threads = options.threads;
 
@@ -48,10 +62,26 @@ export function Toolbar() {
 				? selection.getRangeAt(0).getBoundingClientRect()
 				: undefined;
 			editor.getEditorState().read(() => {
-				let marked = $describe($getSelection());
+				let current = $getSelection();
+				let marked = $describe(current);
 				if (marked) {
+					let [start, end] = $isRangeSelection(current)
+						? current.isBackward()
+							? [current.focus, current.anchor]
+							: [current.anchor, current.focus]
+						: [];
 					threads.draft({
 						...marked,
+						...(start && end
+							? {
+								points: {
+									anchorKey: start.key,
+									anchorOffset: start.offset,
+									focusKey: end.key,
+									focusOffset: end.offset,
+								},
+							}
+							: {}),
 						...(range
 							? {
 								placement: {
@@ -72,8 +102,23 @@ export function Toolbar() {
 
 	return (
 		<>
-			<SelectionBubble disabled={disabled} hidden={linking} onComment={comment} />
-			<LinkSurface binding={options.binding} disabled={disabled} onEditing={setLinking} />
+			{phone
+				? <SelectionBar disabled={offer === "none"} hidden={linking} onComment={comment} />
+				: (
+					<SelectionBubble
+						commentOnly={offer === "comment"}
+						disabled={offer === "none"}
+						hidden={linking}
+						onComment={comment}
+					/>
+				)}
+			<LinkSurface
+				binding={options.binding}
+				disabled={disabled}
+				follow={options.editMode === "reading"}
+				onEditing={setLinking}
+			/>
+			{dock && createPortal(<FormatDock disabled={disabled} onComment={comment} />, dock)}
 			<SlashMenu
 				actions={options.research && options.researchDrafts ? RESEARCH_ACTIONS : undefined}
 				disabled={disabled}

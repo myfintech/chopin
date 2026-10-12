@@ -341,12 +341,6 @@ describe("feedback motion", () => {
 		expect(THEME).not.toContain("@keyframes feedback-");
 	});
 
-	it("uses the short control transition for Chat hover glyphs", () => {
-		expect(THEME).toMatch(
-			/:root\[data-motion-input="pointer"\] \.chat-toggle-icon\s*{[^}]*opacity var\(--duration-fast\) var\(--ease-out\)/s,
-		);
-	});
-
 	it("leaves feedback opacity to the component", () => {
 		for (let kind of ["icon", "count", "alert"]) {
 			let settled = new RegExp(
@@ -467,7 +461,23 @@ describe("child document shell", () => {
 			/\.room-header\s*\{[^}]*height:\s*var\(--document-shell-header-height\)/s,
 		);
 		expect(NAVIGATION).toMatch(
-			/@media \(max-width: 1197px\)[^{]*\{.*?\.anchored-child-surface\s*\{[^}]*inset:\s*var\(--document-shell-header-height\) 0 0/s,
+			/\.workspace-root\[data-workspace-mode="compact"\][^{]*\.anchored-child-card\s*\{[^}]*inset:\s*var\(--child-bar-height\) 0 0/s,
 		);
+	});
+
+	it("declares each child motion token once", () => {
+		for (
+			let token of [
+				"--child-open-dur",
+				"--child-close-dur",
+				"--child-scrim-dur",
+				"--child-scrim-lag-dur",
+				"--child-ease",
+				"--child-recede-step",
+				"--child-scrim-opacity",
+				"--child-zoom-push",
+				"--child-bar-height",
+			]
+		) expect(THEME.match(new RegExp(`${token}:`, "g"))?.length).toBe(1);
 	});
 });

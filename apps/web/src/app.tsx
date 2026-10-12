@@ -6,6 +6,7 @@ import { clearRepositoryCache } from "./repository-cache";
 
 let loadHostedLogin = () => import("./hosted-login");
 let HostedLogin = lazy(() => loadHostedLogin().then(module => ({ default: module.HostedLogin })));
+let PairingPage = lazy(() => import("./experiments/pairing"));
 let LocalLogin = lazy(() =>
 	import("./local-login").then(module => ({ default: module.LocalLogin }))
 );
@@ -48,12 +49,25 @@ export function App() {
 		setRepositoryCacheReady(true);
 	}, [session]);
 
-	if (error) return <HostedFailure error={error} />;
+	if (error) {
+		return (
+			<Suspense fallback={<HostedLoading />}>
+				<HostedFailure error={error} />
+			</Suspense>
+		);
+	}
 	if (!session || !repositoryCacheReady) return <HostedLoading />;
 	if (!session.user) {
 		return (
 			<Suspense fallback={<HostedLoading />}>
 				{session.auth === "local" ? <LocalLogin /> : <HostedLogin />}
+			</Suspense>
+		);
+	}
+	if (location.pathname === "/connect") {
+		return (
+			<Suspense fallback={<HostedLoading />}>
+				<PairingPage />
 			</Suspense>
 		);
 	}

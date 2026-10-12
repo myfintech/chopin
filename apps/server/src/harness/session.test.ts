@@ -6,6 +6,10 @@ import { openPlannerSession } from "./session";
 import { fullPlanner } from "./atomic/full";
 import { forgetWorkspaces, rememberCheckout, stateDirectory } from "./atomic/workspace";
 import { plannerInstructions } from "../agent/planner";
+import { BACKGROUND_TOOL_NAMES, PLANNER_TOOL_NAMES, VISUAL_PLANNER_TOOL_NAMES } from "./tool-names";
+import { remotePlanner } from "./remote/registry";
+import { hostInputRoom } from "../testing/decisions";
+import { limits } from "@chopin/question";
 
 import type { ActiveOwnerBinding } from "../agent/active-owner";
 import type { PlannerSessionDependencies } from "./session";
@@ -57,6 +61,133 @@ function fixture() {
 }
 
 describe("openPlannerSession", () => {
+	it("uses the visual Planner profile only when the room has Jev routing", async () => {
+		let { owner, channel, deps } = fixture();
+		let visualOpened = false;
+		deps.agent = undefined;
+		channel.room = {
+			id: "channel",
+			plan: {},
+			server: {},
+			visual: {
+				ask: async () => {
+					throw new Error("unused");
+				},
+			},
+		} as never;
+		deps.visualAgent = {
+			createSession: async () => {
+				visualOpened = true;
+				return { destroy: async () => {} };
+			},
+		} as never;
+		let opened = await openPlannerSession(owner, channel, deps);
+		expect(opened.ok).toBe(true);
+		if (!opened.ok) return;
+		expect(visualOpened).toBe(true);
+		expect(opened.value.activeTools).toEqual(VISUAL_PLANNER_TOOL_NAMES);
+		await opened.value.destroy();
+	});
+
+	it("registers a remote Planner for its document, with Decisions and run control on the client", async () => {
+		let { owner, channel, deps } = fixture();
+		let room = await hostInputRoom();
+		let sessionId = "";
+		let instructions = "";
+		deps.agent = {
+			createSession: async (options: { sessionId: string }) => {
+				sessionId = options.sessionId;
+				return { destroy: async () => {} };
+			},
+			stream: async (call: { options: { instructions: string } }) => {
+				instructions = call.options.instructions;
+			},
+		} as never;
+		let opened = await openPlannerSession(owner, {
+			...channel,
+			room: room.room,
+			harness: "remote",
+			instructions: workspace => plannerInstructions("owner/repo", "BOOTSTRAP", workspace),
+		}, deps);
+		if (!opened.ok) throw new Error("Planner unavailable");
+		let session = opened.value;
+		let registered = remotePlanner(sessionId)!;
+		try {
+			expect(registered).toMatchObject({ channelId: room.room.id, isolated: false });
+			await session.stream("prompt", new AbortController().signal);
+			expect(instructions).toContain("You run in a member's own session on their machine");
+			expect(instructions).toContain("BOOTSTRAP");
+
+			let delays: unknown[] = [];
+			let original = globalThis.setTimeout;
+			globalThis.setTimeout = ((handler: () => void, ms?: number) => {
+				delays.push(ms);
+				return original(handler, ms);
+			}) as typeof setTimeout;
+			let asked: Promise<unknown>;
+			try {
+				asked = registered.humanInput!(() => {}).confirm("Ship?", "Now.", room.options);
+				await room.cards(1);
+			} finally {
+				globalThis.setTimeout = original;
+			}
+			expect(delays).toContain(limits.INPUT_EXPIRY_MS);
+			room.controller.abort();
+			expect(await asked).toBe(false);
+
+			let seen: unknown[] = [];
+			session.watchRuns!(runs => seen.push(runs));
+			let runs = { active: ["run"], paused: [], cards: [] };
+			registered.runs = runs;
+			registered.onRuns!(runs);
+			expect(seen).toEqual([runs]);
+			expect(session.runs!()).toBe(runs);
+			await expect(session.pauseRuns!()).rejects.toThrow("no attached session to control");
+			let controls: unknown[] = [];
+			registered.control = async (action, runId) => void controls.push([action, runId]);
+			await session.pauseRuns!();
+			await session.resumeRun!("run");
+			expect(controls).toEqual([["stop", undefined], ["resume", "run"]]);
+			registered.activeTools = ["read_plan", "bash"];
+			expect(session.activeTools).toEqual(["read_plan", "bash"]);
+		} finally {
+			await session.destroy();
+			await room.close();
+		}
+		expect(remotePlanner(sessionId)).toBeUndefined();
+	});
+
+	it("keeps a remote background job isolated, without Decisions or run control", async () => {
+		let { owner, channel, deps } = fixture();
+		let sessionId = "";
+		let instructions = "";
+		deps.headingAgent = {
+			createSession: async (options: { sessionId: string }) => {
+				sessionId = options.sessionId;
+				return { destroy: async () => {} };
+			},
+			stream: async (call: { options: { instructions: string } }) => {
+				instructions = call.options.instructions;
+			},
+		} as never;
+		deps.agent = undefined;
+		let opened = await openPlannerSession(owner, {
+			...channel,
+			room: { id: "channel", plan: { chat: { job: { kind: "heading" } } }, server: {} } as never,
+			harness: "remote",
+			instructions: workspace => plannerInstructions("owner/repo", undefined, workspace),
+		}, deps);
+		if (!opened.ok) throw new Error("Planner unavailable");
+		expect(remotePlanner(sessionId)).toMatchObject({ channelId: "channel", isolated: true });
+		expect(remotePlanner(sessionId)!.humanInput).toBeUndefined();
+		expect(opened.value.pauseRuns).toBeUndefined();
+		expect(opened.value.activeTools).toEqual(BACKGROUND_TOOL_NAMES.heading);
+		await opened.value.stream("prompt", new AbortController().signal);
+		expect(instructions).toContain("You have no shell");
+		await opened.value.destroy();
+		expect(remotePlanner(sessionId)).toBeUndefined();
+	});
+
 	it("keeps the credential host-side and destroys the session and sandbox once", async () => {
 		let { owner, channel, deps, destroyed } = fixture();
 		let opened = await openPlannerSession(owner, channel, deps);
@@ -247,4 +378,12 @@ describe("Planner workspaces", () => {
 			expect(instructions).not.toContain("intercom");
 		}
 	});
+});
+
+it("member Planner sessions include the child tools and background jobs never do", () => {
+	for (let name of ["list_children", "read_child", "edit_child", "anchor_child"]) {
+		expect(PLANNER_TOOL_NAMES).toContain(name);
+		expect(VISUAL_PLANNER_TOOL_NAMES).toContain(name);
+		for (let names of Object.values(BACKGROUND_TOOL_NAMES)) expect(names).not.toContain(name);
+	}
 });

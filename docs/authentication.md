@@ -33,11 +33,16 @@ Contents:        Read-only
 Pull requests:   Read-only
 Checks:          Read-only
 Commit statuses: Read-only
+Issues:          Read-only
 Metadata:        Read-only (automatic)
 ```
 
-Contents backs file, tree, code-search, and commit-history tools. The other
-read-only permissions back the hosted GitHub MCP pull-request toolset. Chopin
+Contents backs file, tree, code-search, and commit-history tools. Pull requests
+and Issues also back the summaries behind pull request and issue links in a
+document; without Issues, issue links stay plain links. The other read-only
+permissions back the hosted GitHub MCP pull-request toolset. Existing
+installations must approve the added Issues permission before issue summaries
+appear. Chopin
 does not request repository, organization, or account write permission. An
 `AGENT=off` deployment only needs Contents and automatic Metadata access unless
 organization admission is enabled.
@@ -261,6 +266,14 @@ lookup. An MCP-created document for a repository outside the App installation is
 not available through browser routes, WebSockets, or the hosted agent until
 the installation includes that repository. See [Local agent MCP](local-agent-mcp.md).
 
+`upload_image` follows the MCP rule for writing: the bearer needs push or
+administration access to the document's repository. Serving the uploaded image
+at `/images/<sha256>.<ext>` follows the browser rule instead: it needs a browser
+session whose installation-gated repository role includes pull access to a
+document the image was uploaded to. Every other request receives the same `404`
+as an unknown image, so an image URL reveals nothing to someone who cannot read
+the document.
+
 `invoke_planner` is the one MCP tool that starts a hosted agent turn. It never
 lends the caller's bearer to the Planner: the turn runs under the channel's
 existing Planner owner, and a channel without one is claimed only for the
@@ -385,6 +398,7 @@ GET  /api/repositories/:owner/:repository/documents/:slug
 GET  /api/channels/:channelId
 PATCH /api/channels/:channelId
 POST /api/channels/:channelId/agent/reset
+GET  /api/channels/:channelId/github-references?ref=owner/repository/pull/12
 POST /auth/logout
 ```
 

@@ -9,12 +9,25 @@ import type { ActiveMemberRequest } from "../chat/service";
  */
 
 import * as Arguments from "./arguments";
+import {
+	answer,
+	applyAnchors,
+	applyBlockEdit,
+	documentView,
+	EDIT_OPERATIONS_SCHEMA,
+} from "./document-ops";
 import * as Comments from "../comments/service";
 import * as edit from "../plan/edit";
 import * as Questions from "../questions/service";
-import { ULID } from "@chopin/dialect";
+import { limits, ULID } from "@chopin/dialect";
 import { implementationGraphs, implementationReadiness } from "../tasks/plan-graphs";
 import { documentIdentity, implementationActive } from "../plan/service";
+import { childTools, Refusal, shielded } from "./child-tools";
+import { experimentTools } from "./experiment-tools";
+import type { InvestigationTools } from "./experiment-tools";
+
+import type { ActiveOwnerBinding } from "./active-owner";
+import type { VisualSession } from "./visual-handoff";
 
 import type { Server } from "bun";
 import { jsonSchema, tool } from "ai";
@@ -24,15 +37,12 @@ import type { Plan } from "../plan/service";
 import type { JobService } from "../jobs/service";
 import type { SocketData } from "../wire";
 
-/** Every tool answers with a string; a failure is a value, not a throw. */
-async function answer(name: string, produce: () => unknown): Promise<string> {
-	try {
-		return JSON.stringify(await produce(), null, 2) ?? "null";
-	} catch (err) {
-		let message = err instanceof Error ? err.message : String(err);
-		console.error(`[agent/${name}]`, err);
-		return `Error: ${message}`;
-	}
+function sameMemberRequest(
+	current: ActiveMemberRequest | undefined,
+	expected: Pick<ActiveMemberRequest, "entryId" | "turnId" | "lifecycle">,
+): boolean {
+	return !!current && current.entryId === expected.entryId
+		&& current.turnId === expected.turnId && current.lifecycle === expected.lifecycle;
 }
 
 function researchQuestion(raw: unknown): string {
@@ -70,6 +80,7 @@ export type ResearchWorkspaceRequest = {
 };
 
 export type DocumentRoom = {
+	investigations?: InvestigationTools;
 	id: string;
 	plan: Plan;
 	server: Server<SocketData>;
@@ -90,6 +101,10 @@ export type DocumentRoom = {
 	createResearch?: (question: string) => Promise<ResearchWorkspaceRequest>;
 	/** Reads one reference retained by this room's active Planner session. */
 	readReference?: (id: string, repositoryId: string) => Promise<unknown>;
+	/** Experimental foreground visual handoff; absent from production sessions. */
+	visual?: VisualSession;
+	/** This root's children; absent in a child room and in tests that do not need them. */
+	children?: import("../chat/children").ChildDocuments;
 };
 const roomContext = z.object({
 	room: z.custom<DocumentRoom>(value =>
@@ -99,8 +114,16 @@ const roomContext = z.object({
 	),
 });
 const referenceContext = roomContext.extend({ repository: z.object({ id: z.string() }) });
+type Owner = Pick<ActiveOwnerBinding, "revalidate" | "signal">;
+// The owner is needed only to reach into a child, as for the child tools.
+const replyContext = roomContext.extend({
+	owner: z.custom<Owner>(value =>
+		!!value && typeof (value as Owner).revalidate === "function" && !!(value as Owner).signal
+	).optional(),
+});
 
 export const documentTools = {
+	...experimentTools,
 	read_plan: tool({
 		contextSchema: roomContext,
 		description: "Read the plan: its revision, canonical source, the top-level blocks you can "
@@ -111,41 +134,7 @@ export const documentTools = {
 		// anybody needs to approve.
 		metadata: { skipPermission: true },
 		execute: (_raw, { context: { room: context } }) =>
-			answer("read_plan", async () => ({
-				document: await documentIdentity(context.plan),
-				revision: context.plan.revision,
-				source: edit.source(context.plan),
-				blocks: edit.outline(context.plan),
-				/*
-				 * Accepted threads only.
-				 *
-				 * An open one is a conversation the room is still having, and
-				 * acting on feedback nobody has accepted would make the accept
-				 * button decorative. A dismissed one was decided against and
-				 * never reaches here at all.
-				 */
-				comments: [...context.plan.threads.values()]
-					.filter(thread => thread.status === "accepted")
-					.map(thread => ({
-						id: thread.id,
-						quote: thread.quote,
-						accepted_by: thread.resolver,
-						// False means this one still needs acting on and
-						// anchoring; it is the same list `anchors_pending` gives.
-						actioned: !!thread.result && !thread.result.pending,
-						comments: thread.notes.map(note => `@${note.handle}: ${note.text}`),
-					})),
-				questions: [...context.plan.records.values()].map(record => ({
-					id: record.id,
-					status: record.status,
-					questions: record.definition.questions.map(question => question.question),
-					options: record.definition.questions.map(question =>
-						question.options.map(option => option.label)
-					),
-					...(record.answers ? { answers: record.answers } : {}),
-					...(record.resolver ? { answered_by: record.resolver } : {}),
-				})),
-			})),
+			answer("read_plan", () => documentView(context.plan)),
 	}),
 
 	read_reference: tool({
@@ -221,6 +210,91 @@ export const documentTools = {
 			}),
 	}),
 
+	assess_visual: tool({
+		contextSchema: roomContext,
+		description: "Assess one proposed explanatory paragraph before editing it. Jev decides "
+			+ "whether a visual is possible and helpful, then selects its supported type. "
+			+ "Use the returned visual_route id with edit_plan for this exact paragraph and position.",
+		inputSchema: jsonSchema({
+			type: "object",
+			properties: {
+				revision: { type: "integer", minimum: 0 },
+				operation: {
+					type: "object",
+					properties: {
+						op: { type: "string", enum: ["insert", "insert_root", "replace", "replace_root"] },
+						index: { type: "integer", minimum: 0 },
+						source: { type: "string", maxLength: 100_000 },
+					},
+					required: ["op", "source"],
+					additionalProperties: false,
+				},
+			},
+			required: ["revision", "operation"],
+			additionalProperties: false,
+		}),
+		metadata: { skipPermission: true },
+		execute: (raw, { context: { room: context } }) =>
+			answer("assess_visual", async () => {
+				let [{ visualCandidate }, { assessVisual }, { bindVisualRoute }, catalog] = await Promise
+					.all([
+						import("./visual-handoff"),
+						import("./visual-routing"),
+						import("./visual-receipt"),
+						import("./visual-catalog"),
+					]);
+				let visual = context.visual;
+				if (!visual || context.plan.chat?.job) {
+					throw new Error("visual assessment is unavailable in this session");
+				}
+				let member = context.currentMemberRequest?.();
+				if (!member) throw new Error("visual assessment needs a current member request");
+				let { revision, operation } = Arguments.assessVisual(raw);
+				if (revision !== context.plan.revision) {
+					return { ok: false, reason: "stale-route", revision: context.plan.revision };
+				}
+				let { passage, target } = visualCandidate(operation);
+				let assessment = await assessVisual(
+					{ passages: [{ index: 0, source: passage }], readerQuestion: member.text },
+					request => {
+						if (
+							context.plan.revision !== revision
+							|| !sameMemberRequest(context.currentMemberRequest?.(), member)
+						) throw new Error("visual assessment turn changed");
+						return visual.ask(request);
+					},
+				);
+				if (
+					context.plan.revision !== revision
+					|| !sameMemberRequest(context.currentMemberRequest?.(), member)
+				) return { ok: false, reason: "stale-route", revision: context.plan.revision };
+				if (assessment.failure) {
+					return { ok: false, reason: "assessment-unavailable", failure: assessment.failure };
+				}
+				let route = assessment.routes[0]!;
+				let id = crypto.randomUUID();
+				visual.pending = {
+					id,
+					member: {
+						entryId: member.entryId,
+						turnId: member.turnId,
+						lifecycle: member.lifecycle,
+					},
+					passage,
+					receipt: bindVisualRoute({ revision, passage, target, route }),
+				};
+				return {
+					ok: true,
+					visual_route: id,
+					route,
+					...(route.kind === "diagram" && route.type && {
+						requires: catalog.VISUAL_DESCRIPTIONS[route.type]?.requires,
+						example: catalog.visualExample(route.type),
+					}),
+				};
+			}),
+	}),
+
 	edit_plan: tool({
 		contextSchema: roomContext,
 		description: "Edit the plan as an atomic batch against the revision you last read. Indices "
@@ -237,44 +311,12 @@ export const documentTools = {
 					minimum: 0,
 					description: "The revision returned by the `read_plan` you are editing from.",
 				},
-				operations: {
-					type: "array",
-					minItems: 1,
-					maxItems: 50,
-					items: {
-						type: "object",
-						properties: {
-							op: {
-								type: "string",
-								enum: [
-									"insert",
-									"insert_root",
-									"replace",
-									"replace_root",
-									"move",
-									"delete",
-									"detach_question",
-								],
-							},
-							index: {
-								type: "integer",
-								minimum: 0,
-								description: "Block to act on. Required except for insert_root and replace_root.",
-							},
-							to: { type: "integer", minimum: 0, description: "Destination, for move." },
-							source: {
-								type: "string",
-								maxLength: 100000,
-								description: "Plan MDX, for insert, insert_root, replace and replace_root.",
-							},
-							id: {
-								type: "string",
-								description: "Questionnaire id, for detach_question.",
-							},
-						},
-						required: ["op"],
-						additionalProperties: false,
-					},
+				operations: EDIT_OPERATIONS_SCHEMA,
+				visual_route: {
+					type: "string",
+					minLength: 1,
+					maxLength: 100,
+					description: "The id returned by assess_visual for this exact explanatory edit.",
 				},
 			},
 			required: ["revision", "operations"],
@@ -282,52 +324,46 @@ export const documentTools = {
 		}),
 		execute: (raw, { context: { room: context } }) =>
 			answer("edit_plan", async () => {
+				let visual = context.visual
+					? await Promise.all([import("./visual-handoff"), import("./visual-receipt")])
+					: undefined;
 				let document = await documentIdentity(context.plan);
 				let result = await context.exclusive(async () => {
 					if (implementationActive(context.plan)) return { ok: false, reason: "locked" };
 					let args = Arguments.editPlan(raw);
-					let outcome = edit.apply(context.plan, args.revision, args.operations);
-					if (!outcome.ok) return outcome;
-
-					for (let id of outcome.detached) {
-						let record = context.plan.records.get(id);
-						if (record) context.plan.records.set(id, { ...record, status: "cancelled" });
+					if (context.visual) {
+						let written = visual![0].visualWrite(args.operations);
+						if (written) {
+							let pending = context.visual.pending;
+							let member = context.currentMemberRequest?.();
+							if (
+								!pending || args.visualRoute !== pending.id
+								|| !sameMemberRequest(member, pending.member)
+							) return { ok: false, reason: "missing-route" };
+							if (args.revision !== context.plan.revision) {
+								return { ok: false, reason: "stale-route", revision: context.plan.revision };
+							}
+							let check = visual![1].checkVisualRoute({
+								required: true,
+								receipt: pending.receipt,
+								revision: args.revision,
+								passage: pending.passage,
+								target: written.target,
+								authored: written.authored,
+							});
+							if (!check.ok) return check;
+						} else if (args.visualRoute) return { ok: false, reason: "wrong-placement" };
+					} else if (args.visualRoute) {
+						return { ok: false, reason: "visual-routing-unavailable" };
 					}
-
-					// Prose moved, so every relationship has to be brought forward
-					// and anything answered has to be looked at again: the passage a
-					// decision produced is the most likely thing to have been
-					// rewritten.
-					Questions.rebase(context.plan);
-					Questions.invalidate(context.plan, "plan_changed");
-					Comments.rebase(context.plan);
-					Comments.invalidate(context.plan, "plan_changed");
-
-					// After invalidating, so it is not immediately undone. If
-					// this turn was started by accepting a comment, what it
-					// just wrote is what that decision produced — unless the
-					// agent says otherwise with `anchor_plan`, which wins.
-					let acting = context.plan.chat.acting;
-					if (acting) Comments.attribute(context.plan, acting, outcome.touched);
-
-					if (outcome.mutation) await context.publish(outcome.mutation);
-
-					// After the update that created them, never before it. Both
-					// go to the same topic in order, so by the time this arrives
-					// the browser already holds the blocks it names.
-					context.changes(outcome.changes);
-
-					context.anchors();
-
-					return {
-						ok: true,
-						revision: context.plan.revision,
-						blocks: outcome.blocks,
-						anchors_pending: [
-							...Questions.outstanding(context.plan),
-							...Comments.outstanding(context.plan),
-						],
-					};
+					let { acting, actingChannel } = context.plan.chat;
+					return applyBlockEdit(context, args, {
+						// A thread in a child is answered by `edit_child`, not by an edit here.
+						acting: actingChannel ? undefined : acting,
+						applied: () => {
+							if (context.visual) context.visual.pending = undefined;
+						},
+					});
 				});
 				return { ...result, document };
 			}),
@@ -428,7 +464,9 @@ export const documentTools = {
 		contextSchema: roomContext,
 		description: "Read the current plan revision and implementation graph before drafting or "
 			+ "revising tasks. The returned plan_revision and graph_revision are required by "
-			+ "edit_implementation_graph; a newer plan or graph refuses the whole edit.",
+			+ "edit_implementation_graph; a newer plan or graph refuses the whole edit. "
+			+ "When needs_revision is true, the graph is stale even if approved. Revise it "
+			+ "against plan_revision before calling it ready; replace an unchanged task if its content remains valid.",
 		inputSchema: jsonSchema({ type: "object", properties: {}, additionalProperties: false }),
 		metadata: { skipPermission: true },
 		execute: (_raw, { context: { room: context } }) =>
@@ -438,6 +476,8 @@ export const documentTools = {
 					plan_revision: context.plan.revision,
 					source: edit.source(context.plan),
 					graph_revision: version?.revision ?? 0,
+					graph_plan_revision: version?.planRevision,
+					needs_revision: !!version && version.planRevision !== context.plan.revision,
 					graph: context.plan.graph,
 				};
 			}),
@@ -477,6 +517,7 @@ export const documentTools = {
 		execute: (raw, { context: { room: context } }) =>
 			answer("edit_implementation_graph", async () => {
 				let args = Arguments.graphPlan(raw);
+				if (implementationActive(context.plan)) return { ok: false, reason: "locked" };
 				let ready = implementationReadiness(context.plan, args.planRevision);
 				if (!ready.ok) return { ok: false, reason: "not-ready", blockers: ready.blockers };
 				let result = await implementationGraphs().revise(context.plan, args);
@@ -490,7 +531,7 @@ export const documentTools = {
 		contextSchema: roomContext,
 		description: "Say where in the plan each decision lives. Call it immediately after every "
 			+ "successful `edit_plan`, using that result's revision and block digests. For a "
-			+ "question, give `widget` and `question`; for an accepted comment, give `thread`. "
+			+ "question, give `widget` and `question`; for a comment thread, give `thread`. "
 			+ "Either way the blocks are the prose that decision produced. Link only blocks that "
 			+ "would have to change if the decision changed. A question's card moves after its "
 			+ "first related block. An empty list means reviewed and "
@@ -513,7 +554,7 @@ export const documentTools = {
 							question: { type: "string", description: "The question id." },
 							thread: {
 								type: "string",
-								description: "An accepted comment thread's id, instead of widget/question.",
+								description: "A comment thread's id, instead of widget/question.",
 							},
 							blocks: {
 								type: "array",
@@ -543,48 +584,49 @@ export const documentTools = {
 			answer("anchor_plan", async () => {
 				if (implementationActive(context.plan)) return { ok: false, reason: "locked" };
 				let args = Arguments.anchorPlan(raw);
-
-				if (args.revision !== context.plan.revision) {
-					return {
-						ok: false,
-						reason: "stale",
-						revision: context.plan.revision,
-						message: "The plan changed. Read it again and re-anchor.",
-					};
-				}
-
-				let failures: string[] = [];
-				let placements: Questions.Placement[] = [];
-				for (let update of args.anchors) {
-					let failure = update.thread
-						? Comments.relate(context.plan, update.thread, update.blocks)
-						: update.widget && update.question
-						? Questions.relate(context.plan, update.widget, update.question, update.blocks)
-						: "give either `thread`, or both `widget` and `question`.";
-					if (failure) {
-						failures.push(failure);
-					} else if (update.widget !== undefined && update.question !== undefined) {
-						placements.push({
-							widget: update.widget,
-							blocks: update.blocks,
-						});
-					}
-				}
-				let mutation = Questions.place(context.plan, placements);
-				if (mutation) await context.publish(mutation);
-
-				await context.persist();
-				context.anchors();
-
-				return failures.length > 0
-					? { ok: false, reason: "invalid", errors: failures }
-					: {
-						ok: true,
-						anchors_pending: [
-							...Questions.outstanding(context.plan),
-							...Comments.outstanding(context.plan),
-						],
-					};
+				return applyAnchors(context, args);
 			}),
 	}),
+
+	reply_comment: tool({
+		contextSchema: replyContext,
+		description: "Reply in the comment thread this turn was sent. Use it once, after any edit "
+			+ "and `anchor_plan`, to answer the latest note sent to you — briefly, since it is "
+			+ "shown in a small card beside the passage. Only that thread can be answered, and "
+			+ "not once it has been resolved.",
+		inputSchema: jsonSchema({
+			type: "object",
+			properties: {
+				thread: { type: "string", description: "The comment thread's id, from the prompt." },
+				text: { type: "string", minLength: 1, maxLength: limits.MAX_NOTE },
+			},
+			required: ["thread", "text"],
+			additionalProperties: false,
+		}),
+		execute: (raw, { context: { room: context, owner } }) =>
+			answer("reply_comment", async () => {
+				let args = raw as Record<string, unknown>;
+				if (
+					!args || typeof args !== "object" || typeof args.thread !== "string"
+					|| typeof args.text !== "string"
+					|| Object.keys(args).some(key => key !== "thread" && key !== "text")
+				) throw new Error("reply_comment takes only `thread` and `text`, both text");
+				let { thread, text } = args;
+				let { acting, actingChannel } = context.plan.chat;
+				// A comment sent from a child: its thread, and the reply, live in that child.
+				if (actingChannel) {
+					let children = context.children;
+					return shielded("reply_comment", async () => {
+						if (!children) throw new Refusal("child documents are unavailable in this session");
+						if (!owner || owner.signal.aborted || !await owner.revalidate()) {
+							throw new Refusal("the Planner's repository access could not be confirmed");
+						}
+						return children.open(actingChannel, child =>
+							Comments.answer(child.plan, child.server, child.id, thread, text, acting));
+					});
+				}
+				return Comments.answer(context.plan, context.server, context.id, thread, text, acting);
+			}),
+	}),
+	...childTools,
 };

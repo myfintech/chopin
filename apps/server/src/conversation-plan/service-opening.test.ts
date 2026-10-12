@@ -9,9 +9,11 @@ import type {
 import * as Chat from "../chat/service";
 import * as Service from "../plan/service";
 import { MemoryStorage } from "../storage/memory/adapter";
+import { openPlan } from "../testing/plan";
 import type { Socket, SocketData } from "../wire";
 import { createProcessor, type Processor } from "./service";
 import * as Jobs from "./jobs";
+import { initialState } from "./domain";
 import {
 	greetJoinedPlan,
 	publishOpenedPlan,
@@ -122,6 +124,31 @@ describe("conversation-plan open and join ordering", () => {
 		expect(joiner.frames.find(frame => frame.kind === "conversation-plan:snapshot")?.jobs)
 			.toEqual(context.plan.conversationPlanJobs);
 		await Service.close(context.plan);
+	});
+
+	test("a child document greets without any Chat frames", async () => {
+		let { plan } = await openPlan("# Child\n", { parent: "Root" });
+		expect(plan.parentChannelId).toBeDefined();
+		// A kept child still holds what its Chat derived; none of it is served.
+		plan.conversationPlan = {
+			...initialState(),
+			threads: [{ id: "t", question: "Quoted from Chat?" }] as never,
+		};
+		plan.conversationPlanJobs = [{ id: "j" }] as never;
+		let joiner = socket();
+		await greetJoinedPlan(
+			plan,
+			joiner.ws,
+			{ kind: "plan:open", ts: 0, rid: "open-child" },
+			true,
+			() => true,
+		);
+		let kinds = joiner.frames.map(frame => frame.kind);
+		expect(kinds).toContain("plan:open");
+		expect(kinds.filter(kind => String(kind).startsWith("chat:"))).toEqual([]);
+		expect(joiner.frames.find(frame => frame.kind === "conversation-plan:snapshot"))
+			.toMatchObject({ state: initialState(), jobs: [] });
+		await Service.close(plan);
 	});
 
 	test("a send during deferred open waits for processor attachment and commits its pending ID", async () => {

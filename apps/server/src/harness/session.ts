@@ -1,6 +1,12 @@
-import { BACKGROUND_TOOL_NAMES, PLANNER_TOOL_NAMES } from "./tool-names";
+import { BACKGROUND_TOOL_NAMES, PLANNER_TOOL_NAMES, VISUAL_PLANNER_TOOL_NAMES } from "./tool-names";
 import { createJustBashNetworkSandboxSession } from "@ai-sdk/sandbox-just-bash";
-import { headingPlannerAgent, plannerAgent, prosePlannerAgent, refinePlannerAgent } from "./agents";
+import {
+	headingPlannerAgent,
+	plannerAgent,
+	prosePlannerAgent,
+	refinePlannerAgent,
+	visualPlannerAgent,
+} from "./agents";
 import { extensionTools } from "../planner-extensions";
 import { githubTools, type GitHubToolsError, type Result } from "./github-tools";
 import { registerCredential } from "./harnesses";
@@ -14,11 +20,13 @@ import {
 } from "./atomic/full";
 import { createHumanInput } from "./atomic/human-input";
 import { type PlannerWorkspace, plannerWorkspace } from "./atomic/workspace";
+import { registerRemotePlanner, type RemotePlanner } from "./remote/registry";
 
 import type { HarnessAgent } from "@ai-sdk/harness/agent";
 import type { ActiveOwnerBinding } from "../agent/active-owner";
 import type { HostedRepository } from "../agent/repository";
 import type { DocumentRoom } from "../agent/tools";
+import type { RemoteWorkspace } from "../agent/planner";
 
 export type OpenError =
 	| GitHubToolsError
@@ -33,9 +41,12 @@ type PlannerAgent = typeof plannerAgent;
 export type PlannerChannel = {
 	room: DocumentRoom;
 	repository: HostedRepository;
-	instructions: string | ((workspace?: PlannerWorkspace) => string);
+	instructions: string | ((workspace?: PlannerWorkspace | RemoteWorkspace) => string);
 	model?: string;
-	/** `atomic` runs the session as a full Atomic session in the channel's workspace. */
+	/**
+	 * `atomic` runs the session as a full Atomic session in the channel's workspace;
+	 * `remote` runs it in the client attached to the channel.
+	 */
 	harness?: string;
 };
 
@@ -49,7 +60,7 @@ export type PlannerSession = {
 	activeTools?: readonly string[];
 	stream: (prompt: string, abortSignal: AbortSignal) => ReturnType<PlannerAgent["stream"]>;
 	destroy: () => Promise<void>;
-	/** Workflow runs this session owns; only atomic Planner sessions report them. */
+	/** Workflow runs this session owns; only atomic and remote Planner sessions report them. */
 	runs?: () => PlannerRuns | undefined;
 	/** Subscribes to run changes; returns the unsubscribe function. */
 	watchRuns?: (listener: (runs: PlannerRuns) => void) => () => void;
@@ -61,13 +72,43 @@ export type PlannerSession = {
 	pauseRun?: (runId: string) => Promise<void>;
 	/** Resumes one paused run this session owns. */
 	resumeRun?: (runId: string) => Promise<void>;
+	/**
+	 * Whether a run that ends blocked or failed between turns starts a Planner turn
+	 * about it. A remote Planner's runs are only what its client reports, so they
+	 * never start a turn no writer asked for.
+	 */
+	followsUpRuns?: boolean;
 };
+
+/** Run control for a remote Planner: the attached client stops and resumes its own runs. */
+function remoteRunControl(
+	remote: RemotePlanner,
+	watchRuns: NonNullable<PlannerSession["watchRuns"]>,
+): Pick<
+	PlannerSession,
+	"runs" | "watchRuns" | "pauseRuns" | "resumeRuns" | "pauseRun" | "resumeRun" | "followsUpRuns"
+> {
+	let control = () => {
+		if (!remote.control) throw new Error("The Planner has no attached session to control.");
+		return remote.control;
+	};
+	return {
+		runs: () => remote.runs,
+		watchRuns,
+		pauseRuns: async () => control()("stop"),
+		resumeRuns: async () => control()("resume"),
+		pauseRun: async runId => control()("stop", runId),
+		resumeRun: async runId => control()("resume", runId),
+		followsUpRuns: false,
+	};
+}
 
 export type PlannerSessionDependencies = {
 	agent?: PlannerAgent;
 	headingAgent?: PlannerAgent;
 	refineAgent?: PlannerAgent;
 	proseAgent?: PlannerAgent;
+	visualAgent?: PlannerAgent;
 	githubTools?: typeof githubTools;
 	extensionTools?: typeof extensionTools;
 	createSandbox?: () => Promise<Sandbox>;
@@ -116,6 +157,7 @@ export async function openPlannerSession(
 	}
 	let unregister: (() => void) | undefined;
 	let unregisterFull: (() => void) | undefined;
+	let unregisterRemote: (() => void) | undefined;
 	let session: Awaited<ReturnType<HarnessAgent["createSession"]>> | undefined;
 	let timeout: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -147,8 +189,31 @@ export async function openPlannerSession(
 			};
 			unregisterFull = registerFullPlanner(sessionId, planner);
 		}
+		let remote: RemotePlanner | undefined;
+		if (channel.harness === "remote") {
+			let held: RemotePlanner = { channelId: channel.room.id, isolated: !!job };
+			if (!job) {
+				held.humanInput = report =>
+					createHumanInput(
+						channel.room,
+						undefined,
+						(runId, signal) => untilUnpaused(held, runId, signal),
+						report,
+					);
+				held.onRuns = runs => {
+					for (let listener of listeners) listener(runs);
+				};
+				held.toolReport = (id, output, state) => {
+					let chat = channel.room.plan.chat;
+					if (state === "running") chat?.toolProgress?.(id, output);
+					else chat?.toolFinished?.(id, output, state === "done");
+				};
+			}
+			remote = held;
+			unregisterRemote = registerRemotePlanner(sessionId, held);
+		}
 		let instructions = typeof channel.instructions === "function"
-			? channel.instructions(workspace)
+			? channel.instructions(workspace ?? (remote && !job ? { remote: true } : undefined))
 			: channel.instructions;
 		let agent = deps.agent ?? (job?.kind === "heading"
 			? deps.headingAgent ?? headingPlannerAgent
@@ -156,6 +221,8 @@ export async function openPlannerSession(
 			? deps.refineAgent ?? refinePlannerAgent
 			: job?.kind === "prose"
 			? deps.proseAgent ?? prosePlannerAgent
+			: channel.room.visual
+			? deps.visualAgent ?? visualPlannerAgent
 			: plannerAgent);
 		let opening = agent.createSession({ sessionId, sandboxSession: sandbox });
 		let deadline = new Promise<never>((_, reject) => {
@@ -180,31 +247,41 @@ export async function openPlannerSession(
 			}
 			return planner.workflows;
 		};
+		let watchRuns = (listener: (runs: PlannerRuns) => void) => {
+			listeners.add(listener);
+			return () => listeners.delete(listener);
+		};
 		let runControl = planner
 			? {
 				runs: () => planner.runs,
-				watchRuns: (listener: (runs: PlannerRuns) => void) => {
-					listeners.add(listener);
-					return () => listeners.delete(listener);
-				},
+				watchRuns,
 				pauseRuns: () => pauseOwnedRuns(workflows()),
 				resumeRuns: () => resumeOwnedRuns(workflows()),
 				pauseRun: async (runId: string) => applied(await workflows().pause(runId)),
 				resumeRun: async (runId: string) => applied(await workflows().resume(runId)),
 			}
+			: remote && !job
+			? remoteRunControl(remote, watchRuns)
 			: {};
 		let fixedTools = Object.freeze([
-			...(job ? BACKGROUND_TOOL_NAMES[job.kind] : PLANNER_TOOL_NAMES),
+			...(job
+				? BACKGROUND_TOOL_NAMES[job.kind]
+				: channel.room.visual
+				? VISUAL_PLANNER_TOOL_NAMES
+				: PLANNER_TOOL_NAMES),
 		]);
 		return {
 			ok: true,
 			value: {
 				get activeTools() {
-					return planner?.activeTools ?? fixedTools;
+					return planner?.activeTools ?? remote?.activeTools ?? fixedTools;
 				},
 				...runControl,
-				stream: (prompt, abortSignal) =>
-					agent.stream({
+				stream: (prompt, abortSignal) => {
+					// The remote turn aborts it when the turn ends or the link drops mid-tool.
+					let hostTools = remote ? new AbortController() : undefined;
+					if (remote) remote.hostTools = hostTools;
+					return agent.stream({
 						session: active,
 						prompt,
 						abortSignal,
@@ -214,8 +291,10 @@ export async function openPlannerSession(
 							owner,
 							githubTools: tools.value,
 							extensionTools: extensions,
+							...(hostTools ? { toolSignal: hostTools.signal } : {}),
 						},
-					}),
+					});
+				},
 				destroy: () =>
 					stopped ??= (async () => {
 						try {
@@ -226,6 +305,7 @@ export async function openPlannerSession(
 							} finally {
 								release();
 								unregisterFull?.();
+								unregisterRemote?.();
 							}
 						}
 					})(),
@@ -244,6 +324,7 @@ export async function openPlannerSession(
 		}
 		unregister?.();
 		unregisterFull?.();
+		unregisterRemote?.();
 		let message = cause instanceof Error ? cause.message : String(cause);
 		let kind: "Timeout" | "ShuttingDown" | "HarnessCapabilityUnsupported" | "Unavailable" =
 			message.includes("timed out")

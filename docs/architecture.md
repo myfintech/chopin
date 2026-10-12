@@ -3,8 +3,10 @@
 Chopin is one Bun application, one browser client, and one PostgreSQL database.
 The application serves the built client, HTTP API, Streamable HTTP MCP endpoint,
 and WebSocket from the same origin. GitHub supplies identity and repository
-authorization; the selected harness (GitHub Copilot by default, or Pi) supplies
-the hosted document agent runtime, currently named Planner.
+authorization; the selected harness (GitHub Copilot by default, Pi, or Atomic)
+supplies the hosted document agent runtime, currently named Planner. Under
+`HARNESS=remote` the Planner's model instead runs in a member's client attached
+over the Planner link WebSocket, `/planner-link`, on the same origin.
 
 This document describes the system boundaries and collaborative document model.
 See [Repository channels](channels.md) for channel creation and access,
@@ -28,13 +30,15 @@ and [Self-hosting](self-hosting.md) for deployment.
   pending, it is represented by an inline card rather than a channel, document,
   Chat, decision set, navigation row, or browser route.
 - A **child document** is an ordinary channel attached to one top-level parent
-  for navigation and context. It owns its document, Chat, and Decisions.
+  for navigation and context. It owns its document and Decisions but has no
+  Chat: its root's Chat and Planner reach it through the child document tools.
   The V1 product surface offers neither child research nor grandchildren. The UI
   blocks starting research from a child; the API may accept the request, but
   publication validation rejects linking a grandchild.
 - The **Planner** is the current name of Chopin's hosted document agent, backed
-  by GitHub Copilot by default, by Pi under `HARNESS=pi`, or by an in-process
-  Atomic session under `HARNESS=atomic`.
+  by GitHub Copilot by default, by Pi under `HARNESS=pi`, by an in-process
+  Atomic session under `HARNESS=atomic`, or by a client attached over the
+  Planner link under `HARNESS=remote`.
 - A **coding agent** is an external MCP client that creates, revises, or implements a
   document from its own local workspace.
 
@@ -52,6 +56,7 @@ prompt remains optimized for planning.
 flowchart LR
 	B[Browser] -->|HTTP and WebSocket| S[Bun application]
 	C[Local coding agent] -->|Bearer-authenticated MCP| S
+	R[Remote Planner client] -->|Bearer-authenticated Planner link WebSocket| S
 	S --> P[(PostgreSQL)]
 	S --> G[GitHub API]
 	S --> A[Harness model provider: Copilot, Pi, or Atomic]
@@ -61,9 +66,10 @@ flowchart LR
 The browser uses a GitHub App user session backed by encrypted hosted credentials.
 Browser HTTP routes
 and the WebSocket intersect that identity's repository role with repositories
-selected in a GitHub App installation. The external MCP endpoint instead checks
-its caller-supplied GitHub bearer token directly. Both paths apply the instance
-admission policy.
+selected in a GitHub App installation. The external MCP endpoint and the
+Planner link instead check their caller-supplied GitHub bearer token directly.
+Every path applies the instance admission policy. Under `HARNESS=remote` the
+server calls no model provider; the attached client does.
 
 The application holds an exclusive database-wide writer lease. It refuses to
 start beside another active Chopin process and stops if it can no longer renew
@@ -71,17 +77,18 @@ the lease. This is a single-writer design, not an application cluster.
 
 ## Workspace packages
 
-| Area                | Responsibility                                                                             | Internal dependencies                                     |
-| ------------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------- |
-| `packages/dialect`  | Restricted MDX dialect, parsing, serialization, and Lexical schema                         | none                                                      |
-| `packages/protocol` | WebSocket types and shared addressing helper                                               | none                                                      |
-| `packages/question` | Questionnaire definitions, shared drafts, and answer derivation                            | `protocol`                                                |
-| `packages/draft`    | Bounded collaborative plain-text draft codec                                               | none                                                      |
-| `packages/viewport` | Browser viewport geometry and subscriptions                                                | none                                                      |
-| `packages/diagrams` | SeeCode-derived, bounded diagram rendering and scoped React viewing                        | none (React peer)                                         |
-| `packages/editor`   | Collaborative editor, cursors, decisions, comments, and widgets                            | `diagrams`, `dialect`, `question`, `protocol`, `viewport` |
-| `apps/server`       | Authentication, channels, rooms, storage, Planner, jobs, MCP, and implementation lifecycle | `diagrams`, `dialect`, `draft`, `question`, `protocol`    |
-| `apps/web`          | Repository picker, channel navigation, Chat, and workspace shell                           | `dialect`, `draft`, `editor`, `protocol`, `viewport`      |
+| Area                    | Responsibility                                                                             | Internal dependencies                                                  |
+| ----------------------- | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| `packages/dialect`      | Restricted MDX dialect, parsing, serialization, and Lexical schema                         | none                                                                   |
+| `packages/protocol`     | WebSocket types and shared addressing helper                                               | none                                                                   |
+| `packages/planner-link` | Remote Planner link messages, schemas, and test client                                     | none                                                                   |
+| `packages/question`     | Questionnaire definitions, shared drafts, and answer derivation                            | `protocol`                                                             |
+| `packages/draft`        | Bounded collaborative plain-text draft codec                                               | none                                                                   |
+| `packages/viewport`     | Browser viewport geometry and subscriptions                                                | none                                                                   |
+| `packages/diagrams`     | SeeCode-derived, bounded diagram rendering and scoped React viewing                        | `icons` (React peer)                                                   |
+| `packages/editor`       | Collaborative editor, cursors, decisions, comments, and widgets                            | `diagrams`, `dialect`, `question`, `protocol`, `viewport`, `visuals`   |
+| `apps/server`           | Authentication, channels, rooms, storage, Planner, jobs, MCP, and implementation lifecycle | `diagrams`, `dialect`, `draft`, `planner-link`, `question`, `protocol` |
+| `apps/web`              | Repository picker, channel navigation, Chat, and workspace shell                           | `dialect`, `draft`, `editor`, `protocol`, `viewport`                   |
 
 Runtime workspace packages do not depend on either application. The E2E suite
 and skill contract tests deliberately import server internals as test harnesses;
@@ -113,8 +120,8 @@ push or administration access permits mutation.
 `/mcp` authenticates a GitHub bearer supplied by the coding agent. It applies
 instance admission and checks that token's current repository role without
 requiring the GitHub App for Chopin installation. Pull access permits reads;
-push or administration access permits document creation, document updates, and
-implementation lifecycle mutations.
+push or administration access permits document creation, document updates, image
+uploads, and implementation lifecycle mutations.
 
 ### Hosted agent
 
@@ -135,7 +142,41 @@ filesystem access as the server process's user. Model-backed
 `active-planner` workers use the same owner credential but fresh isolated
 harness sessions; see [Background jobs](background-jobs.md).
 
+### Remote Planner link
+
+Under `HARNESS=remote`, `/planner-link` accepts a WebSocket whose upgrade carries
+a GitHub bearer, checked like `/mcp`. The client attaches to one document and
+needs push or administration access to its repository, rechecked before every
+session and turn and periodically while attached. Attaching makes the account's
+live browser login the document's Planner owner, one client per document; a
+document without one refuses `@chopin` and `invoke_planner` with
+`planner-not-attached`. The link closes when that login ends or the document's
+Planner is reset.
+Turns run on the client's model; Chopin's host
+tools, Decisions, and room writes still run in the server under the document's
+Planner owner and the permission checks above. The client sees what a turn sees
+and steers its document writes during turns writers start; its run reports never
+start a turn. See [Remote Planner](hosted-agent.md#remote-planner) and
+[Planner link](planner-link.md).
+
 ## State ownership
+
+### Local investigations
+
+An outbound local connector uses ACP to control a participant's coding agent and a
+separate, scoped `/connector/mcp` surface for work claims and bounded result data.
+Browser pairing binds the connector to an authenticated owner and document. Only
+that owner can authorize execution. Connector grants remain process-local; their
+durable investigations, captured results, shared view state and evidence decisions
+live in PostgreSQL. New native document references project these records without
+evaluating uploaded code. See [Local investigations](local-experiments.md).
+
+Local implementation builds share that connector, owner pairing and workspace
+reservation. Approval durably binds the reviewed document/graph revisions and
+checkout before work is offered. Build is a third document view beside Document
+and Decisions, not a document preface. Lightweight implementation notifications
+keep editing locks current independently of that view; graph and task snapshots
+are fetched while it is open. See [Local implementation](local-launcher.md).
 
 ### Durable PostgreSQL state
 
@@ -265,9 +306,9 @@ read cannot publish a duplicate.
 The browser nests published children beneath their parent. Opening a ready card
 or nested row keeps the parent mounted but inert behind an anchored child
 surface. The child opens through its ordinary channel stack with its own
-Chat and Decisions; closing, Escape, and browser Back restore the
-parent's history, scroll, selection, and opener focus. Compact layouts occupy
-the viewport, and reduced motion uses a crossfade.
+Decisions; its root's Chat stays the only Chat. Closing, Escape, and browser
+Back restore the parent's history, scroll, selection, and opener focus. Compact
+layouts occupy the viewport, and reduced motion uses a crossfade.
 
 ## Collaborative document
 
@@ -354,7 +395,7 @@ structural block operations against that revision rather than a text patch.
 4. Existing MDAST objects identify untouched or moved blocks. Their live Lexical
    nodes are reused; genuinely new blocks receive new nodes.
 5. Lexical produces a Yjs delta. The server finalizes records, reviews
-   relationships, and attributes accepted-comment results.
+   relationships, and attributes the results of the comment thread a turn was sent.
 6. The delta and sidecar commit before broadcast.
 7. The server derives added, moved, and removed marks and places the Planner
    cursor at the end of the final changed block.
@@ -503,6 +544,8 @@ Treat these as implementation work, not guarantees to build new behavior upon.
   `apps/server/src/harness/github-tools.ts`
 - Copilot SDK adapter: `apps/server/src/harness/copilot-sdk/adapter.ts`
 - Atomic SDK adapter: `apps/server/src/harness/atomic/adapter.ts`
+- Remote Planner adapter and link endpoint: `apps/server/src/harness/remote/` and
+  `packages/planner-link`
 - Channel routes and IDs: `apps/server/src/channels/`
 - Research requests and child publication: `apps/server/src/research/service.ts`
 - Inline request state and anchored children: `apps/web/src/research-requests.ts`

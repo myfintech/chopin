@@ -1,15 +1,34 @@
 import { createPortal } from "react-dom";
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import {
+	lazy,
+	Suspense,
+	useCallback,
+	useEffect,
+	useId,
+	useLayoutEffect,
+	useRef,
+	useState,
+} from "react";
+import { usePhone } from "@chopin/editor/pointer";
 import { useTransitionPresence } from "@chopin/editor/transition-presence";
 import { ArchiveIcon, ArrowUpIcon, CloseIcon, LinkIcon, PencilIcon } from "@chopin/icons";
 
 import { motionContract } from "./motion-contract";
 import { useMenuDismissal } from "./menu-dismissal";
 import { motionImmediately } from "./motion-input";
+import { MenuItem } from "./menu-item";
+import { IconButton } from "./icon-button";
 
 import type { IconProps } from "@chopin/icons";
 import type * as Api from "./api";
-import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
+import type { ComponentProps, ComponentType, CSSProperties, KeyboardEvent, ReactNode } from "react";
+
+// Once prefetched, the sheet renders directly: lazy() would still suspend its first render.
+let actionSheet: typeof import("./action-sheet") | undefined;
+export let loadActionSheet = () => import("./action-sheet").then(module => (actionSheet = module));
+let LazyActionSheet = lazy(() =>
+	loadActionSheet().then(module => ({ default: module.ActionSheet }))
+);
 
 export type DocumentAction = "copy-link" | "rename" | "archive" | "restore" | "delete";
 
@@ -49,12 +68,14 @@ export function DocumentActionsMenu(
 		channel,
 		align = "end",
 		className = "",
+		iconButton = false,
 		onAction,
 		trigger,
 	}: {
 		align?: "start" | "end";
 		channel: Pick<Api.Channel, "title" | "archivedAt">;
 		className?: string;
+		iconButton?: boolean;
 		onAction: (action: DocumentAction) => void;
 		trigger: ReactNode;
 	},
@@ -63,7 +84,14 @@ export function DocumentActionsMenu(
 	let button = useRef<HTMLButtonElement>(null);
 	let panel = useRef<HTMLDivElement>(null);
 	let initialItem = useRef(0);
+	let phone = usePhone();
+	// Chosen when opened, so a load finishing later never remounts an open sheet.
+	let sheet = useRef<
+		ComponentType<ComponentProps<typeof LazyActionSheet>>
+	>(LazyActionSheet);
+	let Sheet = sheet.current;
 	let [open, setOpen] = useState(false);
+	let [sheetOpen, setSheetOpen] = useState(false);
 	let [position, setPosition] = useState<CSSProperties>();
 	let items = documentMenuItems(channel);
 	let immediately = motionImmediately();
@@ -177,27 +205,76 @@ export function DocumentActionsMenu(
 			: (current - 1 + controls.length) % controls.length;
 		controls[next]?.focus();
 	};
+	let toggleMenu = () => {
+		if (phone) {
+			sheet.current = actionSheet?.ActionSheet ?? LazyActionSheet;
+			setSheetOpen(true);
+		} else if (open) closeMenu();
+		else openAt(0);
+	};
+	// A phone's first tap should open the sheet, not wait for its code.
+	let preload = phone
+		? () => {
+			void loadActionSheet();
+			void import("./copy-link");
+		}
+		: undefined;
+	let triggerKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+		if (phone) return;
+		if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+		event.preventDefault();
+		openAt(event.key === "ArrowUp" ? items.length - 1 : 0);
+	};
 
 	return (
 		<>
-			<button
-				aria-controls={open ? id : undefined}
-				aria-expanded={open}
-				aria-haspopup="menu"
-				aria-label={`Actions for ${channel.title}`}
-				className={className}
-				data-tooltip="Document actions"
-				onClick={() => open ? closeMenu() : openAt(0)}
-				onKeyDown={event => {
-					if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
-					event.preventDefault();
-					openAt(event.key === "ArrowUp" ? items.length - 1 : 0);
-				}}
-				ref={button}
-				type="button"
-			>
-				{trigger}
-			</button>
+			{iconButton
+				? (
+					<IconButton
+						aria-controls={open ? id : undefined}
+						aria-expanded={open || sheetOpen}
+						aria-haspopup="menu"
+						aria-label={`Actions for ${channel.title}`}
+						data-tooltip="Document actions"
+						glyph="compact"
+						onClick={toggleMenu}
+						onKeyDown={triggerKeyDown}
+						placement="sidebar-document"
+						ref={button}
+						size="compact"
+					>
+						{trigger}
+					</IconButton>
+				)
+				: (
+					<button
+						aria-controls={open ? id : undefined}
+						aria-expanded={open || sheetOpen}
+						aria-haspopup={phone ? "dialog" : "menu"}
+						aria-label={`Actions for ${channel.title}`}
+						className={className}
+						data-tooltip="Document actions"
+						onClick={toggleMenu}
+						onKeyDown={triggerKeyDown}
+						onPointerDown={preload}
+						ref={button}
+						type="button"
+					>
+						{trigger}
+					</button>
+				)}
+			{sheetOpen && (
+				<Suspense fallback={null}>
+					<Sheet
+						immediate={["copy-link"]}
+						items={items}
+						label={`Actions for ${channel.title}`}
+						onClose={() => setSheetOpen(false)}
+						onSelect={action => onAction(action as DocumentAction)}
+						title={channel.title}
+					/>
+				</Suspense>
+			)}
 			{mounted && createPortal(
 				<div
 					aria-hidden={active ? undefined : "true"}
@@ -212,19 +289,17 @@ export function DocumentActionsMenu(
 					style={presence.value ?? { visibility: "hidden" }}
 				>
 					{items.map(item => (
-						<button
-							className={item.destructive ? "document-actions-menu-destructive" : undefined}
+						<MenuItem
 							key={item.action}
 							onClick={() => {
 								closeMenu(true);
 								onAction(item.action);
 							}}
-							role="menuitem"
-							type="button"
+							tone={item.destructive ? "destructive" : "normal"}
 						>
 							<item.icon aria-hidden="true" size={14} />
 							{item.label}
-						</button>
+						</MenuItem>
 					))}
 				</div>,
 				document.body,

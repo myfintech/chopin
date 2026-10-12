@@ -5,7 +5,8 @@ inspect one selected GitHub repository, co-author the shared document, ask the
 participants structured questions, and anchor decisions to prose. For documents
 used as plans, it can also draft an implementation graph. Under `copilot-sdk` and
 `pi` it does not implement code or change GitHub; under `atomic` it runs as a full
-Atomic session, described [below](#full-atomic-planner).
+Atomic session, described [below](#full-atomic-planner); under `remote` its model
+runs in a member's own client, described in [Remote Planner](#remote-planner).
 
 The product role is document co-authoring. The current prompt and tool vocabulary
 remain optimized for planning and may structure another document type as a plan;
@@ -15,9 +16,10 @@ Chopin runs the Planner through `@ai-sdk/harness`: `HARNESS` selects one adapter
 from a code-owned map, defaulting to `copilot-sdk`, a host-process adapter over
 `@github/copilot-sdk`. `pi`, over `@ai-sdk/harness-pi`, and `atomic`, which
 embeds Atomic's headless SDK (`@bastani/atomic`) in the server process, are
-further reviewed adapters. Both require an explicit `HARNESS_AUTH`. The
-harness owns the agent loop and model. Under `copilot-sdk` and `pi`, Chopin owns
-every tool the Planner can call.
+further reviewed adapters. Both require an explicit `HARNESS_AUTH`. `remote`
+runs no model in the server at all: each turn goes to a client attached over the
+Planner link. The harness owns the agent loop and model. Under `copilot-sdk` and
+`pi`, Chopin owns every tool the Planner can call.
 
 **Choosing `HARNESS=atomic` gives the Planner shell and filesystem access as the
 server process's user, on hosted instances as well as local ones.** No other flag
@@ -31,7 +33,10 @@ The first eligible editor to invoke the Planner or start a model-backed research
 request supplies the GitHub App user access token for that channel and, under
 the default `copilot-sdk` harness, the Copilot entitlement. Under `HARNESS=pi`
 and `HARNESS=atomic` the owner supplies only the GitHub token; model access
-comes from the operator's `HARNESS_AUTH` mode. The user must pass instance
+comes from the operator's `HARNESS_AUTH` mode. Under `HARNESS=remote` the owner
+also supplies only the GitHub token, and the model runs in the client attached
+to the document; only [attaching](#remote-planner) makes an account the owner
+there. The user must pass instance
 admission and have repository push or administration access. Ownership is
 assigned atomically in storage and guarded by a generation token.
 
@@ -47,6 +52,20 @@ call follows the same rules. Its instruction is posted as the caller's own
 message; the turn runs under the channel's current owner, whoever that is. A
 channel without one is claimed for the caller's live browser login, hosted or
 local, and without such a login the call is refused and nothing is posted.
+Under `HARNESS=remote` only attaching claims ownership. An `@chopin` message or
+`invoke_planner` call for a document without an attached Planner is refused with
+`planner-not-attached`, and with one it runs as a turn on that Planner under its
+owner. Other Planner requests, such as sending a comment to the Planner or a
+Build draft, claim nothing either: with a client attached they run on it, and
+without one they fail as any request without a usable owner does, not with
+`planner-not-attached`. Model-backed research is unavailable, because the remote
+Planner requires `BACKGROUND_JOBS=off`; a research request claims no ownership
+and is refused as not ready.
+
+An attachment lasts only as long as its owner. Signing that browser login out,
+its expiry, or a repository writer's reset of the document's Planner closes the
+attached link at once and frees the document for any eligible account to attach;
+see [Planner link ownership](planner-link.md#ownership).
 
 Planner ownership stores only the owner session ID, referring to a login loaded
 in this process. Hosted logins separately persist encrypted credentials in
@@ -82,8 +101,13 @@ Chopin's tools available to the Planner under every harness are:
 
 - Chopin document, question, relationship, and implementation-graph tools (with
   current plan-oriented tool names);
-- bounded file and tree reads plus commit history fixed to the default branch
-  captured when the session is created;
+- Chopin's child document tools (`list_children`, `read_child`, `edit_child`,
+  `anchor_child`), bound to the root document's own children and rechecked on
+  every call (owner access, parentage, repository, and archive state). They are
+  never offered to background jobs, and unexpected storage errors reach the
+  model only as a generic message;
+- bounded file and tree reads plus commit history using the session's default
+  branch, or an explicitly supplied full commit ID when inspecting investigation evidence;
 - repository-scoped code search, post-filtered by repository node ID; and
 - bounded reads of document and historical research references attached to the
   current Chat context; and
@@ -91,11 +115,44 @@ Chopin's tools available to the Planner under every harness are:
   `createMCPClient` against GitHub's remote MCP server, bound to the channel's
   repository.
 
+A comment note sent to Chopin (`to: "planner"` on `comment:start` or
+`comment:reply`; the server never looks for a mention in the text) starts or
+joins a turn about that one thread, under the sender's claimant session after
+the same write-authority recheck as Chat. That turn alone may call
+`reply_comment { thread, text }`: it refuses any thread other than the one the
+running turn was sent, and a resolved or full one, and persists the Planner's
+note before the room sees it. The turn's `edit_plan` writes are recorded as the
+thread's result. If the turn ends having said something in Chat but nothing in
+the thread, that last message is posted to the thread for it. Background jobs
+cannot call `reply_comment`.
+
+A child document has no Chat. A comment sent to Chopin inside one is admitted
+by its root's queue and starts or joins a turn on the root's Chat, with the
+child as the turn's focus; the root's transcript notice names the child. That
+turn alone may `reply_comment` in that child thread, and its `edit_child` writes
+are the thread's result. The note is saved in the child before the turn is
+queued, and the reply is saved in the child before the child's room sees it.
+Admission, queueing the turn, and `reply_comment` each re-ask storage that the
+child still belongs to a live root in the same repository; admission refuses the
+note before saving it when it does not. The end-of-turn fallback reply is posted
+to the child room the note came from, which stays held until that turn ends,
+without asking again. Planner ownership is the root's.
+
 Issue and general search MCP tools are refused because linked objects and
 free-form qualifiers can cross the selected repository boundary. Repository
 REST tools construct owner and repository coordinates on the server, bound
 response sizes and line ranges, reject path escape, and post-filter code search
 by GitHub repository node ID.
+
+With `PLANNER_VISUALS=on` and a configured Jev key, foreground `copilot-sdk` and
+`pi` sessions for an explicit member request of at most 1,000 characters also
+receive `assess_visual`. It routes one explanatory paragraph through
+possibility, comprehension, and type choices before `edit_plan` can publish it.
+The route is bound to the member turn, document revision, passage, and placement.
+Comment turns, longer requests, background jobs, and `atomic` sessions
+keep their existing authoring prompt, tool set, and edit path. Atomic sessions
+may retain workflow ownership across turns and are outside this disposable-session
+prototype. This path is opt-in while the bounded authoring workflow is evaluated.
 
 The isolated Planner does not see a user's local checkout, current branch, working tree,
 or uncommitted changes. A coding agent must compare the repository context
@@ -227,6 +284,133 @@ any harness. The instruction is posted as the MCP caller's own message and runs
 under the document's Planner ownership rules (see [Ownership](#ownership)).
 Harnesses other than `atomic` ignore its `checkout`.
 
+## Remote Planner
+
+Under `HARNESS=remote` the Planner's model runs in a client attached to the
+document over the Planner link, usually a member's own Atomic session on their
+machine. The server keeps the document, Decisions, room writes, and anchors; the
+client keeps its code, model credentials, and its own tools. The adapter
+(`apps/server/src/harness/remote`) forwards each Planner session as `start` and
+each turn as `turn`, and re-emits the parts the client streams back.
+
+The link is a WebSocket at `/planner-link`, on the application's own origin.
+[Planner link](planner-link.md) is its complete wire format, written for
+clients that cannot import Chopin's packages. Its messages are declared and
+validated by `@chopin/planner-link` (`packages/planner-link`), whose minimal
+client in `@chopin/planner-link/client` uses only that wire format at runtime. Every message is a JSON text frame of at most
+2 MiB, checked against a strict schema; a binary, malformed, out-of-order, or
+oversized message ends the link (close codes 1008 or 1009) after an `error`
+message naming the problem.
+
+| Server to client                                      | Client to server                                                                       |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `attached` or `refused` (answers `attach`)            | `attach` (version, document id or URL, checkout identity)                              |
+| `start` (session, `planner` or `isolated` mode)       | `started` or `start-failed`                                                            |
+| `turn` (prompt, instructions, host tool specs)        | `tools` (the client's own tools for this turn)                                         |
+| `abort`                                               | `part` (text, reasoning, tool input, own tool call/result, finish-step, finish, error) |
+| `host-tool-result`                                    | `host-tool-call`                                                                       |
+| `input-result` (answered, expired, cancelled, failed) | `input-request`, `input-cancel`                                                        |
+| `stop`, `resume` (Stop and Resume Planner)            | `control-result`, `runs` (run cards for Chat)                                          |
+| `destroy`                                             | `turn-end`, `detach`                                                                   |
+
+**Attaching.** The upgrade request carries `Authorization: Bearer <GitHub token>`,
+checked exactly as hosted MCP checks it: the token must resolve through instance
+admission, a bad or missing token gets HTTP 401, a refused account 403, a foreign
+`Origin` 403, and GitHub outages 503, all before anything is upgraded. The first
+message must be `attach` with protocol version 1. Its document is resolved like
+an MCP document locator, and the bearer's own account must have push or
+administration access to the document's repository. An unsupported version, a
+repository it cannot write, or a missing or archived document is refused with a
+`refused` message and close code 4426, 4403, or 4404. Neither attaching nor a
+refusal posts anything to the document. The account and repository access are
+checked again before every session and every turn the link starts, including
+turns of a session kept for its runs, and every 5 minutes while the link stays
+attached; losing either fails that session or turn and closes the link with
+`access-revoked`.
+
+**Ownership.** Attaching makes the account the document's Planner owner through
+the same generation-guarded storage claim as any other owner
+(`apps/server/src/harness/remote/attachments.ts`). The owner record names the
+account's live browser login, not the link, because Chopin's repository tools
+run with that login's GitHub App token and never with the link's bearer; an
+account with no live sign-in since the server started is refused with
+`sign-in-required` (4401). The login must pass the same eligibility as every
+Planner owner: instance admission and push or administration access. This is
+stricter than the design's "can read the repository", because an attached
+client steers what the Planner writes and runs repository tools as the owner.
+An owner left without an attachment, which only a race or an operator reset can
+produce, is cleared under its generation and the document is claimed again.
+
+One client holds a document's Planner. While it is attached, every other
+`attach` for that document is refused with `planner-attached` (4409) and a
+message naming its GitHub login. A link that detaches or drops keeps the
+ownership for `PLANNER_ATTACH_GRACE_MS` (2 minutes by default): the same account
+can attach again within it and keeps the same ownership generation, and anyone
+else is refused. When it ends, the ownership is cleared under its generation, so
+a newer owner is never released by an old timer. An attach, including a grace
+reattach, binds only if no sign-out, expiry, or Planner reset of its ownership
+landed while it was checking, including the eligibility checks of the sign-in
+it is about to claim with; otherwise it is refused like an attached link would
+be closed. Attachments live in the server process; startup already clears
+every owner reference, which releases every attachment.
+
+**Unattached documents.** Members, MCP callers, and research requests never claim
+ownership under `HARNESS=remote`. An `@chopin` message or `invoke_planner` call
+for a document with no attached client, including one within its grace period,
+is refused with `planner-not-attached` before anything is posted or queued.
+Before accepting either, the server rechecks an attached link as its periodic
+recheck would: if the owner's browser sign-in has ended or storage no longer
+assigns that owner, it closes the link, releases the ownership, and refuses the
+request the same way. The
+refusal names the document URL and says to connect a Planner client to it over
+the Planner link from a session in a checkout of the repository, which attaches
+that session as the Planner; the browser shows that text on the `@chopin`
+request. Room messages are unaffected. Once a client is attached, both arrive as
+turns on its link and run under its ownership whoever sent them.
+
+**Turns and tools.** Chopin's host tools (document, repository, and job tools)
+still run in the server against the room, under the document's Planner owner and
+the permission checks below. The client calls them with `host-tool-call` and
+receives `host-tool-result`. Its own tools run on its machine: it must declare
+them with `tools` before calling any, may not reuse a host tool's name, and
+reports them as provider-executed `tool-call` and `tool-result` parts. An
+undeclared tool fails the turn as a tool boundary failure. Background job
+sessions start in `isolated` mode, where the client may offer no tools of its own
+and ask nothing. A turn ends with `turn-end`. An abort waits briefly for the
+client's `turn-end`, then ends the turn anyway. A turn that ends while one of
+its host tools still runs, such as an `ask` waiting on Decisions, stops that tool
+and withdraws the cards it opened. A link that closes mid-turn ends the turn
+with an error rather than as a stop, its open questions are withdrawn, and runs
+it reported are shown stopped; nothing waits on a client that has gone. A
+session the client refuses or does not start in time is destroyed, and any
+question it asked while starting is withdrawn.
+
+**Questions.** An `input-request` carries one Atomic `HostInput` call
+(`questionnaire`, `confirm`, `select`, `input`, or `editor`) and becomes Decisions
+through the same path as the [full Atomic Planner](#full-atomic-planner): the same
+verbatim text, the same 30-minute expiry, cancellation that withdraws open
+cards, and answers to a workflow question held while the client reports that
+run's root as paused. `input-result` returns what Atomic would have received in
+process, with a status that tells an expiry from a cancellation.
+
+**Runs.** The client reports its workflow runs with `runs`; Chat shows those
+cards and keeps the session after its turn while any run is live or paused, as
+for an Atomic Planner. **Stop Planner** and **Resume Planner** send `stop` and
+`resume`, optionally for one run, and wait for `control-result`. Unlike an
+Atomic Planner's, a reported run that ends blocked or failed between turns gets
+only its Chat notice: the reports are the client's word, so they never start a
+Planner turn that no writer asked for.
+
+**Trust boundary.** The server never holds the client's model credentials and
+gains no shell or filesystem access from this harness. The client, in turn,
+receives everything a Planner turn sees: the conversation, the document, and
+the results of repository tools that run with the document Planner owner's
+GitHub App token, limited to the document's repository, which its own account
+can already read. The attached client decides what the Planner writes to the
+document during turns writers start, which is why attaching requires the push
+or administration access every Planner owner needs. Summary and research workers
+have no model in the server, so `HARNESS=remote` requires `BACKGROUND_JOBS=off`.
+
 ## Permission checks
 
 Before each Chopin host tool or its repository-bound GitHub MCP tool executes, callbacks recheck:
@@ -301,7 +485,13 @@ through Atomic's session run control, and **Resume Planner** resumes the runs it
 paused. A run waiting on a question pauses too: Atomic withdraws the question
 from Decisions while the run is paused and presents it again on Resume, and an
 answer that arrives during the pause reaches the run only after Resume, so a
-paused run never advances. Chat shows the session's runs as one stack, one row
+paused run never advances. A run that ends blocked or failed while the Planner
+is between turns starts a Planner turn about it, on the kept session, so the
+Planner reports what happened and what the team needs to do; Chat records the
+run's end as that turn's reason, and the session is let go after the turn. The
+adapter stops any turn Atomic starts on its own, such as for its lifecycle
+notices, because Chopin would neither show nor record it.
+Chat shows the session's runs as one stack, one row
 per run: its name, status (running, waiting on Decisions, paused, or ended), and
 elapsed time. Several runs can be live at once. Runs waiting on Decisions come
 first, then running, paused, and ended runs, newest first within each, and more
@@ -365,6 +555,28 @@ Open, edit, restore, and MCP creation paths schedule descriptions lazily. They d
 not establish Planner ownership, and there is no unattended scan of every
 document. Without an active owner, model-backed work cannot run; the last
 completed description, if any, remains visible while work is pending or failed.
+
+## Diagrams and wireframes
+
+The prompt teaches two validated fence languages. `seecode` holds a JSON spec
+for any registered SeeCode diagram or numerical chart. The ordinary prompt lists
+the full native catalog, including bar, line, scatter, radar, polar, waterfall,
+treemap, heatmap, and Sankey. Numerical aliases have variant-specific purpose
+and data requirements; the guide includes labelled synthetic bar, Marimekko and
+dumbbell examples that are checked against the renderer.
+This capability does not require `PLANNER_VISUALS`; that flag selects the
+experimental Jev routing workflow described above. Ordinary and Atomic Planners
+prefer native `seecode` whenever a registered type can represent the required
+information. Mermaid is a fallback only for a representation the native catalogue
+cannot provide or an explicit user request; it supports numerical charts such as
+pie and bar/line charts. Jev-routed diagrams must keep the selected native type
+and SeeCode fence, with no Mermaid substitution. `wireframe` holds an indented
+outline of interface parts for layouts and mockups, and the prompt forbids
+box-drawing or ASCII art in text fences. `edit_plan` and MCP `update_document`
+refuse a batch that introduces or changes an invalid fence of either language;
+a wireframe refusal names the failing lines, counted inside the fence. An
+unchanged malformed fence, such as one a person left mid-edit, is carried
+through unrelated edits and moves rather than blocking them.
 
 ## Implementation graph status
 
