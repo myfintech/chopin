@@ -37,7 +37,8 @@ import { annotatedText, compose, focusContext, referenceCatalog, remember } from
 import { createNotices } from "./notices";
 import { createJobQueue, finishJob, jobReason, type JobTurn, safeProjection } from "./job-queue";
 import { translateJob } from "./job-translate";
-import { argsText, outputText } from "./activity";
+import { argsText, outputText, textOutput } from "./activity";
+import { toolErrorSchema } from "@chopin/planner-link";
 import { watchJobAbort } from "./job-fence";
 import { JOB_TOOLS } from "../agent/job-scope";
 import type { JobOutcome } from "../conversation-plan/jobs";
@@ -57,6 +58,7 @@ import type { Plan } from "../plan/service";
 import type { Focus, Said } from "./address";
 import type { ReferenceService } from "./references";
 import type { Socket, SocketData } from "../wire";
+import type { ToolError } from "@chopin/planner-link";
 
 /** Beyond this the queue is a backlog nobody is going to read. */
 const MAX_QUEUE = 20;
@@ -2390,19 +2392,62 @@ function conclude(
 	if (existing && existing.status !== "running") return;
 	let started = chat.timings.get(id);
 	if (status !== "running") chat.timings.delete(id);
+	let failure = status === "failed" && !refused && name !== "read_reference"
+		? toolError(output)
+		: undefined;
 	let detail = name === "read_reference"
 		? success
 			? "Reference content was returned privately to the Planner."
 			: "The reference could not be read."
+		: failure
+		? textOutput(failure.message)
 		: outputText(output);
 	publish(context, {
 		id,
 		name,
 		status,
 		...(refused ? { refused: true as const } : {}),
+		...(failure
+			? {
+				error: {
+					code: failure.code,
+					...(failure.kind === undefined ? {} : { kind: failure.kind }),
+				},
+			}
+			: {}),
 		...(started && status !== "running" ? { took: Date.now() - started } : {}),
 		...(detail ? { result: detail } : {}),
 	});
+}
+
+/**
+ * A failed tool's structured error, sent as the envelope or as its JSON text.
+ * Only a plain object holding a plain `error` object is an envelope, read from
+ * its own enumerable properties: an Error or other class instance at either
+ * level shows as the raw result, which never shows its hidden properties.
+ * Its code and kind are plain identifiers shown as written, so one that the
+ * redactor would change is not recognised and shows as the raw result.
+ */
+function toolError(output: unknown): ToolError["error"] | undefined {
+	if (typeof output === "string") {
+		try {
+			output = JSON.parse(output);
+		} catch {
+			return undefined;
+		}
+	}
+	if (!plain(output) || !plain(output.error)) return undefined;
+	let error = toolErrorSchema.safeParse({ ...output, error: { ...output.error } }).data?.error;
+	if (!error) return undefined;
+	let shown = [error.code, error.kind ?? ""];
+	return shown.every(text => textOutput(text) === text) ? error : undefined;
+}
+
+/** Whether a value is an object literal or a null-prototype object. */
+function plain(value: unknown): value is Record<string, unknown> {
+	if (typeof value !== "object" || value === null) return false;
+	let prototype = Object.getPrototypeOf(value);
+	return prototype === Object.prototype || prototype === null;
 }
 
 /** Whether the session offers this tool; one it does not offer ends the turn. */

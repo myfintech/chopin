@@ -38,6 +38,57 @@ so nothing is opened:
 | 503    | GitHub is unavailable or rate limiting; retry later         |
 | 500    | Any other admission failure                                 |
 
+### Pings
+
+The server sends the link a WebSocket ping control frame (RFC 6455) every
+**15 seconds** from the moment it opens. The client must answer each with a
+pong. Standard clients do this on their own, including Bun's and Node.js's
+built-in `WebSocket` and the `ws` package; pings are control frames, not
+messages, and carry no JSON. Any frame from the client, a pong or a message,
+shows the link is alive.
+
+A client that is slow to read leaves the server's frames to it queued. While
+anything is queued the server sends no ping, since a ping can be dropped from a
+full queue. A queue getting shorter puts off the close by another timeout, but
+it does not count as hearing from the client: the kernel's buffers or a proxy in
+front of the client can drain it while the client reads nothing. A client that
+has stopped reading entirely keeps a queue that never shrinks, and counts as
+silent.
+
+A link the server hears nothing from for **120 seconds** is treated as dropped,
+such as one whose network silently went away. However much of its queue drains
+meanwhile, a link that sends nothing at all, not even a pong, for **15
+minutes** is dropped too. The server closes it with 1001 and reason
+`unresponsive`, without an `error` or `refused` message, and releases it exactly
+as any dropped link (see [Closing](#closing)): its account keeps the document's
+Planner for the grace period in [Ownership](#ownership). The operator sets the
+interval, the timeout and the longest silence with `PLANNER_LINK_PING_MS`,
+`PLANNER_LINK_TIMEOUT_MS` and `PLANNER_LINK_MAX_SILENCE_MS`.
+
+So a client working through a large backlog must still send something within
+the longest silence. A client that answers pings needs nothing more: once it has
+read the queue to the end, the server pings it again and its pong counts. The
+server may queue up to about **16 MiB** for a client, so the longest silence is
+a trade-off:
+
+- A client that reads at about **19 KiB/s** or faster can always drain a full
+  16 MiB queue and answer the next ping within the default 15 minutes.
+- A client that has stopped reading behind a proxy that keeps accepting bytes is
+  released after 15 minutes at the latest, and usually much sooner: once the
+  proxy's and the kernel's buffers fill, the queue stops shrinking and the
+  120-second timeout applies.
+- An operator can lower `PLANNER_LINK_MAX_SILENCE_MS` to release such a client
+  sooner, at the cost of closing slower readers, or raise it, up to an hour, for
+  slower links.
+
+The server cannot see a frame until it has arrived whole, and a client's pongs
+wait behind a frame it is still sending. So every frame must arrive within the
+timeout of the last frame heard before it. With the defaults, a 2 MiB frame
+needs a sustained client upload of about **17 KiB/s** (2 MiB in 120 seconds),
+or about 20 KiB/s if it starts just before a ping is due (2 MiB in the 105
+seconds left). A client on a slower uplink is closed as unresponsive while it
+uploads its largest frames; raise `PLANNER_LINK_TIMEOUT_MS` for it.
+
 ## Frames
 
 Every message is one JSON object in one text frame, with a string `type`. A
@@ -311,11 +362,76 @@ fields:
   emits their call and result parts itself.
 - `tool-input-start` may name a host tool (its input streams before the
   `host-tool-call`) or a declared own tool.
+- A failed own tool's `tool-result` may carry a
+  [structured tool error](#structured-tool-errors) as its `result`.
 - `finishReason.unified` is one of `stop`, `length`, `content-filter`,
   `tool-calls`, `error`, `other`. `usage` and `totalUsage` are
   `{ "inputTokens": { "total?", "noCache?", "cacheRead?", "cacheWrite?" }, "outputTokens": { "total?", "text?", "reasoning?" } }`
   with non-negative integers.
 - `error` fails the turn with that text.
+
+### Structured tool errors
+
+An own tool that fails may say why in a form Chat can show. Send its
+`tool-result` with `"isError": true` and, as `result`, this envelope or its
+JSON text:
+
+```text
+{ "error": { "code": "", "kind?": "", "message": "" } }
+```
+
+- `code` is a stable machine identifier, such as
+  `no-repository-credential`.
+- `kind` is an optional display name, such as `NoRepositoryCredential`.
+- `message` is human-readable text of 1 to 4000 characters.
+
+`code` and `kind` are plain identifiers of 1 to 128 characters: an ASCII
+letter or digit, then ASCII letters, digits, `.`, `_` or `-`. They cannot hold
+spaces, quotes, `:` or `=`.
+
+The envelope has exactly these fields. `@chopin/planner-link` exports it as
+`toolErrorSchema` and `ToolError`. It is a convention, not a new wire shape:
+`result` remains any JSON, and an envelope that does not match is shown as an
+ordinary result. Chopin recognises the envelope only on a failed, final
+result; a successful or `preliminary` result that contains `error` is
+shown as it is.
+
+Work details then shows the call as **Failed** with `kind`, or `code` when
+there is no `kind`, and `message` as plain text instead of the JSON. Chopin
+masks credential assignments, including every proxy setting such as
+`http_proxy` or `HTTPS_PROXY`, token shapes such as `ghp_…` and Slack `xox…-`
+tokens, and URL credentials before it stores or shows them. The URL rule is
+deliberately broad, so it masks too much rather than too little. After any
+`://`, whatever comes before it, and after a protocol-relative `//` that starts
+the text or follows whitespace, a quote, `(`, `<`, `=`, `[`, a comma or a colon
+(so not a `//` inside a path), it finds the last at-sign within 8,192
+characters and masks everything between them, user name included:
+`https://alice:hunter2@host` shows as `https://[redacted]@host`. It reads the
+colon, slashes and at-sign in any spelling a URL parser or a later decoding
+step would accept: JSON, JavaScript (`\u{40}`, `%u0040`), Python and C
+(`\U00000040`, `\x40`, `\100`) escapes behind any run of backslashes,
+percent-encoding at any depth (`%40`, `%2540`, …), and HTML entities with or
+without their semicolon. As URL parsers do, it reads a backslash as a slash and
+lets tabs and line breaks come before each slash, as in
+`https:\\alice:hunter2@host`. Only that
+window bounds the scan: spaces, quotes, slashes, line breaks and later schemes
+do not end it, so a password holding `://` is masked whole, and text that
+merely contains a later `@`, even another URL, can be masked too. Only a short
+plain user name with no password, such as `git` in `ssh://git@github.com`,
+stays visible. It masks `message` as plain text, even when it holds JSON. It
+shows `code` and `kind` as written, and does not recognise an envelope whose
+`code` or `kind` the masking would change; that envelope is shown as an
+ordinary result. The masking is not exhaustive; keep credentials out of the
+envelope. Known limits: it does not recognise a fullwidth at-sign (`＠`), a
+separator split by zero-width or soft-hyphen characters, which no URL parser
+accepts, a tab or line break written as an escape or entity rather than as
+the character itself, a Python named escape such as `\N{COMMERCIAL AT}`, or
+percent-encoding of an escape's own characters, such as `%25%34%30` for `%40`.
+
+This masking applies only to what Chat stores and shows. It does not change
+what crosses the link: `host-tool-result.output` reaches the client exactly as
+the host tool returned it, and a failed host call keeps its
+`{ "error": "<message>" }` output.
 
 ## Questions
 
@@ -404,17 +520,18 @@ ids. When the link closes, the server shows the reported live runs as stopped.
 
 ## Closing
 
-| Close code | Sent after                                     | Meaning                                       |
-| ---------- | ---------------------------------------------- | --------------------------------------------- |
-| 1000       | `detach`                                       | The client detached                           |
-| 1008       | `error` with `malformed-message` or `protocol` | Unparseable, invalid, or out-of-order message |
-| 1009       | `error` with `message-too-large`               | A frame over 2 MiB                            |
-| 1011       | `refused` with `unavailable`                   | The server could not check the document       |
-| 4401       | `refused`                                      | `sign-in-required`                            |
-| 4403       | `refused`                                      | `repository-forbidden` or `access-revoked`    |
-| 4404       | `refused`                                      | `document-unavailable` or `document-archived` |
-| 4409       | `refused`                                      | `planner-attached`                            |
-| 4426       | `refused`                                      | `unsupported-version`                         |
+| Close code | Sent after                                     | Meaning                                         |
+| ---------- | ---------------------------------------------- | ----------------------------------------------- |
+| 1000       | `detach`                                       | The client detached                             |
+| 1001       | nothing                                        | No pong or message within the [timeout](#pings) |
+| 1008       | `error` with `malformed-message` or `protocol` | Unparseable, invalid, or out-of-order message   |
+| 1009       | `error` with `message-too-large`               | A frame over 2 MiB                              |
+| 1011       | `refused` with `unavailable`                   | The server could not check the document         |
+| 4401       | `refused`                                      | `sign-in-required`                              |
+| 4403       | `refused`                                      | `repository-forbidden` or `access-revoked`      |
+| 4404       | `refused`                                      | `document-unavailable` or `document-archived`   |
+| 4409       | `refused`                                      | `planner-attached`                              |
+| 4426       | `refused`                                      | `unsupported-version`                           |
 
 `protocol` covers a message before `attach` is answered, a second `attach`, and
 a repeated `input-request` id the server remembers. When the link closes for

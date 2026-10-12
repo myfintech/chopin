@@ -17,6 +17,7 @@ import "@fontsource/lora/latin-400.css";
 import "./theme.css";
 import "@chopin/visuals/styles.css";
 import "./navigation.css";
+import "./phone-skeleton.css";
 import "./icon-tooltip.css";
 import "./local-login.css";
 import "./chat/run-card.css";
@@ -30,9 +31,14 @@ if (!root) throw new Error("missing #root");
 function Root() {
 	useFocusInput();
 	useMotionInput();
-	usePointerCapabilities();
 	useVisualViewport();
 	return <App />;
+}
+
+/** Every route, development pages included, mirrors the phone class into CSS. */
+function PointerCapabilities() {
+	usePointerCapabilities();
+	return null;
 }
 
 let content = isDesignAuditRoute(location.pathname, import.meta.env.DEV)
@@ -51,6 +57,7 @@ void Promise.all([content, import("./icon-tooltip"), agentation]).then(
 	([value, { IconTooltip }, feedback]) => {
 		createRoot(root).render(
 			<StrictMode>
+				<PointerCapabilities />
 				{value}
 				<IconTooltip />
 				{feedback}

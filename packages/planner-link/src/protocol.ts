@@ -12,6 +12,8 @@ export const MAX_LINK_MESSAGE_BYTES = 2 * 1024 * 1024;
 /** WebSocket close codes a Chopin server uses to end a link. */
 export const LINK_CLOSE = {
 	detached: 1000,
+	/** The client answered no protocol ping for the server's timeout. */
+	unresponsive: 1001,
 	malformed: 1008,
 	tooLarge: 1009,
 	failed: 1011,
@@ -105,6 +107,25 @@ export const streamPartSchema = z.discriminatedUnion("type", [
 	z.strictObject({ type: z.literal("finish"), finishReason, totalUsage: usage }),
 	z.strictObject({ type: z.literal("error"), error: note }),
 ]);
+
+/** A plain identifier: no spaces, quotes, `:` or `=`, so it cannot hold an assignment. */
+const identifier = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
+
+/**
+ * The structured error a failed `tool-result` may carry as its `result`, either
+ * as this object or as its JSON text. `code` is a stable machine identifier,
+ * `kind` an optional display name, and `message` human-readable text. `code`
+ * and `kind` are plain identifiers: an ASCII letter or digit, then up to 127
+ * letters, digits, `.`, `_` or `-`. Chopin still accepts any JSON as a result;
+ * this is a recognised convention.
+ */
+export const toolErrorSchema = z.strictObject({
+	error: z.strictObject({
+		code: identifier,
+		kind: identifier.optional(),
+		message: note.min(1),
+	}),
+});
 
 const option = z.strictObject({
 	label: z.string().max(MAX_NOTE),
@@ -315,6 +336,7 @@ export const serverMessageSchema = z.discriminatedUnion("type", [
 export type ClientMessage = z.infer<typeof clientMessageSchema>;
 export type ServerMessage = z.infer<typeof serverMessageSchema>;
 export type StreamPart = z.infer<typeof streamPartSchema>;
+export type ToolError = z.infer<typeof toolErrorSchema>;
 export type InputCall = z.infer<typeof inputSchema>;
 export type InputMethod = InputCall["method"];
 export type LinkRun = z.infer<typeof runSchema>;

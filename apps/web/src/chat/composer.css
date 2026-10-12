@@ -230,6 +230,42 @@
 	flex-shrink: 0;
 }
 
+/*
+ * Who holds the remote Planner: one quiet line under the composer, aligned with
+ * the draft's text. The words name the state; the dot only repeats it.
+ */
+.chat-composer .composer-planner {
+	display: flex;
+	align-items: center;
+	gap: 0.375rem;
+	padding: 0.375rem 0.75rem 0;
+	color: var(--color-text-secondary);
+	font-size: var(--text-xs);
+	line-height: var(--text-xs--line-height);
+}
+.chat-composer .composer-planner-label {
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+.chat-composer .composer-planner-dot {
+	flex: none;
+	width: 0.375rem;
+	height: 0.375rem;
+	border-radius: var(--radius-full);
+	background: var(--color-success);
+}
+.chat-composer .composer-planner[data-planner-state="held"] .composer-planner-dot {
+	background: var(--color-warning);
+}
+.chat-composer .composer-planner[data-planner-state="none"] {
+	color: var(--color-text-tertiary);
+}
+/* Hollow: nothing holds the Planner. */
+.chat-composer .composer-planner[data-planner-state="none"] .composer-planner-dot {
+	border: var(--edge-width) solid currentColor;
+	background: transparent;
+}
+
 /* Inside the footer row, so losing the connection moves nothing above it. */
 .chat-composer .composer-connection {
 	display: inline-flex;
@@ -287,8 +323,8 @@
  * transcript keeps the space above the keyboard. Every phone-only rule lives
  * in this block, behind this one condition.
  */
-/* Landscape phones too; the shared `:root[data-phone]` hook can replace this condition. */
-@media (pointer: coarse) and (max-width: 600px), (pointer: coarse) and (max-height: 500px) {
+/* The phone class, landscape phones too. */
+:root[data-phone] {
 	.chat-composer {
 		padding-inline: 0.5rem;
 		/* The home indicator's inset, but not while the keyboard covers it. */
@@ -343,7 +379,7 @@
 	.chat-composer[data-planner="off"] .composer-mode-trigger {
 		display: none;
 	}
-	:root[data-plan-coarse-pointer] .chat-composer .composer-surface button:not([role="option"]) {
+	&[data-plan-coarse-pointer] .chat-composer .composer-surface button:not([role="option"]) {
 		min-width: var(--composer-pill-control);
 		min-height: var(--composer-pill-control);
 	}

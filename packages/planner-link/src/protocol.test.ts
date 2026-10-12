@@ -9,6 +9,7 @@ import {
 	parseServerMessage,
 	PLANNER_LINK_PATH,
 	PLANNER_LINK_VERSION,
+	toolErrorSchema,
 } from "./protocol";
 
 describe("Planner link messages", () => {
@@ -132,6 +133,69 @@ describe("Planner link messages", () => {
 			version: PLANNER_LINK_VERSION,
 			document: { id: "d", title: "T", repository: "o/r" },
 		}))).toMatchObject({ ok: true });
+	});
+
+	it("carries a structured tool error in a failed tool-result and recognises its envelope", () => {
+		let error = {
+			error: {
+				code: "no-repository-credential",
+				kind: "NoRepositoryCredential",
+				message: "No credential can read this repository.",
+			},
+		};
+		let message = {
+			type: "part" as const,
+			session: "s",
+			turn: "t",
+			part: {
+				type: "tool-result" as const,
+				toolCallId: "c",
+				toolName: "read",
+				result: error,
+				isError: true,
+			},
+		};
+		expect(parseClientMessage(encodeMessage(message))).toEqual({ ok: true, message });
+		expect(toolErrorSchema.parse(error)).toEqual(error);
+		let plain = { error: { code: "stale-revision", message: "The document moved on." } };
+		expect(toolErrorSchema.parse(plain)).toEqual(plain);
+		let dotted = {
+			error: { code: `E.clone_1-${"x".repeat(118)}`, kind: "Git.Timeout", message: "m" },
+		};
+		expect(toolErrorSchema.parse(dotted)).toEqual(dotted);
+	});
+
+	it("refuses a malformed tool error envelope but keeps any JSON as a tool result", () => {
+		for (
+			let malformed of [
+				{ error: "plain text" },
+				{ error: { message: "No code." } },
+				{ error: { code: "", message: "Empty code." } },
+				{ error: { code: "x".repeat(129), message: "Long code." } },
+				{ error: { code: "c", message: "" } },
+				{ error: { code: "c", message: "x".repeat(MAX_LINK_NOTE_LENGTH + 1) } },
+				{ error: { code: "c", kind: 3, message: "Numeric kind." } },
+				{ error: { code: "c", message: "Extra field.", stack: "at x" } },
+				{ error: { code: "c", message: "Extra sibling." }, details: {} },
+				{ error: { code: '{"token=abc":0}', message: "JSON code." } },
+				{ error: { code: "c", kind: '{"token=abc":0}', message: "JSON kind." } },
+				{ error: { code: "password: x", message: "Assignment code." } },
+				{ error: { code: "c", kind: "token=abc", message: "Assignment kind." } },
+				{ error: { code: "no credential", message: "Spaced code." } },
+				{ error: { code: "c", kind: "Bearer x", message: "Spaced kind." } },
+				{ error: { code: "-leading", message: "Leading punctuation." } },
+				{ error: { code: "__proto__", message: "Leading underscore." } },
+				{ error: { code: "line\u2028break", message: "Line separator." } },
+			]
+		) {
+			expect(toolErrorSchema.safeParse(malformed).success).toBe(false);
+			expect(parseClientMessage(JSON.stringify({
+				type: "part",
+				session: "s",
+				turn: "t",
+				part: { type: "tool-result", toolCallId: "c", toolName: "read", result: malformed },
+			}))).toMatchObject({ ok: true });
+		}
 	});
 
 	it("gives the wire-only client the same constants the server enforces", async () => {

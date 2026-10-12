@@ -30,6 +30,15 @@ export type Config = {
 	 * the document's Planner ownership for the same account to reattach.
 	 */
 	plannerAttachGraceMs: number;
+	/** How often the server sends a Planner link a WebSocket protocol ping. */
+	plannerLinkPingMs: number;
+	/** How long a Planner link may go without a pong or message before it counts as dropped. */
+	plannerLinkTimeoutMs: number;
+	/**
+	 * How long a Planner link may send nothing at all, however much of what the
+	 * server queued for it drains meanwhile, before it counts as dropped.
+	 */
+	plannerLinkMaxSilenceMs: number;
 	/**
 	 * Whether to run the agent at all.
 	 *
@@ -65,6 +74,13 @@ export type Config = {
 
 const DEFAULT_PORT = 8787;
 const DEFAULT_ATTACH_GRACE_MS = 120_000;
+export const DEFAULT_LINK_PING_MS = 15_000;
+export const DEFAULT_LINK_TIMEOUT_MS = 120_000;
+/**
+ * Long enough for a client reading at about 19 KiB/s to drain the 16 MiB Bun lets the
+ * server queue toward it and answer the next ping.
+ */
+export const DEFAULT_LINK_MAX_SILENCE_MS = 900_000;
 const DEFAULT_MODEL = "gpt-6-luna";
 
 /** The default is a Copilot model ID. Pi and Atomic resolve IDs against their
@@ -98,6 +114,17 @@ function port(): number {
 	let value = Number.parseInt(raw, 10);
 	if (!Number.isInteger(value) || value < 1 || value > 65535) {
 		throw new Error(`PORT must be a number between 1 and 65535, got ${JSON.stringify(raw)}`);
+	}
+	return value;
+}
+
+/** A Planner link liveness setting, in whole milliseconds from 1 second to `max`, 10 minutes by default. */
+function milliseconds(name: string, fallback: number, max = 600_000): number {
+	let raw = process.env[name];
+	if (raw === undefined) return fallback;
+	let value = Number(raw);
+	if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < 1_000 || value > max) {
+		throw new Error(`${name} must be an integer between 1000 and ${max} milliseconds`);
 	}
 	return value;
 }
@@ -155,6 +182,19 @@ export function load(): Config {
 			"PLANNER_ATTACH_GRACE_MS must be an integer between 0 and 3600000 milliseconds",
 		);
 	}
+	let plannerLinkPingMs = milliseconds("PLANNER_LINK_PING_MS", DEFAULT_LINK_PING_MS);
+	let plannerLinkTimeoutMs = milliseconds("PLANNER_LINK_TIMEOUT_MS", DEFAULT_LINK_TIMEOUT_MS);
+	if (plannerLinkTimeoutMs <= plannerLinkPingMs) {
+		throw new Error("PLANNER_LINK_TIMEOUT_MS must be longer than PLANNER_LINK_PING_MS");
+	}
+	let plannerLinkMaxSilenceMs = milliseconds(
+		"PLANNER_LINK_MAX_SILENCE_MS",
+		DEFAULT_LINK_MAX_SILENCE_MS,
+		3_600_000,
+	);
+	if (plannerLinkMaxSilenceMs < plannerLinkTimeoutMs) {
+		throw new Error("PLANNER_LINK_MAX_SILENCE_MS must be at least PLANNER_LINK_TIMEOUT_MS");
+	}
 	let selection = harnessSelection();
 	if (selection.harness === "remote" && backgroundJobs) {
 		throw new Error(
@@ -167,6 +207,9 @@ export function load(): Config {
 		port: serverPort,
 		model: model(selection.harness),
 		plannerAttachGraceMs,
+		plannerLinkPingMs,
+		plannerLinkTimeoutMs,
+		plannerLinkMaxSilenceMs,
 		agent,
 		backgroundJobs,
 		webResearch: agent && backgroundJobs && process.env.WEB_RESEARCH !== "off",

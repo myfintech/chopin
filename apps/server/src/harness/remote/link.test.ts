@@ -17,6 +17,7 @@ import {
 	DENIED_TOKEN,
 	finishTurn,
 	GUEST_TOKEN,
+	holdingProxy,
 	linkAuth,
 	linkServer,
 	MEMBER_TOKEN,
@@ -24,6 +25,8 @@ import {
 	rawLink,
 	RIVAL_TOKEN,
 	scriptedPlanner,
+	silentLink,
+	slowUplink,
 	VIEWER_TOKEN,
 } from "../../testing/planner-link";
 import { createRemoteAdapter } from "./adapter";
@@ -122,6 +125,13 @@ async function rawAttached(server: ReturnType<typeof linkServer>, document: stri
 		return start.session as string;
 	});
 	return { raw, started };
+}
+
+/** Waits until `condition` holds, for at most `withinMs`. */
+async function until(condition: () => boolean, withinMs: number) {
+	for (let deadline = Date.now() + withinMs; !condition() && Date.now() < deadline;) {
+		await Bun.sleep(10);
+	}
 }
 
 function upgradeRequest(url: string, headers: Record<string, string> = {}) {
@@ -575,6 +585,229 @@ describe("Planner link ownership", () => {
 		expect(server.attachments.attached(channel.id)).toBe(false);
 		await rivalAttaches(server.url, channel.id, storage, logins.get("rival")!);
 	});
+
+	describe("liveness", () => {
+		const liveness = { pingEveryMs: 50, pongTimeoutMs: 300 };
+
+		it("closes a link that stops answering pings within the timeout, ending its turn as a drop does", async () => {
+			let { auth, channel } = await linkAuth();
+			let server = linkServer(auth, 2_000, undefined, 2_000, liveness);
+			cleanups.push(server.stop);
+			let silent = await silentLink(server.url);
+			cleanups.push(silent.end);
+			silent.send({ type: "attach", version: PLANNER_LINK_VERSION, document: channel.id });
+			await silent.next("attached");
+			expect(server.attachments.attached(channel.id)).toBe(true);
+			let started = silent.next("start").then(start => {
+				silent.send({ type: "started", session: start.session });
+				return silent.next("turn");
+			});
+			let outcome = streamTurn(
+				adapterFor(server, { channelId: channel.id, isolated: false }),
+				"hang",
+			);
+			let turn = await started;
+			let quiet = Date.now();
+			expect(turn).toMatchObject({ type: "turn", prompt: "hang" });
+			expect(await silent.closed).toEqual({
+				code: LINK_CLOSE.unresponsive,
+				reason: "unresponsive",
+			});
+			let elapsed = Date.now() - quiet;
+			expect(elapsed).toBeGreaterThan(liveness.pongTimeoutMs - 100);
+			expect(elapsed).toBeLessThan(liveness.pongTimeoutMs + 500);
+			expect(silent.pings).toBeGreaterThanOrEqual(3);
+			let { errors, session } = await outcome;
+			expect(errors.join("\n")).toContain("disconnected during the turn");
+			expect(session.hasUnfinishedTurn()).toBe(false);
+			expect(server.links).toEqual([]);
+			expect(server.attachments.attached(channel.id)).toBe(false);
+		});
+
+		it("holds a silent link's ownership through the grace period, then releases it", async () => {
+			let { auth, storage, channel, logins } = await linkAuth();
+			let server = linkServer(auth, 2_000, undefined, 400, liveness);
+			cleanups.push(server.stop);
+			let silent = await silentLink(server.url);
+			cleanups.push(silent.end);
+			silent.send({ type: "attach", version: PLANNER_LINK_VERSION, document: channel.id });
+			await silent.next("attached");
+			expect((await silent.closed).code).toBe(LINK_CLOSE.unresponsive);
+			expect(server.attachments.attached(channel.id)).toBe(false);
+			expect(await owner(storage, channel.id))
+				.toMatchObject({ ownerSessionId: logins.get("member"), generation: 1 });
+			let refusal = await refused(server.url, channel.id, RIVAL_TOKEN);
+			expect(refusal).toMatchObject({ code: "planner-attached", close: LINK_CLOSE.attached });
+			expect(refusal.message).toStartWith(
+				"member detached from this document's Planner and holds it until ",
+			);
+			for (let deadline = Date.now() + 3_000; Date.now() < deadline;) {
+				if (!(await owner(storage, channel.id))?.ownerSessionId) break;
+				await Bun.sleep(25);
+			}
+			expect(await owner(storage, channel.id))
+				.toMatchObject({ ownerSessionId: undefined, generation: 1, status: "unavailable" });
+			await rivalAttaches(server.url, channel.id, storage, logins.get("rival")!);
+		});
+
+		it("keeps a client that answers pings attached across several timeouts", async () => {
+			let { auth, channel } = await linkAuth();
+			let server = linkServer(auth, 2_000, undefined, 2_000, liveness);
+			cleanups.push(server.stop);
+			let script = scriptedPlanner();
+			let client = await attach(server.url, channel.id, script.handlers);
+			cleanups.push(() => client.detach());
+			await Bun.sleep(liveness.pongTimeoutMs * 4);
+			expect(server.links).toHaveLength(1);
+			expect(server.attachments.attached(channel.id)).toBe(true);
+			let { errors } = await streamTurn(
+				adapterFor(server, { channelId: channel.id, isolated: false }),
+				"turn",
+			);
+			expect(errors).toEqual([]);
+			expect(script.turns).toHaveLength(1);
+		});
+
+		/** Writes valid host results until the server's outbound queue passes Bun's 16 MiB limit. */
+		function flood(server: ReturnType<typeof linkServer>) {
+			let [socket] = server.sockets;
+			let result = JSON.stringify({
+				type: "host-tool-result",
+				session: "session",
+				turn: "turn",
+				toolCallId: "call",
+				output: "x".repeat(MAX_LINK_MESSAGE_BYTES - 200),
+				isError: false,
+			});
+			for (let count = 0; count < 15; count++) socket!.send(result);
+			expect(socket!.getBufferedAmount()).toBeGreaterThan(16 * 1024 * 1024);
+			return socket!;
+		}
+
+		/** Bun's client socket, which can stop reading from the network. */
+		type Readable = WebSocket & { pause(): boolean; resume(): boolean; terminate(): void };
+
+		// Bun drops control frames, pings included, while the queue is over its limit.
+		const backlogged = { pingEveryMs: 200, pongTimeoutMs: 600 };
+
+		it(
+			"keeps a client that stopped reading under a flood once it reads again and drains",
+			async () => {
+				let { auth, channel } = await linkAuth();
+				let server = linkServer(auth, 2_000, undefined, 2_000, backlogged);
+				cleanups.push(server.stop);
+				let raw = await rawLink(server.url);
+				let client = raw.socket as Readable;
+				cleanups.push(() => client.close());
+				raw.send({ type: "attach", version: PLANNER_LINK_VERSION, document: channel.id });
+				await raw.next("attached");
+				client.pause();
+				let socket = flood(server);
+				await Bun.sleep(backlogged.pingEveryMs * 2.4);
+				client.resume();
+				await until(() => socket.getBufferedAmount() === 0, 3_000);
+				expect(socket.getBufferedAmount()).toBe(0);
+				await Bun.sleep(backlogged.pongTimeoutMs * 3);
+				expect(client.readyState).toBe(WebSocket.OPEN);
+				expect(server.attachments.attached(channel.id)).toBe(true);
+				expect(server.links).toHaveLength(1);
+			},
+			10_000,
+		);
+
+		it(
+			"closes a client that stops reading under a flood and never drains within about the timeout",
+			async () => {
+				let { auth, channel } = await linkAuth();
+				let server = linkServer(auth, 2_000, undefined, 2_000, backlogged);
+				cleanups.push(server.stop);
+				let raw = await rawLink(server.url);
+				let client = raw.socket as Readable;
+				cleanups.push(() => client.terminate());
+				raw.send({ type: "attach", version: PLANNER_LINK_VERSION, document: channel.id });
+				await raw.next("attached");
+				client.pause();
+				let quiet = Date.now();
+				flood(server);
+				await until(() => !server.attachments.attached(channel.id), 3_000);
+				let elapsed = Date.now() - quiet;
+				expect(server.attachments.attached(channel.id)).toBe(false);
+				expect(server.links).toEqual([]);
+				expect(elapsed).toBeGreaterThan(backlogged.pongTimeoutMs - 100);
+				expect(elapsed).toBeLessThan(backlogged.pongTimeoutMs + 500);
+			},
+			10_000,
+		);
+
+		it(
+			"closes a silent client by about the silence cap although a proxy keeps draining its queue",
+			async () => {
+				// Bun hands the proxy its queue in steps about half a second apart at this pace.
+				let capped = { pingEveryMs: 100, pongTimeoutMs: 800, maxSilenceMs: 1_600 };
+				let { auth, channel } = await linkAuth();
+				let server = linkServer(auth, 2_000, undefined, 2_000, capped);
+				cleanups.push(server.stop);
+				let proxy = await holdingProxy(server.url, 100);
+				cleanups.push(proxy.stop);
+				let raw = await rawLink(proxy.url);
+				cleanups.push(() => (raw.socket as Readable).terminate());
+				raw.send({ type: "attach", version: PLANNER_LINK_VERSION, document: channel.id });
+				await raw.next("attached");
+				let quiet = Date.now();
+				proxy.hold();
+				let socket = flood(server);
+				let queued = socket.getBufferedAmount();
+				let drainedPastTimeout = false;
+				setTimeout(() => {
+					drainedPastTimeout = socket.getBufferedAmount() < queued;
+				}, capped.pongTimeoutMs + 300);
+				await until(() => !server.attachments.attached(channel.id), 6_000);
+				let elapsed = Date.now() - quiet;
+				expect(server.attachments.attached(channel.id)).toBe(false);
+				expect(server.links).toEqual([]);
+				expect(elapsed).toBeGreaterThan(capped.maxSilenceMs - 100);
+				expect(elapsed).toBeLessThan(capped.maxSilenceMs + 500);
+				// The queue was still draining past the timeout, which defers the close only up to the cap.
+				expect(drainedPastTimeout).toBe(true);
+			},
+			10_000,
+		);
+
+		it(
+			"keeps a live client through an upload that outlasts several pings but not the timeout",
+			async () => {
+				let slow = { pingEveryMs: 100, pongTimeoutMs: 1_500 };
+				let { auth, channel } = await linkAuth();
+				let server = linkServer(auth, 2_000, undefined, 2_000, slow);
+				cleanups.push(server.stop);
+				let uplink = await slowUplink(server.url, 4_096, 10);
+				cleanups.push(uplink.stop);
+				let raw = await rawLink(uplink.url);
+				cleanups.push(() => raw.socket.close());
+				raw.send({ type: "attach", version: PLANNER_LINK_VERSION, document: channel.id });
+				await raw.next("attached");
+				// One unfragmented frame: the client's pongs queue behind it until it is through.
+				let frame = JSON.stringify({
+					type: "part",
+					session: "session",
+					turn: "turn",
+					part: { type: "text-delta", id: "text", delta: "x".repeat(256 * 1024) },
+				});
+				let before = uplink.uploaded;
+				let started = Date.now();
+				raw.send(frame);
+				await until(() => uplink.uploaded - before >= frame.length, slow.pongTimeoutMs);
+				let took = Date.now() - started;
+				expect(uplink.uploaded - before).toBeGreaterThanOrEqual(frame.length);
+				expect(took).toBeGreaterThan(slow.pingEveryMs * 3);
+				expect(took).toBeLessThan(slow.pongTimeoutMs);
+				await Bun.sleep(slow.pongTimeoutMs);
+				expect(raw.socket.readyState).toBe(WebSocket.OPEN);
+				expect(server.attachments.attached(channel.id)).toBe(true);
+			},
+			10_000,
+		);
+	});
 });
 
 describe("Planner link protocol", () => {
@@ -732,6 +965,55 @@ describe("Planner link protocol", () => {
 			.toMatchObject([{ toolName: "read_plan" }]);
 		expect(JSON.stringify(outcome.parts)).not.toContain("x".repeat(1_000));
 		expect(JSON.stringify(outcome.parts)).toContain(failure.error);
+	});
+
+	it("reports an own tool's structured error as a failure and returns host results unredacted", async () => {
+		let secret = `token=ghp_${"A".repeat(30)}\npassword: hunter2`;
+		let envelope = {
+			error: { code: "no-repository-credential", kind: "NoRepositoryCredential", message: "Nope." },
+		};
+		let seen: unknown[] = [];
+		let reports: unknown[] = [];
+		let { server, channel } = await setup({
+			async turn(context) {
+				seen.push(await context.callHostTool("read_plan", {}));
+				context.offerTools(["fetch_repository"]);
+				context.emit({
+					type: "tool-call",
+					toolCallId: "own-1",
+					toolName: "fetch_repository",
+					input: "{}",
+					providerExecuted: true,
+				});
+				context.emit({
+					type: "tool-result",
+					toolCallId: "own-1",
+					toolName: "fetch_repository",
+					result: envelope,
+					isError: true,
+				});
+				finishTurn(context);
+			},
+		});
+		let agent = new HarnessAgent({
+			harness: adapterFor(server, {
+				channelId: channel.id,
+				isolated: false,
+				toolReport: (...report) => reports.push(report),
+			}),
+			tools: { read_plan: tool({ inputSchema: z.object({}), execute: async () => secret }) },
+			activeTools: ["read_plan"],
+			permissionMode: "allow-reads",
+		});
+		let session = await agent.createSession({ sandboxSession });
+		cleanups.push(() => session.destroy());
+		let outcome = await streamOn(agent, session, "structured");
+		expect(outcome.errors).toEqual([]);
+		expect(seen).toEqual([{ output: secret, isError: false }]);
+		expect(reports).toEqual([["own-1", envelope, "failed"]]);
+		expect(outcome.parts.filter(part => part.type === "tool-error")).toMatchObject([
+			{ toolCallId: "own-1", error: envelope },
+		]);
 	});
 
 	it("fails a session the client refuses or never starts, and tells it to let go", async () => {

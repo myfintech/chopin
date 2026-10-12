@@ -344,8 +344,12 @@ produce, is cleared under its generation and the document is claimed again.
 One client holds a document's Planner. While it is attached, every other
 `attach` for that document is refused with `planner-attached` (4409) and a
 message naming its GitHub login. A link that detaches or drops keeps the
-ownership for `PLANNER_ATTACH_GRACE_MS` (2 minutes by default): the same account
-can attach again within it and keeps the same ownership generation, and anyone
+ownership for `PLANNER_ATTACH_GRACE_MS` (2 minutes by default). A link that
+answers none of the server's [protocol pings](planner-link.md#pings) for
+`PLANNER_LINK_TIMEOUT_MS` (2 minutes by default) is closed as dropped, so a
+client whose network silently went away does not keep the document attached.
+Within the grace period the same account can attach again and keeps the same
+ownership generation, and anyone
 else is refused. When it ends, the ownership is cleared under its generation, so
 a newer owner is never released by an old timer. An attach, including a grace
 reattach, binds only if no sign-out, expiry, or Planner reset of its ownership
@@ -353,6 +357,14 @@ landed while it was checking, including the eligibility checks of the sign-in
 it is about to claim with; otherwise it is refused like an attached link would
 be closed. Attachments live in the server process; startup already clears
 every owner reference, which releases every attachment.
+
+**Who is attached.** Each room socket hears `session:planner` after
+`session:hello`, and the whole room hears it again whenever an attachment
+changes: an attach, a detach into the grace period with the time it ends, the
+grace period ending, a sign-out, a Planner reset, or the server closing a link
+whose ownership was released. It names only the holder's GitHub login and
+state, never a machine, checkout, or token. Chat shows it as one line under the
+composer. Other harnesses never send it, and Chat then shows nothing.
 
 **Unattached documents.** Members, MCP callers, and research requests never claim
 ownership under `HARNESS=remote`. An `@chopin` message or `invoke_planner` call

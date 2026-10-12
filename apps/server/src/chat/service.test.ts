@@ -1,5 +1,6 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { ulid } from "@chopin/dialect";
+import { MAX_LINK_NOTE_LENGTH } from "@chopin/planner-link";
 
 import {
 	consumeBootstrapBackscroll,
@@ -11,6 +12,8 @@ import {
 	sessionBootstrap,
 	translate,
 } from "./service";
+import { outputText } from "./activity";
+import { URL_CREDENTIAL_LEAKS } from "./activity.test-fixtures";
 
 import { PLANNER_TOOL_NAMES } from "../harness/tool-names";
 
@@ -36,6 +39,11 @@ function part(value: Record<string, unknown>): TextStreamPart<ToolSet> {
 
 function call(toolName: string, toolCallId = "t1", input: unknown = {}) {
 	return part({ type: "tool-call", toolCallId, toolName, input });
+}
+
+/** A structured tool error envelope as JSON text. */
+function envelope(code: string, message: string, kind?: string) {
+	return JSON.stringify({ error: { code, ...(kind === undefined ? {} : { kind }), message } });
 }
 
 describe("AI SDK stream projection", () => {
@@ -421,6 +429,309 @@ describe("AI SDK stream projection", () => {
 			expect(JSON.stringify(chat.entries)).not.toContain("synthetic-final-314");
 		},
 	);
+
+	let structured = {
+		error: {
+			code: "no-repository-credential",
+			kind: "NoRepositoryCredential",
+			message: "No credential can read octo-org/score.",
+		},
+	};
+
+	it.each([
+		["a streamed object", "stream", structured],
+		["a streamed serialization", "stream", JSON.stringify(structured)],
+		["a host object", "host", structured],
+		["a host serialization", "host", JSON.stringify(structured)],
+	])(
+		"shows a failed tool's structured error from %s as its label and message",
+		(_name, mode, output) => {
+			let chat = create();
+			let { context, sent } = room(chat);
+			translate(context, call("read_plan"));
+			if (mode === "host") finished(context, "t1", output, false);
+			else {
+				translate(
+					context,
+					part({ type: "tool-error", toolCallId: "t1", toolName: "read_plan", error: output }),
+				);
+			}
+			let expected = {
+				status: "failed",
+				error: { code: "no-repository-credential", kind: "NoRepositoryCredential" },
+				result: "No credential can read octo-org/score.",
+			};
+			expect(sent.findLast(frame => frame.kind === "chat:tool")?.activity).toMatchObject(expected);
+			expect(chat.entries[0]?.tools?.[0]).toMatchObject(expected);
+		},
+	);
+
+	it.each(["stream", "host"])(
+		"shows a %s failure whose error is a class instance as its raw result",
+		mode => {
+			let chat = create();
+			let { context, sent } = room(chat);
+			translate(context, call("read_plan"));
+			let output = {
+				error: Object.assign(new Error("Recovery code 1234-5678"), { code: "denied" }),
+			};
+			if (mode === "host") finished(context, "t1", output, false);
+			else {
+				translate(
+					context,
+					part({ type: "tool-error", toolCallId: "t1", toolName: "read_plan", error: output }),
+				);
+			}
+			let broadcast = sent.findLast(frame => frame.kind === "chat:tool")?.activity as Wire.Activity;
+			let stored = chat.entries[0]!.tools![0]!;
+			for (let activity of [broadcast, stored]) {
+				expect(activity).toMatchObject({ status: "failed", result: '{"error":{"code":"denied"}}' });
+				expect(activity.error).toBeUndefined();
+			}
+			expect(JSON.stringify(sent)).not.toContain("1234-5678");
+			expect(JSON.stringify(chat.entries)).not.toContain("1234-5678");
+		},
+	);
+
+	it("shows a structured error whose code or kind is not a plain identifier as its raw result", () => {
+		let chat = create();
+		let { context } = room(chat);
+		let token = `ghp_${"A".repeat(30)}`;
+		let envelopes = [
+			{ error: { code: "password: synthetic-code-314", message: "Denied." } },
+			{ error: { code: "denied", kind: `Bearer ${"k".repeat(20)}`, message: "Denied." } },
+			{ error: { code: token, message: "Denied." } },
+			{ error: { code: "denied", kind: token, message: "Denied." } },
+		];
+		for (let [index, failure] of envelopes.entries()) {
+			translate(context, call("read_plan", `t${index}`));
+			finished(context, `t${index}`, failure, false);
+		}
+		let tools = chat.entries[0]!.tools!;
+		expect(tools.map(tool => tool.result)).toEqual([
+			'{"error":{"code":"password: [redacted]","message":"Denied."}}',
+			'{"error":{"code":"denied","kind":"Bearer [redacted]","message":"Denied."}}',
+			'{"error":{"code":"[redacted]","message":"Denied."}}',
+			'{"error":{"code":"denied","kind":"[redacted]","message":"Denied."}}',
+		]);
+		expect(tools.every(tool => tool.status === "failed" && tool.error === undefined)).toBe(true);
+	});
+
+	it("scrubs a structured error's message as plain text before publication and retention", () => {
+		let chat = create();
+		let { context, sent } = room(chat);
+		translate(context, call("read_plan"));
+		let token = `ghp_${"A".repeat(30)}`;
+		finished(context, "t1", {
+			error: {
+				code: "denied",
+				kind: "Denied",
+				message: `Failed with Bearer ${"m".repeat(20)}; password: synthetic-message-314 ${token}`,
+			},
+		}, false);
+		let expected = {
+			status: "failed",
+			error: { code: "denied", kind: "Denied" },
+			result: "Failed with Bearer [redacted]; password: [redacted]",
+		};
+		expect(sent.findLast(frame => frame.kind === "chat:tool")?.activity).toMatchObject(expected);
+		expect(chat.entries[0]?.tools?.[0]).toMatchObject(expected);
+		for (let secret of ["synthetic-message-314", "m".repeat(20), token]) {
+			expect(JSON.stringify(sent)).not.toContain(secret);
+			expect(JSON.stringify(chat.entries)).not.toContain(secret);
+		}
+	});
+
+	it("masks a URL password in a structured error's message before publication and retention", () => {
+		let chat = create();
+		let { context, sent } = room(chat);
+		translate(context, call("read_plan"));
+		let message = "Could not clone https://alice:synthetic-url-314@github.com/octo-org/score.git";
+		finished(context, "t1", envelope("clone-failed", message, "CloneFailed"), false);
+		let expected = {
+			status: "failed",
+			error: { code: "clone-failed", kind: "CloneFailed" },
+			result: "Could not clone https://[redacted]@github.com/octo-org/score.git",
+		};
+		expect(sent.findLast(frame => frame.kind === "chat:tool")?.activity).toMatchObject(expected);
+		expect(chat.entries[0]?.tools?.[0]).toMatchObject(expected);
+		expect(JSON.stringify(sent)).not.toContain("synthetic-url-314");
+		expect(JSON.stringify(chat.entries)).not.toContain("synthetic-url-314");
+	});
+
+	it.each(URL_CREDENTIAL_LEAKS)(
+		"never publishes or retains a URL credential with %s in a structured error or result",
+		(_name, input, secrets) => {
+			let chat = create();
+			let { context, sent } = room(chat);
+			translate(context, call("read_plan", "error"));
+			finished(context, "error", envelope("clone-failed", input, "CloneFailed"), false);
+			translate(context, call("read_plan", "result"));
+			finished(context, "result", input, false);
+			let [error, result] = chat.entries[0]!.tools!;
+			// A message longer than a link note is no envelope and shows as the raw result.
+			let envelopeCode = input.length > MAX_LINK_NOTE_LENGTH ? undefined : "clone-failed";
+			expect(error?.status).toBe("failed");
+			expect(error?.error?.code).toBe(envelopeCode);
+			expect(result?.status).toBe("failed");
+			let broadcast = sent.filter(frame => frame.kind === "chat:tool").map(frame => frame.activity);
+			let shown = [JSON.stringify(broadcast), JSON.stringify(chat.entries)];
+			for (let text of shown) {
+				for (let secret of secrets) expect(text).not.toContain(secret);
+			}
+		},
+	);
+
+	it("does not reveal a credential in a property name of JSON text in a code or message", () => {
+		let chat = create();
+		let { context, sent } = room(chat);
+		translate(context, call("read_plan", "code"));
+		finished(context, "code", '{"error":{"code":"{\\"token=abc\\":0}","message":"Denied"}}', false);
+		translate(context, call("read_plan", "message"));
+		finished(
+			context,
+			"message",
+			'{"error":{"code":"denied","message":"{\\"token=abc\\":0}"}}',
+			false,
+		);
+		let [code, message] = chat.entries[0]!.tools!;
+		expect(code).toMatchObject({
+			status: "failed",
+			result: '{"error":{"code":"{\\"token=[redacted]}","message":"Denied"}}',
+		});
+		expect(code?.error).toBeUndefined();
+		expect(message).toMatchObject({
+			status: "failed",
+			error: { code: "denied" },
+			result: '{"token=[redacted]}',
+		});
+		let broadcast = sent.filter(frame => frame.kind === "chat:tool").map(frame => frame.activity);
+		expect(JSON.stringify(broadcast)).not.toContain("abc");
+		expect(JSON.stringify(chat.entries)).not.toContain("abc");
+	});
+
+	it("hides every secret in a structured error that its raw result display hides", () => {
+		let token = `ghp_${"S".repeat(30)}`;
+		let corpus: Array<[string, string, string[]]> = [
+			["JSON in code", envelope('{"token=syn-c1":0}', "Denied"), ["syn-c1"]],
+			["JSON in kind", envelope("denied", "Denied", '{"password=syn-k1":0}'), ["syn-k1"]],
+			["assignment key in JSON message", envelope("denied", '{"token=syn-m1":0}'), ["syn-m1"]],
+			["secret key in JSON message", envelope("denied", '{"api_key":"syn-m2","n":1}'), ["syn-m2"]],
+			["spaced JSON message", envelope("denied", '{ "secret" : "syn-m3" }'), ["syn-m3"]],
+			["password in message", envelope("denied", "password: syn-p1"), ["syn-p1"]],
+			["password in code", envelope("password: syn-p2", "Denied"), ["syn-p2"]],
+			[
+				"authorization in message",
+				envelope("denied", "Authorization: Bearer syn-bearer-0123456789"),
+				["syn-bearer-0123456789"],
+			],
+			["bearer in kind", envelope("denied", "Denied", "Bearer syn-bearer-9876543210"), [
+				"syn-bearer-9876543210",
+			]],
+			["token assignment in message", envelope("denied", "token=syn-t1"), ["syn-t1"]],
+			["token assignment in code", envelope("token=syn-t2", "Denied"), ["syn-t2"]],
+			["token assignment in kind", envelope("denied", "Denied", "token=syn-t3"), ["syn-t3"]],
+			["GitHub token in message", envelope("denied", `cloned with ${token}`), [token]],
+			["GitHub token as code", envelope(token, "Denied"), [token]],
+			["GitHub token as kind", envelope("denied", "Denied", token), [token]],
+			["prefixed GitHub token in code", envelope(`E.${token}`, "Denied"), [token]],
+			["line separator in message", envelope("denied", "ok\u2028password: syn-ls1"), ["syn-ls1"]],
+			["paragraph separator in message", envelope("denied", "ok\u2029token=syn-ps1"), ["syn-ps1"]],
+			["line separator in code", envelope("c\u2028token=syn-ls2", "Denied"), ["syn-ls2"]],
+			[
+				"duplicate message, secret last",
+				'{"error":{"code":"denied","message":"ok","message":"token=syn-dup1"}}',
+				["syn-dup1"],
+			],
+			[
+				"duplicate code, secret last",
+				'{"error":{"code":"denied","code":"{\\"token=syn-dup2\\":0}","message":"Denied"}}',
+				["syn-dup2"],
+			],
+			[
+				"duplicate error, secret last",
+				'{"error":{"code":"denied","message":"ok"},"error":{"code":"denied","message":"password: syn-dup3"}}',
+				["syn-dup3"],
+			],
+			[
+				"__proto__ in error",
+				'{"error":{"code":"denied","message":"Denied","__proto__":{"token":"syn-proto1"}}}',
+				["syn-proto1"],
+			],
+			[
+				"__proto__ beside error",
+				'{"__proto__":{"password":"syn-proto2"},"error":{"code":"denied","message":"Denied"}}',
+				["syn-proto2"],
+			],
+			["__proto__ as code", envelope("__proto__", "token=syn-proto3"), ["syn-proto3"]],
+			["near-limit message", envelope("denied", `${"x".repeat(3_980)}password: syn-near1`), [
+				"syn-near1",
+			]],
+			["near-limit token", envelope("denied", `${"x".repeat(3_960)} ${token}`), [token]],
+			["over-limit message", envelope("denied", `${"x".repeat(3_990)} token=syn-near2`), [
+				"syn-near2",
+			]],
+		];
+		for (let [name, text, secrets] of corpus) {
+			for (let output of [text, JSON.parse(text) as unknown]) {
+				let old = outputText(output);
+				let hidden = secrets.filter(secret => !old.includes(secret));
+				expect({ name, hidden }).toEqual({ name, hidden: secrets });
+				let chat = create();
+				let { context, sent } = room(chat);
+				translate(context, call("read_plan"));
+				finished(context, "t1", output, false);
+				let broadcast = sent.findLast(frame => frame.kind === "chat:tool")
+					?.activity as Wire.Activity;
+				let stored = chat.entries[0]!.tools![0]!;
+				for (let activity of [broadcast, stored]) {
+					let shown = [activity.error?.code, activity.error?.kind, activity.result].join("\n");
+					for (let secret of hidden) {
+						expect({ name, leaked: shown.includes(secret) }).toEqual({ name, leaked: false });
+					}
+				}
+			}
+		}
+	});
+
+	it("recognises a structured error only while its message is within the result bound", () => {
+		let chat = create();
+		let { context } = room(chat);
+		translate(context, call("read_plan", "bounded"));
+		finished(context, "bounded", { error: { code: "huge", message: "x".repeat(4_000) } }, false);
+		translate(context, call("read_plan", "over"));
+		finished(context, "over", { error: { code: "huge", message: "x".repeat(4_001) } }, false);
+		let [bounded, over] = chat.entries[0]!.tools!;
+		expect(bounded).toMatchObject({ error: { code: "huge" }, result: "x".repeat(4_000) });
+		expect(over?.error).toBeUndefined();
+		expect(over?.result).toHaveLength(4_000);
+		expect(over?.result?.startsWith('{"error":')).toBe(true);
+	});
+
+	it("treats an error envelope as an ordinary result unless the tool failed", () => {
+		let chat = create();
+		let { context } = room(chat);
+		let raw = JSON.stringify(structured);
+		translate(context, call("read_plan", "done"));
+		translate(
+			context,
+			part({ type: "tool-result", toolCallId: "done", toolName: "read_plan", output: structured }),
+		);
+		translate(context, call("read_plan", "running"));
+		progressed(context, "running", structured);
+		translate(context, call("read_reference", "private"));
+		finished(context, "private", structured, false);
+		translate(context, call("read_plan", "malformed"));
+		finished(context, "malformed", { error: { code: "c", message: "m", stack: "at x" } }, false);
+		let tools = chat.entries[0]!.tools!;
+		expect(tools.map(tool => [tool.id, tool.status, tool.result])).toEqual([
+			["done", "done", raw],
+			["running", "running", raw],
+			["private", "failed", "The reference could not be read."],
+			["malformed", "failed", '{"error":{"code":"c","message":"m","stack":"at x"}}'],
+		]);
+		expect(tools.every(tool => tool.error === undefined)).toBe(true);
+	});
 
 	it("accepts the tools of a full session's active set and rejects the rest", () => {
 		let chat = create();

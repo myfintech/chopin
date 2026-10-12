@@ -7,9 +7,16 @@
  * Planner owner. Nothing is posted to the document by attaching or refusing.
  */
 
+import { LINK_CLOSE } from "@chopin/planner-link";
+
 import { AdmissionDenied } from "../../auth/admission";
 import { documentUrl } from "../../channels/document-url";
 import { GitHubError } from "../../github/client";
+import {
+	DEFAULT_LINK_MAX_SILENCE_MS,
+	DEFAULT_LINK_PING_MS,
+	DEFAULT_LINK_TIMEOUT_MS,
+} from "../../config";
 import { locateDocument } from "../../mcp/hosted";
 import { forbiddenMessage } from "./attachments";
 import { PlannerLink } from "./link";
@@ -31,6 +38,8 @@ export type PlannerLinkSocketData = {
 	sidebar?: undefined;
 	caller: HostedCaller;
 	link?: PlannerLink;
+	/** The link's liveness: any frame from the client is `heard`; `stop` ends its pings. */
+	alive?: { heard(): void; stop(): void };
 };
 
 export type PlannerLinkHooks = {
@@ -42,6 +51,18 @@ export type PlannerLinkHooks = {
 	register?: LinkOptions["register"];
 	timeoutMs?: number;
 	revalidateEveryMs?: number;
+	/** How often the link is sent a protocol ping. */
+	pingEveryMs?: number;
+	/**
+	 * How long the link may send nothing, not even a pong, and read none of what the
+	 * server queued for it, before it is closed as dropped.
+	 */
+	pongTimeoutMs?: number;
+	/**
+	 * How long the link may send nothing at all, however much of the server's
+	 * queue drains meanwhile, before it is closed as dropped. 15 minutes by default.
+	 */
+	maxSilenceMs?: number;
 };
 
 const BEARER = /^Bearer ([A-Za-z0-9._~+/-]+=*)$/i;
@@ -170,13 +191,64 @@ export function isPlannerLinkSocket(
 	return (ws.data as { plannerLink?: unknown } | undefined)?.plannerLink === true;
 }
 
+/**
+ * Opens the link and starts its protocol pings. The socket's `message` and
+ * `pong` handlers call `alive.heard()`, and its `close` handler `alive.stop()`.
+ */
 export function openPlannerLinkSocket(
 	ws: ServerWebSocket<PlannerLinkSocketData>,
 	auth: PlannerLinkAuth,
 	hooks: PlannerLinkHooks,
 ): void {
-	ws.data.link = plannerLink(ws.data.caller, auth, {
+	let link = plannerLink(ws.data.caller, auth, {
 		send: text => void ws.send(text),
 		close: (code, reason) => ws.close(code, reason),
 	}, hooks);
+	ws.data.link = link;
+	// A network that silently goes away sends no FIN or RST. Bun's server-wide
+	// idle timeout is two minutes and every send resets it, so a link the server
+	// keeps writing to would stay attached and its document's turns go nowhere.
+	//
+	// A client slow to read leaves the server's frames queued, and Bun drops
+	// control frames, pings included, while that queue is over its limit; an
+	// empty ping returns the same whether it was sent or dropped. So a ping goes
+	// out only once the queue is empty, and a queue that shrank since it was last
+	// looked at defers the close by another timeout.
+	//
+	// A shrinking queue does not prove the client reads it: the kernel's buffers
+	// or a proxy in front of it may be what drains it. So that deferral never runs
+	// past `maxSilenceMs` after the client last sent anything; a client reading a
+	// long backlog must send something, such as the pongs that follow it, by then.
+	let timeoutMs = hooks.pongTimeoutMs ?? DEFAULT_LINK_TIMEOUT_MS;
+	let maxSilenceMs = hooks.maxSilenceMs ?? DEFAULT_LINK_MAX_SILENCE_MS;
+	let heard = Date.now();
+	let progressed = heard;
+	let backlog = 0;
+	function reading(): void {
+		let previous = backlog;
+		backlog = ws.getBufferedAmount();
+		if (backlog < previous) progressed = Date.now();
+	}
+	let pinging = setInterval(() => {
+		reading();
+		if (backlog === 0) ws.ping();
+	}, hooks.pingEveryMs ?? DEFAULT_LINK_PING_MS);
+	let deadline: ReturnType<typeof setTimeout>;
+	function expire(): void {
+		reading();
+		let due = Math.min(progressed + timeoutMs, heard + maxSilenceMs);
+		let left = due - Date.now();
+		if (left > 0) deadline = setTimeout(expire, left);
+		else link.close(LINK_CLOSE.unresponsive, "unresponsive");
+	}
+	deadline = setTimeout(expire, Math.min(timeoutMs, maxSilenceMs));
+	ws.data.alive = {
+		heard() {
+			heard = progressed = Date.now();
+		},
+		stop() {
+			clearInterval(pinging);
+			clearTimeout(deadline);
+		},
+	};
 }
