@@ -463,9 +463,15 @@ async function selectText(page: Page, text: string): Promise<void> {
 			let range = document.createRange();
 			range.setStart(node, index);
 			range.setEnd(node, index + target.length);
+			// Lexical reads the range on `selectionchange`, which a shortcut pressed now can beat.
+			let seen = new Promise(resolve =>
+				document.addEventListener("selectionchange", () => requestAnimationFrame(resolve), {
+					once: true,
+				})
+			);
 			getSelection()!.removeAllRanges();
 			getSelection()!.addRange(range);
-			return;
+			return seen;
 		}
 		throw new Error(`no text ${target}`);
 	}, text);
