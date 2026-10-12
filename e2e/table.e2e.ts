@@ -370,7 +370,11 @@ test("touch table action groups are labelled, reachable, and clear of the select
 		toolbar.getByRole("button", { name: "Move", exact: true }),
 		toolbar.getByRole("button", { name: /^Align column 2/ }),
 	];
-	for (let button of access) await expectInsideViewport(button);
+	for (let button of access) {
+		// The measurement does not retry, and the bar can still be settling after the tap.
+		await expect(button).toBeVisible();
+		await expectInsideViewport(button);
+	}
 	let targets = await Promise.all(access.map(button =>
 		button.evaluate(node => {
 			let box = node.getBoundingClientRect();
