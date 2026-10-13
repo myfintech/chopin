@@ -365,6 +365,10 @@ test("the research draft takes its line in document flow without overlapping any
 	// Enter straight after a click can reach Lexical before the click's selection does.
 	await expect.poll(() => page.evaluate(() => getSelection()?.anchorNode?.textContent))
 		.toBe("Opening paragraph.");
+	// Lexical reads the caret on `selectionchange`, which an Enter pressed now can beat.
+	await page.evaluate(() =>
+		new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+	);
 	await page.keyboard.press("Enter");
 	await page.keyboard.type("/research");
 	await page.keyboard.press("Enter");
