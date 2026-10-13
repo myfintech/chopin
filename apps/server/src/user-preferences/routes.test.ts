@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import { Admission } from "../auth/admission";
+import { Machines } from "../auth/machines";
 import { Sessions } from "../auth/session";
 import { Router } from "../http/router";
 import { MemoryStorage } from "../storage/memory/adapter";
@@ -37,6 +38,8 @@ async function setup() {
 		admission: new Admission(config, github, () => now.getTime()),
 		sessions,
 		clock: () => now,
+		machines: new Machines(storage, () => now, { origin: ORIGIN, clientId: "client-id" }),
+		pairings: {},
 	};
 	let router = new Router();
 	registerPreferenceRoutes(router, auth, { storage });
