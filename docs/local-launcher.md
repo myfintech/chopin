@@ -1,6 +1,6 @@
 # Local implementation tracer
 
-“Build on my laptop” launches an implementation through the same
+**Build plan** launches an implementation through the same
 [ACP connector used for investigations](local-experiments.md). Chopin displays
 tasks, dependencies, blockers and per-task PR links. The connector claims the
 approved graph before prompting the coding agent; a completed ACP turn is
@@ -8,41 +8,83 @@ separate from passing implementation verification.
 
 ## Connect a workspace
 
-Authenticate an ACP-compatible coding agent normally, then connect a checkout:
+Authenticate an ACP-compatible coding agent normally, then connect a checkout
+from its folder. [Bun](https://bun.sh) is required:
 
 ```sh
-CHOPIN_URL=https://your-chopin-instance.example \
-  bun run connector connect /absolute/path/to/project -- copilot --acp
+mkdir -p ~/.chopin \
+  && curl -fsSL https://your-chopin-instance.example/connector.js -o ~/.chopin/connector.js \
+  && CHOPIN_URL=https://your-chopin-instance.example \
+    bun --no-env-file --config=/dev/null \
+      ~/.chopin/connector.js connect . -- copilot --acp --allow-all
 ```
 
-Open the printed pairing link, sign into Chopin, choose the document and select
-**Connect**. This is the existing investigation pairing flow. No GitHub bearer
-needs to be configured in a second companion. The connector credential is held
-in memory and tied to the owner's browser login. Reconnect after a server
-restart or logout.
+`--no-env-file` and `--config=/dev/null` stop Bun from loading the project folder's
+`.env` and `bunfig.toml`: a checkout must not choose which server the connector pairs
+with or run code through a `preload`. The `chopin` binary below ignores both by itself.
+
+Open the printed pairing link, sign into Chopin, check that the page shows the
+confirmation code printed in your terminal, and select **Connect**. Leave
+**Let Chopin build and prototype automatically on this machine** unticked unless
+you want Chopin to start work there by itself: rebuilds of a living document
+(`LIVE_BUILD`) and, where enabled, prototypes. Without it, only work a person
+presses Build or Run for reaches the laptop. The choice is stored with the paired
+machine, so reconnecting keeps it and pairing again asks again. This is
+the existing investigation pairing flow; one connection serves every document in
+the checkout's repository. No GitHub bearer
+needs to be configured in a second companion. Pairing stores a machine token
+that outlives server restarts, deploys and browser sign-out, until the machine
+is disconnected in the browser or unpaired with `chopin unpair`; see
+[Connect a checkout](local-experiments.md#connect-a-checkout). See
+[Trouble connecting](local-experiments.md#trouble-connecting)
+for pairing problems, refusals and stale locks.
 
 Keep the connector running. Each browser Build action starts an agent process;
 automatically installing or starting the connector itself remains future work.
-Standard ACP permission requests appear in its terminal and are declined when
-no interactive terminal is available. The agent retains its normal tools,
-project instructions and configured services.
+Standard ACP permission requests appear in its terminal with the command or
+paths involved, and are declined when no interactive terminal is available.
+The agent retains its normal tools, project instructions and configured
+services.
+
+### Install the chopin CLI
+
+The connector is also released as `chopin`, one executable that needs no Bun.
+Install it, then connect from the checkout's folder:
+
+```sh
+curl -fsSL https://github.com/githubnext/chopin/releases/latest/download/install.sh | sh
+CHOPIN_URL=https://your-chopin-instance.example \
+  chopin connect . -- copilot --acp --allow-all
+```
+
+On Windows, install it in PowerShell with
+`irm https://github.com/githubnext/chopin/releases/latest/download/install.ps1 | iex`.
+`chopin connect` behaves exactly like the `bun` command above. Until the first
+`cli-v*` release is published, the installers have nothing to download, and the
+`curl` and `bun` command above remains the way to connect. See
+[Install the chopin CLI](local-experiments.md#install-the-chopin-cli) for where
+it installs, version pins and how the download is verified.
 
 ## Build a settled plan
 
 1. Resolve planning questions and accepted comments awaiting document updates.
-   Build lists them as links until they are done.
-2. Open **Build** beside Document and Decisions. When the tasks are missing or
-   older than the document, opening Build asks the hosted Planner to draft them
-   without posting a Chat message, once per visit; it waits if the Planner is
-   already working. See
-   [drafting tasks from Build](implementation-lifecycle.md#drafting-tasks-from-build).
-3. Review task goals, acceptance criteria and dependencies. To change them, ask
-   Chopin in Chat.
-4. Select **Build on my laptop**. It uses your first available connected
-   workspace; without one, Build shows the connector command to start, and you
-   select it again once connected. Approval persists the reviewed document and
-   graph counters, checkout commit and connection owner, then freezes planning
-   edits.
+   Until then **Build plan** in the document header is inert and its tooltip
+   says what is left.
+2. Select **Build plan**. When the tasks are missing or older than the
+   document, it asks the hosted Planner to draft them without posting a Chat
+   message, then starts them without a separate review. See
+   [drafting tasks from Build plan](implementation-lifecycle.md#drafting-tasks-from-build-plan).
+3. The build runs on your own local agent: the server picks your idle
+   connection for the repository, preferring the one that last ran work for this
+   document, and derives the checkout from it. Without one, the header reads
+   **Build stopped**, and Build says your local agent isn't connected and shows
+   the connector command to run in your project folder; **Retry** tries again
+   once connected. Approval persists the document and graph
+   counters, checkout commit, connection and the person who started it, then
+   freezes planning edits.
+4. The **Build** tab turns on with the press. It shows the status and the
+   tasks with their goals, acceptance criteria and dependencies; opening it
+   never starts anything.
 5. The connector creates an isolated worktree at that exact commit and an
    implementation branch, preserving existing local edits. It creates an ACP
    session and claims the graph before prompting the orchestrator.
@@ -65,8 +107,8 @@ not stop a run, and editing
 locks continue to update through the document socket. A `#task-<id>` link opens
 Build with that task expanded.
 
-Duplicate Build requests for the same owner, workspace and reviewed graph return
-the same durable intent. A picked-up build is never automatically replayed.
+Duplicate Build requests from the same person for the same reviewed graph
+return the same durable intent. A picked-up build is never automatically replayed.
 Refresh retains task progress, blockers, session
 identity and reported PRs. Expired connections or missing heartbeats mark tracked
 builds as needing attention; after a server restart, opening the document tracks
@@ -85,14 +127,14 @@ browser PR-creation action remain future work. Multiple reported PRs already
 appear beside their tasks; Chopin never merges them automatically.
 
 Inspect failures in the connector terminal and retained worktree. If startup
-failed before the graph was claimed, **Try again** creates a
-new attempt after another explicit review. Repeating that retry request returns
+failed before the graph was claimed, **Retry** in the header creates a
+new attempt. Repeating that retry request returns
 the same attempt; it does not start duplicate work.
 
 If a claimed run stops or fails, its graph remains locked. After inspecting the
 retained checkout, choose **Return to planning**, enter a reason and confirm to
-record a revision request and release the editing lock. Opening Build then asks
-the Planner to revise the tasks; review the replacement before building again.
+record a revision request and release the editing lock. **Build plan** then asks
+the Planner to revise the tasks and builds the replacement.
 This action is unavailable while the agent is still running; stop the connector
 in its terminal first. An admitted
 repository writer can also continue the existing lifecycle through ordinary

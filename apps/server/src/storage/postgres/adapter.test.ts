@@ -1006,6 +1006,8 @@ if (url) {
 				"017_experiments",
 				"017_unanswered_decisions",
 				"018_plan_images",
+				"019_investigation_children",
+				"020_machines",
 				"mantl_document_provenance",
 				"mantl_user_preferences",
 			]);

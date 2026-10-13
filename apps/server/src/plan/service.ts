@@ -1,5 +1,5 @@
-import { restoreBuilds } from "../tasks/builds";
-import { implementationStatus } from "../tasks/notifications";
+import { locksEditing, restoreBuilds, restoreLive } from "../tasks/builds";
+import { announceImplementation, implementationStatus } from "../tasks/notifications";
 import type { BuildRequest } from "@chopin/protocol/implementation";
 /**
  * The plan, as a room offers it.
@@ -63,6 +63,7 @@ import type {
 import type { StorageAdapter } from "../storage/port";
 import type { PendingCardAction } from "../questions/card-actions";
 import type { ClaimInput, ClaimResult, Graph, Run } from "../tasks/graphs";
+import type { LiveBuild } from "../tasks/builds";
 import type { Lifecycle, LifecycleInput, LifecycleResult } from "../tasks/lifecycle";
 
 /** Updates are grouped for this long before being applied together. */
@@ -114,6 +115,12 @@ export type Backend = {
 	lease: () => Lease;
 	fatal: (error: unknown) => void;
 	onDocumentPersisted?: (target: DocumentTarget) => void;
+	/** Keep a finished build's source so later edits can rebuild onto its pull requests. */
+	liveBuild?: boolean;
+	/** A build reached a terminal state after its stop was persisted. */
+	onBuildStopped?: (channelId: string) => void;
+	/** A living document's editing lock was released and announced; links it refused are owed. */
+	onEditingUnlocked?: (channelId: string) => void;
 };
 
 export type DocumentTarget = {
@@ -121,6 +128,10 @@ export type DocumentTarget = {
 	revision: number;
 	source: string;
 	sourceHash: string;
+	/** The person whose update this was, when one person's edit caused it. */
+	editor?: string;
+	/** With `editor`: the source before this update, so a reader can tell what they changed. */
+	previousSource?: string;
 };
 
 /** Durable MCP context for a document created through the hosted surface. */
@@ -157,6 +168,8 @@ type Persistence = Backend & {
 	committedDocument: Uint8Array;
 	committedSidecar: JsonValue;
 	closing: boolean;
+	/** The member whose batch is committing, for derived work that follows their edit. */
+	editor?: string;
 };
 
 type Captured = {
@@ -222,6 +235,13 @@ export type Plan = {
 	execution?: Run;
 	/** Mutable task progress and prior runs, separate from claim identity. */
 	lifecycle: Lifecycle;
+	/** The finished build this living document was last delivered from. */
+	live?: LiveBuild;
+	/**
+	 * A one-click Build plan waiting for its tasks, kept until the build starts or is cancelled so
+	 * the click outlives a decision the draft raised and a reload. In memory only (prototype).
+	 */
+	buildRequested?: { by: string; revision: number };
 	/** A claim has closed mutation ingress while accepted work drains. */
 	claiming: boolean;
 	/**
@@ -263,6 +283,7 @@ type Sidecar = {
 	graph?: Graph;
 	execution?: Run;
 	lifecycle?: Lifecycle;
+	live?: LiveBuild;
 	mcpUpdates?: McpUpdateRecord[];
 	questions: Questions.Record[];
 	openQuestions: Questions.StoredOpen[];
@@ -291,6 +312,7 @@ function state(plan: Plan, chat: ChatView = plan.chat): Sidecar {
 		...(plan.lifecycle.events?.length || plan.lifecycle.history.length > 0
 			? { lifecycle: plan.lifecycle }
 			: {}),
+		...(plan.live ? { live: plan.live } : {}),
 		...(plan.mcpUpdates.length > 0 ? { mcpUpdates: plan.mcpUpdates } : {}),
 		questions: [...plan.records.values()],
 		openQuestions: Questions.dump(plan.questions),
@@ -484,6 +506,7 @@ function restoredState(
 	if (Object.hasOwn(item, "graph")) expected.push("graph");
 	if (Object.hasOwn(item, "execution")) expected.push("execution");
 	if (Object.hasOwn(item, "lifecycle")) expected.push("lifecycle");
+	if (Object.hasOwn(item, "live")) expected.push("live");
 	if (Object.hasOwn(item, "mcpUpdates")) expected.push("mcpUpdates");
 	if (Object.hasOwn(item, "conversationPlan")) expected.push("conversationPlan");
 	if (Object.hasOwn(item, "conversationPlanRetries")) expected.push("conversationPlanRetries");
@@ -524,6 +547,9 @@ function restoredState(
 		throw new Error("hosted channel has an invalid implementation lifecycle");
 	}
 	let lifecycle = hasLifecycle ? restoredLifecycle : undefined;
+	let live = Object.hasOwn(item, "live")
+		? restoreLive(item.live, builds, lifecycle, graph, item.revision)
+		: undefined;
 	let questions = objects(item.questions, "question record");
 	let records = questions.map(question => Questions.normalizeRecord(question));
 	let openQuestions = objects(item.openQuestions, "open questionnaire");
@@ -658,6 +684,7 @@ function restoredState(
 		...(builds.length ? { builds } : {}),
 		...(execution ? { execution } : {}),
 		...(lifecycle ? { lifecycle } : {}),
+		...(live ? { live } : {}),
 		...(mcpUpdates.length > 0 ? { mcpUpdates } : {}),
 		questions: records,
 		openQuestions: openQuestions as unknown as Questions.StoredOpen[],
@@ -871,7 +898,9 @@ async function commitHosted(
 		return;
 	}
 	try {
-		let sourceChanged = captured.source !== durable.committedSource;
+		let previousSource = durable.committedSource;
+		let sourceChanged = captured.source !== previousSource;
+		let wasInSync = durable.committedSource === plan.live?.baseSource;
 		let result = await durable.storage.collaboration.commit({
 			channelId: durable.channelId,
 			lease: durable.lease(),
@@ -911,6 +940,10 @@ async function commitHosted(
 		durable.committedDocument = captured.document;
 		durable.committedSidecar = captured.sidecar;
 		announceUnanswered(plan);
+		// A living document's sync status flips only here, between rebuilds.
+		if (plan.live && wasInSync !== (captured.source === plan.live.baseSource)) {
+			announceImplementation(plan);
+		}
 		if (plan.document.epoch === captured.epoch) {
 			plan.document.checkpoint = new Uint8Array(captured.document);
 		}
@@ -921,6 +954,7 @@ async function commitHosted(
 					revision: captured.revision,
 					source: captured.source,
 					sourceHash: captured.sourceHash,
+					...(durable.editor ? { editor: durable.editor, previousSource } : {}),
 				});
 			} catch (err) {
 				console.warn(`[plan] could not schedule derived work for ${durable.channelId}:`, err);
@@ -1151,10 +1185,7 @@ export async function drain(plan: Plan): Promise<void> {
 
 /** One gate for every path that can mutate a plan during implementation. */
 export function implementationActive(plan: Plan): boolean {
-	return plan.claiming || !!plan.execution
-		|| plan.builds.some(build =>
-			build.state === "queued" || build.state === "starting" || build.state === "running"
-		);
+	return plan.claiming || !!plan.execution || plan.builds.some(locksEditing);
 }
 
 /** Sidecar-only commit for a caller already holding `exclusive`. */
@@ -1369,6 +1400,7 @@ export async function open(
 		graph: sidecar.graph,
 		execution: sidecar.execution,
 		lifecycle: sidecar.lifecycle ?? { history: [] },
+		...(sidecar.live ? { live: sidecar.live } : {}),
 		claiming: false,
 		queue: [],
 		timer: undefined,
@@ -1586,7 +1618,16 @@ async function commit(plan: Plan): Promise<void> {
 	let outcome = await room.apply(
 		plan.document,
 		batch.map(item => item.update),
-		async (id, action) => {
+		async (id, action, type) => {
+			if (type === "Investigation") {
+				let value = await plan.persistence.storage.experiments.get(id);
+				if (value && value.documentId !== plan.id) return false;
+				// A child document holds no investigations of its own.
+				if (action === "add") return !!value && !plan.parentChannelId;
+				// Only stopped or failed work leaves the document: a ready card is withdrawn first,
+				// and running or completed work keeps its card.
+				return !value || ["failed", "cancelled", "interrupted"].includes(value.state);
+			}
 			let request = await plan.persistence.storage.research.get(plan.id, id);
 			let initial = request?.turns.find(turn => turn.kind === "initial");
 			let jobId = initial?.answerJobId ?? initial?.evidenceJobId;
@@ -1625,6 +1666,7 @@ async function commit(plan: Plan): Promise<void> {
 		createHash("sha256").update(merged).digest("hex")
 	}`;
 	try {
+		plan.persistence.editor = batch.at(-1)?.ws.data.principalId;
 		await DocumentProvenance.browser(batch[0]!.ws, commitHosted)(
 			plan,
 			merged,
@@ -1640,6 +1682,8 @@ async function commit(plan: Plan): Promise<void> {
 		plan.threads = previousThreads;
 		await rejectBatch(plan, batch, ["research-reference-conflict"]);
 		return;
+	} finally {
+		plan.persistence.editor = undefined;
 	}
 
 	for (let item of batch) {
@@ -1698,7 +1742,7 @@ export async function publish(
 	}
 }
 
-class ImplementationActiveError extends Error {
+export class ImplementationActiveError extends Error {
 	constructor() {
 		super("implementation is active");
 	}
@@ -2147,6 +2191,50 @@ export function placeResearchReference(plan: Plan, id: string): Promise<"placed"
 				throw err;
 			}
 			return "placed";
+		} finally {
+			document.doc.destroy();
+		}
+	});
+}
+
+/**
+ * Put an investigation's card after the block it concerns, or at the end when that block
+ * can no longer be identified.
+ */
+export function placeInvestigationReference(
+	plan: Plan,
+	id: string,
+	after?: { index: number; digest: string },
+): Promise<room.InvestigationPlacement> {
+	return exclusive(plan, async () => {
+		if (implementationActive(plan)) throw new ImplementationActiveError();
+		let document = await room.restore(
+			plan.document.epoch,
+			Y.encodeStateAsUpdate(plan.document.doc),
+			room.project(plan.document),
+			[],
+		);
+		document.seq = plan.document.seq;
+		try {
+			let { mutation, placement } = room.insertInvestigation(document, id, after);
+			if (!mutation) return placement;
+			await publishStaged(plan, plan.server, plan.id, { ...plan, document }, mutation, {
+				agent: true,
+			});
+			// Marked only once the update that created the card has been relayed.
+			let index = parse(room.project(plan.document)).children.findIndex(node =>
+				node.type === "mdxJsxFlowElement" && node.name === "Investigation"
+				&& node.attributes.some(item => "name" in item && item.name === "id" && item.value === id)
+			);
+			if (index >= 0) {
+				changes(plan, plan.server, plan.id, [{
+					kind: "added",
+					index,
+					type: "Investigation",
+					preview: "",
+				}]);
+			}
+			return placement;
 		} finally {
 			document.doc.destroy();
 		}

@@ -414,6 +414,45 @@ let fake = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof f
 			usage: { input_tokens: 10, output_tokens: 5 },
 		});
 	}
+	if (Object.keys(request.questions).some(key => key.startsWith("spike_"))) {
+		let passages = (request.state as { passages?: Array<{ key: string; text: string }> })
+			.passages ?? [];
+		let open = /\b(unsure|whether|open decision|need to know|prototype)\b/i;
+		return Response.json({
+			model: "jev-e2e-fixture",
+			answers: Object.fromEntries(
+				passages.map(passage => [passage.key, {
+					type: "noul",
+					noul: open.test(passage.text) ? 0.9 : 0.1,
+				}]),
+			),
+			usage: { input_tokens: 10, output_tokens: 5 },
+		});
+	}
+	if ("rebuild" in request.questions) {
+		let changes = (request.state as { changes?: string }).changes ?? "";
+		let lines = changes.split("\n").filter(line => /^[-+] /.test(line));
+		let strip = (side: string) =>
+			lines.filter(line => line.startsWith(side)).map(line =>
+				line.slice(2).replace(/[\s\p{P}]/gu, "")
+			)
+				.join("\n");
+		let trivial = strip("-") === strip("+");
+		return Response.json({
+			model: "jev-e2e-fixture",
+			answers: { rebuild: { type: "noul", noul: trivial ? 0.03 : 0.96 } },
+			usage: { input_tokens: 10, output_tokens: 5 },
+		});
+	}
+	if ("build_ready" in request.questions) {
+		let source = (request.state as { document?: string }).document ?? "";
+		let words = source.match(/[\p{L}\p{N}]+/gu)?.length ?? 0;
+		return Response.json({
+			model: "jev-e2e-fixture",
+			answers: { build_ready: { type: "noul", noul: words >= 120 ? 0.9 : 0.1 } },
+			usage: { input_tokens: 10, output_tokens: 5 },
+		});
+	}
 	let scenario = current?.text && SCENARIOS[current.text];
 	if (!current?.id || !scenario) {
 		return Response.json({ error: "unknown Jev fixture scenario" }, { status: 501 });

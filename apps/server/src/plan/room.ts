@@ -20,6 +20,7 @@ import * as Y from "yjs";
 import {
 	$createDecisionNode,
 	$createExperimentNode,
+	$createInvestigationNode,
 	$createPlanNodes,
 	$createResearchNode,
 	$exportPlanTree,
@@ -28,6 +29,7 @@ import {
 	assertIntroducedUrls,
 	ExperimentNode,
 	exportPlan,
+	InvestigationNode,
 	limits,
 	parse,
 	PlanParseError,
@@ -58,6 +60,7 @@ import {
 	$nodesOfType,
 } from "lexical";
 
+import type { Reference } from "./projections";
 import type { ResearchProjectionChange } from "../storage/model";
 import type { Binding, Provider } from "@lexical/yjs";
 import type { LexicalEditor, LexicalNode } from "lexical";
@@ -356,7 +359,11 @@ export type Applied =
 export async function apply(
 	target: Document,
 	updates: Uint8Array[],
-	authorizeResearch?: (id: string, action: "add" | "remove") => Promise<boolean>,
+	authorizeResearch?: (
+		id: string,
+		action: "add" | "remove",
+		type: Reference,
+	) => Promise<boolean>,
 	open = 0,
 ): Promise<Applied> {
 	if (updates.length === 0) return { ok: true, seq: target.seq, researchProjections: [] };
@@ -376,22 +383,24 @@ export async function apply(
 		assertIntroducedUrls(before, after);
 		let added = new Set<string>();
 		let removed = new Set<string>();
-		for (
-			let [action, ids, allowed] of [
-				["add", newResearchProjections(before, after), added],
-				["remove", removedResearchProjections(before, after), removed],
-			] as const
-		) {
-			for (let id of ids) {
-				let authorized = false;
-				try {
-					authorized = !!authorizeResearch && await authorizeResearch(id, action);
-				} catch {
-					return { ok: false, issues: ["research-reference-unverified"] };
+		for (let type of ["Research", "Investigation"] as const) {
+			for (
+				let [action, ids, allowed] of [
+					["add", newResearchProjections(before, after, type), added],
+					["remove", removedResearchProjections(before, after, type), removed],
+				] as const
+			) {
+				for (let id of ids) {
+					let authorized = false;
+					try {
+						authorized = !!authorizeResearch && await authorizeResearch(id, action, type);
+					} catch {
+						return { ok: false, issues: ["research-reference-unverified"] };
+					}
+					if (!authorized) return { ok: false, issues: ["protected-projection"] };
+					allowed.add(id);
+					if (type === "Research") researchProjections.push({ id, action });
 				}
-				if (!authorized) return { ok: false, issues: ["protected-projection"] };
-				allowed.add(id);
-				researchProjections.push({ id, action });
 			}
 		}
 		if (protectProjections(before, after, added, removed)) {
@@ -1260,6 +1269,57 @@ export function insertResearch(target: Document, id: string): Mutation | undefin
 		$getRoot().append($createResearchNode(id));
 		return true;
 	});
+}
+
+/**
+ * The block an investigation card should follow: the addressed one when its digest still
+ * matches, else the one block that now carries that digest. A missing or repeated digest
+ * resolves to nothing rather than a guess.
+ */
+export function resolveBlock(
+	target: Document,
+	at: { index: number; digest: string },
+): number | undefined {
+	let hashes = digests(target);
+	if (hashes[at.index] === at.digest) return at.index;
+	let matches = hashes.flatMap((hash, index) => hash === at.digest ? [index] : []);
+	return matches.length === 1 ? matches[0] : undefined;
+}
+
+/** Where an investigation card went; `present` means an earlier call already placed it. */
+export type InvestigationPlacement = "anchored" | "appended" | "present";
+
+/**
+ * Put an investigation card after the block it concerns, or at the end when that block
+ * cannot be identified. Cards already following the block keep their order.
+ */
+export function insertInvestigation(
+	target: Document,
+	id: string,
+	after?: { index: number; digest: string },
+): { mutation: Mutation | undefined; placement: InvestigationPlacement } {
+	let index = after && resolveBlock(target, after);
+	let placement: InvestigationPlacement = "present";
+	let mutation = mutate(target, () => {
+		if ($nodesOfType(InvestigationNode).some(node => node.getId() === id)) return false;
+		let card = $createInvestigationNode(id);
+		let block = index === undefined ? undefined : addressable()[index];
+		if (!block) {
+			$getRoot().append(card);
+			placement = "appended";
+			return true;
+		}
+		let previous = block;
+		for (
+			let next = previous.getNextSibling();
+			next instanceof InvestigationNode;
+			next = previous.getNextSibling()
+		) previous = next;
+		previous.insertAfter(card);
+		placement = "anchored";
+		return true;
+	});
+	return { mutation, placement };
 }
 
 export function placeExperiment(

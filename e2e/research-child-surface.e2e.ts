@@ -33,18 +33,30 @@ function rootSheet(page: Page, room: string) {
 	);
 }
 
-/** Lift's peeking tab row in split, or the stack bar's Back in compact. Both return to the root. */
+function titleBar(page: Page, room: string) {
+	return rootSheet(page, room).locator("[data-document-title-bar]");
+}
+
+/** Pins Lift, which stays available behind the development toggle; Zoom is the default. */
+async function useLift(page: Page) {
+	await page.addInitScript(() => localStorage.setItem("chopin:dev:child-motion", "lift"));
+}
+
+/**
+ * Back to the root: the title bar's arrow under Zoom, the stack bar's in compact, or under Lift
+ * an empty stretch of the root's peeking title bar.
+ */
 async function returnToRoot(page: Page, room: string) {
+	let name = `Back to Test ${room.slice(0, 8)}`;
 	let back = page.getByRole("navigation", { name: "Document stack" })
-		.getByRole("button", { name: `Back to Test ${room.slice(0, 8)}` });
-	let rowReturn = rootSheet(page, room).locator("[data-document-toolbar]")
-		.getByRole("button", { name: `Back to Test ${room.slice(0, 8)}` });
+		.getByRole("button", { name })
+		.or(titleBar(page, room).locator(".document-title-slot").getByRole("button", { name }));
+	let rowReturn = titleBar(page, room).locator(".workspace-tab-row-return");
 	await expect(back.or(rowReturn)).toBeVisible();
 	if (await back.isVisible()) await back.click();
 	else {
-		// Click an empty stretch of the peeking row: tab buttons switch views, not just return.
-		let tabs = rootSheet(page, room).locator("[data-document-toolbar]");
-		let gap = await tabs.evaluate(row => {
+		let bar = titleBar(page, room);
+		let gap = await bar.evaluate(row => {
 			let box = row.getBoundingClientRect();
 			for (let x = box.left + 4; x < box.right; x += 4) {
 				let hit = document.elementFromPoint(x, box.top + box.height / 2);
@@ -53,7 +65,7 @@ async function returnToRoot(page: Page, room: string) {
 			return null;
 		});
 		expect(gap).not.toBeNull();
-		await tabs.click({ position: { x: gap!, y: (await tabs.boundingBox())!.height / 2 } });
+		await bar.click({ position: { x: gap!, y: (await bar.boundingBox())!.height / 2 } });
 	}
 }
 
@@ -134,7 +146,7 @@ async function captureChatSends(page: Page) {
 	return () => sends.map(send => ({ ...send }));
 }
 
-test("a parent-owned child keeps the parent chrome and nested geometry", async ({ baseURL, join, page, room, seed }) => {
+test("a Lift child keeps the parent title bar as its stack and nested geometry", async ({ baseURL, join, page, room, seed }) => {
 	await seed(PARENT_SOURCE);
 	let childTitle = `Chrome source ${room.slice(0, 8)}`;
 	let child = await seedChildChannel(
@@ -146,9 +158,9 @@ test("a parent-owned child keeps the parent chrome and nested geometry", async (
 	);
 	// A child inherits the parent's Chat state; closed here so the parent is expanded.
 	await page.addInitScript(() => localStorage.setItem("chopin:pane:chat:choice", "false"));
+	await useLift(page);
 	await join("ana");
 	await page.setViewportSize({ width: 1920, height: 1080 });
-	let parent = page.locator(`[data-workspace-room="${room}"]`);
 	let sidebar = page.getByRole("complementary", { name: "Projects" });
 	let childLink = sidebar.getByRole("link", { name: childTitle, exact: true });
 	await childLink.focus();
@@ -158,31 +170,29 @@ test("a parent-owned child keeps the parent chrome and nested geometry", async (
 	await expect(page).toHaveURL(url => url.pathname === child.path);
 	await expect(surface.locator(`[data-workspace-room="${child.id}"]`)).toBeVisible();
 	let sheet = rootSheet(page, room);
+	let parentBar = titleBar(page, room);
 	let tabs = sheet.locator("[data-document-toolbar]");
-	let parentHeader = parent.locator(".room-header");
-	await expect(page.locator(".room-header:visible")).toHaveCount(1);
-	await expect(page.locator(".workspace-header-slot")).toBeVisible();
-	await expect(parentHeader.getByRole("button", { name: /^Return to / })).toHaveCount(0);
-	await expect(parentHeader).not.toContainText(childTitle);
+	await expect(page.getByRole("banner")).toHaveCount(0);
+	await expect(parentBar.locator(".document-title-slot")).toContainText(`Test ${room.slice(0, 8)}`);
+	await expect(parentBar).not.toContainText(childTitle);
 	await expect(sheet.locator("[data-workspace-document-swap]")).toHaveAttribute("inert", "");
-	await expect(tabs).not.toHaveAttribute("inert", "");
-	await expect(tabs.getByRole("group", { includeHidden: true, name: /People here:/ }))
+	// The child lifts over the root's views; the root's title bar stays above it as the stack.
+	await expect(tabs).toHaveAttribute("inert", "");
+	await expect(parentBar.getByRole("group", { includeHidden: true, name: /People here:/ }))
 		.toBeVisible();
-	await expect(surface.locator(".anchored-child-title")).toHaveText(childTitle);
+	let childBar = surface.locator("[data-child-title-bar]");
+	await expect(childBar.getByRole("group", { name: `Document: ${childTitle}` })).toBeVisible();
+	await expect(childBar.getByRole("group", { name: /People here:/ })).toHaveCount(0);
 	await expect(
 		surface.getByRole("button", { name: /^(Document|Decisions|Show chat|Expand document)/ }),
 	).toHaveCount(0);
-	await expect(surface.locator(".room-header")).toBeHidden();
 	await page.waitForFunction(() => document.getAnimations().every(a => a.playState !== "running"));
 	expect(await sheet.evaluate(element => getComputedStyle(element).transform)).not.toBe("none");
 	await expect(sheet.locator(".workspace-child-scrim")).toHaveCSS("opacity", "0.45");
-	let tabsBox = (await tabs.boundingBox())!;
+	let barBox = (await parentBar.boundingBox())!;
 	let cardBox = (await surface.boundingBox())!;
 	let sheetBox = (await sheet.boundingBox())!;
-	let headerBox = (await parentHeader.boundingBox())!;
-	// The visible header row sits above the expanded parent sheet's tab row.
-	expect(headerBox.y + headerBox.height).toBeLessThanOrEqual(tabsBox.y);
-	expect(cardBox.y).toBeGreaterThanOrEqual(tabsBox.y + tabsBox.height - 1);
+	expect(cardBox.y).toBeGreaterThanOrEqual(barBox.y + barBox.height - 1);
 	expect(cardBox.width).toBeGreaterThan(sheetBox.width);
 	expect(await page.locator(".anchored-child-shadow").evaluate(e => getComputedStyle(e).boxShadow))
 		.not.toBe("none");
@@ -272,8 +282,8 @@ test("the root's Chat stays live while a child is open, across every close path"
 		await expect(surface).toBeVisible();
 	}
 
-	// 1. The peeking tab row, closed twice in one task: only one close happens.
-	await sheet.locator("[data-document-toolbar]")
+	// 1. The title bar's root crumb, pressed twice in one task: only one close happens.
+	await sheet.locator("[data-document-title-bar]")
 		.getByRole("button", { name: `Back to Test ${room.slice(0, 8)}` }).evaluate(button => {
 			(button as HTMLButtonElement).click();
 			(button as HTMLButtonElement).click();
@@ -290,19 +300,10 @@ test("the root's Chat stays live while a child is open, across every close path"
 	await page.goBack();
 	await expectClosed();
 
-	// 4. A root tab returns and also switches the root's view.
+	// 4. The title bar's arrow, a pointer target beside the crumb.
 	await reopen();
-	await sheet.locator("[data-document-toolbar]").getByRole("button", {
-		name: "Decisions",
-		exact: true,
-	}).click();
-	await expect(surface).toHaveCount(0);
-	await expect(parent.locator('[data-document-view="decisions"]')).toBeVisible();
-	await sheet.locator("[data-document-toolbar]").getByRole("button", {
-		name: "Document",
-		exact: true,
-	}).click();
-	await expect(parent.locator('[data-document-view="plan"]')).toBeVisible();
+	await sheet.locator("[data-document-title-bar] .document-title-back").click();
+	await expectClosed();
 	await reopen();
 	await expect(chatSends().filter(send => send.channelId === child.id)).toHaveLength(0);
 });
@@ -364,14 +365,14 @@ test("Tab from an open child never reaches covered root content, and root Chat s
 	await expect(parentChat).toBeVisible();
 });
 
-test("Lift keeps the child for the surface toggle and presence, returns for the row and a tab", async ({ baseURL, join, page, room, seed }) => {
+test("Lift keeps the child for the surface toggle and presence, returns for the title bar and the child's close", async ({ baseURL, join, page, room, seed }) => {
 	await seed(PARENT_SOURCE);
 	let childTitle = `Lift source ${room.slice(0, 8)}`;
 	await seedChildChannel(port(baseURL!), room, crypto.randomUUID(), childTitle, CHILD_SOURCE);
 	await page.setViewportSize({ width: 1440, height: 900 });
+	await useLift(page);
 	await join("ana");
-	let parent = page.locator(`[data-workspace-room="${room}"]`);
-	let tabs = rootSheet(page, room).locator("[data-document-toolbar]");
+	let tabs = titleBar(page, room);
 	let childLink = page.getByRole("complementary", { name: "Projects" })
 		.getByRole("link", { name: childTitle, exact: true });
 	let surface = page.getByRole("region", { name: `Child document: ${childTitle}` });
@@ -413,11 +414,22 @@ test("Lift keeps the child for the surface toggle and presence, returns for the 
 	).toBe(false);
 	await expect(page).toHaveURL(url => url.pathname.endsWith(`/test-${room.slice(0, 8)}`));
 
+	// A click on the root's covered title returns rather than renaming it.
 	await childLink.click();
 	await expect(surface).toBeVisible();
-	await tabs.getByRole("button", { name: "Decisions", exact: true }).click();
+	let [slotBox, barBox] = await Promise.all([
+		tabs.locator(".document-title-slot").boundingBox(),
+		tabs.boundingBox(),
+	]);
+	await tabs.click({ position: { x: slotBox!.x - barBox!.x + 24, y: barBox!.height / 2 } });
 	await expect(surface).toHaveCount(0);
-	await expect(parent.locator('[data-document-view="decisions"]')).toBeVisible();
+	await expect(page.getByRole("textbox", { name: "Document title" })).toHaveCount(0);
+
+	await childLink.click();
+	await expect(surface).toBeVisible();
+	await surface.locator("[data-child-title-bar]")
+		.getByRole("button", { name: `Back to Test ${room.slice(0, 8)}` }).click();
+	await expect(surface).toHaveCount(0);
 });
 
 test("an in-app child preserves and restores its mounted parent", async ({ baseURL, join, page, room, seed }) => {
@@ -464,8 +476,10 @@ test("an in-app child preserves and restores its mounted parent", async ({ baseU
 	await expect(surface).toBeFocused();
 	await expect(parent).toHaveAttribute("data-mount-token", "preserved");
 	let sheet = rootSheet(page, room);
-	await expect(sheet.locator("[data-workspace-document-swap]")).toHaveAttribute("inert", "");
-	await expect(sheet.locator("[data-document-toolbar]")).not.toHaveAttribute("inert", "");
+	await expect(sheet.locator('[data-document-view="plan"]')).toHaveAttribute("inert", "");
+	await expect(titleBar(page, room)).not.toHaveAttribute("inert", "");
+	// Under Zoom the child has no views, so the root's fold away while it is open.
+	await expect(sheet.locator("[data-document-toolbar]")).toHaveAttribute("data-folded", "true");
 	await expect(surface.getByRole("complementary", { name: "Chat" })).toHaveCount(0);
 	await expect(parentChat).toBeVisible();
 	await expect(surface.getByRole("button", { name: "Decisions", exact: true })).toHaveCount(0);
@@ -727,9 +741,10 @@ test("a recovered child id enters the canonical anchored child workspace", async
 	// With no saved preference, Chat starts open in the parent; the child never mounts one.
 	await expect(surface.getByRole("complementary", { name: "Chat" })).toHaveCount(0);
 	await expect(parent.getByRole("complementary", { name: "Chat" })).toBeVisible();
-	await expect(parent.locator(".room-header").getByRole("button", { name: /^Return to / }))
-		.toHaveCount(0);
-	await expect(surface.locator(".anchored-child-title")).toHaveText(childTitle);
+	await expect(page.getByRole("button", { name: /^Return to / })).toHaveCount(0);
+	// Zoom puts the child at the end of the root's title bar path.
+	await expect(titleBar(page, room).getByRole("group", { name: `Document: ${childTitle}` }))
+		.toBeVisible();
 
 	let editor = surface.getByRole("textbox", { name: "editable markdown", exact: true });
 	await editor.click();
@@ -816,7 +831,7 @@ test("a child load failure preserves its mounted parent through back and retry",
 	let surface = page.locator(".anchored-child-card");
 	await expect(surface).toContainText("Couldn't open this document");
 	await expect(parent).toHaveAttribute("data-mount-token", "preserved");
-	await expect(rootSheet(page, room).locator("[data-workspace-document-swap]"))
+	await expect(rootSheet(page, room).locator('[data-document-view="plan"]'))
 		.toHaveAttribute("inert", "");
 	await returnToRoot(page, room);
 	await expect(surface).toHaveCount(0);
@@ -939,7 +954,60 @@ test("Escape in a child editor dismisses the innermost thing before the sheet", 
 	await expect(page).toHaveURL(url => url.pathname.endsWith(`/test-${room.slice(0, 8)}`));
 });
 
-test("Zoom keeps an open child across root tab switches without remounting it", async ({ baseURL, join, page, room, seed }) => {
+test("split Zoom renames the child from the title bar and keeps the caret on its title", async ({ baseURL, join, page, room, seed }) => {
+	await seed(PARENT_SOURCE);
+	let childTitle = `Zoom rename ${room.slice(0, 8)}`;
+	await seedChildChannel(port(baseURL!), room, crypto.randomUUID(), childTitle, CHILD_SOURCE);
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await join("ana");
+	await page.getByRole("complementary", { name: "Projects" })
+		.getByRole("link", { name: childTitle, exact: true }).click();
+	let bar = titleBar(page, room);
+	let root = bar.getByRole("group", { name: `Document: Test ${room.slice(0, 8)}`, exact: true });
+	let child = bar.getByRole("group", { name: `Document: ${childTitle}`, exact: true });
+	await expect(child).toBeVisible();
+	// The child's title sits beside the root's, not inside it.
+	await expect(root.getByRole("group")).toHaveCount(0);
+	// One Back stop for the keyboard: the root crumb, named for where it goes.
+	await expect(bar.getByRole("button", { name: /^Back to / })).toHaveCount(1);
+	await expect(bar.locator(".document-title-back")).toHaveAttribute("tabindex", "-1");
+
+	let renamed = `Renamed ${room.slice(0, 8)}`;
+	await child.getByRole("button", { name: `Rename ${childTitle}` }).click();
+	let field = page.getByRole("textbox", { name: "Document title" });
+	await expect(field).toBeFocused();
+	await field.fill(renamed);
+	await field.press("Enter");
+	await expect(field).toHaveCount(0);
+	// The rename rekeys the child's card; the remounted title takes the caret back.
+	await expect(bar.getByRole("button", { name: `Rename ${renamed}` })).toBeFocused();
+});
+
+test("split Zoom off Document makes the child a crumb back to it, not a rename", async ({ baseURL, join, page, room, seed }) => {
+	await seed(PARENT_SOURCE);
+	let childTitle = `Zoom off Document ${room.slice(0, 8)}`;
+	await seedChildChannel(port(baseURL!), room, crypto.randomUUID(), childTitle, CHILD_SOURCE);
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await join("ana");
+	let sheet = rootSheet(page, room);
+	await sheet.locator("[data-document-toolbar]").getByRole("button", { name: /^Decisions/ })
+		.click();
+	await page.getByRole("complementary", { name: "Projects" })
+		.getByRole("link", { name: childTitle, exact: true }).click();
+	let surface = page.getByRole("region", { name: `Child document: ${childTitle}` });
+	await expect(sheet.locator('[data-document-view="decisions"]')).toBeVisible();
+	await expect(surface).toBeHidden();
+	let bar = titleBar(page, room);
+	await expect(bar.getByRole("button", { name: `Rename ${childTitle}` })).toHaveCount(0);
+	let crumb = bar.getByRole("button", { name: childTitle, exact: true });
+	await expect(crumb).toHaveAttribute("aria-current", "page");
+	await crumb.click();
+	await expect(surface).toBeVisible();
+	await expect(surface).toBeFocused();
+	await expect(bar.getByRole("button", { name: `Rename ${childTitle}` })).toBeVisible();
+});
+
+test("compact Zoom keeps an open child across root view switches without remounting it", async ({ baseURL, join, page, room, seed }) => {
 	await seed(PARENT_SOURCE);
 	let childTitle = `Zoomed source ${room.slice(0, 8)}`;
 	let long = `${CHILD_SOURCE}\n${
@@ -947,11 +1015,10 @@ test("Zoom keeps an open child across root tab switches without remounting it", 
 	}\n`;
 	let child = await seedChildChannel(port(baseURL!), room, crypto.randomUUID(), childTitle, long);
 	let mounts = await recordRoomMounts(page);
-	await page.addInitScript(() => localStorage.setItem("chopin:dev:child-motion", "zoom"));
-	await page.setViewportSize({ width: 1440, height: 900 });
+	// Split folds the root's views away under a Zoom child; compact keeps its view navigation.
+	await page.setViewportSize({ width: 600, height: 844 });
 	await join("ana");
-	await page.getByRole("complementary", { name: "Projects" })
-		.getByRole("link", { name: childTitle, exact: true }).click();
+	await page.goto(child.path);
 	let surface = page.getByRole("region", { name: `Child document: ${childTitle}` });
 	let stack = page.getByRole("navigation", { name: "Document stack" });
 	await expect(surface).toBeVisible();
@@ -967,7 +1034,7 @@ test("Zoom keeps an open child across root tab switches without remounting it", 
 			return element.scrollTop;
 		})
 	).toBe(120);
-	let tabs = rootSheet(page, room).locator("[data-document-toolbar]");
+	let tabs = page.locator(`[data-workspace-room="${room}"] > nav[aria-label="Workspace view"]`);
 	await tabs.getByRole("button", { name: /^Decisions/ }).click();
 	await expect(surface).toBeHidden();
 	// The stack bar stays in sight off Document, so the open child is never lost.

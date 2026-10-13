@@ -1,6 +1,7 @@
 /** Phone chrome: a floating bottom tab bar and a top bar that tucks away while reading. */
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { Count } from "@chopin/editor/count";
 import { DecisionIcon, DocumentIcon, MessageIcon, WrenchIcon } from "@chopin/icons";
 
@@ -13,7 +14,7 @@ import type { WorkspaceDestination } from "./workspace-model";
 
 /** Scrolled less than this from the top, the top bar always shows. */
 const TOP_BAR_REVEAL = 60;
-/** Ignore scroll jitter smaller than this before hiding or showing the top bar. */
+/** Travel in one direction needed before the bars hide or show, so jitter never toggles them. */
 const TOP_BAR_SLOP = 6;
 
 const SCROLLERS =
@@ -27,10 +28,14 @@ export function PhoneTabBar(
 		action,
 		active,
 		buildReason,
+		hint,
+		onUnavailable,
 		chatActivity,
 		destinations,
 		documentActivity,
 		labels,
+		minimised = false,
+		onRestore,
 		onSelect,
 		toolbar,
 		unanswered,
@@ -40,10 +45,17 @@ export function PhoneTabBar(
 		active: WorkspaceDestination;
 		/** Set while Build cannot open yet: the id of the text that says why. */
 		buildReason?: string;
+		/** A brief note above the bar, such as why Build cannot open yet; announced politely. */
+		hint?: string;
+		/** Build was tapped while it cannot open; touch has no tooltip, so the host says why. */
+		onUnavailable?: () => void;
 		chatActivity: { unread: number; busy: boolean };
 		destinations: WorkspaceDestination[];
 		documentActivity?: DocumentActivity;
 		labels: Record<WorkspaceDestination, string>;
+		/** Shrinks the tabs to one circle showing the current tab while reading down a pane. */
+		minimised?: boolean;
+		onRestore?: () => void;
 		onSelect: (destination: WorkspaceDestination, current: boolean, source: HTMLElement) => void;
 		/** Takes the tabs' place while set, such as formatting while editing; stays above the keyboard. */
 		toolbar?: ReactNode;
@@ -51,17 +63,40 @@ export function PhoneTabBar(
 	},
 ) {
 	let index = destinations.indexOf(active);
+	let small = minimised && !toolbar;
+	let nav = useRef<HTMLElement>(null);
+	// Restoring from the circle hands focus to the current tab, since the circle itself goes inert.
+	let restore = () => {
+		flushSync(() => onRestore?.());
+		nav.current?.querySelector<HTMLElement>('.phone-tab[aria-current="page"]')?.focus({
+			preventScroll: true,
+		});
+	};
+	let ActiveIcon = index < 0 ? undefined : ICONS[active];
+	// The circle shows one icon, so it marks unseen activity on any other tab with a dot.
+	let elsewhere = (active !== "decisions" && unanswered > 0)
+		|| (active !== "chat" && (chatActivity.busy || chatActivity.unread > 0));
 	return (
 		<div
 			className="phone-tab-row"
+			data-phone-tab-minimised={small ? "" : undefined}
 			data-phone-tab-row=""
 			data-phone-tab-toolbar={toolbar ? "" : undefined}
 		>
 			{toolbar && <div className="phone-tab-toolbar">{toolbar}</div>}
+			<p
+				aria-live="polite"
+				className="phone-tab-hint"
+				data-shown={hint ? "" : undefined}
+				role="status"
+			>
+				{hint}
+			</p>
 			<nav
 				hidden={!!toolbar}
 				aria-label="Workspace view"
 				className="phone-tab-bar"
+				ref={nav}
 				style={{ "--phone-tab-count": destinations.length } as CSSProperties}
 			>
 				<span
@@ -81,10 +116,13 @@ export function PhoneTabBar(
 							aria-disabled={unavailable || undefined}
 							aria-label={labels[destination]}
 							className="phone-tab"
+							aria-hidden={small || undefined}
 							data-press="small"
+							inert={small}
 							key={destination}
 							onClick={event => {
-								if (!unavailable) onSelect(destination, current, event.currentTarget);
+								if (unavailable) onUnavailable?.();
+								else onSelect(destination, current, event.currentTarget);
 							}}
 							type="button"
 						>
@@ -116,6 +154,27 @@ export function PhoneTabBar(
 						</button>
 					);
 				})}
+				{ActiveIcon && (
+					<button
+						aria-hidden={small ? undefined : true}
+						aria-label={`Show tabs, ${labels[active]}`}
+						className="phone-tab-mini"
+						data-press="small"
+						inert={!small}
+						onClick={restore}
+						onFocus={restore}
+						type="button"
+					>
+						<ActiveIcon aria-hidden="true" size={24} />
+						{/* Pinned to the circle's corner rather than the icon, so neither covers the icon. */}
+						{active === "decisions" && unanswered > 0 && (
+							<span aria-hidden="true" className="phone-tab-badge">
+								<Count ring>{unanswered}</Count>
+							</span>
+						)}
+						{elsewhere && <span aria-hidden="true" className="phone-tab-dot" />}
+					</button>
+				)}
 			</nav>
 			{action}
 		</div>
@@ -128,8 +187,8 @@ export function phonePaneScroller(pane: Element | null | undefined): HTMLElement
 }
 
 /**
- * Hides the top bar while reading down the document, Decisions or Build and brings it back on
- * any scroll up, or when focus moves into it. Chat keeps its bar, because new messages scroll
+ * Hides the top bar and minimises the tab bar while reading down the document, Decisions or Build,
+ * and brings both back on any scroll up, or when focus moves into either. Chat keeps its bar, because new messages scroll
  * the transcript on their own. The bar's small title waits until the document's own heading
  * has scrolled under the bar; other destinations have no heading, so it always shows there.
  */
@@ -137,7 +196,7 @@ export function usePhoneTopBar(
 	root: RefObject<HTMLElement | null>,
 	enabled: boolean,
 	destination: WorkspaceDestination,
-): { hidden: boolean; titleHidden: boolean } {
+): { hidden: boolean; show: () => void; titleHidden: boolean } {
 	let [hidden, setHidden] = useState(false);
 	let [headingVisible, setHeadingVisible] = useState(true);
 	useEffect(() => setHidden(false), [destination, enabled]);
@@ -145,7 +204,9 @@ export function usePhoneTopBar(
 		let element = root.current;
 		if (!enabled || !element) return;
 		let reduced = matchMedia("(prefers-reduced-motion: reduce)");
-		let last = new WeakMap<Element, number>();
+		// Each pane's last position, direction and distance travelled since that direction began,
+		// so a slow drag of a few pixels a frame still adds up to a reading direction.
+		let last = new WeakMap<Element, { direction: number; travel: number; y: number }>();
 		let frame = 0;
 		// Collaborative edits mutate the document often; measure at most once a frame.
 		let measure = () => {
@@ -174,14 +235,19 @@ export function usePhoneTopBar(
 				Math.max(0, target.scrollHeight - target.clientHeight),
 			);
 			// Panes open at their top, so a first scroll event already has a direction.
-			let previous = last.get(target) ?? 0;
-			last.set(target, y);
+			let previous = last.get(target) ?? { direction: 0, travel: 0, y: 0 };
+			let delta = y - previous.y;
+			let direction = Math.sign(delta) || previous.direction;
+			let travel = (direction === previous.direction ? previous.travel : 0) + Math.abs(delta);
+			last.set(target, { direction, travel, y });
 			if (reduced.matches || target.matches("[data-chat-scroll]")) return;
-			if (y < TOP_BAR_REVEAL || previous - y > TOP_BAR_SLOP) setHidden(false);
-			else if (y - previous > TOP_BAR_SLOP) setHidden(true);
+			if (y < TOP_BAR_REVEAL || (direction < 0 && travel > TOP_BAR_SLOP)) setHidden(false);
+			else if (direction > 0 && travel > TOP_BAR_SLOP) setHidden(true);
 		};
 		let focus = (event: FocusEvent) => {
-			if (event.target instanceof Element && event.target.closest(".phone-top-bar")) {
+			if (
+				event.target instanceof Element && event.target.closest(".phone-top-bar, .phone-tab-row")
+			) {
 				setHidden(false);
 			}
 		};
@@ -202,8 +268,10 @@ export function usePhoneTopBar(
 			element.removeEventListener("focusin", focus);
 		};
 	}, [enabled, root]);
+	let show = useCallback(() => setHidden(false), []);
 	return {
 		hidden: enabled && hidden,
+		show,
 		titleHidden: enabled && destination === "plan" && headingVisible,
 	};
 }

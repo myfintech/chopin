@@ -15,6 +15,8 @@ async function openPhoneChat(page: Page): Promise<void> {
 	await page.getByRole("navigation", { name: "Workspace view" })
 		.getByRole("button", { name: /^Chat/ }).click();
 	await expect(chatInput(chatPane(page))).toBeVisible();
+	// The pane slides in from the side; measure it once it has arrived at the left edge.
+	await expect.poll(async () => (await chatPane(page).boundingBox())?.x).toBe(0);
 }
 
 /** From the top of the pill to the bottom of the composer, leaving out the status line above it. */
@@ -217,4 +219,61 @@ test("the desktop composer keeps its labelled mode switch, footer and dropdown p
 		chat.locator(".composer-surface").boundingBox(),
 	]);
 	expect(list!.width).toBeLessThan(pill!.width / 2);
+});
+
+test("a phone composer shows a removable Chopin chip while a message addresses Chopin", async ({ join }) => {
+	let page = await join("ana", PHONE);
+	// The Planner is off in this suite; the session says it is on, as the composer reads it.
+	await page.context().route("**/api/session", async route => {
+		let response = await route.fetch();
+		await route.fulfill({ response, json: { ...await response.json(), agent: true } });
+	});
+	await page.reload();
+	await openPhoneChat(page);
+	let chat = chatPane(page);
+	let draft = chatInput(chat);
+	let chip = chat.getByRole("button", { name: "Remove Chopin", exact: true });
+	// Hidden while the chip shows, but its pressed state still says where the message goes.
+	let mode = chat.getByRole("button", { includeHidden: true, name: "Talk to Chopin", exact: true });
+	await expect(chip).toHaveCount(0);
+
+	// A mention addresses Chopin; the chip says so above the draft, inside the pill.
+	await draft.click();
+	await page.keyboard.type("@chopin what is left? ");
+	await expect(chip).toBeVisible();
+	await expect(mode).toHaveAttribute("aria-pressed", "true");
+	// The chip stands in for the switch while it shows.
+	await expect(mode).toBeHidden();
+	let [chipBox, draftBox, pill] = await Promise.all([
+		chip.boundingBox(),
+		draft.boundingBox(),
+		chat.locator(".composer-surface").boundingBox(),
+	]);
+	expect(chipBox!.y + chipBox!.height).toBeLessThanOrEqual(draftBox!.y + 1);
+	expect(chipBox!.y).toBeGreaterThanOrEqual(pill!.y);
+	// Drawn small, but a full touch target.
+	let reach = await chip.evaluate(element => {
+		let box = element.getBoundingClientRect();
+		let x = box.left + box.width / 2;
+		let y = box.top + box.height / 2;
+		return [y - 21, y + 21].every(at =>
+			document.elementFromPoint(x, at)?.closest("button") === element
+		);
+	});
+	expect(reach).toBe(true);
+
+	// Removing the chip removes the address, as switching to Chat does.
+	await chip.tap();
+	await expect(chip).toHaveCount(0);
+	await expect(mode).toHaveAttribute("aria-pressed", "false");
+	// No leading space is left where the mention was.
+	expect(await draft.textContent()).toBe("what is left? ");
+
+	// The switch turns it back on without a mention.
+	await expect(mode).toBeVisible();
+	await mode.tap();
+	await expect(chip).toBeVisible();
+	await chip.tap();
+	await expect(mode).toHaveAttribute("aria-pressed", "false");
+	await expectNoHorizontalOverflow(page);
 });

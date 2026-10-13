@@ -40,6 +40,18 @@ test("an icon tooltip remains visible while its button is focused", async ({ joi
 	await expect(tooltip).toBeVisible();
 });
 
+test("a visible tooltip follows its trigger's changing label", async ({ join, page }) => {
+	await join("ana");
+	let addProject = page.getByRole("button", { exact: true, name: "Add project" });
+	let tooltip = page.locator("[data-icon-tooltip]");
+	await addProject.hover();
+	await expect(tooltip).toHaveText("Add project");
+	// A status such as the Build capsule changes its words while the pointer rests on it.
+	await addProject.evaluate(button => button.setAttribute("data-tooltip", "Every task is built"));
+	await expect(tooltip).toBeVisible();
+	await expect(tooltip).toHaveText("Every task is built");
+});
+
 test("an icon tooltip stays hidden after its button is pressed until the pointer returns", async ({ join, page }) => {
 	await join("ana");
 	let mention = page.getByRole("button", { exact: true, name: "Mention docs" });
@@ -182,7 +194,7 @@ test("split Chat owns its controls and keeps its draft while hidden", async ({ j
 
 	await draft.fill("unfinished thought");
 	await expect(pane.locator("[data-chat-header]")).toHaveCount(0);
-	let expand = page.locator("[data-document-toolbar]").getByRole("button", {
+	let expand = page.locator("[data-document-title-bar]").getByRole("button", {
 		name: "Expand document",
 	});
 	await expand.hover();
@@ -199,7 +211,7 @@ test("split Chat owns its controls and keeps its draft while hidden", async ({ j
 	await expect(opener).toHaveAttribute("aria-expanded", "false");
 	await expect(opener).toBeFocused();
 	let [openerBox, tabBox] = await Promise.all([opener.boundingBox(), documentTab.boundingBox()]);
-	expect(openerBox!.x + openerBox!.width).toBeLessThan(tabBox!.x);
+	expect(openerBox!.y + openerBox!.height).toBeLessThanOrEqual(tabBox!.y);
 	await opener.click();
 	await expect(heading).toBeFocused();
 	await expectChatValue(draft, "unfinished thought");
@@ -214,7 +226,7 @@ test("split Chat owns its controls and keeps its draft while hidden", async ({ j
 test("split Chat controls remain available to touch", async ({ join }) => {
 	let page = await join("ana", { hasTouch: true, viewport: { width: 1280, height: 800 } });
 	let pane = chatPane(page);
-	let close = page.locator("[data-document-toolbar]").getByRole("button", {
+	let close = page.locator("[data-document-title-bar]").getByRole("button", {
 		name: "Expand document",
 	});
 	expect(await page.evaluate(() => matchMedia("(any-pointer: coarse)").matches)).toBe(true);

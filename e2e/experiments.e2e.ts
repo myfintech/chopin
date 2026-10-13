@@ -1,12 +1,78 @@
 import { performance } from "../packages/experiment/src/fixtures";
+import { CONNECTOR_PROTOCOL_HEADER } from "../packages/protocol/connector";
+import { CONNECTOR_PROTOCOL } from "../apps/connector/src/version";
+import { testChannelPath } from "./database";
 import { content, expect, test } from "./room";
 
-test("owner pairs a workspace and publishes evidence that survives disconnect", async ({ baseURL, join, room, seed }) => {
-	await seed("# Investigation\n\nCompare measured startup time.\n");
-	let page = await join("ana");
+import type { Page } from "@playwright/test";
+
+/** What the current connector sends with each request. */
+const CONNECTOR = { [CONNECTOR_PROTOCOL_HEADER]: String(CONNECTOR_PROTOCOL) };
+
+/** A connection serves every document in its repository, so each pairing test is its own person. */
+function person() {
+	return `ana-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+const PASSAGE = "Compare measured startup time.";
+const FOLLOW_UP = "Then check memory use.";
+
+/** The investigation card whose brief this is. */
+function card(page: Page, brief: string) {
+	return page.getByRole("article", { name: "Investigation", exact: true }).filter({
+		hasText: brief,
+	});
+}
+
+/** Open the child document a completed investigation published, from its inline card. */
+async function openChild(page: Page, room: string) {
+	await card(page, "Startup comparison")
+		// Other tests publish the same fixture into this repository, so its title may be numbered.
+		.getByRole("button", { name: /^Open Startup comparison/ })
+		// Recorded decisions sit above the card-wide control, so open from its status row.
+		.click({ position: { x: 16, y: 16 } });
+	let child = page.getByRole("region", { name: /^Child document: Startup comparison/ });
+	let provenance = child.locator("[data-child-provenance]");
+	await expect(provenance).toContainText(`Investigation from Test ${room.slice(0, 8)}`);
+	await expect(provenance).toContainText("1 view");
+	await expect(child.getByRole("heading", { name: "Startup comparison", exact: true }))
+		.toBeVisible();
+	return child;
+}
+
+/**
+ * Type `/investigate` on a new line after a prose passage, write the brief, and return the
+ * created record. The passage keeps the caret in text, clear of cards and embedded evidence.
+ */
+async function investigate(page: Page, room: string, brief: string, after: string) {
+	await content(page).getByText(after, { exact: true }).click();
+	await page.keyboard.press("End");
+	await page.keyboard.press("Enter");
+	await page.keyboard.type("/investigate");
+	await page.getByRole("listbox", { name: "Insert block" })
+		.getByRole("option", { name: "Investigate", exact: true })
+		.click();
+	let composer = page.getByRole("region", { name: "Investigation brief", exact: true });
+	await composer.getByRole("textbox", { name: "Investigation brief", exact: true }).fill(brief);
+	let [created] = await Promise.all([
+		page.waitForResponse(response =>
+			response.request().method() === "POST"
+			&& response.url().endsWith(`/documents/${room}/experiments`)
+		),
+		composer.getByRole("button", { name: "Propose investigation", exact: true }).click(),
+	]);
+	await expect(composer).toHaveCount(0);
+	return await created.json() as { id: string };
+}
+
+test("the clicker's own agent runs work and publishes evidence that survives disconnect", async ({ baseURL, join, room, seed }) => {
+	// Two people open the published child document as well as running the work.
+	test.slow();
+	await seed(`# Investigation\n\n${PASSAGE}\n\n${FOLLOW_UP}\n`);
+	let page = await join(person());
 	let pairing = await (await fetch(`${baseURL}/api/connector/pairings`, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: { "content-type": "application/json", ...CONNECTOR },
 		body: JSON.stringify({
 			repository: "octo-org/score",
 			commit: "a".repeat(40),
@@ -14,72 +80,63 @@ test("owner pairs a workspace and publishes evidence that survives disconnect", 
 		}),
 	})).json();
 	await page.goto(pairing.url);
-	await page.getByRole("combobox", { name: "Document", exact: true }).selectOption(room);
+	await expect(page.getByRole("heading", { name: "Connect your local agent", exact: true }))
+		.toBeVisible();
+	await expect(page.getByText("Connect this checkout of octo-org/score so Chopin can run work"))
+		.toBeVisible();
+	await expect(page.getByText(pairing.code, { exact: true })).toBeVisible();
+	await expect(page.getByRole("combobox")).toHaveCount(0);
 	await page.getByRole("button", { name: "Connect", exact: true }).click();
-	await page.getByRole("link", { name: "Open document", exact: true }).click();
-	let paired = await (await fetch(`${baseURL}/api/connector/pairings/${pairing.id}/claim`, {
+	await expect(page.getByRole("status")).toHaveText("Connected.");
+	await expect(page.getByRole("link", { name: "Open octo-org/score", exact: true }))
+		.toHaveAttribute("href", "/documents/octo-org/score");
+	await expect(page.getByText("a".repeat(8))).toHaveCount(0);
+	await page.goto(testChannelPath(room));
+	let machine = await (await fetch(`${baseURL}/api/connector/pairings/${pairing.id}/claim`, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: { "content-type": "application/json", ...CONNECTOR },
 		body: JSON.stringify({ secret: pairing.secret }),
+	})).json();
+	// The paired machine connects its checkout, as `chopin connect` does.
+	let paired = await (await fetch(`${baseURL}/api/connector/connections`, {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			authorization: `Bearer ${machine.token}`,
+			...CONNECTOR,
+		},
+		body: JSON.stringify({
+			repository: "octo-org/score",
+			commit: "a".repeat(40),
+			label: "Ana laptop",
+		}),
 	})).json();
 
 	await expect(page.getByRole("button", { name: "Investigations", exact: true })).toHaveCount(0);
 	await expect(page.getByRole("dialog", { name: "Investigations", exact: true })).toHaveCount(0);
-	let proposeToggle = page.getByRole("button", {
-		name: "Propose investigation",
-		exact: true,
-		expanded: false,
-	});
-	await proposeToggle.click();
-	let proposal = page.getByRole("form", { name: "New investigation", exact: true });
-	// A plain accordion folds at the accordion pace, not the card-preview pace.
-	expect(
-		await proposal.evaluate(form =>
-			getComputedStyle(form.closest("[data-slot='unfold']")!).transitionDuration
-		),
-	).toBe("0.25s");
-	let brief = proposal.getByRole("textbox", { name: "Investigation brief", exact: true });
-	await brief.focus();
-	await page.evaluate(() => Promise.all(document.getAnimations().map(a => a.finished)));
-	// The clip must leave room for the focus ring outside a full-width control.
-	expect(
-		await brief.evaluate(control => {
-			// Outside a focus boundary the ring sits outside the control; that is the case at risk.
-			control.closest("[data-focus-boundary]")?.removeAttribute("data-focus-boundary");
-			let clipElement = control.closest<HTMLElement>(".cv-unfold-clip")!;
-			let clip = clipElement.getBoundingClientRect();
-			let box = control.getBoundingClientRect();
-			let style = getComputedStyle(control);
-			let reach = Math.max(parseFloat(style.outlineWidth) + parseFloat(style.outlineOffset), 0);
-			let room = parseFloat(getComputedStyle(clipElement).paddingInlineStart);
-			return {
-				visible: style.outlineStyle !== "none",
-				outside: reach > 0,
-				roomed: room >= reach,
-				clipped: box.left - reach < clip.left || box.right + reach > clip.right,
-			};
-		}),
-	).toEqual({ visible: true, outside: true, roomed: true, clipped: false });
-	await brief.fill("Compare startup approaches");
-	let [created] = await Promise.all([
-		page.waitForResponse(response =>
-			response.request().method() === "POST"
-			&& response.url().endsWith(`/documents/${room}/experiments`)
-		),
-		proposal.getByRole("button", { name: "Propose investigation", exact: true }).click(),
-	]);
-	// The submit button disables while busy; closing the fold returns focus to its toggle.
-	await expect(proposeToggle).toBeFocused();
-	await expect(proposal).toBeHidden();
-	let experiment = await created.json();
+	await expect(page.getByText("Propose investigation", { exact: true })).toHaveCount(0);
+	let experiment = await investigate(page, room, "Compare startup approaches", PASSAGE);
+	await expect(content(page).locator(`[data-plan-investigation="${experiment.id}"]`))
+		.toHaveCount(1);
 	let peer = await join("leo");
-	await expect(peer.getByRole("button", { name: "Run on my workspace", exact: true }))
-		.toBeDisabled();
-	await page.getByRole("button", { name: "Run on my workspace", exact: true }).click();
+	let proposal = card(page, "Compare startup approaches");
+	await expect(proposal).toContainText("Ready to run");
+	await expect(proposal.getByRole("combobox")).toHaveCount(0);
+	// Another person's Run never borrows Ana's agent.
+	let peerProposal = card(peer, "Compare startup approaches");
+	await peerProposal.getByRole("button", { name: "Run", exact: true }).click();
+	await expect(peerProposal).toContainText("Your local agent isn’t connected.");
+	await expect(proposal).toContainText("Ready to run");
+	await proposal.getByRole("button", { name: "Run", exact: true }).click();
+	await expect(proposal).toContainText("Waiting for your local agent");
 	async function tool(name: string, args: unknown, token = paired.token) {
 		let response = await fetch(`${baseURL}/connector/mcp`, {
 			method: "POST",
-			headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+			headers: {
+				"content-type": "application/json",
+				authorization: `Bearer ${token}`,
+				...CONNECTOR,
+			},
 			body: JSON.stringify({
 				jsonrpc: "2.0",
 				id: 1,
@@ -95,106 +152,97 @@ test("owner pairs a workspace and publishes evidence that survives disconnect", 
 	let claim = await tool("claim_experiment", { id: experiment.id });
 	await tool("submit_experiment_result", { result: performance }, claim.runToken);
 	await tool("complete_experiment", { id: experiment.id, generation: claim.generation });
-	await expect(page.getByRole("table", { name: "Median startup time", exact: true })).toBeVisible();
-	await expect(page.getByRole("table", { name: "Median startup time", exact: true })).toContainText(
-		"183",
-	);
-	await peer.getByRole("combobox", { name: "Filter Workload", exact: true }).selectOption(
+	// The result is published as a child document; the inline card only links to it.
+	let ready = card(page, "Startup comparison");
+	await expect(ready).toHaveAttribute("data-investigation-ready", "");
+	await expect(ready).toContainText("Caching reduced median startup time");
+	await expect(ready.getByRole("table")).toHaveCount(0);
+	let child = await openChild(page, room);
+	let peerChild = await openChild(peer, room);
+	let table = child.getByRole("table", { name: "Median startup time", exact: true });
+	await expect(table).toContainText("183");
+	await peerChild.getByRole("combobox", { name: "Filter Workload", exact: true }).selectOption(
 		JSON.stringify("small"),
 	);
-	await expect(page.getByRole("combobox", { name: "Filter Workload", exact: true })).toHaveValue(
+	await expect(child.getByRole("combobox", { name: "Filter Workload", exact: true })).toHaveValue(
 		JSON.stringify("small"),
 	);
-	await expect(page.getByRole("table", { name: "Median startup time", exact: true })).not
-		.toContainText("410");
-	await peer.getByRole("button", { name: "Select Cached", exact: true }).click();
-	await expect(page.getByRole("button", { name: "Select Cached", exact: true })).toHaveAttribute(
+	await expect(table).not.toContainText("410");
+	await peerChild.getByRole("button", { name: "Select Cached", exact: true }).click();
+	await expect(child.getByRole("button", { name: "Select Cached", exact: true })).toHaveAttribute(
 		"aria-pressed",
 		"true",
 	);
-	await peer.getByRole("button", { name: "Record decision", exact: true }).click();
-	await peer.getByRole("textbox", { name: "Decision conclusion", exact: true }).fill(
+	await peerChild.getByRole("button", { name: "Record decision", exact: true }).click();
+	await peerChild.getByRole("textbox", { name: "Decision conclusion", exact: true }).fill(
 		"Use cached startup",
 	);
-	await peer.getByRole("textbox", { name: "Decision rationale", exact: true }).fill(
+	await peerChild.getByRole("textbox", { name: "Decision rationale", exact: true }).fill(
 		"Lower median in the captured workload",
 	);
-	await peer.getByRole("button", { name: "Save decision", exact: true }).click();
-	await expect(peer.getByRole("heading", { name: "Use cached startup", exact: true }))
-		.toBeVisible();
-	await peer.getByRole("combobox", { name: "Filter Workload", exact: true }).selectOption(
+	await peerChild.getByRole("button", { name: "Save decision", exact: true }).click();
+	await expect.poll(async () =>
+		(await (await peer.request.get(`/api/documents/${room}/experiments/${experiment.id}`)).json())
+			.decisions.map((decision: { conclusion: string }) => decision.conclusion)
+	).toEqual(["Use cached startup"]);
+	await peerChild.getByRole("combobox", { name: "Filter Workload", exact: true }).selectOption(
 		JSON.stringify("large"),
 	);
-	await peer.getByRole("button", { name: "Insert decision evidence in document", exact: true })
-		.click();
-	await expect(content(page)).toHaveAttribute("contenteditable", "true");
-	let saved = page.getByRole("article", { name: "Saved investigation evidence", exact: true });
-	await expect(saved).toContainText("Use cached startup");
-	await expect(saved.getByRole("table")).toContainText("183");
-	await expect(saved.getByRole("table")).not.toContainText("410");
-	let queuedId = crypto.randomUUID();
-	let proposed = await page.request.post(`/api/documents/${room}/experiments`, {
-		headers: { origin: new URL(page.url()).origin },
-		data: { id: queuedId, brief: "Check memory use" },
-	});
-	expect(proposed.ok(), await proposed.text()).toBe(true);
-	let queued = page.getByRole("article", { name: "Check memory use", exact: true });
-	await queued.getByRole("button", { name: "Run on my workspace", exact: true }).click();
-	await expect(queued.getByRole("button", { name: "Cancel investigation", exact: true }))
-		.toBeVisible();
-	await expect(peer.getByRole("button", { name: "Cancel investigation", exact: true })).toHaveCount(
-		0,
-	);
-	await queued.getByRole("button", { name: "Cancel investigation", exact: true }).click();
-	await expect(queued).toContainText("cancelled");
-	await queued.getByRole("button", { name: "Propose retry", exact: true }).click();
-	await expect(queued).toHaveCount(2);
-	await expect(queued.getByRole("button", { name: "Run on my workspace", exact: true }))
-		.toBeVisible();
+	await expect(table).toContainText("410");
+	await page.goto(testChannelPath(room));
+	let second = await investigate(page, room, "Check memory use", FOLLOW_UP);
+	let queued = card(page, "Check memory use");
+	await queued.getByRole("button", { name: "Run", exact: true }).click();
+	await expect(queued.getByRole("button", { name: "Stop", exact: true })).toBeVisible();
+	await expect(card(peer, "Check memory use").getByRole("button", { name: "Stop", exact: true }))
+		.toHaveCount(0);
+	await queued.getByRole("button", { name: "Stop", exact: true }).click();
+	await expect(queued).toContainText("Stopped");
+	await queued.getByRole("button", { name: "Retry", exact: true }).click();
+	// Retry keeps the same investigation and its one card.
+	await expect(queued).toHaveCount(1);
+	await expect(content(page).locator(`[data-plan-investigation="${second.id}"]`)).toHaveCount(1);
+	await expect(queued.getByRole("button", { name: "Run", exact: true })).toBeVisible();
+	await queued.getByRole("button", { name: "Remove investigation", exact: true }).click();
+	await expect(queued).toHaveCount(0);
 	await tool("disconnect_workspace", {});
 	await page.reload();
-
-	let completed = page.getByRole("article", { name: "Compare startup approaches", exact: true });
-	let completedToggle = completed.getByRole("button", {
-		name: "Compare startup approaches",
+	await expect((await openChild(page, room)).getByRole("table", {
+		name: "Median startup time",
 		exact: true,
-	});
-	await expect(completedToggle).toHaveAttribute("aria-expanded", "false");
-	await expect(completed.getByRole("table", { name: "Median startup time", exact: true }))
-		.toBeHidden();
-	await completedToggle.click();
-	await expect(completed.getByRole("table", { name: "Median startup time", exact: true }))
-		.toContainText("410");
+	})).toContainText("410");
 });
 
-test("an incoming proposal appears inline and recovers from a failed detail load", async ({ join, seed, room }) => {
+test("a proposal typed from the slash menu appears inline on a phone", async ({ join, seed, room }) => {
 	await seed("# Investigation\n\nCheck before choosing an approach.\n");
-	let page = await join("ana", {
+	let page = await join(person(), {
 		viewport: { width: 390, height: 844 },
 		isMobile: true,
 		hasTouch: true,
 	});
-	let id = crypto.randomUUID();
-	await page.route(`**/api/documents/${room}/experiments/${id}`, async route => {
-		await route.fulfill({ status: 503, json: { error: "Investigation temporarily unavailable" } });
-	}, { times: 1 });
-	let response = await page.request.post(`/api/documents/${room}/experiments`, {
-		headers: { origin: new URL(page.url()).origin },
-		data: { id, brief: "Measure startup before choosing a cache" },
-	});
-	expect(response.ok(), await response.text()).toBe(true);
-	let card = page.getByRole("article", {
-		name: "Measure startup before choosing a cache",
-		exact: true,
-	});
-	await expect(card.getByRole("button", { name: "Retry loading", exact: true })).toBeVisible();
-	await card.getByRole("button", { name: "Retry loading", exact: true }).click();
-	await expect(card.getByRole("button", { name: "Run on my workspace", exact: true }))
-		.toBeDisabled();
-	await expect(card).toContainText("Connect a local workspace");
+	// A phone opens the document for reading; writing starts from the edit toggle.
+	await page.getByRole("button", { name: "Edit document", exact: true }).tap();
+	let created = await investigate(
+		page,
+		room,
+		"Measure startup before choosing a cache",
+		"Check before choosing an approach.",
+	);
+	let proposal = card(page, "Measure startup before choosing a cache");
+	await expect(proposal).toContainText("Ready to run");
+	await expect(proposal.getByRole("combobox")).toHaveCount(0);
+	await proposal.getByRole("button", { name: "Run", exact: true }).click();
+	await expect(proposal).toContainText(
+		"Your local agent isn’t connected. Run this in your project folder, then press Run again.",
+	);
+	await expect(proposal.locator("code")).toHaveText(
+		/curl -fsSL http:\/\/\S+\/connector\.js .* bun --no-env-file --config=\/dev\/null ~\/\.chopin\/connector\.js connect \. /,
+	);
+	await expect(proposal.getByRole("link", { name: "Trouble connecting?", exact: true }))
+		.toBeVisible();
 	await expect(page.getByRole("alert")).toHaveCount(0);
 	await expect(page.getByRole("dialog")).toHaveCount(0);
 	await page.reload();
-	await expect(card.getByRole("button", { name: "Run on my workspace", exact: true }))
-		.toBeDisabled();
+	await expect(content(page).locator(`[data-plan-investigation="${created.id}"]`)).toHaveCount(1);
+	await expect(proposal.getByRole("button", { name: "Run", exact: true })).toBeEnabled();
 });

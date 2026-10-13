@@ -36,14 +36,7 @@ export function EvidenceActions({ store, item, view, disabled }: {
 			{error && <p role="alert" className="text-destructive-ink">{error}</p>}
 			<div className="flex flex-wrap gap-2">
 				<button
-					className="btn btn-md btn-outline"
-					disabled={disabled || busy}
-					onClick={() => void act(() => store.place(item.id, view.key))}
-				>
-					Insert view in document
-				</button>
-				<button
-					className="btn btn-md btn-primary"
+					className="btn btn-sm btn-outline"
 					disabled={disabled || busy}
 					onClick={() => {
 						setRevision(item.views[view.key].revision);
@@ -108,6 +101,87 @@ export function EvidenceActions({ store, item, view, disabled }: {
 	);
 }
 
+/** Record a decision from a view embedded in a document, by the investigation's id. */
+export function ViewDecision({ store, id, view, disabled }: {
+	store: ExperimentStore;
+	id: string;
+	view: string;
+	disabled: boolean;
+}) {
+	useSyncExternalStore(store.subscribe, store.snapshot);
+	let item = store.get(id);
+	let found = item?.result?.views.find(candidate => candidate.key === view);
+	if (!item || !found) return null;
+	return (
+		<EvidenceActions store={store} item={item} view={found} disabled={disabled || !!item.locked} />
+	);
+}
+
+/** One recorded decision with its fixed evidence and the action that embeds it. */
+function DecisionRecord({ store, item, decision, canEdit, onError }: {
+	store: ExperimentStore;
+	item: PublishedInvestigation;
+	decision: PublishedInvestigation["decisions"][number];
+	canEdit: boolean;
+	onError: (message: string) => void;
+}) {
+	let view = item.result?.views.find(view => view.key === decision.view);
+	return (
+		<article className="plan-evidence flex min-w-0 flex-col gap-1 rounded-md bg-inset p-3 text-sm">
+			<h4 className="m-0 font-semibold">{decision.conclusion}</h4>
+			{decision.rationale && <p className="m-0 text-text-secondary">{decision.rationale}</p>}
+			<p className="m-0 text-xs text-text-tertiary">
+				Recorded by {decision.by} · Fixed evidence
+			</p>
+			{view && item.result && (
+				<UnfoldSection label="View saved evidence">
+					<ExperimentView result={item.result} view={view} state={decision.state} disabled />
+				</UnfoldSection>
+			)}
+			{canEdit && (
+				<button
+					className="btn btn-sm btn-ghost self-start"
+					onClick={() => {
+						onError("");
+						void store.place(item.id, decision.view, decision.id).catch(error =>
+							onError(error.message)
+						);
+					}}
+				>
+					Insert decision evidence in document
+				</button>
+			)}
+		</article>
+	);
+}
+
+/** The decisions recorded against one investigation, shown on its inline card. */
+export function ItemDecisions(
+	{ store, item, canEdit }: {
+		store: ExperimentStore;
+		item: PublishedInvestigation;
+		canEdit: boolean;
+	},
+) {
+	let [error, setError] = useState("");
+	if (!item.decisions.length) return null;
+	return (
+		<section aria-label="Investigation decisions" className="flex flex-col gap-3">
+			{error && <p role="alert" className="m-0 text-sm text-destructive-ink">{error}</p>}
+			{item.decisions.toSorted((a, b) => b.at - a.at).map(decision => (
+				<DecisionRecord
+					key={decision.id}
+					store={store}
+					item={item}
+					decision={decision}
+					canEdit={canEdit}
+					onError={setError}
+				/>
+			))}
+		</section>
+	);
+}
+
 export function EvidenceDecisions(
 	{ store, canEdit }: { store: ExperimentStore; canEdit: boolean },
 ) {
@@ -122,36 +196,16 @@ export function EvidenceDecisions(
 		<section aria-label="Investigation decisions" className="flex flex-col gap-4 p-4">
 			<h3 className="text-base font-semibold">Investigation decisions</h3>
 			{error && <p role="alert" className="text-sm text-destructive-ink">{error}</p>}
-			{decisions.map(({ item, decision }) => {
-				let view = item.result?.views.find(view => view.key === decision.view);
-				return (
-					<article key={decision.id} className="flex flex-col gap-2 rounded-md border p-3 text-sm">
-						<h4 className="font-semibold">{decision.conclusion}</h4>
-						<p>{decision.rationale}</p>
-						<p className="text-xs text-text-secondary">
-							Recorded by {decision.by} · Fixed evidence
-						</p>
-						{view && item.result && (
-							<UnfoldSection label="View saved evidence">
-								<ExperimentView result={item.result} view={view} state={decision.state} disabled />
-							</UnfoldSection>
-						)}
-						{canEdit && (
-							<button
-								className="btn btn-md btn-outline"
-								onClick={() => {
-									setError("");
-									void store.place(item.id, decision.view, decision.id).catch(error =>
-										setError(error.message)
-									);
-								}}
-							>
-								Insert decision evidence in document
-							</button>
-						)}
-					</article>
-				);
-			})}
+			{decisions.map(({ item, decision }) => (
+				<DecisionRecord
+					key={decision.id}
+					store={store}
+					item={item}
+					decision={decision}
+					canEdit={canEdit}
+					onError={setError}
+				/>
+			))}
 		</section>
 	);
 }

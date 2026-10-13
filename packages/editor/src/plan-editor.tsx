@@ -74,6 +74,8 @@ function resume(provider: PlanProvider): void {
 
 export type PlanEditorProps = {
 	experiments?: import("./widget-options").ExperimentResources;
+	/** Local investigations, offered from the slash menu when present. */
+	investigations?: import("./widget-options").InvestigationResources;
 	wire: Transport | undefined;
 	connection?: Connection;
 	/** How comment threads are presented by the surrounding workspace. */
@@ -96,6 +98,8 @@ export type PlanEditorProps = {
 	editMode?: EditMode;
 	/** Host element for the docked formatting toolbar while editing on a phone. */
 	formatDock?: HTMLElement | null;
+	/** Told while the docked formatting's panel holds the keyboard's place; keep the dock up. */
+	onFormatPanel?: (open: boolean) => void;
 	/**
 	 * Where the plan's questionnaires are published.
 	 *
@@ -129,8 +133,6 @@ export type PlanEditorProps = {
 	onState?: (state: PlanState) => void;
 	/** Host-owned context shown above the document, in the prose column. */
 	preface?: ReactNode;
-	/** Host-owned work cards following the authored document in its scroll lane. */
-	afterword?: ReactNode;
 	className?: string;
 };
 
@@ -161,15 +163,16 @@ const UNDO_NOTICE = 3000;
 export function PlanEditor(
 	{
 		authorship,
-		afterword,
 		busy,
 		experiments,
+		investigations,
 		className,
 		commentPresentation = "popover",
 		connection,
 		disclosureMotion,
 		editMode,
 		formatDock,
+		onFormatPanel,
 		motionImmediately,
 		onScrollTop,
 		onState,
@@ -206,6 +209,7 @@ export function PlanEditor(
 	let [changes] = useState(() => new ChangeStore());
 	// This survives the keyed MDXEditor remount used for collaboration epoch rotation.
 	let [researchDrafts] = useState(() => new ResearchDraftStore());
+	let [investigationDrafts] = useState(() => new ResearchDraftStore("investigation"));
 
 	// A rotated epoch invalidates the whole local document, so the editor is
 	// rebuilt rather than reconciled — that is what "reset" means. The marks
@@ -499,6 +503,8 @@ export function PlanEditor(
 						research,
 						researchDrafts,
 						researchLauncher,
+						investigations,
+						investigationDrafts,
 						threads,
 						changes,
 						wire,
@@ -507,6 +513,7 @@ export function PlanEditor(
 						editMode,
 						blocked,
 						formatDock,
+						onFormatPanel,
 						self: user.name,
 						synced: state.synced,
 					}),
@@ -535,6 +542,8 @@ export function PlanEditor(
 			research,
 			researchDrafts,
 			researchLauncher,
+			investigations,
+			investigationDrafts,
 			commentPresentation,
 			disclosureMotion,
 			motionImmediately,
@@ -546,6 +555,7 @@ export function PlanEditor(
 			editMode,
 			blocked,
 			formatDock,
+			onFormatPanel,
 			state.synced,
 			authorship,
 		],
@@ -573,7 +583,6 @@ export function PlanEditor(
 	return (
 		<div
 			className={`plan flex h-full w-full flex-col ${className ?? ""}`}
-			data-plan-afterword={!!afterword || undefined}
 			data-plan-offline={offline || undefined}
 			data-plan-reading={editMode === "reading" || undefined}
 		>
@@ -608,7 +617,6 @@ export function PlanEditor(
 							// its HTML visitors and quietly admits `html` nodes.
 							suppressHtmlProcessing
 						/>
-						{afterword && <div className="plan-afterword">{afterword}</div>}
 					</div>
 					{authorship && <AuthorshipLayer canEdit={!readOnly && !offline} store={authorship} />}
 					{/* In the document column, so they track the prose, not the pane. */}

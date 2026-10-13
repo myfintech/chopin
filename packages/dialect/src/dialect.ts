@@ -252,6 +252,7 @@ export const COMPONENTS: Readonly<Record<string, Component>> = Object.freeze({
 			"Tab",
 			"Callout",
 			"Research",
+			"Investigation",
 			"Columns",
 			"Column",
 		],
@@ -282,12 +283,24 @@ export const COMPONENTS: Readonly<Record<string, Component>> = Object.freeze({
 		attributes: {
 			type: { type: "enum", required: true, values: CALLOUT_TYPES },
 			title: { type: "text", required: false, max: limits.MAX_CALLOUT_TITLE },
+			/** How many leading blocks stay visible; the rest fold behind a disclosure. */
+			fold: { type: "integer", required: false, min: 1, max: limits.MAX_CALLOUT_FOLD },
 		},
 	}),
 
 	/** A reference to authoritative Research Workspace state. */
 	Research: plain({
 		name: "Research",
+		kind: "flow",
+		content: { type: "empty" },
+		attributes: {
+			id: { type: "reference", required: true, max: 96 },
+		},
+	}),
+
+	/** A reference to an authoritative local investigation record. */
+	Investigation: plain({
+		name: "Investigation",
 		kind: "flow",
 		content: { type: "empty" },
 		attributes: {

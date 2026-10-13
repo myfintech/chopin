@@ -50,7 +50,8 @@ export type Progress = {
 	verification?: VerificationReport;
 };
 
-export type ArchivedRun = { run: Run; events: ProgressEvent[] };
+/** `live` marks a run released when its last task completed, without verification. */
+export type ArchivedRun = { run: Run; events: ProgressEvent[]; live?: true };
 export type HistoricalRun = {
 	run: Run;
 	progress: Progress;
@@ -210,7 +211,7 @@ function refused(reason: string): Reduction {
 	return { kind: "refused", reason };
 }
 
-function reduceEvent(state: ReducerState, stored: ProgressEvent): Reduction {
+function reduceEvent(state: ReducerState, stored: ProgressEvent, live = false): Reduction {
 	let { run, tasks } = state.context;
 	let progress = state.progress;
 	if (state.phase === "revision_requested") return refused("terminal");
@@ -312,13 +313,19 @@ function reduceEvent(state: ReducerState, stored: ProgressEvent): Reduction {
 			};
 			break;
 		case "block":
-			if (item.state !== "in_progress") return refused("task-state");
+			// A blocker found before start_task implicitly starts the task, so it is never lost. A
+			// live run's rebuild may replace a blocker directly; restarting first would recheck
+			// dependencies that may still be outstanding.
+			if (
+				item.state !== "in_progress" && item.state !== "queued"
+				&& !(live && item.state === "blocked")
+			) return refused("task-state");
 			if (!text(stored.reason)) return refused("reason");
 			next = {
 				id: item.id,
 				state: "blocked",
 				blocker: stored.reason,
-				...(item.pullRequest ? { pullRequest: item.pullRequest } : {}),
+				...(item.state !== "queued" && item.pullRequest ? { pullRequest: item.pullRequest } : {}),
 			};
 			break;
 		case "report_pr": {
@@ -339,6 +346,8 @@ function reduceEvent(state: ReducerState, stored: ProgressEvent): Reduction {
 			break;
 		}
 		case "complete":
+			// A repeated complete_task under a new key is not order-dependent; say so plainly.
+			if (item.state === "completed") return refused("already-complete");
 			if (item.state !== "in_progress") return refused("task-state");
 			if (!item.pullRequest) return refused("pull-request");
 			if (!text(stored.summary)) return refused("summary");
@@ -364,12 +373,22 @@ function reduceEvent(state: ReducerState, stored: ProgressEvent): Reduction {
 	});
 }
 
-function foldRun(tasks: Task[], run: Run, events: ProgressEvent[]): Reduction {
+function settled(state: ReducerState): ReducerState {
+	return state.phase === "active" && state.progress.tasks.every(task => task.state === "completed")
+		? {
+			phase: deliveryPhase(state.progress.tasks),
+			context: state.context,
+			progress: state.progress,
+		}
+		: state;
+}
+
+function foldRun(tasks: Task[], run: Run, events: ProgressEvent[], live = false): Reduction {
 	let state = initial(tasks, run);
 	for (let stored of events) {
-		let result = reduceEvent(state, stored);
+		let result = reduceEvent(state, stored, live);
 		if (result.kind === "refused") return result;
-		state = result.state;
+		state = live ? settled(result.state) : result.state;
 	}
 	return accepted(state);
 }
@@ -485,11 +504,14 @@ function restoreHistory(stored: unknown, graph: Graph): ArchivedRun[] | undefine
 	for (let value of stored) {
 		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 		let item = value as Record<string, unknown>;
-		if (!exact(item, ["events", "run"])) return undefined;
+		if (!exact(item, item.live === undefined ? ["events", "run"] : ["events", "live", "run"])) {
+			return undefined;
+		}
+		if (item.live !== undefined && item.live !== true) return undefined;
 		let run = restoreRunVersion(item.run, graph);
 		let events = restoreEvents(item.events);
 		if (!run || !events) return undefined;
-		history.push({ run, events });
+		history.push({ run, events, ...(item.live ? { live: true as const } : {}) });
 	}
 	return history;
 }
@@ -499,7 +521,7 @@ function projectHistory(graph: Graph, history: ArchivedRun[]): HistoricalRun[] |
 	for (let archived of history) {
 		let version = versionFor(graph, archived.run);
 		if (!version) return undefined;
-		let folded = foldRun(version.definition.tasks, archived.run, archived.events);
+		let folded = foldRun(version.definition.tasks, archived.run, archived.events, archived.live);
 		if (folded.kind === "refused") return undefined;
 		let derived = projectRun(folded.state, archived.events);
 		if (derived.phase === "active") return undefined;
@@ -535,7 +557,7 @@ export function claimEligibility(
 ): ClaimEligibility {
 	let history = lifecycle.history.map(archived => {
 		if (!matches(archived.run, version)) return { run: archived.run, successful: false };
-		let folded = foldRun(version.definition.tasks, archived.run, archived.events);
+		let folded = foldRun(version.definition.tasks, archived.run, archived.events, archived.live);
 		return {
 			run: archived.run,
 			successful: folded.kind === "accepted"
@@ -704,19 +726,31 @@ function released(
 	state: LifecycleState,
 	run: Run,
 	events: ProgressEvent[],
+	live = false,
 ): LifecycleState {
 	let next = copy(state);
 	let version = next.graph.versions.at(-1)!;
 	next.graph.versions[next.graph.versions.length - 1] = { ...version, state: "approved" };
 	next.execution = undefined;
 	next.lifecycle = {
-		history: [...next.lifecycle.history, { run: copy(run), events: copy(events) }],
+		history: [
+			...next.lifecycle.history,
+			{ run: copy(run), events: copy(events), ...(live ? { live: true as const } : {}) },
+		],
 	};
 	return next;
 }
 
-/** Apply one lifecycle event without mutating the graph or claim identity. */
-export function transition(state: LifecycleState, input: LifecycleInput): LifecycleResult {
+/**
+ * Apply one lifecycle event without mutating the graph or claim identity.
+ *
+ * A `live` transition releases the run as soon as every task is complete.
+ */
+export function transition(
+	state: LifecycleState,
+	input: LifecycleInput,
+	live = false,
+): LifecycleResult {
 	if (!text(input.runId)) return { kind: "refused", reason: "run" };
 	if (!text(input.idempotencyKey)) {
 		return { kind: "refused", reason: "idempotency-key" };
@@ -730,7 +764,7 @@ export function transition(state: LifecycleState, input: LifecycleInput): Lifecy
 		let archived = state.lifecycle.history[archivedIndex]!;
 		let version = versionFor(state.graph, archived.run);
 		if (!version) return { kind: "refused", reason: "inactive" };
-		let folded = foldRun(version.definition.tasks, archived.run, archived.events);
+		let folded = foldRun(version.definition.tasks, archived.run, archived.events, archived.live);
 		if (folded.kind === "refused") return folded;
 		let stored = event(input);
 		let reduced = reduceEvent(folded.state, stored);
@@ -741,7 +775,7 @@ export function transition(state: LifecycleState, input: LifecycleInput): Lifecy
 		let events = [...archived.events, stored];
 		let next = copy(state);
 		next.lifecycle.history[archivedIndex] = {
-			run: copy(archived.run),
+			...copy(archived),
 			events: copy(events),
 		};
 		return { kind: "accepted", state: next };
@@ -766,6 +800,9 @@ export function transition(state: LifecycleState, input: LifecycleInput): Lifecy
 			kind: "accepted",
 			state: released(state, run, events),
 		};
+	}
+	if (live && settled(reduced.state).phase !== "active") {
+		return { kind: "accepted", state: released(state, run, events, true) };
 	}
 	return {
 		kind: "accepted",
@@ -792,6 +829,37 @@ export function progressFor(
 }
 
 /** Project archived event logs against the graph versions they implemented. */
+/**
+ * Add task events to a live run that stopped short and was archived by request_revision. They go
+ * before its revision, which is dropped once every task completes so the run reads as implemented.
+ * Returns undefined when any event is refused or reuses an idempotency key.
+ */
+export function resumeLiveRun(
+	graph: Graph,
+	lifecycle: Lifecycle,
+	runId: string,
+	added: ProgressEvent[],
+): Lifecycle | undefined {
+	let index = lifecycle.history.findIndex(item => item.run.id === runId);
+	let archived = lifecycle.history[index];
+	let revision = archived?.events.at(-1);
+	let version = archived && versionFor(graph, archived.run);
+	if (!archived?.live || !version || revision?.kind !== "request_revision") return;
+	let keys = new Set(
+		[...(lifecycle.events ?? []), ...lifecycle.history.flatMap(item => item.events)].map(event =>
+			event.idempotencyKey
+		),
+	);
+	if (added.some(event => keys.has(event.idempotencyKey))) return;
+	let events = [...archived.events.slice(0, -1), ...copy(added)];
+	let folded = foldRun(version.definition.tasks, archived.run, events, true);
+	if (folded.kind === "refused" || folded.state.phase === "revision_requested") return;
+	if (folded.state.phase === "active") events.push(revision);
+	let next = copy(lifecycle);
+	next.history[index] = { ...copy(archived), events };
+	return next;
+}
+
 export function historyFor(graph: Graph, lifecycle: Lifecycle): HistoricalRun[] {
 	return copy(projectHistory(graph, lifecycle.history) ?? []);
 }

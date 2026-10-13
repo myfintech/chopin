@@ -165,11 +165,17 @@ start a turn. See [Remote Planner](hosted-agent.md#remote-planner) and
 
 An outbound local connector uses ACP to control a participant's coding agent and a
 separate, scoped `/connector/mcp` surface for work claims and bounded result data.
-Browser pairing binds the connector to an authenticated owner and document. Only
-that owner can authorize execution. Connector grants remain process-local; their
+Browser pairing binds the connector to an authenticated owner and one
+repository, and it serves every document there. Work always runs on the
+connection of the person who starts it; only that owner can authorize or cancel
+execution. Connector grants remain process-local; their
 durable investigations, captured results, shared view state and evidence decisions
-live in PostgreSQL. New native document references project these records without
-evaluating uploaded code. See [Local investigations](local-experiments.md).
+live in PostgreSQL. An atomic `<Investigation id>` card, placed from the slash
+menu or by the Planner after the block it concerns, and `<Experiment>` view
+embeds project these records without evaluating uploaded code. A completed
+investigation is published atomically as a child document, linked from the
+record, whose embeds read the parent's record. See
+[Local investigations](local-experiments.md).
 
 Local implementation builds share that connector, owner pairing and workspace
 reservation. Approval durably binds the reviewed document/graph revisions and

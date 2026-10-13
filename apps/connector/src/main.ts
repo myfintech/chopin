@@ -1,11 +1,22 @@
+import { hostname } from "node:os";
 import { basename, resolve } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { requestSchema } from "@chopin/experiment";
 import { createBridge } from "./bridge";
-import { ConnectorError, remote } from "./mcp";
+import { ConnectorStopped, serveWork } from "./connection";
+import { remote } from "./mcp";
+import { parseArgs } from "./args";
+import { connectorMessage, forget, machineToken, pair, register, SELF, unpair } from "./machine";
+import { createOutput } from "./output";
+import { permissionMemory } from "./permission";
+import { commandWords, servePlanners } from "./planner";
 import { runWork } from "./run";
 import { implementationBridge } from "./implementation";
+import { removeReplaced, update } from "./update";
+import { CONNECTOR_PROTOCOL, VERSION } from "./version";
 import { lockWorkspace, stateDirectory, workspace } from "./workspace";
+
+const DEFAULT_URL = "https://chopin.githubnext.com";
 
 function origin(value: string) {
 	let url = new URL(value);
@@ -25,8 +36,10 @@ async function bridge() {
 		process.env.CHOPIN_BRIDGE_TOKEN!,
 	);
 	let server;
-	if (process.env.CHOPIN_BRIDGE_KIND === "implementation") server = await implementationBridge(api);
-	else {
+	// A spike's tools are the server's run-scoped list, relayed as they are.
+	if (["implementation", "spike"].includes(process.env.CHOPIN_BRIDGE_KIND ?? "")) {
+		server = await implementationBridge(api, process.env.CHOPIN_BRIDGE_ROOT);
+	} else {
 		let context = await api.call("read_experiment") as { input: unknown };
 		server = createBridge(requestSchema.parse(context.input), async result => {
 			await api.call("submit_experiment_result", { result });
@@ -41,120 +54,238 @@ async function bridge() {
 	process.once("SIGINT", () => void close());
 }
 
+function server() {
+	return origin(process.env.CHOPIN_URL ?? DEFAULT_URL);
+}
+
+/** Interrupt a command at the first Ctrl-C; a second exits at once. */
+function interruptible() {
+	let abort = new AbortController();
+	let stop = () => {
+		if (abort.signal.aborted) process.exit(130);
+		abort.abort();
+		process.once("SIGINT", () => process.exit(130));
+	};
+	process.once("SIGINT", stop);
+	process.once("SIGTERM", stop);
+	return {
+		signal: abort.signal,
+		done() {
+			process.removeListener("SIGINT", stop);
+			process.removeListener("SIGTERM", stop);
+		},
+	};
+}
+
+/** `pair [--label <name>]`: pair this machine and store its token, replacing any earlier one. */
+async function pairCommand(args: string[]) {
+	let parsed = parseArgs(args, { options: ["label"] });
+	if (parsed.positional.length || parsed.rest) {
+		throw new Error(`Usage: ${SELF} pair [--label <name>]`);
+	}
+	let output = createOutput();
+	let label = parsed.options.get("label") ?? hostname();
+	let run = interruptible();
+	try {
+		let token = await pair({
+			url: server(),
+			label,
+			directory: stateDirectory(),
+			output,
+			signal: run.signal,
+		});
+		if (token) output.say(`${output.style.green("✓ Paired.")} This machine is ${label} in Chopin.`);
+	} finally {
+		run.done();
+	}
+}
+
+/** `unpair`: revoke this machine's token on the server and delete it here. */
+async function unpairCommand(args: string[]) {
+	let parsed = parseArgs(args);
+	if (parsed.positional.length || parsed.rest) throw new Error(`Usage: ${SELF} unpair`);
+	let url = server();
+	let result = await unpair(url, stateDirectory());
+	createOutput().say(
+		result === "unpaired"
+			? `Unpaired this machine from ${url}.`
+			: `This machine is not paired with ${url}.`,
+	);
+}
+
 async function connect(args: string[]) {
-	let split = args.indexOf("--");
-	let command = split >= 0
-		? args.slice(split + 1)
-		: JSON.parse(process.env.CHOPIN_ACP_COMMAND ?? "[]");
+	let parsed = parseArgs(args, { options: ["planner-command"], lists: ["planner"] });
+	let command = parsed.rest ?? JSON.parse(process.env.CHOPIN_ACP_COMMAND ?? "[]");
 	if (
 		!Array.isArray(command) || !command.length
 		|| command.some(item => typeof item !== "string" || !item)
 	) {
+		throw new Error(USAGE);
+	}
+	let plannerDocuments = parsed.lists.get("planner") ?? [];
+	let plannerLine = parsed.options.get("planner-command");
+	let plannerCommand = plannerLine === undefined
+		? JSON.parse(process.env.CHOPIN_PLANNER_COMMAND ?? "[]")
+		: commandWords(plannerLine);
+	if (
+		!Array.isArray(plannerCommand)
+		|| plannerCommand.some(item => typeof item !== "string" || !item)
+		|| !!plannerDocuments.length !== !!plannerCommand.length
+	) {
 		throw new Error(
-			"Usage: CHOPIN_URL=https://your-instance chopin connect [checkout] -- agent acp-arguments",
+			`--planner <document URL> and --planner-command <command> go together.\n\n${USAGE}`,
 		);
 	}
-	let url = origin(process.env.CHOPIN_URL ?? "https://chopin.githubnext.com");
-	let info = await workspace(resolve(args[0] && args[0] !== "--" ? args[0] : "."));
+	let url = server();
+	let info = await workspace(resolve(parsed.positional[0] ?? "."));
 	let directory = stateDirectory();
 	let release = await lockWorkspace(info.root, directory);
 	let abort = new AbortController();
-	let stop = () => abort.abort();
+	// The first Ctrl-C reports running work as stopped, then disconnects; a second forces exit.
+	let stop = () => {
+		if (abort.signal.aborted) process.exit(130);
+		abort.abort();
+		process.once("SIGINT", () => process.exit(130));
+	};
 	process.once("SIGINT", stop);
 	process.once("SIGTERM", stop);
-	async function post(path: string, body: unknown) {
-		let response = await fetch(url + path, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify(body),
-			signal: abort.signal,
-		});
-		let value = await response.json();
-		if (!response.ok) throw new Error(value.error ?? "Connector request failed");
-		return value;
-	}
-	let api: Awaited<ReturnType<typeof remote>> | undefined;
+	let output = createOutput();
+	let permissions = permissionMemory();
 	try {
 		let { root: _root, ...source } = info;
-		let pairing = await post("/api/connector/pairings", { ...source, label: basename(info.root) });
-		console.error(`Approve this workspace in Chopin: ${pairing.url}`);
-		let token: string | undefined;
-		while (!abort.signal.aborted && !token) {
-			let claim = await post(`/api/connector/pairings/${pairing.id}/claim`, {
-				secret: pairing.secret,
-			});
-			token = claim.token;
-			if (!token) await delay(1000, abort.signal);
-		}
-		if (!token) return;
-		api = await remote(url, token);
-		console.error("Connected. Waiting for owner-authorized local work. Ctrl-C disconnects.");
-		while (!abort.signal.aborted) {
-			let offered = await api.call("wait_for_work", {}, abort.signal) as {
-				id?: string;
-				kind?: "experiment" | "implementation";
-			};
-			if (!offered.id || !offered.kind) continue;
-			let claim;
-			try {
-				claim = await api.call(
-					offered.kind === "implementation" ? "claim_implementation_build" : "claim_experiment",
-					{ id: offered.id },
-				);
-			} catch (error) {
-				if (
-					error instanceof ConnectorError
-					&& ["workspace-busy", "build-already-claimed", "invalid-state"].includes(error.code)
-				) {
-					await delay(1000, abort.signal);
-					continue;
-				}
-				throw error;
-			}
-			await runWork(api, offered.kind, claim, {
-				root: info.root,
-				directory,
-				command,
+		let checkout = { ...source, label: basename(info.root) };
+		for (;;) {
+			// A machine paired once reconnects with its stored token; an unpaired one pairs first.
+			let stored = await machineToken(directory, url);
+			let machine = stored
+				?? await pair({
+					url,
+					label: hostname(),
+					directory,
+					output,
+					signal: abort.signal,
+					checkout: source,
+				});
+			if (!machine) return;
+			let announced = false;
+			// Planner backends run beside the work loop with this machine token and stop with it, so
+			// none outlives a revoked token and a machine paired again starts them with its new one.
+			let planners = new AbortController();
+			let planning = servePlanners({
 				url,
-				script: resolve(process.argv[1]),
-				signal: abort.signal,
+				machine,
+				documents: plannerDocuments,
+				command: plannerCommand,
+				cwd: info.root,
+				output,
+				signal: AbortSignal.any([abort.signal, planners.signal]),
 			});
+			try {
+				await serveWork({
+					// Every connection registers anew with the machine token: a connection token lasts only
+					// while the server runs, so after a restart Chopin refuses the old one for good.
+					connect: async signal => {
+						let api = await remote(url, await register(url, machine, checkout, signal), signal);
+						if (!announced) output.connected(info.repository);
+						announced = true;
+						return api;
+					},
+					signal: abort.signal,
+					output,
+					run: (api, kind, claim) =>
+						runWork(api, kind, claim, {
+							root: info.root,
+							directory,
+							command,
+							url,
+							signal: abort.signal,
+							output,
+							permissions,
+							interrupt: stop,
+						}),
+				});
+				return;
+			} catch (error) {
+				if (!(error instanceof ConnectorStopped && error.reason === "revoked")) throw error;
+				// Chopin no longer accepts the token, so it is forgotten and the next connect pairs.
+				await forget(url, directory, machine);
+				// A stored token refused at the start pairs again at once on a terminal, as if none were
+				// stored. A service stops rather than wait on a browser, and a machine disconnected while
+				// it was connected stays stopped.
+				if (!stored || announced || !process.stdin.isTTY || !process.stdout.isTTY) throw error;
+				output.say("This machine needs pairing with Chopin again.");
+			} finally {
+				planners.abort();
+				await planning;
+			}
 		}
 	} catch (error) {
 		if (!abort.signal.aborted) throw error;
 	} finally {
-		if (api) {
-			await api.call("disconnect_workspace").catch(() => {});
-			await api.close();
-		}
 		process.removeListener("SIGINT", stop);
 		process.removeListener("SIGTERM", stop);
 		await release();
 	}
 }
 
-function delay(ms: number, signal: AbortSignal) {
-	return new Promise<void>(resolve => {
-		let finish = () => {
-			clearTimeout(timer);
-			signal.removeEventListener("abort", finish);
-			resolve();
-		};
-		let timer = setTimeout(finish, ms);
-		signal.addEventListener("abort", finish, { once: true });
-		if (signal.aborted) finish();
-	});
-}
+const USAGE = `Usage: CHOPIN_URL=https://your-instance ${SELF} connect [checkout] `
+	+ "[--planner <document URL>]... [--planner-command <command>] -- agent [ACP arguments]";
+
+const HELP = [
+	`Usage: ${SELF} <command> [--base-dir <dir>]`,
+	"",
+	"Commands:",
+	"  pair [--label <name>]",
+	"      Pair this machine with Chopin (once) and store its token. Pairing again replaces it.",
+	"      --label names the machine in Chopin (default: this computer's hostname).",
+	"  unpair",
+	"      Revoke this machine's token in Chopin and delete it here.",
+	"  connect [checkout] -- <agent> [ACP arguments]",
+	"      Run the work you start in the checkout's documents with a local ACP agent.",
+	"      Pairs this machine first if it isn't paired yet.",
+	"      --planner <document URL> (repeatable) with --planner-command <command> also runs that",
+	"      command in the checkout as each document's Planner under HARNESS=remote, and starts it",
+	"      again whenever it exits. CHOPIN_PLANNER_COMMAND may hold the command as a JSON array.",
+	"  update [version] [--allow-downgrade] [--yes]",
+	"      Replace this chopin with a verified release: by default the one your Chopin instance",
+	"      recommends, or else the newest. An older release needs --allow-downgrade; --yes skips",
+	"      the question asked on a terminal.",
+	"  version    Print the CLI version and the connector protocol it speaks.",
+	"  help       Show this help.",
+	"",
+	"--base-dir (or CHOPIN_HOME) is where the machine token, locks and worktrees live",
+	"(default ~/.local/state/chopin/connector).",
+	`CHOPIN_URL names your Chopin instance (default ${DEFAULT_URL}).`,
+].join("\n");
 
 if (import.meta.main) {
 	let [mode, ...args] = process.argv.slice(2);
+	await removeReplaced();
 	try {
 		if (mode === "bridge") await bridge();
-		else if (mode === "connect") await connect(args);
-		else throw new Error("Usage: chopin connect [checkout] -- agent [ACP arguments]");
+		else if (mode === "update") {
+			let parsed = parseArgs(args, { flags: ["allow-downgrade", "yes"] });
+			if (parsed.positional.length > 1 || parsed.rest) {
+				throw new Error(`Usage: ${SELF} update [version] [--allow-downgrade] [--yes]`);
+			}
+			await update({
+				version: parsed.positional[0],
+				allowDowngrade: parsed.flags.has("allow-downgrade"),
+				yes: parsed.flags.has("yes"),
+				server: server(),
+			});
+		} else if (mode === "connect") await connect(args);
+		else if (mode === "pair") await pairCommand(args);
+		else if (mode === "unpair") await unpairCommand(args);
+		else if (mode === "version" || mode === "--version" || mode === "-v") {
+			console.log(`chopin ${VERSION} (connector protocol ${CONNECTOR_PROTOCOL})`);
+		} else if (mode === "help" || mode === "--help" || mode === "-h") console.log(HELP);
+		else throw new Error(mode ? `Unknown command: ${mode}\n\n${HELP}` : HELP);
 	} catch (error) {
 		if (!(error instanceof Error && error.name === "AbortError")) {
-			console.error(error instanceof Error ? error.message : "Connector failed");
+			createOutput().error(
+				connectorMessage(error) ?? (error instanceof Error ? error.message : "Connector failed"),
+			);
 			process.exitCode = 1;
 		}
 	}

@@ -385,6 +385,12 @@ async function expectCompactDestinationStatePreserved(page: Page): Promise<void>
 			tracker;
 	});
 
+	// Reading down minimises the tab bar to the current tab; a tap brings the tabs back.
+	let showTabs = async () => {
+		let show = nav.getByRole("button", { name: /^Show tabs/ });
+		if (await show.isVisible()) await show.click();
+	};
+	await showTabs();
 	await nav.getByRole("button", { name: /Chat/ }).click();
 	await draft.fill("unfinished compact thought");
 
@@ -395,6 +401,7 @@ async function expectCompactDestinationStatePreserved(page: Page): Promise<void>
 		element.dispatchEvent(new Event("scroll"));
 	});
 	let decisionScroll = await decisionScroller.evaluate(element => element.scrollTop);
+	await showTabs();
 	await nav.getByRole("button", { name: "Document" }).click();
 
 	await expectChatValue(draft, "unfinished compact thought");
@@ -1029,7 +1036,11 @@ test("a compact new-comment sheet blocks navigation and restores editor focus", 
 		exact: true,
 		includeHidden: true,
 	});
-	let decisions = page.getByRole("button", { name: /^Decisions/, includeHidden: true });
+	let documents = page.locator(".phone-top-bar").getByRole("button", {
+		name: "Documents",
+		exact: true,
+		includeHidden: true,
+	});
 
 	let openDraft = async () => {
 		await editor.locator("p").nth(1).selectText();
@@ -1041,21 +1052,30 @@ test("a compact new-comment sheet blocks navigation and restores editor focus", 
 	};
 
 	let sheet = await openDraft();
-	let destination = await decisions.boundingBox();
+	// Once risen, the sheet covers the tab bar; the scrim still covers the top bar's navigation.
+	// Measuring before it stands on the viewport's foot would race its rise.
+	await expect.poll(() =>
+		sheet.evaluate(element =>
+			element.getAnimations().length === 0
+			&& Math.round(element.getBoundingClientRect().bottom) === window.innerHeight
+		)
+	).toBe(true);
+	let destination = await documents.boundingBox();
 	expect(destination).not.toBeNull();
 	let destinationPoint = {
 		x: destination!.x + destination!.width / 2,
 		y: destination!.y + destination!.height / 2,
 	};
-	await expect.poll(() =>
-		page.evaluate(
+	expect(
+		await page.evaluate(
 			({ x, y }) =>
 				!!document.elementFromPoint(x, y)?.closest("[data-plan-comment-sheet-backdrop]"),
 			destinationPoint,
-		)
+		),
 	).toBe(true);
 	await page.mouse.click(destinationPoint.x, destinationPoint.y);
 	await expect(sheet).toHaveCount(0);
+	await expect(page.getByRole("dialog", { name: "Documents" })).toHaveCount(0);
 	await expect(plan).toHaveAttribute("aria-current", "page");
 	await expect(editor).toBeFocused();
 	sheet = await openDraft();
@@ -1323,6 +1343,55 @@ test("a removed subject block moves its comment to document orphan chrome", asyn
 	await expect(orphaned).toBeVisible();
 	await orphaned.click();
 	await expect(page.getByRole("dialog", { name: "Orphaned comments" })).toContainText(QUOTED);
+});
+
+test("an open comment card hides the formatting toolbar of a lingering selection", async ({ join, seed }) => {
+	await seed(TWO_BLOCKS);
+	let page = await join("ana");
+	await page.setViewportSize({ width: 1_280, height: 800 });
+	await content(page).locator("p").nth(1).selectText();
+	let toolbar = page.getByRole("toolbar", { name: "Text formatting" });
+	await expect(toolbar).toBeVisible();
+
+	let card = await thread(page);
+	await expect(card).toBeVisible();
+	await expect(toolbar).toBeHidden();
+});
+
+test("the orphaned comments popover shows its whole card beneath the pill", async ({ join, seed }) => {
+	await seed(TWO_BLOCKS);
+	let page = await join("ana");
+	await page.setViewportSize({ width: 1_280, height: 800 });
+	let first = content(page).locator("p").first();
+	await first.selectText();
+	await page.keyboard.press("Backspace");
+	await page.keyboard.press("Backspace");
+
+	// A selection's formatting toolbar would sit over the card it opens.
+	await content(page).locator("p").first().selectText();
+	let toolbar = page.getByRole("toolbar", { name: "Text formatting" });
+	await expect(toolbar).toBeVisible();
+
+	let opener = page.getByRole("button", { name: "1 orphaned comments" });
+	await opener.click();
+	let popover = page.getByRole("dialog", { name: "Orphaned comments" });
+	await expect(popover).toBeVisible();
+	await expect(toolbar).toBeHidden();
+	// The card sizes against the document, not the pill that holds it.
+	let reply = popover.getByRole("textbox", { name: "Reply", exact: true });
+	await expect(reply).toBeInViewport({ ratio: 1 });
+	await expect(popover.getByText(QUOTED, { exact: true })).toBeInViewport({ ratio: 1 });
+	await expect.poll(() => popover.evaluate(element => element.scrollHeight - element.clientHeight))
+		.toBeLessThanOrEqual(1);
+	let card = await popover.boundingBox();
+	let pill = await opener.boundingBox();
+	expect(card!.width).toBeGreaterThanOrEqual(280);
+	expect(card!.y).toBeGreaterThanOrEqual(pill!.y + pill!.height);
+	expect(Math.abs(card!.x + card!.width - (pill!.x + pill!.width))).toBeLessThanOrEqual(1);
+
+	await page.keyboard.press("Escape");
+	await expect(popover).toHaveCount(0);
+	await expect(opener).toBeFocused();
 });
 
 test("a compact orphan sheet owns focus and restores its opener", async ({ join, seed }) => {

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, open, realpath, rm } from "node:fs/promises";
+import { mkdir, open, readFile, realpath, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { execFile, spawnSync } from "node:child_process";
@@ -27,9 +27,10 @@ export async function workspace(path: string) {
 	};
 }
 
+/** Where the machine token, locks and worktrees live: `--base-dir`, CHOPIN_HOME, or the default. */
 export function stateDirectory() {
-	return process.env.CHOPIN_CONNECTOR_STATE_DIR
-		?? join(
+	return process.env.CHOPIN_HOME || process.env.CHOPIN_CONNECTOR_STATE_DIR
+		|| join(
 			process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"),
 			"chopin",
 			"connector",
@@ -44,15 +45,70 @@ export async function lockWorkspace(root: string, directory: string) {
 	try {
 		file = await open(path, "wx", 0o600);
 	} catch {
-		throw new Error(
-			`Workspace already locked. After confirming no connector is running, remove ${path}`,
-		);
+		// A connector that crashed leaves its lock behind; replace it once its process is gone.
+		if (!await staleLock(path)) {
+			throw new Error(
+				`Workspace already locked. After confirming no connector is running, remove ${path}`,
+			);
+		}
+		await rm(path, { force: true });
+		try {
+			file = await open(path, "wx", 0o600);
+		} catch {
+			throw new Error(`Workspace already locked by a connector that just started. ${path}`);
+		}
 	}
 	await file.writeFile(JSON.stringify({ pid: process.pid, root }));
 	return async () => {
 		await file.close();
 		await rm(path, { force: true });
 	};
+}
+
+/** Only a lock naming a process that no longer exists is stale; unreadable locks are kept. */
+async function staleLock(path: string): Promise<boolean> {
+	let pid: unknown;
+	try {
+		pid = JSON.parse(await readFile(path, "utf8")).pid;
+	} catch {
+		return false;
+	}
+	if (!Number.isSafeInteger(pid) || (pid as number) <= 0) return false;
+	try {
+		process.kill(pid as number, 0);
+		return false;
+	} catch (err) {
+		// EPERM means the process exists but belongs to someone else.
+		return (err as NodeJS.ErrnoException).code === "ESRCH";
+	}
+}
+
+/**
+ * Git configuration, through the environment, under which every push from the agent's process
+ * tree fails: each remote URL is rewritten to a scheme Git cannot push to. A spike runs under it,
+ * so its throwaway branch never leaves the laptop even if the agent tries.
+ */
+export function noPushEnvironment(): Record<string, string> {
+	let prefixes = ["https://", "http://", "ssh://", "git@", "git://", "file://", "/", "."];
+	let env: Record<string, string> = { GIT_CONFIG_COUNT: String(prefixes.length) };
+	prefixes.forEach((prefix, index) => {
+		env[`GIT_CONFIG_KEY_${index}`] = "url.chopin-spike-never-pushes://.pushInsteadOf";
+		env[`GIT_CONFIG_VALUE_${index}`] = prefix;
+	});
+	return env;
+}
+
+/** Remove a finished spike's worktree and throwaway branch; its screenshots were uploaded. */
+export async function discardWorkspace(root: string, path: string, branch: string) {
+	try {
+		await promisify(execFile)("git", ["-C", root, "worktree", "remove", "--force", path], {
+			timeout: 60_000,
+		});
+	} catch {
+		await rm(path, { recursive: true, force: true });
+		await promisify(execFile)("git", ["-C", root, "worktree", "prune"]).catch(() => {});
+	}
+	await promisify(execFile)("git", ["-C", root, "branch", "-D", branch]).catch(() => {});
 }
 
 export async function prepareWorkspace(

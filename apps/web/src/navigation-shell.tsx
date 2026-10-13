@@ -158,10 +158,10 @@ let NavigationDocument = createContext<{
 	onRepositoryAccessChanged: () => void;
 	onResearchChildOpen: (
 		parentId: string,
-		child: Research.ReadyChild,
+		child: Pick<Research.ReadyChild, "slug">,
 		opener: ResearchOpener,
 	) => void;
-	onResearchChildPublished: (parentId: string, child: Research.ReadyChild) => void;
+	onResearchChildPublished: (parentId: string, child: Pick<Research.ReadyChild, "slug">) => void;
 }>({
 	onDocumentChanged() {},
 	onDocumentAction() {},
@@ -309,12 +309,10 @@ export function NavigationShell(
 		if (restoreFocus) accountTrigger.current?.focus();
 	};
 	useMenuDismissal(accountOpen, [accountWrap], closeAccount);
-	useEffect(() => {
+	// Focus moves in as the menu mounts, not a frame later, so no key pressed meanwhile is lost.
+	useLayoutEffect(() => {
 		if (!accountOpen) return;
-		let frame = requestAnimationFrame(() => {
-			accountWrap.current?.querySelector<HTMLElement>("[role=menuitem]")?.focus();
-		});
-		return () => cancelAnimationFrame(frame);
+		accountWrap.current?.querySelector<HTMLElement>("[role=menuitem]")?.focus();
 	}, [accountOpen]);
 	let accountPresence = useTransitionPresence(
 		accountOpen ? true : undefined,
@@ -699,7 +697,7 @@ export function NavigationShell(
 										`[data-project-sidebar] [data-document-id="${restored.channel.id}"] .project-sidebar-document-link`,
 									)
 										?? document.querySelector<HTMLElement>(
-											"header button[aria-label^='Actions for ']",
+											"[aria-label^='Document:'] button[aria-label^='Actions for ']",
 										))
 										?.focus({ preventScroll: true })
 								);
@@ -719,7 +717,7 @@ export function NavigationShell(
 	}, [documentAction]);
 	let researchChildOpen = useCallback((
 		parentId: string,
-		child: Research.ReadyChild,
+		child: Pick<Research.ReadyChild, "slug">,
 		opener: ResearchOpener,
 	) => {
 		let channel = knownChannelsRef.current.get(parentId);
@@ -730,15 +728,18 @@ export function NavigationShell(
 		let target = researchChildNavigation(channel, child, opener);
 		navigate(target.destination, { opener: target.opener });
 	}, [navigate]);
-	let researchChildPublished = useCallback((parentId: string, _child: Research.ReadyChild) => {
-		let channel = knownChannelsRef.current.get(parentId);
-		if (!channel) return;
-		let entry = projectsRef.current.find(value =>
-			value.project.repositoryId === channel.repositoryId
-		);
-		if (!entry?.project.available) return;
-		refreshProjectRef.current(entry.project);
-	}, []);
+	let researchChildPublished = useCallback(
+		(parentId: string, _child: Pick<Research.ReadyChild, "slug">) => {
+			let channel = knownChannelsRef.current.get(parentId);
+			if (!channel) return;
+			let entry = projectsRef.current.find(value =>
+				value.project.repositoryId === channel.repositoryId
+			);
+			if (!entry?.project.available) return;
+			refreshProjectRef.current(entry.project);
+		},
+		[],
+	);
 	let repositoryAccessChanged = useCallback(() => {
 		void refresh();
 	}, [refresh]);

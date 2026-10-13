@@ -17,6 +17,16 @@ function sheet(page: Page) {
 	return page.getByRole("dialog", { name: "Documents" });
 }
 
+/** The sheet rises into place; measure or grab it only once it stands on the viewport's foot. */
+async function standing(page: Page): Promise<void> {
+	await expect.poll(() =>
+		sheet(page).evaluate(element =>
+			element.getAnimations().length === 0
+			&& Math.round(element.getBoundingClientRect().bottom) === window.innerHeight
+		)
+	).toBe(true);
+}
+
 async function otherDocument(baseURL: string): Promise<string> {
 	let id = crypto.randomUUID();
 	await createChannel(Number(new URL(baseURL).port), id);
@@ -29,6 +39,7 @@ test("a phone opens its documents in a bottom sheet over an inert page", async (
 	let before = await page.getByRole("banner").boundingBox();
 	await opener.click();
 	await expect(sheet(page)).toBeVisible();
+	await standing(page);
 	await expect(page.getByRole("dialog", { name: "Projects" })).toHaveCount(0);
 	await expect(sheet(page).getByRole("button", { name: "Close documents" }).first()).toBeFocused();
 	await expect(page.locator(".navigation-shell")).toHaveAttribute("inert", "");
@@ -48,9 +59,12 @@ test("a phone opens its documents in a bottom sheet over an inert page", async (
 
 	await opener.click();
 	await expect(sheet(page)).toBeVisible();
+	// Measured mid-rise, the grab point would land on a document link, which a mouse drags as a link.
+	await standing(page);
 	let box = (await sheet(page).boundingBox())!;
 	await page.mouse.move(box.x + box.width / 2, box.y + 12);
 	await page.mouse.down();
+	// Past half the sheet's height, so it dismisses however slowly the drag arrives.
 	for (let step = 1; step <= 12; step++) {
 		await page.mouse.move(box.x + box.width / 2, box.y + 12 + step * 40);
 	}
@@ -170,7 +184,9 @@ test("desktop keeps the Projects sidebar and popover menus", async ({ join, room
 	let page = await join("ana", { viewport: { width: 1440, height: 900 } });
 	await expect(page.getByRole("complementary", { name: "Projects" })).toBeVisible();
 	await expect(page.getByRole("button", { name: "Documents", exact: true })).toHaveCount(0);
-	await page.getByRole("banner").getByRole("button", { name: `Actions for ${title(room)}` })
+	await page.getByRole("group", { name: /^Document: / }).getByRole("button", {
+		name: `Actions for ${title(room)}`,
+	})
 		.click();
 	await expect(page.getByRole("menu", { name: `Actions for ${title(room)}` })).toBeVisible();
 	await expect(page.getByRole("dialog", { name: /^Actions for / })).toHaveCount(0);

@@ -290,6 +290,41 @@ export function rehearse(
 	}
 }
 
+/** Each editor's history, so a control outside the binding can show what it can step to. */
+const histories = new WeakMap<
+	LexicalEditor,
+	{ manager?: Y.UndoManager; changed: Set<() => void> }
+>();
+
+function historyOf(editor: LexicalEditor) {
+	let history = histories.get(editor);
+	if (!history) histories.set(editor, history = { changed: new Set() });
+	return history;
+}
+
+export type HistorySteps = { undo: boolean; redo: boolean };
+
+/**
+ * Follow whether undo and redo have a step to take. Until the editor's shared history is
+ * registered there is nothing to step to; a listener added before then hears when it arrives.
+ */
+export function listenToHistory(
+	editor: LexicalEditor,
+	listener: (steps: HistorySteps) => void,
+): () => void {
+	let history = historyOf(editor);
+	let report = () => {
+		let manager = history.manager;
+		listener({
+			undo: !!manager && manager.undoStack.length > 0,
+			redo: !!manager && manager.redoStack.length > 0,
+		});
+	};
+	report();
+	history.changed.add(report);
+	return () => history.changed.delete(report);
+}
+
 /** Why an undo did not happen, as the person is told. */
 export type Refusal = "others" | "change";
 
@@ -316,6 +351,15 @@ export function registerPlanHistory(
 		trackedOrigins: new Set([binding]),
 		captureTimeout,
 	});
+	let history = historyOf(editor);
+	history.manager = manager;
+	let notify = () => {
+		for (let listener of history.changed) listener();
+	};
+	manager.on("stack-item-added", notify);
+	manager.on("stack-item-popped", notify);
+	manager.on("stack-cleared", notify);
+	notify();
 
 	let step = (direction: "undo" | "redo") => {
 		if (!editor.isEditable()) return false;
@@ -328,6 +372,7 @@ export function registerPlanHistory(
 			// Only the refused step goes. Older ones still reverse cleanly or are
 			// refused in turn, since each is rehearsed against the room as it is.
 			stack.splice(-verdict.steps);
+			notify();
 			onRefused?.(verdict.reason === "others" ? "others" : "change");
 		}
 		return true;
@@ -360,6 +405,10 @@ export function registerPlanHistory(
 			stopUndo();
 			stopRedo();
 			manager.destroy();
+			if (history.manager === manager) {
+				history.manager = undefined;
+				notify();
+			}
 		},
 	};
 }

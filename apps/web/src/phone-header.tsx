@@ -1,7 +1,11 @@
-/** The phone top bar: Documents on the left, a small centred title, and actions on the right. */
+/**
+ * The phone top bar: Documents on the left, a small centred title, and the document's
+ * comments and actions on the right.
+ */
 
 import { useContext, useEffect, useLayoutEffect, useRef } from "react";
-import { DocumentsIcon, EllipsisIcon } from "@chopin/icons";
+import { CommentIcon, DocumentsIcon, EllipsisIcon } from "@chopin/icons";
+import type { ReactNode } from "react";
 
 import { DocumentActionsMenu, loadActionSheet } from "./document-actions-menu";
 import { DocumentRename } from "./document-rename";
@@ -23,26 +27,34 @@ export function PhoneHeader(
 	{
 		archivedAt,
 		canManage,
+		comments = 0,
 		editing,
 		editingDocument,
 		label,
 		onAction,
+		onComments,
 		onEditingChange,
 		onRenamed,
 		presentation,
 		room,
+		build,
 	}: {
 		archivedAt?: string;
 		canManage: boolean;
+		/** Open comment threads in the document; the bar offers a list of them when there are any. */
+		comments?: number;
 		editing?: TitleEdit;
 		/** The document itself is in edit mode, which the bar says under the title. */
 		editingDocument?: boolean;
 		label: string;
 		onAction: (action: DocumentAction) => void;
+		onComments?: () => void;
 		onEditingChange: (editing?: TitleEdit) => void;
 		onRenamed: (channel: DocumentMetadata) => void;
 		presentation: WorkspacePresentation;
 		room: string;
+		/** The build capsule's glyph, beside the document's actions. */
+		build?: ReactNode;
 	},
 ) {
 	let header = useRef<HTMLElement>(null);
@@ -123,6 +135,20 @@ export function PhoneHeader(
 				)}
 			</div>
 			<div className="phone-top-bar-slot">
+				{build}
+				{comments > 0 && onComments && (
+					<button
+						aria-haspopup="dialog"
+						aria-label={comments === 1 ? "1 open comment" : `${comments} open comments`}
+						className="phone-top-bar-comments btn btn-md btn-ghost"
+						data-phone-comments=""
+						onClick={onComments}
+						type="button"
+					>
+						<CommentIcon aria-hidden="true" size={18} />
+						<span aria-hidden="true">{comments}</span>
+					</button>
+				)}
 				{canManage && (
 					<DocumentActionsMenu
 						channel={{ archivedAt, title: label }}

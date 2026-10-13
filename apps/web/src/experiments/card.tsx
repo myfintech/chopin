@@ -1,200 +1,143 @@
-import { useEffect, useState } from "react";
-import { ExperimentView } from "@chopin/experiment/react";
-import { StaticPlanEditor } from "@chopin/editor/static";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import { InvestigationCard, SidecarCard } from "@chopin/editor";
 import type { ExperimentStore } from "./store";
-import { EvidenceActions } from "./evidence";
-import type { InvestigationSummary } from "@chopin/experiment/records";
-import { UnfoldPanel, UnfoldSection, UnfoldToggle, useUnfold } from "@chopin/visuals/unfold";
+import { ItemDecisions } from "./evidence";
+import { LocalAgentNote } from "../local-agent-note";
+import type { InvestigationChild, InvestigationState } from "@chopin/experiment/records";
 
-export function InvestigationCard({ store, summary, userId, canEdit, locked }: {
+const ACTIVE: ReadonlySet<InvestigationState> = new Set(["queued", "running", "publishing"]);
+const SETTLED: ReadonlySet<InvestigationState> = new Set(["failed", "cancelled", "interrupted"]);
+
+/** Plain copy for a refused card action; unknown refusals keep the server's words. */
+const REFUSALS: Record<string, string> = {
+	"document-archived": "This document is archived.",
+	"document-locked": "This document is locked while it builds.",
+	"repository-forbidden": "You need push access to this repository.",
+	"invalid-state": "This investigation has already started or ended.",
+	"connection-forbidden": "That local agent isn’t yours to use.",
+	"connection-unavailable": "That local agent disconnected. Start it again, then retry.",
+	"workspace-busy": "Your local agent is busy. Try again when it finishes.",
+	"child-document": "Investigations start only in a top-level document.",
+};
+
+/** The freshest state this browser knows, from the list or a loaded record. */
+function latest(store: ExperimentStore, id: string) {
+	let summary = store.items.find(item => item.id === id);
+	let value = store.get(id);
+	if (!summary) return value;
+	return value && value.revision > summary.revision ? value : summary;
+}
+
+/**
+ * Whether a document may drop this investigation's card. Only stopped or failed work can go:
+ * a ready card is withdrawn first, and a completed one stays as the link to its child
+ * document. The server applies the same rule.
+ */
+export function removableInvestigation(store: ExperimentStore, id: string): boolean {
+	let state = latest(store, id)?.state;
+	return !!state && SETTLED.has(state);
+}
+
+/** The inline card for one investigation, placed in the document by its id. */
+export function InvestigationReference({ store, id, userId, canEdit, locked, onRemove, onOpen }: {
 	store: ExperimentStore;
-	summary: InvestigationSummary;
+	id: string;
 	userId: string;
 	canEdit: boolean;
 	locked: boolean;
+	onRemove: () => void;
+	/** Open the child document a completed investigation was published as. */
+	onOpen?: (child: InvestigationChild, opener: HTMLElement) => void;
 }) {
-	let [connectionId, setConnectionId] = useState("");
+	useSyncExternalStore(store.subscribe, store.snapshot, store.snapshot);
+	let [needsAgent, setNeedsAgent] = useState(false);
 	let [busy, setBusy] = useState(false);
 	let [error, setError] = useState("");
-	let [loadFailed, setLoadFailed] = useState(false);
-	let [loading, setLoading] = useState(!store.get(summary.id));
-	let item = store.get(summary.id);
-	let owned = store.connections.filter(connection => connection.owner === userId);
-	// Work that still needs a person opens; a finished result folds to its brief.
-	let body = useUnfold(summary.state !== "completed", "card");
-	let load = async () => {
-		setLoading(true);
-		await store.load(summary.id);
-		if (loadFailed && store.get(summary.id)) void store.refresh();
-		setLoadFailed(!store.get(summary.id));
-		setLoading(false);
-	};
+	let summary = store.items.find(item => item.id === id);
+	let item = store.get(id);
+	let current = latest(store, id);
+	let revision = summary?.revision;
 	useEffect(() => {
-		if (!store.get(summary.id)) void load();
-	}, [store, summary.id]);
+		if (!store.get(id) || revision !== undefined && store.get(id)!.revision < revision) {
+			void store.load(id);
+		}
+	}, [store, id, revision]);
 	async function act(action: () => Promise<unknown>) {
 		setBusy(true);
 		setError("");
+		setNeedsAgent(false);
 		try {
 			await action();
 		} catch (error) {
-			setError(String((error as Error).message));
+			let message = String((error as Error).message);
+			if (message === "no-workspace") setNeedsAgent(true);
+			else setError(REFUSALS[message] ?? message);
 		} finally {
 			setBusy(false);
 		}
 	}
+	let state = current?.state;
+	let brief = current?.brief;
+	if (!state || !brief) {
+		return (
+			<SidecarCard label="Investigation">
+				<p role="status" className="m-0 text-sm text-text-tertiary">
+					{store.error ? "Investigation unavailable" : "Loading investigation…"}
+				</p>
+			</SidecarCard>
+		);
+	}
+	let stoppable = ACTIVE.has(state) && item?.input?.authorizer === userId;
+	let child = state === "completed" ? item?.child : undefined;
+	// A completed record loaded without a child has lost its document; say so plainly.
+	let orphaned = state === "completed" && !!item && item.revision >= (revision ?? 0) && !child;
 	return (
-		<article
-			aria-label={summary.brief}
-			className="flex min-w-0 flex-col gap-3 rounded-md border border-edge p-4"
+		<InvestigationCard
+			brief={brief}
+			busy={busy}
+			canEdit={canEdit && (stoppable || !locked)}
+			error={error}
+			id={id}
+			notice={needsAgent
+				? <AgentHint />
+				: orphaned && (
+					<p className="m-0 text-sm text-text-secondary">
+						Its published document is no longer available.
+					</p>
+				)}
+			onOpen={child && onOpen ? opener => onOpen(child, opener) : undefined}
+			onRemove={canEdit && state === "requested"
+				? () =>
+					void act(async () => {
+						// Withdraw the record before its card leaves, so nothing is left unplaced.
+						await store.action(id, "cancel", {});
+						onRemove();
+					})
+				: canEdit && SETTLED.has(state)
+				? onRemove
+				: undefined}
+			onRetry={canEdit && SETTLED.has(state)
+				? () => void act(() => store.action(id, "retry", {}))
+				: undefined}
+			onRun={canEdit && state === "requested"
+				? () => void act(() => store.action(id, "run", {}))
+				: undefined}
+			onStop={canEdit && stoppable
+				? () => void act(() => store.action(id, "cancel", {}))
+				: undefined}
+			progress={current?.progress}
+			ready={child && {
+				title: child.title,
+				summary: child.summary,
+				views: item?.result?.views.length ?? 0,
+			}}
+			state={state}
 		>
-			<h3 className="m-0 text-sm font-semibold">
-				{item
-					? (
-						<UnfoldToggle className="w-full justify-between" unfold={body}>
-							<span className="min-w-0 break-words">{summary.brief}</span>
-						</UnfoldToggle>
-					)
-					: <span className="min-w-0 break-words">{summary.brief}</span>}
-			</h3>
-			<p role="status" className="m-0 text-xs text-text-secondary">
-				{summary.state} {summary.progress && `· ${summary.progress}`}
-			</p>
-			{error && <p role="alert" className="m-0 text-sm text-destructive-ink">{error}</p>}
-			{!item && loading && <p role="status" className="m-0 text-sm">Loading investigation…</p>}
-			{loadFailed && !item && (
-				<button
-					className="btn btn-sm btn-outline"
-					disabled={loading}
-					onClick={() => void load()}
-				>
-					Retry loading
-				</button>
-			)}
-			{item && (
-				<UnfoldPanel className="-mt-3" unfold={body}>
-					<div className="flex flex-col gap-3 pt-3">
-						{canEdit && item.state === "requested" && (
-							<div className="flex flex-wrap gap-2">
-								{owned.length === 0 && (
-									<p className="w-full m-0 text-sm text-text-secondary">
-										Connect a local workspace to run this investigation.
-									</p>
-								)}
-								<select
-									aria-label="Your workspace"
-									className="field text-sm"
-									value={connectionId || (owned.length === 1 ? owned[0].id : "")}
-									onChange={event => setConnectionId(event.target.value)}
-								>
-									<option value="">Choose your workspace</option>
-									{owned.map(value => (
-										<option key={value.id} value={value.id}>
-											{value.label} · {value.source.commit.slice(0, 8)}
-										</option>
-									))}
-								</select>
-								<button
-									className="btn btn-md btn-primary"
-									disabled={busy || locked || !(connectionId || owned.length === 1)}
-									onClick={() =>
-										void act(() =>
-											store.action(item.id, "run", { connectionId: connectionId || owned[0].id })
-										)}
-								>
-									Run on my workspace
-								</button>
-							</div>
-						)}
-						{canEdit && ["queued", "running", "publishing"].includes(item.state)
-							&& item.input?.authorizer === userId && (
-							<button
-								className="btn btn-md btn-outline"
-								disabled={busy}
-								onClick={() => void act(() => store.action(item.id, "cancel", {}))}
-							>
-								Cancel investigation
-							</button>
-						)}
-						{canEdit && ["failed", "cancelled", "interrupted"].includes(item.state) && (
-							<button
-								className="btn btn-md btn-outline"
-								disabled={busy || locked}
-								onClick={() =>
-									void act(async () => {
-										await store.action("", "", {
-											id: crypto.randomUUID(),
-											brief: item.brief,
-											parentId: item.id,
-										});
-									})}
-							>
-								Propose retry
-							</button>
-						)}
-						{item.result && (
-							<>
-								<UnfoldSection label="Report">
-									<StaticPlanEditor source={item.result.report} />
-								</UnfoldSection>
-								{item.result.views.map(view => (
-									<div key={view.key} className="flex flex-col gap-3">
-										<ExperimentView
-											key={view.key}
-											result={item.result!}
-											view={view}
-											state={item.views[view.key]}
-											disabled={busy || !canEdit}
-											onChange={(field, values) =>
-												void act(async () => {
-													try {
-														await store.action(item.id, "state", {
-															view: view.key,
-															patch: {
-																mutationId: crypto.randomUUID(),
-																expected: { [field]: item.views[view.key].fields[field].revision },
-																set: { [field]: values },
-															},
-														});
-													} finally {
-														await store.load(item.id);
-													}
-												})}
-										/>
-										<EvidenceActions
-											store={store}
-											item={item}
-											view={view}
-											disabled={busy || !canEdit || locked}
-										/>
-										<div className="flex gap-3 text-sm">
-											<a
-												href={`/api/documents/${store.documentId}/experiments/${item.id}/export/${view.datasetKey}`}
-											>
-												Download JSON
-											</a>
-											<a
-												href={`/api/documents/${store.documentId}/experiments/${item.id}/export/${view.datasetKey}?format=csv`}
-											>
-												Download CSV
-											</a>
-										</div>
-									</div>
-								))}
-								<p className="text-xs text-text-secondary">{item.result.provenance.environment}</p>
-								{item.result.provenance.limitations.map((value, index) => (
-									<p key={index} className="text-sm">{value}</p>
-								))}
-								{item.result.evidence.map(value => (
-									<UnfoldSection key={value.key} label={value.title}>
-										<pre className="max-h-64 overflow-auto text-xs">{value.text}</pre>
-									</UnfoldSection>
-								))}
-							</>
-						)}
-					</div>
-				</UnfoldPanel>
-			)}
-		</article>
+			{child && item && <ItemDecisions store={store} item={item} canEdit={canEdit && !locked} />}
+		</InvestigationCard>
 	);
+}
+
+function AgentHint() {
+	return <LocalAgentNote action="Run" />;
 }

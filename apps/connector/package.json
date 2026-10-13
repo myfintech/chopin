@@ -1,9 +1,14 @@
 {
 	"name": "@chopin/connector",
 	"private": true,
-	"version": "0.0.0",
+	"version": "0.0.1",
 	"type": "module",
-	"scripts": { "types": "tsgo --noEmit --skipLibCheck", "start": "bun src/main.ts" },
+	"scripts": {
+		"build": "bun build src/main.ts --target=bun --outfile dist/connector.js",
+		"build:binaries": "bun scripts/build-binaries.ts",
+		"types": "tsgo --noEmit --skipLibCheck",
+		"start": "bun src/main.ts"
+	},
 	"dependencies": {
 		"@agentclientprotocol/sdk": "1.6.0",
 		"@modelcontextprotocol/sdk": "1.32.1",

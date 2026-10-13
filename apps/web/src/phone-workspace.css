@@ -12,8 +12,11 @@
 	--phone-bottom-chrome: calc(
 		var(--phone-tab-bar-height) + var(--phone-tab-bar-offset) + var(--spacing) * 3
 	);
-	--document-top-inset: calc(var(--phone-top-chrome) + var(--spacing) * 4);
-	--document-decisions-top-inset: var(--document-top-inset);
+	/* Every pane scroller starts below the top bar and can end above the bottom bar. */
+	--phone-pane-top: calc(var(--phone-top-chrome) + var(--spacing) * 4);
+	--phone-pane-bottom: calc(var(--phone-bottom-chrome) + var(--spacing) * 4);
+	--document-top-inset: var(--phone-pane-top);
+	--document-decisions-top-inset: var(--phone-pane-top);
 	position: relative;
 }
 
@@ -66,32 +69,28 @@
 .workspace-root[data-workspace-phone][data-workspace-mode]
 	.workspace-document-stack
 	.anchored-child-card {
-	--document-top-inset: calc(
-		var(--phone-top-chrome) + var(--child-bar-height) + var(--spacing) * 4
-	);
+	--document-top-inset: calc(var(--phone-pane-top) + var(--child-bar-height));
 	inset: 0;
 }
 
+/* Focus, find-in-page and `scrollIntoView` stop between the bars, never under them. */
+.workspace-root[data-workspace-phone]
+	:is([data-plan-scroll], [data-plan-decisions-scroll], [data-build-view-scroll], [data-chat-scroll]) {
+	scroll-padding-block: var(--phone-pane-top) var(--phone-pane-bottom);
+}
+
 .workspace-root[data-workspace-phone] .plan [data-plan-scroll] {
-	scroll-padding-block: calc(var(--phone-top-chrome) + var(--spacing) * 4) 30%;
+	scroll-padding-block: var(--document-top-inset) 30%;
 }
 
 /*
  * While formatting docks above the keyboard, the caret's block stops short of the dock. The
- * workspace already ends at the keyboard (`--app-height`), so only the dock's row is added.
+ * workspace already ends at the keyboard (`--app-height`), so only the dock's bar is added.
  */
 .workspace-root[data-workspace-phone]:has(.phone-tab-row[data-phone-tab-toolbar])
 	.plan
 	[data-plan-scroll] {
-	scroll-padding-bottom: calc(
-		var(--phone-tab-bar-height) + var(--phone-tab-bar-offset) + var(--spacing) * 3
-	);
-}
-
-/* Focus and find-in-page scrolling stop below the top bar, never under it. */
-.workspace-root[data-workspace-phone]
-	:is([data-plan-decisions-scroll], [data-build-view-scroll], [data-chat-scroll]) {
-	scroll-padding-top: calc(var(--phone-top-chrome) + var(--spacing) * 2);
+	scroll-padding-bottom: calc(var(--phone-dock-height) + var(--spacing) * 3);
 }
 
 /*
@@ -106,8 +105,10 @@
 	padding-bottom: var(--phone-bottom-chrome);
 }
 
+/* The Chat panel already stops above the tab bar, so its composer is the only bar below. */
 .workspace-root[data-workspace-phone] [data-chat-scroll] {
-	padding-top: calc(var(--phone-top-chrome) + var(--spacing) * 3);
+	padding-top: var(--phone-pane-top);
+	scroll-padding-bottom: calc(var(--spacing) * 4);
 }
 
 .workspace-root[data-workspace-phone] .workspace-status-row {
@@ -122,11 +123,8 @@
 	inset-inline: 0;
 	top: 0;
 	display: grid;
-	grid-template-columns:
-		minmax(var(--control-target-coarse), auto) minmax(0, 1fr) minmax(
-			var(--control-target-coarse),
-			auto
-		);
+	/* Equal sides keep the title on the bar's centre line whatever each side holds. */
+	grid-template-columns: minmax(max-content, 1fr) minmax(0, max-content) minmax(max-content, 1fr);
 	align-items: center;
 	gap: var(--spacing);
 	height: var(--phone-top-chrome);
@@ -196,6 +194,7 @@
 
 .phone-top-bar-slot {
 	display: flex;
+	min-width: var(--control-target-coarse);
 	align-items: center;
 	justify-content: center;
 }
@@ -251,8 +250,10 @@
 	);
 	margin-inline: auto;
 	display: flex;
+	/* The action sits centred beside the bar; both shrink to the same circle size when minimised. */
 	align-items: center;
-	gap: var(--phone-tab-bar-gap);
+	justify-content: space-between;
+	gap: var(--phone-tab-action-gap);
 	transition: transform var(--tab-slide-dur) var(--tab-slide-ease), visibility 0s;
 }
 
@@ -266,7 +267,6 @@
 }
 
 .phone-tab-bar,
-.phone-tab-toolbar,
 .phone-tab-action {
 	background: var(--color-glass);
 	-webkit-backdrop-filter: var(--glass-filter);
@@ -279,48 +279,152 @@
 .phone-tab-bar {
 	position: relative;
 	display: grid;
-	flex: 1;
+	flex: none;
 	grid-template-columns: repeat(var(--phone-tab-count, 3), minmax(0, 1fr));
+	width: 100%;
 	height: var(--phone-tab-bar-height);
-	padding: var(--spacing);
-	border-radius: var(--radius-full);
+	padding: var(--phone-tab-bar-inset);
+	border-radius: var(--radius-phone-tab-bar);
+	transition:
+		width var(--tab-slide-dur) var(--tab-slide-ease),
+		height var(--tab-slide-dur) var(--tab-slide-ease),
+		border-radius var(--tab-slide-dur) var(--tab-slide-ease);
+}
+
+/* A width rather than flex growth, so minimising can animate it. */
+.phone-tab-row:has(> .phone-tab-action) > .phone-tab-bar {
+	width: calc(100% - var(--phone-tab-action-size) - var(--phone-tab-action-gap));
+}
+
+/*
+ * Reading down a pane minimises the bar to one circle that shows the current tab, as the top
+ * bar tucks away on the same scroll. Scrolling up, focus, or a tap on the circle restores it.
+ */
+.phone-tab-row[data-phone-tab-minimised] > .phone-tab-bar {
+	width: var(--phone-tab-bar-minimised);
+	height: var(--phone-tab-bar-minimised);
+	border-radius: var(--radius-phone-tab-minimised);
+}
+
+.phone-tab-row[data-phone-tab-minimised] > .phone-tab-action {
+	width: var(--phone-tab-bar-minimised);
+	height: var(--phone-tab-bar-minimised);
+}
+
+.phone-tab-row[data-phone-tab-minimised] :is(.phone-tab, .phone-tab-indicator) {
+	opacity: 0;
+	pointer-events: none;
+}
+
+.phone-tab-mini {
+	position: absolute;
+	z-index: 2;
+	inset: 0;
+	display: grid;
+	place-items: center;
+	color: var(--color-brand-ink);
+	opacity: 0;
+	pointer-events: none;
+	touch-action: manipulation;
+	transition: opacity var(--duration-fast) var(--ease-out);
+}
+
+.phone-tab-mini > .phone-tab-badge {
+	top: calc(var(--spacing) * -1);
+	right: calc(var(--spacing) * -1);
+	left: auto;
+}
+
+/* Inset far enough that the dot sits inside the circle's curve, not on its edge. */
+.phone-tab-mini > .phone-tab-dot {
+	top: calc(var(--spacing) * 2);
+	right: calc(var(--spacing) * 2);
+}
+
+.phone-tab-row[data-phone-tab-minimised] .phone-tab-mini {
+	opacity: 1;
+	pointer-events: auto;
+	/* The circle's icon arrives once the tabs have faded, not over them. */
+	transition-delay: var(--duration-fast);
 }
 
 .phone-tab-bar[hidden] {
 	display: none;
 }
 
-/* Editing on a phone: formatting takes the tabs' place and rides above the keyboard. */
+/*
+ * Editing on a phone: formatting takes the tabs' place as one bar across the top of the
+ * keyboard, edge to edge like a native keyboard accessory, with Done at its trailing end. An
+ * Insert or Text style panel stands below the bar where the keyboard was.
+ */
 :root[data-keyboard-open] .phone-tab-row[data-phone-tab-toolbar] {
 	visibility: visible;
 	transform: none;
 }
 
-.phone-tab-toolbar {
-	flex: 1;
-	min-width: 0;
-	height: var(--phone-tab-bar-height);
-	border-radius: var(--radius-full);
-	overflow: hidden;
+.phone-tab-row[data-phone-tab-toolbar] {
+	bottom: 0;
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	align-items: center;
+	width: 100%;
+	gap: 0;
+	padding-inline: env(safe-area-inset-left) calc(var(--spacing) + env(safe-area-inset-right));
+	/* Opaque, as a keyboard's own bar is: prose sliding under the icons would read as clutter. */
+	background: var(--color-page);
+	border-top: var(--edge-width) solid var(--color-edge);
 	animation: phone-tab-toolbar-in var(--tab-slide-dur) var(--tab-slide-ease);
+}
+
+/* The host and the editor's portal add no boxes: the bar, its panel and Done share one grid. */
+.phone-tab-toolbar {
+	display: contents;
+}
+
+.phone-tab-row[data-phone-tab-toolbar] .plan-format-panel {
+	grid-row: 2;
+	grid-column: 1 / -1;
+	margin-inline: calc(-1 * env(safe-area-inset-left))
+		calc(-1 * (var(--spacing) + env(safe-area-inset-right)));
+}
+
+/* A filled check inside a full-size target: the same Done as the bar's round button. */
+.phone-tab-row[data-phone-tab-toolbar] > .phone-tab-action {
+	grid-row: 1;
+	grid-column: 2;
+	width: var(--control-target-coarse);
+	height: var(--control-target-coarse);
+	padding: var(--spacing);
+	background-clip: content-box;
+	/* The bar's edge hugs the smaller fill, where its brand colour disappears into it. */
+	outline-offset: calc(-1 * (var(--spacing) + var(--edge-width)));
+	-webkit-backdrop-filter: none;
+	backdrop-filter: none;
+	box-shadow: none;
+}
+
+.phone-tab-row[data-phone-tab-toolbar] > .phone-tab-action > svg {
+	width: calc(var(--spacing) * 5);
+	height: calc(var(--spacing) * 5);
 }
 
 @keyframes phone-tab-toolbar-in {
 	from {
-		opacity: 0;
-		transform: translateY(calc(var(--spacing) * 3)) scale(0.98);
+		transform: translateY(100%);
 	}
 }
 
 .phone-tab-indicator {
 	position: absolute;
-	inset-block: var(--spacing);
-	left: var(--spacing);
-	width: calc((100% - var(--spacing) * 2) / var(--phone-tab-count, 3));
-	border-radius: var(--radius-full);
+	inset-block: var(--phone-tab-bar-inset);
+	left: var(--phone-tab-bar-inset);
+	width: calc((100% - var(--phone-tab-bar-inset) * 2) / var(--phone-tab-count, 3));
+	border-radius: var(--radius-phone-tab-pill);
 	background: var(--color-selected);
 	transform: translateX(calc(var(--phone-tab-index, 0) * 100%));
-	transition: transform var(--tab-slide-dur) var(--tab-slide-ease);
+	transition:
+		transform var(--tab-slide-dur) var(--tab-slide-ease),
+		opacity var(--duration-fast) var(--ease-out);
 }
 
 .phone-tab {
@@ -331,16 +435,20 @@
 	flex-direction: column;
 	align-items: center;
 	justify-content: center;
-	gap: calc(var(--spacing) / 2);
-	border-radius: var(--radius-full);
-	color: var(--color-text-tertiary);
-	font-size: var(--text-2xs);
-	font-weight: var(--font-weight-medium);
+	gap: calc(var(--spacing) * 0.75);
+	border-radius: var(--radius-phone-tab-pill);
+	color: var(--color-text-secondary);
+	font-size: var(--phone-tab-label-size);
+	font-weight: var(--font-weight-semibold);
+	line-height: var(--phone-tab-label-line);
+	letter-spacing: 0.01em;
 	touch-action: manipulation;
 	user-select: none;
 	-webkit-touch-callout: none;
 	-webkit-user-select: none;
-	transition: color var(--duration-base) var(--ease-out);
+	transition:
+		color var(--duration-base) var(--ease-out),
+		opacity var(--duration-fast) var(--ease-out);
 }
 
 .phone-tab[aria-current="page"] {
@@ -351,19 +459,24 @@
 	opacity: var(--opacity-quiet);
 }
 
-/* The narrowest phones give up gaps and label tracking, never target size. */
+/* The narrowest phones give up gaps, label tracking and some of the action, never target size. */
 @media (max-width: 359px) {
+	.workspace-root[data-workspace-phone] {
+		--phone-tab-action-gap: calc(var(--spacing) * 1.5);
+		--phone-tab-action-size: calc(var(--spacing) * 12);
+	}
+
 	.phone-tab-row {
-		gap: calc(var(--spacing) * 1.5);
 		width: calc(100% - var(--spacing) * 4);
 	}
 
 	.phone-tab-label {
-		letter-spacing: -0.02em;
+		letter-spacing: -0.01em;
 	}
 }
 
 .phone-tab [data-nucleo-icon],
+.phone-tab-mini [data-nucleo-icon],
 .phone-tab-action [data-nucleo-icon] {
 	color: inherit;
 }
@@ -391,15 +504,19 @@
 	left: calc(100% - var(--spacing) * 2);
 }
 
-.phone-tab-dot {
+/* The phone's Chat and Document marks: the shared activity badge, placed for a 24px glyph. */
+.phone-tab-dot,
+.phone-tab-icon > .activity-badge {
 	position: absolute;
 	top: 0;
 	right: calc(var(--spacing) * -0.5);
 	width: calc(var(--spacing) * 2);
 	height: calc(var(--spacing) * 2);
-	border: 2px solid var(--color-page);
 	border-radius: var(--radius-full);
 	background: var(--color-brand);
+	outline-style: solid;
+	outline-width: calc(var(--spacing) / 2);
+	outline-color: var(--color-page);
 }
 
 /* A single circular control at the end of the bar (`phoneAction`); slices add its contents. */
@@ -407,11 +524,14 @@
 	display: grid;
 	flex: none;
 	place-items: center;
-	width: var(--phone-tab-bar-height);
-	height: var(--phone-tab-bar-height);
+	width: var(--phone-tab-action-size);
+	height: var(--phone-tab-action-size);
 	border-radius: var(--radius-full);
 	color: var(--color-text-primary);
 	touch-action: manipulation;
+	transition:
+		width var(--tab-slide-dur) var(--tab-slide-ease),
+		height var(--tab-slide-dur) var(--tab-slide-ease);
 }
 
 /* Landscape: a short window keeps chrome low, with labels beside their icons. */
@@ -420,22 +540,23 @@
 		--phone-bar-height: calc(var(--spacing) * 9);
 		/* Tabs keep the full 44px target inside the bar's 2px inset. */
 		--phone-tab-bar-height: calc(var(--control-target-coarse) + var(--spacing));
+		--phone-tab-bar-inset: var(--phone-tab-bar-inset-compact);
 		--phone-tab-bar-gap: calc(var(--spacing) * 1.5);
+		--phone-tab-action-gap: calc(var(--spacing) * 1.5);
+		--phone-tab-action-size: var(--phone-tab-bar-height);
+		--phone-tab-bar-minimised: var(--phone-tab-bar-height);
 	}
 
-	.phone-tab-bar {
-		padding: calc(var(--spacing) / 2);
-	}
-
-	.phone-tab-indicator {
-		inset-block: calc(var(--spacing) / 2);
-		left: calc(var(--spacing) / 2);
-		width: calc((100% - var(--spacing)) / var(--phone-tab-count, 3));
+	/* The bar is near a capsule at this height, and the pill stays concentric inside the narrower inset. */
+	:is(.phone-tab-indicator, .phone-tab) {
+		border-radius: var(--radius-phone-tab-pill-compact);
 	}
 
 	.phone-tab {
 		flex-direction: row;
 		gap: calc(var(--spacing) * 1.5);
+		font-size: var(--text-2xs);
+		letter-spacing: normal;
 	}
 
 	.phone-tab-icon [data-nucleo-icon] {
@@ -446,6 +567,15 @@
 	/* The label sits beside the icon, so the count follows the label inside the tab. */
 	.phone-tab-badge {
 		display: none;
+	}
+
+	.phone-tab-mini > .phone-tab-badge {
+		display: block;
+	}
+
+	/* The wide bar shrinks toward its action, so the circle and the action stay together. */
+	.phone-tab-row:has(> .phone-tab-action) > .phone-tab-bar {
+		margin-inline-start: auto;
 	}
 
 	.phone-tab-badge-inline {
@@ -524,11 +654,59 @@
 	.workspace-root[data-workspace-phone] .workspace-stack-bar,
 	.phone-tab-indicator,
 	.phone-tab-row,
+	.phone-tab-bar,
+	.phone-tab-action,
 	.phone-tab-action > svg {
 		transition: none;
 	}
 
-	.phone-tab-toolbar {
+	.phone-tab-row[data-phone-tab-toolbar] {
 		animation: none;
 	}
+}
+
+/* Comments join the actions on the right; each side keeps to its outer edge. */
+.phone-top-bar-slot:first-child {
+	justify-content: flex-start;
+}
+
+.phone-top-bar-slot:last-child {
+	justify-content: flex-end;
+}
+
+.phone-top-bar-slot .phone-top-bar-comments {
+	min-width: var(--control-target-coarse);
+	height: var(--control-target-coarse);
+	gap: var(--spacing);
+	padding-inline: calc(var(--spacing) * 2.5);
+	border-radius: var(--radius-full);
+	color: var(--color-text-secondary);
+	font-size: var(--text-sm);
+	font-weight: var(--font-weight-medium);
+	font-variant-numeric: tabular-nums;
+}
+
+/* Why Build cannot open yet, shown briefly above the bar after a tap. */
+.phone-tab-hint {
+	position: absolute;
+	right: 0;
+	bottom: calc(100% + var(--spacing) * 2);
+	left: 0;
+	margin: 0 auto;
+	width: fit-content;
+	max-width: 100%;
+	padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3);
+	border-radius: var(--radius-md);
+	background: var(--color-page);
+	box-shadow: var(--shadow-overlay);
+	color: var(--color-text-primary);
+	font-size: var(--text-sm);
+	text-align: center;
+	opacity: 0;
+	pointer-events: none;
+	transition: opacity var(--duration-fast) var(--ease-out);
+}
+
+.phone-tab-hint[data-shown] {
+	opacity: 1;
 }

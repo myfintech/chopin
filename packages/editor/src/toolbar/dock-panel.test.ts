@@ -1,0 +1,57 @@
+import { expect, test } from "bun:test";
+
+import { covered, insertChoices, keyboardCover, styleChoices, uncovered } from "./dock-panel";
+
+test("a panel takes the height the software keyboard covered", () => {
+	expect(keyboardCover(844, { top: 0, height: 500 })).toBe(344);
+	// A page the browser scrolled up under the keyboard still measures from the layout bottom.
+	expect(keyboardCover(844, { top: 40, height: 460 })).toBe(344);
+});
+
+test("browser toolbars and missing viewports are not a keyboard", () => {
+	expect(keyboardCover(844, { top: 0, height: 780 })).toBeUndefined();
+	expect(keyboardCover(844, undefined)).toBeUndefined();
+});
+
+test("Insert offers the slash menu's blocks, and actions only where the host has them", () => {
+	let plain = insertChoices(new Set()).map(choice => choice.id);
+	expect(plain).toContain("table");
+	expect(plain).not.toContain("research");
+	// Task list is a text style, offered there instead.
+	expect(plain).not.toContain("tasks");
+	expect(plain).not.toContain("investigate");
+	expect(insertChoices(new Set(["research"])).map(choice => choice.id)).toContain("research");
+	expect(insertChoices(new Set(["research"])).map(choice => choice.id)).not.toContain(
+		"investigate",
+	);
+	expect(insertChoices(new Set(["investigate"])).map(choice => choice.id)).toContain(
+		"investigate",
+	);
+});
+
+test("Text style marks the caret's current block", () => {
+	let choices = styleChoices("h2");
+	expect(choices.filter(choice => choice.current).map(choice => choice.label)).toEqual([
+		"Heading 2",
+	]);
+	expect(choices.map(choice => choice.label)).toEqual([
+		"Text",
+		"Heading 1",
+		"Heading 2",
+		"Heading 3",
+		"Quote",
+		"Bulleted list",
+		"Numbered list",
+		"Task list",
+	]);
+});
+
+test("the panel fills only what the keyboard has uncovered, frame by frame", () => {
+	expect(covered(844, { top: 0, height: 500 })).toBe(344);
+	expect(covered(844, { top: 0, height: 900 })).toBe(0);
+	expect(uncovered(344, 344)).toBe(0);
+	expect(uncovered(344, 232)).toBe(112);
+	expect(uncovered(344, 0)).toBe(344);
+	// A taller keyboard than the panel was measured for never makes it negative.
+	expect(uncovered(344, 400)).toBe(0);
+});
