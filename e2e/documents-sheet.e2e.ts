@@ -100,8 +100,8 @@ test("Recent lists the documents this person opened, not the one on screen", asy
 		await sheet(page).getByRole("region", { name: "Documents" })
 			.getByRole("link", { name: title(id) }).click();
 		// The outgoing document's bar stays mounted while the route swaps.
+		await expect(page.locator(".phone-top-bar").filter({ hasText: title(id) })).toHaveCount(1);
 		await expect(page.locator(".phone-top-bar")).toHaveCount(1);
-		await expect(page.locator(".phone-top-bar")).toContainText(title(id));
 	}
 	await documentsButton(page).click();
 	await expect(recent.getByRole("link")).toHaveCount(2);
