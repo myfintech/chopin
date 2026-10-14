@@ -36,6 +36,7 @@ import {
 	GitHubReferencesProvider,
 	openCommentList,
 	opensEditing,
+	personName,
 	PlanEditor,
 	PlanStatus,
 	QuestionnaireStore,
@@ -83,7 +84,7 @@ import { newestDocumentMetadata } from "./document-actions";
 import { DocumentActionsMenu } from "./document-actions-menu";
 import { DocumentRename } from "./document-rename";
 import { browserStorage, rememberOpened } from "./documents-sheet-model";
-import { PhoneHeader } from "./phone-header";
+import { PhoneHeader, PhoneHeaderContent } from "./phone-header";
 import { DocumentSkeleton } from "./phone-skeleton";
 import { useEditorFocus, useKeyboardOpen } from "./keyboard-open";
 import { motionContract } from "./motion-contract";
@@ -148,14 +149,14 @@ export function RoomMembers(
 	let people = peopleHere(members);
 	return (
 		<div
-			aria-label={`People here: ${people.join(", ")}`}
+			aria-label={`People here: ${people.map(personName).join(", ")}`}
 			className="room-members ml-auto flex shrink-0 items-center"
 			role="group"
 		>
 			{people.map(handle => (
 				<span
 					className="room-member-face -ml-1.5 first:ml-0"
-					data-tooltip={handle}
+					data-tooltip={personName(handle)}
 					data-tooltip-verbatim=""
 					key={handle.toLowerCase()}
 				>
@@ -330,6 +331,7 @@ export function DocumentTitle(
 					: <span className="title-control-label truncate">{label}</span>}
 				{canManage && (
 					<DocumentActionsMenu
+						openDocument
 						align="start"
 						channel={{ archivedAt, title: label }}
 						className="title-control-action"
@@ -527,7 +529,7 @@ export function RoomWorkspace(
 	let metadataRef = useRef(metadata);
 	let repositoryRef = useRef(repository);
 	repositoryRef.current = repository;
-	let user = useMemo(() => cursor(handle), [handle]);
+	let user = useMemo(() => ({ name: personName(handle), color: cursor(handle).color }), [handle]);
 	let { available, frame, mode, phone } = useWorkspaceLayout();
 	let workspaceIds = useWorkspaceIds();
 	let profile = workspaceProfile(presentation);
@@ -633,6 +635,8 @@ export function RoomWorkspace(
 		};
 	});
 	let typing = useDocumentEditing(room);
+	let plannerDetached = plannerAttachment.wire === wire && !!plannerAttachment.planner
+		&& plannerAttachment.planner.state !== "attached";
 	let build = useBuildPlan({
 		canEdit: effectiveCanEdit && !(archivedAt ?? metadata.archivedAt) && status === "connected",
 		connected: status === "connected",
@@ -640,8 +644,7 @@ export function RoomWorkspace(
 		hasContent: hasPlanContent,
 		live: liveBuild,
 		planner: agent,
-		plannerDetached: plannerAttachment.wire === wire && !!plannerAttachment.planner
-			&& plannerAttachment.planner.state !== "attached",
+		plannerDetached,
 		room,
 		unanswered,
 		userId,
@@ -694,6 +697,8 @@ export function RoomWorkspace(
 	latestPlanVisible.current = planVisible;
 	let latestBusy = useRef(chatActivity.busy);
 	latestBusy.current = chatActivity.busy;
+	// A running turn is what lets the document say decisions are being written up.
+	useEffect(() => questions.setPlannerBusy(chatActivity.busy), [questions, chatActivity.busy]);
 	let [documentWatch, setDocumentWatch] = useState(QUIET_DOCUMENT);
 	// Read through a ref: the host's callback changes as its route does, and the socket below must
 	// not reconnect (remounting the editor and losing its scroll) when a child opens over it.
@@ -1135,7 +1140,7 @@ export function RoomWorkspace(
 		if (opensEditing({ empty: planState.empty })) setEditing(true);
 	}, [arrived, planState.synced, planState.empty]);
 	// A failed open says so instead; the lines would otherwise pulse beside it indefinitely.
-	let loading = phone && !arrived && !planState.failed;
+	let loading = !arrived && !planState.failed;
 	// A child on a phone borrows its parent's tab bar (see child-phone-chrome.ts).
 	let childChrome = useContext(ChildPhoneChromeContext);
 	// Where this room's title goes when it is an open child, and where its own child's goes.
@@ -1375,6 +1380,7 @@ export function RoomWorkspace(
 				// A child has no Decisions pane to open, so its decisions stay inline.
 				onShowDecision={presentation.type === "child" ? undefined : showDecision}
 				planner={agent}
+				commentPlanner={agent && !plannerDetached}
 				commentPresentation={mode === "split" ? "popover" : "sheet"}
 				connection={status === "deleted" ? "closed" : status}
 				key={workspaceArchivedAt ? "archived" : "active"}
@@ -1434,7 +1440,29 @@ export function RoomWorkspace(
 				<p aria-live="polite" className="sr-only" role="status">
 					<span key={announcement.sequence}>{announcement.text}</span>
 				</p>
-				{childTitle?.slot && createPortal(childTitleControl, childTitle.slot)}
+				{childTitle?.slot && (childTitle.phone
+					? createPortal(
+						<PhoneHeaderContent
+							archivedAt={workspaceArchivedAt}
+							canManage={effectiveCanManage}
+							comments={openComments}
+							editing={titleEdit}
+							editingDocument={editMode === "editing"}
+							label={metadata.title}
+							members={members}
+							onAction={action => onDocumentAction(room, action)}
+							onComments={() => {
+								childChrome?.showDocument();
+								openCommentList(room);
+							}}
+							onEditingChange={setTitleEdit}
+							onRenamed={updateMetadata}
+							lead={`in ${presentation.parent?.label ?? childTitle.parent}`}
+							room={room}
+						/>,
+						childTitle.slot,
+					)
+					: createPortal(childTitleControl, childTitle.slot))}
 				{childTitle?.motion === "lift" && (
 					<div
 						className="document-title-bar panel-header flex shrink-0 items-center px-(--panel-toolbar-padding-inline) hairline-b"
@@ -1487,24 +1515,28 @@ export function RoomWorkspace(
 				slot: setChildTitleSlot,
 			}
 			: undefined;
-	let childTitleValue = presentation.type === "parent-with-child" && mode === "split"
+	// A phone's top bar takes the child's title, controls and people in place of this room's.
+	let childTitleValue = presentation.type === "parent-with-child" && phone
+		? { motion: "zoom" as const, parent: metadata.title, phone: true, slot: childTitleSlot }
+		: presentation.type === "parent-with-child" && mode === "split"
 		? { motion: presentation.motion, slot: zoomChild ? childTitleSlot : null }
 		: undefined;
 	// Build plan or the build capsule sits beside the people here; a child open beside its parent
-	// has no build of its own.
-	let buildSlot = profile.implementation && presentation.type !== "parent-with-child" && (
-		<BuildPlanButton
-			build={build}
-			canEdit={!!workspaceCanEdit && status === "connected"}
-			compact={mode !== "split"}
-			hot={buildHover === "tab"}
-			onExplain={phone ? explainBuild : undefined}
-			phone={phone}
-			onHover={on => setBuildHover(on ? "capsule" : undefined)}
-			onOpen={() => selectDestination("build")}
-			tabReady={build.tabReady}
-		/>
-	);
+	// has no build of its own. A phone shows this room's bar only off Document, so it keeps it.
+	let buildSlot = profile.implementation && (presentation.type !== "parent-with-child" || phone)
+		&& (
+			<BuildPlanButton
+				build={build}
+				canEdit={!!workspaceCanEdit && status === "connected"}
+				compact={mode !== "split"}
+				hot={buildHover === "tab"}
+				onExplain={phone ? explainBuild : undefined}
+				phone={phone}
+				onHover={on => setBuildHover(on ? "capsule" : undefined)}
+				onOpen={() => selectDestination("build")}
+				tabReady={build.tabReady}
+			/>
+		);
 
 	// The tab bar's pencil edits the document on screen: an open child, or else this one.
 	let barEdit = childOpen
@@ -1598,24 +1630,34 @@ export function RoomWorkspace(
 					header={phone
 						? (
 							<PhoneHeader
-								archivedAt={workspaceArchivedAt}
-								canManage={effectiveCanManage}
-								comments={openComments}
-								editing={titleEdit}
-								editingDocument={!!barEdit?.editing}
+								// The child's bar goes with its document: Chat, Decisions and Build are this room's.
+								child={presentation.type === "parent-with-child" && planVisible
+									? { onReturn: presentation.onChildClose, slot: setChildTitleSlot }
+									: undefined}
 								label={metadata.title}
-								onAction={action => onDocumentAction(room, action)}
-								onComments={() => {
-									// The list stands over the document, so it opens from any tab onto it.
-									selectDestination("plan");
-									openCommentList(room);
-								}}
-								onEditingChange={setTitleEdit}
-								onRenamed={updateMetadata}
 								presentation={presentation}
-								room={room}
-								build={buildSlot}
-							/>
+							>
+								<PhoneHeaderContent
+									archivedAt={workspaceArchivedAt}
+									canManage={effectiveCanManage}
+									comments={openComments}
+									context={buildSlot}
+									editing={titleEdit}
+									editingDocument={!childOpen && !!barEdit?.editing}
+									label={metadata.title}
+									members={members}
+									onAction={action => onDocumentAction(room, action)}
+									onComments={() => {
+										// The list stands over the document, so it opens from any tab onto it.
+										selectDestination("plan");
+										openCommentList(room);
+									}}
+									onEditingChange={setTitleEdit}
+									onRenamed={updateMetadata}
+									lead={repository.name}
+									room={room}
+								/>
+							</PhoneHeader>
 						)
 						: (
 							<Header
@@ -1647,7 +1689,8 @@ export function RoomWorkspace(
 							/>
 						</>
 					}
-					status={statusNotices}
+					// Build plan or its capsule closes the status, so the rule before the faces follows it.
+					status={<>{statusNotices}{mode === "split" && buildSlot}</>}
 					ids={workspaceIds}
 					phoneAction={barEdit && (
 						<button
@@ -1668,7 +1711,6 @@ export function RoomWorkspace(
 					mode={mode}
 					presence={
 						<>
-							{mode === "split" && buildSlot}
 							<AuthorshipToggle store={authorship} />
 							<RoomMembers members={members} ring="page" />
 						</>

@@ -25,6 +25,7 @@ import "./feedback.css";
 import { plugins as dialectPlugins } from "@chopin/dialect";
 
 import { AuthorshipLayer, authorshipPlugin, AuthorshipStrip } from "./authorship";
+import { BlankBehindDecisions } from "./blank-behind-decisions";
 import { ChangeStore } from "./changes";
 import { PlanChanges } from "./changes-chip";
 import { collaborationPlugin } from "./collaboration";
@@ -116,6 +117,8 @@ export type PlanEditorProps = {
 	onShowDecision?: (questionnaireId: string) => void;
 	/** False when no Planner will review where decisions live. */
 	planner?: boolean;
+	/** False when no Planner can take a turn now, so a new comment is not sent to Chopin by default. */
+	commentPlanner?: boolean;
 	evidence?: (questionnaireId: string) => ReactNode | null;
 	/** Durable Research Workspace state and actions supplied by the host app. */
 	research?: ResearchStore;
@@ -185,6 +188,7 @@ export function PlanEditor(
 		onShowDecision,
 		evidence,
 		planner,
+		commentPlanner,
 		readOnly,
 		research,
 		researchLauncher,
@@ -500,6 +504,7 @@ export function PlanEditor(
 						onShowDecision,
 						evidence,
 						planner,
+						commentPlanner,
 						research,
 						researchDrafts,
 						researchLauncher,
@@ -539,6 +544,7 @@ export function PlanEditor(
 			onShowDecision,
 			evidence,
 			planner,
+			commentPlanner,
 			research,
 			researchDrafts,
 			researchLauncher,
@@ -566,6 +572,8 @@ export function PlanEditor(
 		setState({ synced: false });
 		setGeneration(value => value + 1);
 	}
+
+	let placeholder = readOnly ? "This document is empty." : "Start writing, or ask Chopin to plan";
 
 	if (!wire) {
 		return (
@@ -609,14 +617,21 @@ export function PlanEditor(
 							plugins={plugins}
 							lexicalTheme={PLAN_LEXICAL_THEME}
 							contentEditableClassName="plan-content focus-caret"
-							placeholder={readOnly
-								? "This document is empty."
-								: "Start writing, or ask Chopin to plan"}
+							placeholder={placeholder}
 							spellCheck
 							// The dialect has no raw HTML. Left on, MDXEditor registers
 							// its HTML visitors and quietly admits `html` nodes.
 							suppressHtmlProcessing
 						/>
+						{questions && (
+							<BlankBehindDecisions
+								cardMeta={cardMeta}
+								editor={binding?.editor}
+								placeholder={placeholder}
+								planner={planner}
+								questions={questions}
+							/>
+						)}
 					</div>
 					{authorship && <AuthorshipLayer canEdit={!readOnly && !offline} store={authorship} />}
 					{/* In the document column, so they track the prose, not the pane. */}

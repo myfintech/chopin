@@ -30,17 +30,64 @@ async function checkout() {
 	return root;
 }
 
-test.skipIf(!binary)("the compiled binary prints its version and connector protocol", () => {
+test.skipIf(!binary)("the compiled binary prints its version", () => {
 	for (let flag of ["--version", "version"]) {
 		let result = Bun.spawnSync([binary!, flag], { stdout: "pipe", stderr: "pipe" });
 		expect(result.stderr.toString()).toBe("");
-		expect(result.stdout.toString()).toBe(`chopin ${version} (connector protocol 2)\n`);
+		expect(result.stdout.toString()).toBe(`chopin ${version}\n`);
 		expect(result.exitCode).toBe(0);
 	}
 	let help = Bun.spawnSync([binary!, "help"], { stdout: "pipe" });
 	expect(help.stdout.toString()).toContain("Usage: chopin <command>");
 	expect(help.exitCode).toBe(0);
 });
+
+test.skipIf(!binary)(
+	"service install uses the server chopin connect saved, and refuses a different CHOPIN_URL",
+	async () => {
+		let directory = await mkdtemp(join(scratch, "state-"));
+		let saved = "https://chopin.example";
+		let install = (url?: string) => {
+			let env: Record<string, string | undefined> = {
+				...process.env,
+				CHOPIN_CONNECTOR_STATE_DIR: directory,
+				CHOPIN_URL: url,
+			};
+			if (!url) delete env.CHOPIN_URL;
+			let result = Bun.spawnSync([binary!, "service", "install"], {
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			return { code: result.exitCode, stderr: result.stderr.toString() };
+		};
+		expect(install()).toEqual({
+			code: 1,
+			stderr: "Run chopin connect once in your checkout first, then chopin service install.\n",
+		});
+		let settings = { server: saved, checkout: scratch, command: ["agent"], planners: [] };
+		await writeFile(
+			join(directory, "config.json"),
+			JSON.stringify({ connect: { ...settings, plannerCommand: [] } }),
+		);
+		expect(install("https://other.example")).toEqual({
+			code: 1,
+			stderr: `CHOPIN_URL is https://other.example, but chopin connect saved ${saved}. Nothing `
+				+ "was installed. Run chopin connect again with the server you want, then chopin "
+				+ "service install.\n",
+		});
+		// With CHOPIN_URL unset, or naming the saved server, install goes on with the saved server
+		// as far as the pairing it checks before touching the service manager.
+		for (let url of [undefined, `${saved}/`]) {
+			expect(install(url)).toEqual({
+				code: 1,
+				stderr: `This machine is not paired with ${saved}. Run \`chopin pair\` first, then `
+					+ "install the service.\n",
+			});
+		}
+	},
+	60_000,
+);
 
 test.skipIf(!binary)(
 	"the compiled binary runs an investigation through its own stdio bridge",
@@ -72,6 +119,8 @@ test.skipIf(!binary)(
 			},
 			claim_experiment: () => ({ input, generation: 1, runToken: "run-token" }),
 			read_experiment: () => ({ input }),
+			read_investigation: () => ({ input }),
+			upload_investigation_image: () => ({ path: `/images/${"a".repeat(64)}.png` }),
 			complete_experiment: () => finished.resolve("complete_experiment"),
 			fail_experiment: () => finished.resolve("fail_experiment"),
 		};
@@ -101,7 +150,13 @@ test.skipIf(!binary)(
 				let server = new Server({ name: "fake-chopin", version: "1" }, {
 					capabilities: { tools: {} },
 				});
-				server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [] }));
+				server.setRequestHandler(ListToolsRequestSchema, () => ({
+					tools: [
+						"read_investigation",
+						"upload_investigation_image",
+						"submit_investigation_result",
+					].map(name => ({ name, inputSchema: { type: "object" as const } })),
+				}));
 				server.setRequestHandler(CallToolRequestSchema, async request => {
 					calls.push([token, request.params.name]);
 					let result = await results[request.params.name]?.();
@@ -123,6 +178,7 @@ test.skipIf(!binary)(
 			"--",
 			process.execPath,
 			join(import.meta.dir, "testing/fake-agent.ts"),
+			"--stdio-images",
 		], {
 			env: {
 				...process.env,
@@ -144,8 +200,9 @@ test.skipIf(!binary)(
 				+ await new Response(connector.stderr).text();
 			expect(outcome, output).toBe("complete_experiment");
 			expect(calls.filter(([token]) => token === "run-token")).toEqual([
-				["run-token", "read_experiment"],
-				["run-token", "submit_experiment_result"],
+				["run-token", "read_investigation"],
+				["run-token", "upload_investigation_image"],
+				["run-token", "submit_investigation_result"],
 			]);
 			expect(calls.at(-1)).toEqual(["connection-token", "disconnect_workspace"]);
 			expect(code, output).toBe(0);
@@ -198,7 +255,7 @@ test.skipIf(!binary)(
 		};
 		let proxies = ["HTTP_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"];
 		for (let name of ["CHOPIN_URL", "NO_PROXY", "no_proxy", ...proxies]) delete env[name];
-		let connector = Bun.spawn([binary!, "connect", ".", "--", "agent"], {
+		let connector = Bun.spawn([binary!, "connect", ".", "--", process.execPath], {
 			cwd: root,
 			env,
 			stdout: "pipe",

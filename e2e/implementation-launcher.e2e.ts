@@ -213,6 +213,65 @@ async function connector(baseURL: string, command: string[]) {
 	};
 }
 
+for (let width of [1280, 390]) {
+	test(`the build owner sees activity and stops the agent from Build at ${width}px`, async ({
+		seed,
+		join: enter,
+		room,
+		baseURL,
+	}, testInfo) => {
+		test.setTimeout(60_000);
+		await seed("# Local demo collaborators\n\nShow build activity and let its owner stop.\n", {
+			graph: preparedGraph(),
+		});
+		let local = await connector(baseURL!, [
+			"bun",
+			join(ROOT, "apps/connector/src/testing/fake-implementer.ts"),
+			"--hang",
+			"--activity",
+		]);
+		try {
+			let page = await enter(person(), { viewport: { width, height: 844 } });
+			await page.goto(await local.pairing);
+			await page.getByRole("button", { name: "Connect", exact: true }).click();
+			await expect(page.getByRole("status").filter({ hasText: "Connected" })).toHaveText(
+				"Connected",
+			);
+			await page.goto(testChannelPath(room));
+			await page.getByRole("button", { name: "Build plan", exact: true }).click();
+			await expect.poll(
+				async () =>
+					(await (await page.request.get(`/api/channels/${room}/implementation`)).json())
+						.build?.activity?.text,
+				{ timeout: 25_000 },
+			).toBe("Running server tests");
+			await page.getByRole("button", { name: "Build", exact: true }).click();
+			let view = page.getByRole("region", { name: "Build", exact: true });
+			await expect(view.getByText("Running server tests", { exact: true })).toBeVisible();
+			await expect(view.getByText(/^Updated /)).toBeVisible();
+			let stop = view.getByRole("button", { name: "Stop build", exact: true });
+			await expect(stop).toBeInViewport({ ratio: 1 });
+			await stop.focus();
+			let screenshot = testInfo.outputPath("running-build.png");
+			await view.screenshot({ path: screenshot });
+			await testInfo.attach("running-build", {
+				path: screenshot,
+				contentType: "image/png",
+			});
+			await page.keyboard.press("Enter");
+			await expect(view).toContainText("Build stopped");
+			await expect(stop).toHaveCount(0);
+			await expect.poll(() => local.output(), { timeout: 20_000 })
+				.toMatch(/Chopin ended this run \(build-(?:inactive|forbidden)\)/);
+			let snapshot = await (await page.request.get(`/api/channels/${room}/implementation`)).json();
+			expect(snapshot.build.error).toBe("Stopped in Chopin.");
+			expect(snapshot.localAgent).toBe(true);
+		} finally {
+			await local.close();
+		}
+	});
+}
+
 for (let mode of ["block", "complete", "startup-failure", "live"] as const) {
 	test(`the paired ACP connector implements a browser plan (${mode})`, async ({ seed, join: enter, room, baseURL }) => {
 		test.skip(
@@ -243,7 +302,9 @@ for (let mode of ["block", "complete", "startup-failure", "live"] as const) {
 			let page = await enter(person());
 			await page.goto(await local.pairing);
 			await page.getByRole("button", { name: "Connect", exact: true }).click();
-			await expect(page.getByRole("status")).toContainText("Connected.");
+			await expect(page.getByRole("status").filter({ hasText: "Connected" })).toHaveText(
+				"Connected",
+			);
 			await page.goto(testChannelPath(room));
 			let view = page.getByRole("region", { name: "Build", exact: true });
 			let openBuild = () =>
@@ -338,6 +399,73 @@ for (let mode of ["block", "complete", "startup-failure", "live"] as const) {
 
 function buildView(page: import("@playwright/test").Page) {
 	return page.getByRole("region", { name: "Build", exact: true });
+}
+
+/** The capsule's own Build, not the Document view tab of the same name. */
+function capsuleBuild(page: import("@playwright/test").Page) {
+	return page.getByRole("button", { name: "Build", exact: true })
+		.and(page.locator(":not([role='group'] *)"));
+}
+
+/**
+ * Build stays 12px from the faces, with the rule as far from Build as from the first face; the faces
+ * sit as far from the rule as from the bar's end, top and bottom.
+ */
+async function expectClearOfPeople(build: import("@playwright/test").Locator) {
+	let people = build.page().getByRole("group", { name: /^People here/ });
+	await expect(build).toBeVisible();
+	await expect(people.locator(":scope > [data-tooltip]").first()).toBeVisible();
+	let control = await build.evaluate(element => element.getBoundingClientRect().right);
+	let gaps = await people.evaluate(group => {
+		let rule = parseFloat(getComputedStyle(group).borderInlineStartWidth);
+		let bar = group.closest("[data-document-title-bar]")!;
+		let edge = parseFloat(getComputedStyle(bar).borderBlockEndWidth);
+		let outer = bar.getBoundingClientRect();
+		let box = group.getBoundingClientRect();
+		let face = group.querySelector(":scope > [data-tooltip]")!.getBoundingClientRect();
+		return {
+			rule,
+			start: box.left,
+			first: face.left,
+			left: face.left - box.left - rule,
+			right: outer.right - box.right,
+			top: face.top - outer.top,
+			bottom: outer.bottom - edge - face.bottom,
+		};
+	});
+	expect(gaps.rule).toBeGreaterThan(0);
+	expect(gaps.first - control).toBeGreaterThanOrEqual(12);
+	expect(Math.abs(gaps.start - control - gaps.left)).toBeLessThanOrEqual(0.5);
+	for (let side of [gaps.right, gaps.top, gaps.bottom]) {
+		expect(Math.abs(side - gaps.left)).toBeLessThanOrEqual(0.5);
+	}
+}
+
+for (let state of ["Build plan", "Build stopped"] as const) {
+	test(`${state} keeps clear of the people here at full and narrow widths`, async ({ seed, join: enter }) => {
+		let graph = preparedGraph();
+		await seed("# Build gap\n\nBuild sits apart from the people here.\n", {
+			graph,
+			builds: state === "Build stopped" ? [failedBuild(graph)] : undefined,
+		});
+		let page = await enter("ana", { viewport: { width: 1440, height: 900 } });
+		// A collaborator's view, with two people here.
+		let other = await enter("bea", { viewport: { width: 1440, height: 900 } });
+		for (let viewer of [page, other]) {
+			// The rightmost build control: Build plan, or the capsule's Retry.
+			let build = state === "Build plan"
+				? viewer.getByRole("button", { name: "Build plan", exact: true })
+				: viewer.getByRole("button", { name: "Retry", exact: true });
+			await expect(
+				viewer.getByRole("group", { name: /^People here/ }).locator(":scope > [data-tooltip]"),
+			)
+				.toHaveCount(2);
+			for (let width of [1440, 1100]) {
+				await viewer.setViewportSize({ width, height: 900 });
+				await expectClearOfPeople(build);
+			}
+		}
+	});
 }
 
 test("a #task link opens Build on that task, and rows toggle from the keyboard", async ({ seed, join: enter, room }) => {
@@ -484,11 +612,12 @@ test("a build in progress shows who started it and offers no action", async ({ s
 		let page = await enter(person());
 		await page.goto(await local.pairing);
 		await page.getByRole("button", { name: "Connect", exact: true }).click();
-		await expect(page.getByRole("status")).toContainText("Connected.");
+		await expect(page.getByRole("status").filter({ hasText: "Connected" })).toHaveText("Connected");
 		await page.goto(testChannelPath(room));
 		await page.getByRole("button", { name: "Build plan", exact: true }).click();
 		let capsule = page.getByRole("button", { name: /^Building · 0 of 2/ });
 		await expect(capsule).toBeVisible();
+		await expectClearOfPeople(capsule);
 		// The capsule and the Build tab light each other, and the capsule opens Build.
 		let tab = page.getByRole("group", { name: "Document view" })
 			.getByRole("button", { name: "Build", exact: true });
@@ -554,11 +683,12 @@ test("edits after a build read as changes to build, and Build sends them to the 
 		let page = await enter(person());
 		await page.goto(await local.pairing);
 		await page.getByRole("button", { name: "Connect", exact: true }).click();
-		await expect(page.getByRole("status")).toContainText("Connected.");
+		await expect(page.getByRole("status").filter({ hasText: "Connected" })).toHaveText("Connected");
 		await page.goto(testChannelPath(room));
 		await page.getByRole("button", { name: "Build plan", exact: true }).click();
 		let built = page.getByRole("button", { name: "Built", exact: true });
 		await expect(built).toBeVisible({ timeout: 30_000 });
+		await expectClearOfPeople(built);
 		// Beside a built document's capsule there is no Build; only the tab has that name.
 		await expect(page.getByRole("button", { name: "Build", exact: true })).toHaveCount(1);
 
@@ -568,13 +698,12 @@ test("edits after a build read as changes to build, and Build sends them to the 
 		let stale = page.getByRole("button", { name: "1 change to build", exact: true });
 		await expect(stale).toBeVisible();
 		await expect(stale).toHaveAccessibleDescription("Edits since the last build");
+		await expectClearOfPeople(capsuleBuild(page));
 		let tab = page.getByRole("group", { name: "Document view" })
 			.getByRole("button", { name: "Build", exact: true });
 		await expect(tab).toBeEnabled();
 		// The capsule's own Build, not the tab, sends the changes.
-		await page.getByRole("button", { name: "Build", exact: true })
-			.and(page.locator(":not([role='group'] *)"))
-			.click();
+		await capsuleBuild(page).click();
 		await expect.poll(async () => {
 			let snapshot = await (await page.request.get(`/api/channels/${room}/implementation`)).json();
 			return snapshot.live?.rebuild?.kind;

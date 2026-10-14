@@ -8,62 +8,15 @@ separate from passing implementation verification.
 
 ## Connect a workspace
 
-Authenticate an ACP-compatible coding agent normally, then connect a checkout
-from its folder. [Bun](https://bun.sh) is required:
+Connect a checkout with the `chopin` CLI, as
+[Use your own machine with Chopin](chopin-cli.md) describes. See
+[Trouble connecting](local-experiments.md#trouble-connecting) for pairing
+problems, refusals and stale locks.
 
-```sh
-mkdir -p ~/.chopin \
-  && curl -fsSL https://your-chopin-instance.example/connector.js -o ~/.chopin/connector.js \
-  && CHOPIN_URL=https://your-chopin-instance.example \
-    bun --no-env-file --config=/dev/null \
-      ~/.chopin/connector.js connect . -- copilot --acp --allow-all
-```
-
-`--no-env-file` and `--config=/dev/null` stop Bun from loading the project folder's
-`.env` and `bunfig.toml`: a checkout must not choose which server the connector pairs
-with or run code through a `preload`. The `chopin` binary below ignores both by itself.
-
-Open the printed pairing link, sign into Chopin, check that the page shows the
-confirmation code printed in your terminal, and select **Connect**. Leave
-**Let Chopin build and prototype automatically on this machine** unticked unless
-you want Chopin to start work there by itself: rebuilds of a living document
-(`LIVE_BUILD`) and, where enabled, prototypes. Without it, only work a person
-presses Build or Run for reaches the laptop. The choice is stored with the paired
-machine, so reconnecting keeps it and pairing again asks again. This is
-the existing investigation pairing flow; one connection serves every document in
-the checkout's repository. No GitHub bearer
-needs to be configured in a second companion. Pairing stores a machine token
-that outlives server restarts, deploys and browser sign-out, until the machine
-is disconnected in the browser or unpaired with `chopin unpair`; see
-[Connect a checkout](local-experiments.md#connect-a-checkout). See
-[Trouble connecting](local-experiments.md#trouble-connecting)
-for pairing problems, refusals and stale locks.
-
-Keep the connector running. Each browser Build action starts an agent process;
-automatically installing or starting the connector itself remains future work.
-Standard ACP permission requests appear in its terminal with the command or
-paths involved, and are declined when no interactive terminal is available.
-The agent retains its normal tools, project instructions and configured
-services.
-
-### Install the chopin CLI
-
-The connector is also released as `chopin`, one executable that needs no Bun.
-Install it, then connect from the checkout's folder:
-
-```sh
-curl -fsSL https://github.com/githubnext/chopin/releases/latest/download/install.sh | sh
-CHOPIN_URL=https://your-chopin-instance.example \
-  chopin connect . -- copilot --acp --allow-all
-```
-
-On Windows, install it in PowerShell with
-`irm https://github.com/githubnext/chopin/releases/latest/download/install.ps1 | iex`.
-`chopin connect` behaves exactly like the `bun` command above. Until the first
-`cli-v*` release is published, the installers have nothing to download, and the
-`curl` and `bun` command above remains the way to connect. See
-[Install the chopin CLI](local-experiments.md#install-the-chopin-cli) for where
-it installs, version pins and how the download is verified.
+Each browser Build action starts an agent process. Standard ACP permission
+requests appear in its terminal with the command or paths involved, and are
+declined when no interactive terminal is available. The agent retains its
+normal tools, project instructions and configured services.
 
 ## Build a settled plan
 
@@ -84,7 +37,9 @@ it installs, version pins and how the download is verified.
    freezes planning edits.
 4. The **Build** tab turns on with the press. It shows the status and the
    tasks with their goals, acceptance criteria and dependencies; opening it
-   never starts anything.
+   never starts anything. While running, it also shows the local agent's latest
+   activity and when that description changed. The build owner can select
+   **Stop build** here, including while a build is queued.
 5. The connector creates an isolated worktree at that exact commit and an
    implementation branch, preserving existing local edits. It creates an ACP
    session and claims the graph before prompting the orchestrator.
@@ -122,8 +77,8 @@ orchestrator instructions, not a server scheduler. The opt-in live tracer checks
 MCP reporting; it does not prove delivery of a complete multi-PR implementation.
 
 New implementation decisions appear as task blockers. Configurable decision
-policy, human resolution/resume controls, automatic connector startup and a
-browser PR-creation action remain future work. Multiple reported PRs already
+policy, human resolution/resume controls and a browser PR-creation action
+remain future work. Multiple reported PRs already
 appear beside their tasks; Chopin never merges them automatically.
 
 Inspect failures in the connector terminal and retained worktree. If startup
@@ -135,8 +90,14 @@ If a claimed run stops or fails, its graph remains locked. After inspecting the
 retained checkout, choose **Return to planning**, enter a reason and confirm to
 record a revision request and release the editing lock. **Build plan** then asks
 the Planner to revise the tasks and builds the replacement.
-This action is unavailable while the agent is still running; stop the connector
-in its terminal first. An admitted
+This action is unavailable while the agent is still running; select **Stop build**
+in Build first. Stop preserves existing commits and pull requests and rejects further
+reports from that run. The connector stops the agent on its next heartbeat (normally
+within 10 seconds) and stays connected. Ctrl-C in its terminal also stops the work
+and disconnects the connector. Reconnect with the updated connector to receive
+activity updates.
+Stop also cancels automatic rebuilds already waiting behind the run; a later
+document edit can start a new automatic rebuild. An admitted
 repository writer can also continue the existing lifecycle through ordinary
 `/mcp`. The connector's run credential stops accepting reports when its turn ends.
 Failure does not undo local edits, and these controls do not automatically resume

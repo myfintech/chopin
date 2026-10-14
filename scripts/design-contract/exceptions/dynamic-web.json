@@ -59,7 +59,7 @@
 				1
 			]
 		],
-		"sourceHash": "8bd6cad9bf857fbb81ccdd5c02cb4c28d1d82a7be288992dc3ffd56192f0b8b1"
+		"sourceHash": "686d11761299b904809f0bed307b80f1affdd076eec1da60a2b7a63e33f5e4e6"
 	},
 	{
 		"file": "apps/web/src/document-rename.tsx",
@@ -101,7 +101,7 @@
 				1
 			]
 		],
-		"sourceHash": "96bd840962bd6f0ef642cece0b1a4baeb96728662f0bea05b97286f7573f0342"
+		"sourceHash": "a243b136337faa8ec8b1878605d907c8830a6fd8bc75116045debcf8cfbcf9ee"
 	},
 	{
 		"file": "apps/web/src/project-sidebar.tsx",
@@ -115,7 +115,7 @@
 				1
 			]
 		],
-		"sourceHash": "96bd840962bd6f0ef642cece0b1a4baeb96728662f0bea05b97286f7573f0342"
+		"sourceHash": "a243b136337faa8ec8b1878605d907c8830a6fd8bc75116045debcf8cfbcf9ee"
 	},
 	{
 		"file": "apps/web/src/design-audit/icons.tsx",
@@ -129,7 +129,7 @@
 				1
 			]
 		],
-		"sourceHash": "08ac02d34f1c383b8e67469a125b92bff7ef1e0dc6ed77e43c34b6b765c53644"
+		"sourceHash": "0021b21e89257d9a961015150862c9587d106933dd7f611363565cbd896e15eb"
 	},
 	{
 		"file": "apps/web/src/design-audit/controls.tsx",
@@ -157,7 +157,7 @@
 				1
 			]
 		],
-		"sourceHash": "6a831eddad9bc4aa3ee4e0d0be0b76611110e72c36dda112fdc1650bc4f1719a"
+		"sourceHash": "71a9eb8593fe0f13b39f6f2b949feb8d7471e77131763247eb54795039c7da4e"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -171,7 +171,7 @@
 				1
 			]
 		],
-		"sourceHash": "6a831eddad9bc4aa3ee4e0d0be0b76611110e72c36dda112fdc1650bc4f1719a"
+		"sourceHash": "71a9eb8593fe0f13b39f6f2b949feb8d7471e77131763247eb54795039c7da4e"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -192,7 +192,7 @@
 				1
 			]
 		],
-		"sourceHash": "6a831eddad9bc4aa3ee4e0d0be0b76611110e72c36dda112fdc1650bc4f1719a"
+		"sourceHash": "71a9eb8593fe0f13b39f6f2b949feb8d7471e77131763247eb54795039c7da4e"
 	},
 	{
 		"file": "apps/web/src/terminal-alert.tsx",
@@ -227,7 +227,7 @@
 				1
 			]
 		],
-		"sourceHash": "de727fb577f1efb11edfdc6aa89005d18b9eef7e445a6aabcffebf1f5b74aea3"
+		"sourceHash": "d95f0437fe4e56c405797c747ecd6d61f0f62c7bcb436af7be75efd5045b9d8c"
 	},
 	{
 		"file": "apps/web/src/navigation-drawer.tsx",
@@ -276,11 +276,11 @@
 				1
 			]
 		],
-		"sourceHash": "6dcdd2c5d6243bdc297c311742fc47e8e5da433d201b6e1b728c42c714d9a9c4"
+		"sourceHash": "39847923947ec187c3f3cb1973ab1df745dea4bcaff882fc5dbbf9bd2108d42f"
 	},
 	{
 		"file": "apps/web/src/navigation-dialog.tsx",
-		"reason": "Motion/presence contract returns finite semantic state classes; imported function evaluation is outside this static scanner. Review the producer when changing this boundary.",
+		"reason": "Motion/presence contract returns finite semantic state classes; imported function evaluation is outside this static scanner. The optional className is a caller's static size class, scanned at its call site. Review the producer when changing this boundary.",
 		"cases": [
 			[
 				"dynamic",
@@ -288,9 +288,16 @@
 				"motion.className",
 				"class > NavigationDialog > <div>",
 				1
+			],
+			[
+				"dynamic",
+				"class",
+				"className",
+				"class > NavigationDialog > <div>",
+				1
 			]
 		],
-		"sourceHash": "43604e407a85bfda98028185d27d2e6be744f490402c7b275b6dfa806a385612"
+		"sourceHash": "f7c06d489223022873b10f1c3ae463e43d02f60212a344b15ae52ebe88eac359"
 	},
 	{
 		"file": "apps/web/src/repository-picker.tsx",
@@ -361,5 +368,33 @@
 			]
 		],
 		"sourceHash": "f6b56e35f4a84411532e598ef53c893966b496b001d3020a3f470d87bd3efd8e"
+	},
+	{
+		"file": "apps/web/src/experiments/machine-setup.tsx",
+		"reason": "Motion/presence contract returns finite semantic state classes; imported function evaluation is outside this static scanner. Review the producer when changing this boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"class",
+				"presence.className",
+				"class > AddMachineMenu > <div>",
+				1
+			]
+		],
+		"sourceHash": "7a7af038fd564985e6ee7630da5943cd39999400368d20f3d112b89385f3fd48"
+	},
+	{
+		"file": "apps/web/src/experiments/machines.tsx",
+		"reason": "Motion/presence contract returns finite semantic state classes; imported function evaluation is outside this static scanner. Review the producer when changing this boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"class",
+				"presence.className",
+				"class > MachineActions > <div>",
+				1
+			]
+		],
+		"sourceHash": "3e9b58052c0f17b9d5e8446b55e37157aa230f2e276dc4182db18dc9e72aa46e"
 	}
 ]

@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { machineFile } from "./machine";
 import { createOutput } from "./output";
 import { commandWords, servePlanners, stopBackend } from "./planner";
-import { git } from "./workspace";
+import type { ServiceHost } from "./service";
+import { collectStatus, formatStatus } from "./status";
+import { git, lockWorkspace, startFailures } from "./workspace";
 
 let scratch = await mkdtemp(join(tmpdir(), "chopin-planner-"));
 afterAll(() => rm(scratch, { recursive: true, force: true }));
@@ -34,7 +36,7 @@ let log = process.argv[2];
 let launches = 0;
 try { launches = readFileSync(log, "utf8").split("\\n").filter(line => line.includes('"argv"')).length; } catch {}
 let env = Object.fromEntries(
-	["CHOPIN_URL", "CHOPIN_DOCUMENT", "CHOPIN_PLANNER_TOKEN"].map(name => [name, process.env[name]]),
+	["CHOPIN_URL", "CHOPIN_DOCUMENT", "CHOPIN_PLANNER_TOKEN", "SOME_FLAG"].map(name => [name, process.env[name]]),
 );
 appendFileSync(log, JSON.stringify({ pid: process.pid, cwd: process.cwd(), argv: process.argv, env }) + "\\n");
 if (launches === 0) process.exit(3);
@@ -110,8 +112,10 @@ test(
 			document,
 			"--planner-command",
 			`${process.execPath} ${script} ${log}`,
+			"--env",
+			"SOME_FLAG=1",
 			"--",
-			"agent",
+			process.execPath,
 		], {
 			env: {
 				...process.env,
@@ -129,8 +133,18 @@ test(
 			await until(async () => (await entries(log)).filter(entry => entry.argv).length >= 2, 15_000);
 			let launches = (await entries(log)).filter(entry => entry.argv);
 			expect(launches.map(launch => launch.env)).toEqual([
-				{ CHOPIN_URL: origin, CHOPIN_DOCUMENT: document, CHOPIN_PLANNER_TOKEN: issued[0] },
-				{ CHOPIN_URL: origin, CHOPIN_DOCUMENT: document, CHOPIN_PLANNER_TOKEN: issued[1] },
+				{
+					CHOPIN_URL: origin,
+					CHOPIN_DOCUMENT: document,
+					CHOPIN_PLANNER_TOKEN: issued[0],
+					SOME_FLAG: "1",
+				},
+				{
+					CHOPIN_URL: origin,
+					CHOPIN_DOCUMENT: document,
+					CHOPIN_PLANNER_TOKEN: issued[1],
+					SOME_FLAG: "1",
+				},
 			]);
 			expect(launches.map(launch => launch.argv.slice(1))).toEqual([[script, log], [script, log]]);
 			expect(asked).toEqual([
@@ -231,7 +245,7 @@ test(
 			"--planner-command",
 			`${process.execPath} ${script} ${log}`,
 			"--",
-			"agent",
+			process.execPath,
 		], {
 			env: {
 				...process.env,
@@ -346,6 +360,331 @@ test.skipIf(process.platform === "win32")(
 		}
 	},
 	40_000,
+);
+
+/** A backend whose first launch can't find its interpreter, as `#!/usr/bin/env node` can't. */
+const FAILING_BACKEND = `
+import { appendFileSync, readFileSync } from "node:fs";
+let log = process.argv[2];
+let launches = 0;
+try { launches = readFileSync(log, "utf8").split("\\n").filter(Boolean).length; } catch {}
+appendFileSync(log, process.pid + "\\n");
+if (launches === 0) {
+	process.stderr.write("\\n/usr/bin/env: 'node': No such file or directory (ghp_${
+	"A".repeat(20)
+})\\nmore\\n");
+	process.exit(127);
+}
+process.on("SIGTERM", () => process.exit(0));
+setInterval(() => {}, 1000);
+`;
+
+test.skipIf(process.platform === "win32")(
+	"chopin status shows a Planner backend that exits early until one stays up",
+	async () => {
+		let chopin = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () =>
+				Response.json({
+					token: `chopin_p_${"P".repeat(43)}`,
+					expiresAt: Date.now() + 15 * 60_000,
+					document: { id: "D_1", url: "http://x" },
+				}),
+		});
+		let directory = await mkdtemp(join(scratch, "failing-"));
+		let script = join(directory, "backend.ts");
+		let log = join(directory, "launches.log");
+		await writeFile(script, FAILING_BACKEND);
+		let release = await lockWorkspace(directory, directory, { planners: ["D_1"] });
+		let host: ServiceHost = {
+			platform: "linux",
+			home: directory,
+			user: "ada",
+			uid: 501,
+			env: {},
+			run: async () => ({ code: 1, stdout: "", stderr: "" }),
+		};
+		let status = () =>
+			collectStatus({ directory, server: "https://chopin.example", source: "config", host });
+		let abort = new AbortController();
+		let quiet = { write: () => true };
+		let serving = servePlanners({
+			url: `http://127.0.0.1:${chopin.port}`,
+			machine: MACHINE,
+			documents: ["D_1"],
+			command: [process.execPath, script, log],
+			cwd: directory,
+			output: createOutput(quiet, quiet, {}),
+			signal: abort.signal,
+			failures: startFailures(directory, directory),
+			healthyMs: 1000,
+		});
+		try {
+			await until(async () => !!(await status()).connectors[0]?.failures, 10_000);
+			let report = await status();
+			let [failure] = report.connectors[0]!.failures!;
+			expect(failure).toEqual({
+				kind: "planner",
+				document: "D_1",
+				how: "exit 127",
+				stderr: "/usr/bin/env: 'node': No such file or directory ([redacted])",
+				at: expect.any(String),
+				retryAt: expect.any(String),
+			});
+			expect(formatStatus(report, Date.parse(failure!.retryAt!) - 22_000)).toContain(
+				"              Planner for D_1: failing (exit 127: /usr/bin/env: 'node': No such file or "
+					+ "directory ([redacted])), retrying in 22s",
+			);
+			// The next launch stays up, so the failure goes.
+			await until(async () => !(await status()).connectors[0]?.failures, 10_000);
+			expect(formatStatus(await status())).toContain("              Planner for D_1");
+		} finally {
+			abort.abort();
+			await serving;
+			await release();
+			await chopin.stop(true);
+		}
+	},
+	30_000,
+);
+
+test.skipIf(process.platform === "win32")(
+	"a Planner backend that prints its credential and an --env value leaves neither in the failures file, chopin status or chopin's own output",
+	async () => {
+		let token = `chopin_p_${"P".repeat(43)}`;
+		let secret = "review-opaque-api-secret";
+		let chopin = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () =>
+				Response.json({ token, expiresAt: Date.now() + 15 * 60_000, document: { id: "D_1" } }),
+		});
+		let directory = await mkdtemp(join(scratch, "leaking-"));
+		let script = join(directory, "backend.ts");
+		await writeFile(
+			script,
+			"process.stderr.write(`CHOPIN_PLANNER_TOKEN=${process.env.CHOPIN_PLANNER_TOKEN} "
+				+ "OPAQUE_API_KEY=${process.env.OPAQUE_API_KEY}\\n`);\nprocess.exit(127);\n",
+		);
+		let release = await lockWorkspace(directory, directory, { planners: ["D_1"] });
+		let host: ServiceHost = {
+			platform: "linux",
+			home: directory,
+			user: "ada",
+			uid: 501,
+			env: {},
+			run: async () => ({ code: 1, stdout: "", stderr: "" }),
+		};
+		let status = () =>
+			collectStatus({ directory, server: "https://chopin.example", source: "config", host });
+		// Everything chopin writes: its own lines, and the backend's stderr it passes on.
+		let written = "";
+		let capture = {
+			write: (chunk: string | Uint8Array) => {
+				written += String(chunk);
+				return true;
+			},
+		};
+		let stderr = process.stderr.write;
+		process.stderr.write = capture.write as typeof process.stderr.write;
+		let abort = new AbortController();
+		let serving = servePlanners({
+			url: `http://127.0.0.1:${chopin.port}`,
+			machine: MACHINE,
+			documents: ["D_1"],
+			command: [process.execPath, script],
+			cwd: directory,
+			output: createOutput(capture, capture, {}),
+			signal: abort.signal,
+			failures: startFailures(directory, directory),
+			env: { OPAQUE_API_KEY: secret },
+		});
+		try {
+			await until(async () => !!(await status()).connectors[0]?.failures, 10_000);
+			abort.abort();
+			await serving;
+			let report = await status();
+			expect(report.connectors[0]!.failures![0]!.stderr).toBe(
+				"CHOPIN_PLANNER_TOKEN=[redacted] OPAQUE_API_KEY=[redacted]",
+			);
+			let failures = await readFile(
+				join(
+					directory,
+					`${new Bun.CryptoHasher("sha256").update(directory).digest("hex")}.failures.json`,
+				),
+				"utf8",
+			);
+			let shown = {
+				failures,
+				status: formatStatus(report).join("\n"),
+				json: JSON.stringify(report, null, 2),
+				written,
+			};
+			for (let [where, text] of Object.entries(shown)) {
+				expect({ where, token: text.includes(token), secret: text.includes(secret) })
+					.toEqual({ where, token: false, secret: false });
+			}
+			expect(written).toContain("Planner for D_1 exited (exit 127)");
+		} finally {
+			process.stderr.write = stderr;
+			abort.abort();
+			await serving;
+			await release();
+			await chopin.stop(true);
+		}
+	},
+	30_000,
+);
+
+test.skipIf(process.platform === "win32")(
+	"a Planner stderr line too long to mask is dropped whole, so a credential split across it leaks nowhere",
+	async () => {
+		let token = `chopin_p_${"Kq4Zt9Wm".repeat(6).slice(0, 43)}`;
+		let marker = "[chopin: dropped a stderr line longer than 65536 characters]";
+		let chopin = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () =>
+				Response.json({ token, expiresAt: Date.now() + 15 * 60_000, document: { id: "D_1" } }),
+		});
+		let directory = await mkdtemp(join(scratch, "long-line-"));
+		let script = join(directory, "backend.ts");
+		// The first 8 characters of the credential end a 65,545-character piece without a newline;
+		// the rest comes after a pause, then a normal line.
+		await writeFile(
+			script,
+			[
+				"let token = process.env.CHOPIN_PLANNER_TOKEN;",
+				"process.stderr.write(`${'x'.repeat(65536)} ${token.slice(0, 8)}`, () => setTimeout(() => {",
+				"\tprocess.stderr.write(`${token.slice(8)}\\nnext CHOPIN_PLANNER_TOKEN=${token}\\n`,",
+				"\t\t() => process.exit(127));",
+				"}, 300));",
+				"",
+			].join("\n"),
+		);
+		let release = await lockWorkspace(directory, directory, { planners: ["D_1"] });
+		let host: ServiceHost = {
+			platform: "linux",
+			home: directory,
+			user: "ada",
+			uid: 501,
+			env: {},
+			run: async () => ({ code: 1, stdout: "", stderr: "" }),
+		};
+		let status = () =>
+			collectStatus({ directory, server: "https://chopin.example", source: "config", host });
+		let written = "";
+		let capture = {
+			write: (chunk: string | Uint8Array) => {
+				written += String(chunk);
+				return true;
+			},
+		};
+		let stderr = process.stderr.write;
+		process.stderr.write = capture.write as typeof process.stderr.write;
+		let abort = new AbortController();
+		let serving = servePlanners({
+			url: `http://127.0.0.1:${chopin.port}`,
+			machine: MACHINE,
+			documents: ["D_1"],
+			command: [process.execPath, script],
+			cwd: directory,
+			output: createOutput(capture, capture, {}),
+			signal: abort.signal,
+			failures: startFailures(directory, directory),
+		});
+		try {
+			await until(async () => !!(await status()).connectors[0]?.failures, 10_000);
+			abort.abort();
+			await serving;
+			let report = await status();
+			let failures = await readFile(
+				join(
+					directory,
+					`${new Bun.CryptoHasher("sha256").update(directory).digest("hex")}.failures.json`,
+				),
+				"utf8",
+			);
+			let pieces = Array.from({ length: token.length - 7 }, (_, at) => token.slice(at, at + 8));
+			let shown = { failures, status: formatStatus(report).join("\n"), written };
+			for (let [where, text] of Object.entries(shown)) {
+				expect({ where, leaked: pieces.filter(piece => text.includes(piece)) })
+					.toEqual({ where, leaked: [] });
+			}
+			expect(written.split(marker).length - 1).toBe(1);
+			expect(written).toContain(`${marker}\nnext CHOPIN_PLANNER_TOKEN=[redacted]\n`);
+			expect(report.connectors[0]!.failures![0]!.stderr).toBe(marker);
+		} finally {
+			process.stderr.write = stderr;
+			abort.abort();
+			await serving;
+			await release();
+			await chopin.stop(true);
+		}
+	},
+	30_000,
+);
+
+test.skipIf(process.platform === "win32")(
+	"chopin status shows a Planner stopped for good, not retrying, once Chopin refuses its credential",
+	async () => {
+		let asked = 0;
+		let chopin = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () =>
+				asked++
+					? Response.json({}, { status: 404 })
+					: Response.json({ token: `chopin_p_${"P".repeat(43)}`, expiresAt: Date.now() + 60_000 }),
+		});
+		let directory = await mkdtemp(join(scratch, "refused-"));
+		let script = join(directory, "backend.ts");
+		await writeFile(script, "process.stderr.write('node: not found\\n');\nprocess.exit(127);\n");
+		let release = await lockWorkspace(directory, directory, { planners: ["D_1"] });
+		let host: ServiceHost = {
+			platform: "linux",
+			home: directory,
+			user: "ada",
+			uid: 501,
+			env: {},
+			run: async () => ({ code: 1, stdout: "", stderr: "" }),
+		};
+		let quiet = { write: () => true };
+		try {
+			// The backend exits 127, then Chopin refuses the next credential, which ends the Planner.
+			await servePlanners({
+				url: `http://127.0.0.1:${chopin.port}`,
+				machine: MACHINE,
+				documents: ["D_1"],
+				command: [process.execPath, script],
+				cwd: directory,
+				output: createOutput(quiet, quiet, {}),
+				signal: new AbortController().signal,
+				failures: startFailures(directory, directory),
+			});
+			let report = await collectStatus({
+				directory,
+				server: "https://chopin.example",
+				source: "config",
+				host,
+			});
+			expect(report.connectors[0]!.failures).toEqual([{
+				kind: "planner",
+				document: "D_1",
+				how: "Chopin refused the request (http-404).",
+				stopped: true,
+				at: expect.any(String),
+			}]);
+			expect(formatStatus(report, Date.now() + 60_000)).toContain(
+				"              Planner for D_1: stopped: Chopin refused the request (http-404).",
+			);
+		} finally {
+			await release();
+			await chopin.stop(true);
+		}
+	},
+	30_000,
 );
 
 test("on Windows a stopped backend's process tree is ended with taskkill", async () => {

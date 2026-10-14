@@ -11,6 +11,7 @@ import { implementationGraphs } from "./plan-graphs";
 import { registerImplementationRoutes } from "./routes";
 import { queueRebuild, requestBuild } from "./builds";
 import { implementationStatus } from "./notifications";
+import { LiveSyncCoordinator } from "./live-sync";
 import type { GitHub } from "../github/client";
 import type { HostedAuth } from "../auth/routes";
 
@@ -198,6 +199,119 @@ async function tool(
 	let result = (await response.json()).result;
 	return result.isError ? result : JSON.parse(result.content[0].text);
 }
+
+test("the build owner can stop from the browser without losing reported pull requests", async () => {
+	let context = await setup();
+	context.plan.persistence.liveBuild = true;
+	let connection = await paired(context);
+	let built = await (await context.call(context.path, {
+		planRevision: 0,
+		graphVersion: 1,
+		graphRevision: 1,
+	})).json();
+	let claim = await tool(context, connection.token, "claim_implementation_build", { id: built.id });
+	await tool(context, connection.token, "report_implementation_build", {
+		id: built.id,
+		state: "running",
+		session: "acp-session",
+	});
+	await tool(context, claim.runToken, "start_task", {
+		taskId: "first",
+		idempotencyKey: "start-first",
+	});
+	await tool(context, claim.runToken, "report_pr", {
+		taskId: "first",
+		idempotencyKey: "pr-first",
+		url: "https://github.com/owner/repository/pull/7",
+		state: "open",
+	});
+	let path = `${context.path}/stop`;
+	expect((await context.call(path, { id: built.id }, undefined, "https://untrusted.test")).status)
+		.toBe(403);
+	expect(
+		(await context.call(path, { id: built.id }, undefined, undefined, context.otherCookie)).status,
+	)
+		.toBe(403);
+	let readonly = await context.auth.sessions.issue("U_other", {
+		accessToken: "readonly",
+		accessExpiresIn: 28_800,
+		refreshToken: "refresh",
+		refreshExpiresIn: 15_897_600,
+	});
+	expect((await context.call(path, { id: built.id }, undefined, undefined, readonly.cookie)).status)
+		.toBe(403);
+	expect((await context.call(path, { id: crypto.randomUUID() })).status).toBe(409);
+	expect((await context.call(path, { id: built.id })).status).toBe(200);
+	expect((await context.call(path, { id: built.id })).status).toBe(200);
+	let snapshot = await (await context.call(context.path)).json();
+	expect(snapshot.build).toMatchObject({ state: "failed", error: "Stopped in Chopin." });
+	expect(context.experiments.connections.assigned(connection.id)).toBeUndefined();
+	expect(context.plan.live).toBeUndefined();
+	expect(snapshot.lifecycle.activity.tasks[0].pullRequest.url)
+		.toBe("https://github.com/owner/repository/pull/7");
+	expect(
+		(await tool(context, connection.token, "renew_implementation_build", { id: built.id })).isError,
+	)
+		.toBe(true);
+	expect(
+		(await tool(context, claim.runToken, "complete_task", {
+			taskId: "first",
+			idempotencyKey: "late-complete",
+			summary: "Finished after stop",
+		})).isError,
+	).toBe(true);
+	await Plan.close(context.plan);
+});
+
+test("a stale Stop rejects a naturally ended build instead of claiming cancellation", async () => {
+	for (let state of ["failed", "stopped"] as const) {
+		let context = await setup();
+		let connection = await paired(context);
+		let build = await (await context.call(context.path, {
+			planRevision: 0,
+			graphVersion: 1,
+			graphRevision: 1,
+		})).json();
+		await tool(context, connection.token, "claim_implementation_build", { id: build.id });
+		await tool(context, connection.token, "report_implementation_build", { id: build.id, state });
+		expect(context.plan.builds.at(-1)?.state).toBe(state);
+		let stopped = await context.call(`${context.path}/stop`, { id: build.id });
+		expect(stopped.status).toBe(409);
+		expect(context.plan.builds.at(-1)?.state).toBe(state);
+		expect(context.plan.builds.at(-1)?.stoppedAtRevision).toBeUndefined();
+		await Plan.close(context.plan);
+	}
+});
+
+test("build heartbeats persist changed activity without resetting its age on every renewal", async () => {
+	let context = await setup();
+	let connection = await paired(context);
+	let built = await (await context.call(context.path, {
+		planRevision: 0,
+		graphVersion: 1,
+		graphRevision: 1,
+	})).json();
+	await tool(context, connection.token, "claim_implementation_build", { id: built.id });
+	let heartbeat = { id: built.id, progress: "Running server tests" };
+	expect((await tool(context, connection.token, "renew_implementation_build", heartbeat)).isError)
+		.toBeUndefined();
+	let first = (await (await context.call(context.path)).json()).build.activity;
+	expect(first.text).toBe("Running server tests");
+	expect(Number.isNaN(Date.parse(first.at))).toBe(false);
+	await tool(context, connection.token, "renew_implementation_build", heartbeat);
+	expect((await (await context.call(context.path)).json()).build.activity).toEqual(first);
+	await tool(context, connection.token, "renew_implementation_build", {
+		...heartbeat,
+		progress: "Opening the pull request",
+	});
+	await Plan.close(context.plan);
+	let stored = await context.storage.collaboration.load(context.plan.id, context.now);
+	expect(
+		(stored!.sidecar as { builds: Array<{ activity: { text: string } }> }).builds.at(-1)!.activity
+			.text,
+	)
+		.toBe("Opening the pull request");
+});
 
 test("a paired workspace claims a browser build once and reports through run-scoped MCP", async () => {
 	let context = await setup();
@@ -793,12 +907,12 @@ function edit(plan: Plan.Plan, text: string) {
 }
 
 /** Deliver a live build, edit the document, then queue and start a rebuild of that edit. */
-async function rebuilding() {
+async function rebuilding(autoRun = false) {
 	let context = await setup();
 	context.plan.persistence.liveBuild = true;
 	let stopped: string[] = [];
 	context.plan.persistence.onBuildStopped = id => stopped.push(id);
-	let connection = await paired(context);
+	let connection = await paired(context, undefined, autoRun);
 	let built = await (await context.call(context.path, {
 		planRevision: 0,
 		graphVersion: 1,
@@ -844,6 +958,33 @@ async function rebuilding() {
 	});
 	return { context, connection, built, claim, rebuild, builtSource, target, stopped };
 }
+
+test("Stop cancels an automatic rebuild deferred by edits until a new edit arrives", async () => {
+	let { context, rebuild } = await rebuilding(true);
+	let plan = context.plan;
+	let coordinator = new LiveSyncCoordinator({
+		withPlan: async (_id, action) => action(plan),
+		connections: context.experiments.connections,
+	});
+	plan.persistence.onBuildStopped = id => coordinator.stopped(id);
+	try {
+		expect((await edit(plan, "An edit while the rebuild runs.")).ok).toBe(true);
+		await coordinator.check(plan.id);
+		expect((await context.call(`${context.path}/stop`, { id: rebuild.build.id })).status).toBe(200);
+		await coordinator.check(plan.id);
+		expect(plan.builds).toHaveLength(2);
+		expect(plan.builds.at(-1)!.state).toBe("failed");
+		await coordinator.check(plan.id);
+		expect(plan.builds).toHaveLength(2);
+		expect((await edit(plan, "A new edit after Stop.")).ok).toBe(true);
+		await coordinator.check(plan.id);
+		expect(plan.builds).toHaveLength(3);
+		expect(plan.builds.at(-1)!.state).toBe("queued");
+	} finally {
+		coordinator.close();
+		await Plan.close(plan);
+	}
+});
 
 test("a running rebuild leaves editing open and reads its sealed delta", async () => {
 	let { context, rebuild, builtSource, target } = await rebuilding();

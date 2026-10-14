@@ -7,9 +7,8 @@
  */
 
 import { CheckIcon, ListIcon } from "@chopin/icons";
-import { INSERT_CHECK_LIST_COMMAND } from "@lexical/list";
-import { $createParagraphNode, $getSelection, $isRangeSelection } from "lexical";
 
+import { $openBlock, insertList } from "./block-target";
 import { convertBlock } from "./bubble";
 import { availableCommands } from "./slash";
 import { nativeSelectionRect } from "./surface";
@@ -57,18 +56,6 @@ export type PanelChoice = {
 	run: (editor: LexicalEditor) => void;
 };
 
-/** A new block goes after one with words in it, as the slash menu's does, never inside them. */
-function $openBlock() {
-	let selection = $getSelection();
-	if (!$isRangeSelection(selection)) return;
-	let block = selection.anchor.getNode().getTopLevelElement();
-	if (block && block.getTextContentSize() > 0) {
-		let paragraph = $createParagraphNode();
-		block.insertAfter(paragraph);
-		paragraph.select();
-	}
-}
-
 /** Kinds of list belong with the other text styles, not with the blocks. */
 const STYLED = new Set(["tasks"]);
 
@@ -82,8 +69,14 @@ export function insertChoices(actions: ReadonlySet<string>): PanelChoice[] {
 			label: command.label,
 			glyph: <command.icon size={18} />,
 			run: editor => {
+				// One update, so one undo removes the opened line with the block.
+				if (command.kind === "insert") {
+					return editor.update(() => {
+						$openBlock();
+						command.run(editor);
+					});
+				}
 				editor.update($openBlock, { discrete: true });
-				if (command.kind === "insert") return command.run(editor);
 				// Nothing was typed to start it, so there is no trigger to consume.
 				let anchor = nativeSelectionRect();
 				if (anchor) command.run(editor, { anchor, consume: () => true });
@@ -110,7 +103,7 @@ export function styleChoices(current: Block): PanelChoice[] {
 		run: editor => {
 			if (style.id === current) return;
 			if (style.id === "task") {
-				editor.dispatchCommand(INSERT_CHECK_LIST_COMMAND, undefined);
+				insertList(editor, "check");
 				return;
 			}
 			convertBlock(editor, current, style.id);

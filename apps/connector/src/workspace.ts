@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
-import { mkdir, open, readFile, realpath, rm } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import { execFile, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import type { RunInput } from "@chopin/experiment";
+import { redacted } from "./connection";
+import { CONNECTOR_PROTOCOL, VERSION } from "./version";
 
 export function git(cwd: string, ...args: string[]): string {
 	let result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 120_000 });
@@ -14,15 +16,51 @@ export function git(cwd: string, ...args: string[]): string {
 	return result.stdout.trim();
 }
 
+/**
+ * The checkout at `path`: its root, GitHub repository, commit and branch. What stops it says what
+ * to do, since `chopin connect` is often the first thing run in a new folder.
+ */
 export async function workspace(path: string) {
-	let root = await realpath(git(path, "rev-parse", "--show-toplevel"));
-	let origin = git(root, "remote", "get-url", "origin");
+	let again = "then run this command again.";
+	let top: string;
+	try {
+		top = git(path, "rev-parse", "--show-toplevel");
+	} catch (error) {
+		if (!Bun.which("git", { PATH: process.env.PATH ?? "" })) {
+			throw new Error(
+				`git isn't installed, so nothing was paired or connected. Install git, ${again}`,
+				{ cause: error },
+			);
+		}
+		throw new Error(
+			`${path} isn't inside a git checkout, so nothing was paired or connected. cd into your `
+				+ `repository's folder (a clone from GitHub), ${again}`,
+			{ cause: error },
+		);
+	}
+	let root = await realpath(top);
+	let origin = "";
+	try {
+		origin = git(root, "remote", "get-url", "origin");
+	} catch { /* Said below, as for an origin elsewhere. */ }
 	let match = origin.match(/(?:github\.com[:/])([^/]+\/[^/]+?)(?:\.git)?$/i);
-	if (!match) throw new Error("The checkout must have a github.com origin.");
+	if (!match) {
+		throw new Error(
+			`${root}'s origin ${origin ? `(${redacted(origin)}) ` : ""}isn't a github.com repository, `
+				+ "so Chopin can't connect it. Check it with `git remote -v`; Chopin connects clones of "
+				+ "GitHub repositories.",
+		);
+	}
+	let commit: string;
+	try {
+		commit = git(root, "rev-parse", "HEAD");
+	} catch {
+		throw new Error(`${root} has no commits yet. Commit once with \`git commit\`, ${again}`);
+	}
 	return {
 		root,
-		repository: match[1],
-		commit: git(root, "rev-parse", "HEAD"),
+		repository: match[1]!,
+		commit,
 		branch: git(root, "branch", "--show-current") || undefined,
 	};
 }
@@ -37,16 +75,117 @@ export function stateDirectory() {
 		);
 }
 
-export async function lockWorkspace(root: string, directory: string) {
+/** When a process started: `id` differs for each process that held a pid, `at` is in ms. */
+export type ProcessStart = { id: string; at: number };
+
+/** Reads when process `pid` started; undefined when it can't be read, as when it is gone. */
+export type StartProbe = (pid: number) => Promise<ProcessStart | undefined>;
+
+type Run = (command: string, args: string[]) => Promise<{ code: number; stdout: string }>;
+
+const runFile: Run = (command, args) =>
+	new Promise(resolve => {
+		execFile(command, args, { timeout: 30_000, windowsHide: true }, (error, stdout) => {
+			resolve({ code: error ? 1 : 0, stdout: String(stdout) });
+		});
+	});
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** Windows FILETIME counts 100 ns from 1601; this many ms lie between 1601 and 1970. */
+const FILETIME_EPOCH_MS = 11644473600000n;
+
+/**
+ * How this machine reads a process's start: on Linux field 22 of /proc/<pid>/stat, in clock
+ * ticks since boot; on macOS `ps -o lstart=` in the C locale and UTC, so the service and a
+ * terminal read it the same; on Windows the process's creation time. Commands go through `run`.
+ */
+export function processStart(
+	platform: NodeJS.Platform = process.platform,
+	run: Run = runFile,
+): StartProbe {
+	if (platform === "linux") {
+		return async pid => {
+			let stat = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => "");
+			// The command name, in parentheses, may hold spaces; field 3 follows its last `)`.
+			let ticks = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+			let boot = (await readFile("/proc/stat", "utf8").catch(() => "")).match(/^btime (\d+)$/m);
+			if (!ticks || !/^\d+$/.test(ticks)) return undefined;
+			// USER_HZ, the tick /proc reports in, is 100 on every Linux architecture.
+			let at = boot ? Number(boot[1]) * 1000 + Number(ticks) * 10 : Number.NaN;
+			return { id: ticks, at };
+		};
+	}
+	if (platform === "darwin") {
+		return async pid => {
+			let shown = await run("/usr/bin/env", [
+				"-i",
+				"LC_ALL=C",
+				"TZ=UTC",
+				"/bin/ps",
+				"-o",
+				"lstart=",
+				"-p",
+				String(pid),
+			]);
+			let id = shown.code === 0 ? shown.stdout.trim().replaceAll(/\s+/g, " ") : "";
+			let part = id.match(/^\w{3} (\w{3}) (\d+) (\d+):(\d+):(\d+) (\d{4})$/);
+			if (!part) return undefined;
+			let [, month, day, hour, minute, second, year] = part;
+			let at = Date.UTC(
+				Number(year),
+				MONTHS.indexOf(month!),
+				Number(day),
+				Number(hour),
+				Number(minute),
+				Number(second),
+			);
+			return { id, at };
+		};
+	}
+	if (platform === "win32") {
+		return async pid => {
+			let root = process.env.SystemRoot ?? "C:\\Windows";
+			let shown = await run(
+				win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+				[
+					"-NoProfile",
+					"-NonInteractive",
+					"-Command",
+					`try { (Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToFileTimeUtc() } catch {}`,
+				],
+			);
+			let id = shown.code === 0 ? shown.stdout.trim() : "";
+			if (!/^\d+$/.test(id)) return undefined;
+			return { id, at: Number(BigInt(id) / 10000n - FILETIME_EPOCH_MS) };
+		};
+	}
+	return async () => undefined;
+}
+
+/**
+ * Hold a checkout for this process. The lock names the process, when it started, the checkout
+ * and the chopin that holds it, so `chopin status` can list the connectors running for a state
+ * directory; `service` marks the one the installed service runs, and `planners` names the
+ * documents whose Planner backends it runs. The lock holds no credential.
+ */
+export async function lockWorkspace(
+	root: string,
+	directory: string,
+	{ service = false, planners = [], probe = processStart() }: {
+		service?: boolean;
+		planners?: string[];
+		probe?: StartProbe;
+	} = {},
+) {
 	await mkdir(directory, { recursive: true, mode: 0o700 });
-	let id = createHash("sha256").update(root).digest("hex");
-	let path = join(directory, `${id}.lock`);
+	let path = join(directory, `${lockId(root)}.lock`);
 	let file;
 	try {
 		file = await open(path, "wx", 0o600);
 	} catch {
 		// A connector that crashed leaves its lock behind; replace it once its process is gone.
-		if (!await staleLock(path)) {
+		if (!await staleLock(path, probe)) {
 			throw new Error(
 				`Workspace already locked. After confirming no connector is running, remove ${path}`,
 			);
@@ -58,29 +197,178 @@ export async function lockWorkspace(root: string, directory: string) {
 			throw new Error(`Workspace already locked by a connector that just started. ${path}`);
 		}
 	}
-	await file.writeFile(JSON.stringify({ pid: process.pid, root }));
+	let started = await probe(process.pid);
+	await file.writeFile(JSON.stringify({
+		pid: process.pid,
+		...(started ? { processStart: started.id } : {}),
+		root,
+		version: VERSION,
+		protocol: CONNECTOR_PROTOCOL,
+		started: Date.now(),
+		...(service ? { service } : {}),
+		...(planners.length ? { planners } : {}),
+	}));
 	return async () => {
 		await file.close();
 		await rm(path, { force: true });
+		await rm(path.replace(/\.lock$/, ".failures.json"), { force: true });
 	};
 }
 
-/** Only a lock naming a process that no longer exists is stale; unreadable locks are kept. */
-async function staleLock(path: string): Promise<boolean> {
-	let pid: unknown;
+function lockId(root: string) {
+	return createHash("sha256").update(root).digest("hex");
+}
+
+/**
+ * How the agent or a document's Planner backend last failed to start or exited early: how it
+ * ended, the first line of its stderr, when, and when the Planner backend is started again.
+ * A Planner that Chopin refused for good is `stopped`, with the refusal as `how`, and is not
+ * started again. Times are in ms.
+ */
+export type StartFailure = {
+	kind: "agent" | "planner";
+	document?: string;
+	how: string;
+	stderr?: string;
+	stopped?: true;
+	at: number;
+	retryAt?: number;
+};
+
+/**
+ * The latest start failure of a connector's agent and of each of its Planner backends, kept for
+ * `chopin status` in a file beside the checkout's lock, without credentials: token-shaped
+ * strings and the `secrets` each failure names, such as --env values, are masked. A successful
+ * start clears its own.
+ */
+export function startFailures(directory: string, root: string) {
+	let path = join(directory, `${lockId(root)}.failures.json`);
+	let current = new Map<string, StartFailure>();
+	// A connector that crashed may have left its failures behind.
+	let writing = rm(path, { force: true }).catch(() => {});
+	let save = () =>
+		writing = writing.then(() =>
+			current.size
+				? writeFile(path, JSON.stringify([...current.values()]), { mode: 0o600 })
+				: rm(path, { force: true })
+		).catch(() => {});
+	return {
+		failed(failure: StartFailure, secrets: string[] = []) {
+			current.set(failure.document ?? "", {
+				...failure,
+				how: redacted(failure.how, secrets).slice(0, 200),
+				...(failure.stderr ? { stderr: redacted(failure.stderr, secrets).slice(0, 200) } : {}),
+			});
+			return save();
+		},
+		started(document?: string) {
+			return current.delete(document ?? "") ? save() : writing;
+		},
+	};
+}
+
+export type StartFailures = ReturnType<typeof startFailures>;
+
+/** Whether no process `pid` exists; EPERM means it exists but belongs to someone else. */
+function gone(pid: number) {
 	try {
-		pid = JSON.parse(await readFile(path, "utf8")).pid;
+		process.kill(pid, 0);
+		return false;
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code === "ESRCH";
+	}
+}
+
+/** How far a start time read back may sit after the moment it was read, from rounding. */
+const START_SLACK_MS = 2000;
+
+/**
+ * Whether the process that wrote a lock still runs: a process has its pid and started when the
+ * lock says. A lock without a start time that can be compared is held while its pid exists,
+ * unless it was written before the process now holding that pid started.
+ */
+async function holds(held: Record<string, unknown>, probe: StartProbe) {
+	let pid = held.pid as number;
+	if (gone(pid)) return false;
+	let now = await probe(pid);
+	if (!now) return true;
+	if (typeof held.processStart === "string") return held.processStart === now.id;
+	return !(typeof held.started === "number" && held.started + START_SLACK_MS < now.at);
+}
+
+/** Only a lock naming a process that no longer runs is stale; unreadable locks are kept. */
+async function staleLock(path: string, probe: StartProbe): Promise<boolean> {
+	let held: Record<string, unknown>;
+	try {
+		held = JSON.parse(await readFile(path, "utf8"));
 	} catch {
 		return false;
 	}
-	if (!Number.isSafeInteger(pid) || (pid as number) <= 0) return false;
-	try {
-		process.kill(pid as number, 0);
-		return false;
-	} catch (err) {
-		// EPERM means the process exists but belongs to someone else.
-		return (err as NodeJS.ErrnoException).code === "ESRCH";
+	return Number.isSafeInteger(held?.pid) && (held.pid as number) > 0 && !await holds(held, probe);
+}
+
+/** A connector that holds, or held until it crashed, a checkout's lock in a state directory. */
+export type RunningConnector = {
+	pid: number;
+	root: string;
+	/**
+	 * False when the lock is stale: its process is gone, or its pid now belongs to a process that
+	 * started at another time. The next `connect` replaces it.
+	 */
+	running: boolean;
+	/** Whether the installed service runs it. */
+	service: boolean;
+	/** The documents whose Planner backends it runs, when it runs any. */
+	planners?: string[];
+	/** The chopin version and protocol it runs, absent from a lock written before they were. */
+	version?: string;
+	protocol?: number;
+	started?: number;
+	/** How its agent or Planner backends last failed to start, while it runs. */
+	failures?: StartFailure[];
+};
+
+/**
+ * Every checkout lock in `directory`, skipping any that is unreadable or still being written.
+ * `probe` reads when each lock's process started.
+ */
+export async function connectors(
+	directory: string,
+	probe: StartProbe = processStart(),
+): Promise<RunningConnector[]> {
+	let names = await readdir(directory).catch(() => [] as string[]);
+	let found: RunningConnector[] = [];
+	for (let name of names.filter(name => /^[0-9a-f]{64}\.lock$/.test(name))) {
+		let held: Record<string, unknown>;
+		try {
+			held = JSON.parse(await readFile(join(directory, name), "utf8"));
+		} catch {
+			continue;
+		}
+		let { pid, root, version, protocol, started, planners } = held;
+		if (!Number.isSafeInteger(pid) || (pid as number) <= 0 || typeof root !== "string") continue;
+		let running = await holds(held, probe);
+		let failures = running
+			? await readFile(join(directory, name.replace(/\.lock$/, ".failures.json")), "utf8")
+				.then(text => JSON.parse(text) as StartFailure[])
+				.catch(() => undefined)
+			: undefined;
+		found.push({
+			pid: pid as number,
+			root,
+			running,
+			service: held.service === true,
+			...(Array.isArray(planners) && planners.length
+					&& planners.every(document => typeof document === "string")
+				? { planners: planners as string[] }
+				: {}),
+			...(typeof version === "string" ? { version } : {}),
+			...(typeof protocol === "number" ? { protocol } : {}),
+			...(typeof started === "number" ? { started } : {}),
+			...(Array.isArray(failures) && failures.length ? { failures } : {}),
+		});
 	}
+	return found;
 }
 
 /**
@@ -115,13 +403,16 @@ export async function prepareWorkspace(
 	root: string,
 	directory: string,
 	input: Pick<RunInput, "id" | "source">,
+	generation = 1,
 ) {
 	let current = await workspace(root);
 	if (current.repository.toLowerCase() !== input.source.repository.toLowerCase()) {
 		throw new Error("Repository differs from the authorized run.");
 	}
 	await mkdir(join(directory, "runs"), { recursive: true, mode: 0o700 });
-	let journalPath = join(directory, "runs", `${input.id}.json`);
+	// Retry keeps the investigation ID but claims a new generation. Keep earlier work intact.
+	let attempt = generation === 1 ? input.id : `${input.id}-${generation}`;
+	let journalPath = join(directory, "runs", `${attempt}.json`);
 	let journal;
 	try {
 		journal = await open(journalPath, "wx", 0o600);
@@ -131,7 +422,7 @@ export async function prepareWorkspace(
 		);
 	}
 	await journal.writeFile(
-		JSON.stringify({ id: input.id, source: input.source, state: "accepted" }),
+		JSON.stringify({ id: input.id, generation, source: input.source, state: "accepted" }),
 	);
 	await journal.sync();
 	await journal.close();
@@ -142,7 +433,7 @@ export async function prepareWorkspace(
 			timeout: 120_000,
 		});
 	}
-	let path = join(directory, "runs", input.id);
+	let path = join(directory, "runs", attempt);
 	await promisify(execFile)("git", [
 		"-C",
 		root,

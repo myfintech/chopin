@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import * as Permission from "./permission";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -104,103 +105,139 @@ test("a living document's first build gets a prompt without verification or revi
 	]);
 });
 
-test("a spike run serves connector-local tools to an HTTP agent over an authenticated loopback bridge", async () => {
-	let root = await mkdtemp(join(tmpdir(), "chopin-spike-"));
-	let state = await mkdtemp(join(tmpdir(), "chopin-spike-state-"));
-	let received: Array<[string, Record<string, unknown>]> = [];
-	let terminal = captured();
-	let chopin = Bun.serve({
-		hostname: "127.0.0.1",
-		port: 0,
-		async fetch(request) {
-			if (request.headers.get("authorization") !== "Bearer run-token") {
-				return new Response(null, { status: 401 });
-			}
-			let server = new Server({ name: "fake-chopin", version: "1" }, {
-				capabilities: { tools: {} },
-			});
-			server.setRequestHandler(ListToolsRequestSchema, () => ({
-				tools: ["upload_investigation_image", "submit_spike_result"].map(name => ({
-					name,
-					inputSchema: { type: "object" as const },
-				})),
-			}));
-			server.setRequestHandler(CallToolRequestSchema, request => {
-				received.push([request.params.name, request.params.arguments ?? {}]);
-				return { content: [{ type: "text", text: "{}" }] };
-			});
-			let transport = new WebStandardStreamableHTTPServerTransport({
-				sessionIdGenerator: undefined,
-				enableJsonResponse: true,
-			});
-			await server.connect(transport);
-			return transport.handleRequest(request);
-		},
-	});
-	try {
-		git(root, "init");
-		git(root, "config", "user.name", "Fixture");
-		git(root, "config", "user.email", "fixture@example.test");
-		git(root, "remote", "add", "origin", "git@github.com:org/repo.git");
-		await writeFile(join(root, "source.txt"), "committed");
-		git(root, "add", ".");
-		git(root, "commit", "-m", "fixture");
-		let calls: string[] = [];
-		let api = {
-			call: async (name: string) => {
-				calls.push(name);
-				return {};
-			},
-		} as unknown as Awaited<ReturnType<typeof remote>>;
-		let id = crypto.randomUUID();
-		await runWork(api, "experiment", {
-			spike: true,
-			passage: "We are not sure a CSS-only fade-in on the heading works without JavaScript.",
-			generation: 1,
-			runToken: "run-token",
-			input: {
-				id,
-				documentId: crypto.randomUUID(),
-				brief: "Prototype the passage",
-				source: {
-					repositoryId: "R_repo",
-					repository: "org/repo",
-					commit: git(root, "rev-parse", "HEAD"),
-				},
-				context: "",
-				requester: "a",
-				authorizer: "a",
-			},
-		}, {
-			root,
-			directory: state,
+test.skipIf(process.platform === "win32")(
+	"the agent runs with the --env connect saved",
+	async () => {
+		let file = join(await mkdtemp(join(tmpdir(), "chopin-env-")), "seen");
+		let implementer = new URL("./testing/fake-implementer.ts", import.meta.url).pathname;
+		let { calls } = await run({ live: true }, [], undefined, undefined, {
 			command: [
+				"/bin/sh",
+				"-c",
+				'printf %s "$SOME_FLAG" > "$0"; exec "$1" "$2" --live',
+				file,
 				process.execPath,
-				new URL("./testing/fake-agent.ts", import.meta.url).pathname,
-				"--http",
-				"--spike",
+				implementer,
 			],
-			url: `http://127.0.0.1:${chopin.port}`,
-			signal: new AbortController().signal,
-			output: terminal.output,
+			env: { SOME_FLAG: "from connect" },
 		});
-		expect(terminal.out()).toContain(
-			"› Prototyping We are not sure a CSS-only fade-in on the heading works without JavaScript.\n",
-		);
-		expect(calls.filter(name => name !== "renew_experiment")).toEqual(["complete_experiment"]);
-		expect(received.map(([name]) => name)).toEqual([
-			"upload_investigation_image",
-			"submit_spike_result",
-		]);
-		expect(received[0][1]).toEqual({ data: "iVBORw0KGgo=", mimeType: "image/png" });
-		// The bridge closes with the run.
-		await expect(fetch(received[1][1].url as string, { method: "POST" })).rejects.toThrow();
-	} finally {
-		await chopin.stop(true);
-		await rm(root, { recursive: true, force: true });
-		await rm(state, { recursive: true, force: true });
-	}
-});
+		expect(calls.findLast(([name]) => name !== "renew_implementation_build")?.[1])
+			.toMatchObject({ state: "stopped" });
+		expect(await readFile(file, "utf8")).toBe("from connect");
+	},
+);
+
+test.each([true, false])(
+	"an investigation (spike=%s) serves image tools through an authenticated local bridge",
+	async spike => {
+		let root = await mkdtemp(join(tmpdir(), "chopin-spike-"));
+		let state = await mkdtemp(join(tmpdir(), "chopin-spike-state-"));
+		let received: Array<[string, Record<string, unknown>]> = [];
+		let terminal = captured();
+		let chopin = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				if (request.headers.get("authorization") !== "Bearer run-token") {
+					return new Response(null, { status: 401 });
+				}
+				let server = new Server({ name: "fake-chopin", version: "1" }, {
+					capabilities: { tools: {} },
+				});
+				server.setRequestHandler(ListToolsRequestSchema, () => ({
+					tools: [
+						"upload_investigation_image",
+						spike ? "submit_spike_result" : "submit_investigation_result",
+					].map(name => ({
+						name,
+						inputSchema: { type: "object" as const },
+					})),
+				}));
+				server.setRequestHandler(CallToolRequestSchema, request => {
+					received.push([request.params.name, request.params.arguments ?? {}]);
+					return { content: [{ type: "text", text: "{}" }] };
+				});
+				let transport = new WebStandardStreamableHTTPServerTransport({
+					sessionIdGenerator: undefined,
+					enableJsonResponse: true,
+				});
+				await server.connect(transport);
+				return transport.handleRequest(request);
+			},
+		});
+		try {
+			git(root, "init");
+			git(root, "config", "user.name", "Fixture");
+			git(root, "config", "user.email", "fixture@example.test");
+			git(root, "remote", "add", "origin", "git@github.com:org/repo.git");
+			await writeFile(join(root, "source.txt"), "committed");
+			git(root, "add", ".");
+			git(root, "commit", "-m", "fixture");
+			let calls: string[] = [];
+			let api = {
+				call: async (name: string) => {
+					calls.push(name);
+					return {};
+				},
+			} as unknown as Awaited<ReturnType<typeof remote>>;
+			let id = crypto.randomUUID();
+			await runWork(api, "experiment", {
+				spike,
+				passage: "We are not sure a CSS-only fade-in on the heading works without JavaScript.",
+				generation: 1,
+				runToken: "run-token",
+				input: {
+					id,
+					documentId: crypto.randomUUID(),
+					brief: "Prototype the passage",
+					source: {
+						repositoryId: "R_repo",
+						repository: "org/repo",
+						commit: git(root, "rev-parse", "HEAD"),
+					},
+					context: "",
+					requester: "a",
+					authorizer: "a",
+				},
+			}, {
+				root,
+				directory: state,
+				command: [
+					process.execPath,
+					new URL("./testing/fake-agent.ts", import.meta.url).pathname,
+					"--http",
+					spike ? "--spike" : "--images",
+				],
+				url: `http://127.0.0.1:${chopin.port}`,
+				signal: new AbortController().signal,
+				output: terminal.output,
+			});
+			expect(terminal.out()).toContain(
+				spike
+					? "› Prototyping We are not sure a CSS-only fade-in on the heading works without JavaScript.\n"
+					: "› Investigating Prototype the passage\n",
+			);
+			expect(calls.filter(name => name !== "renew_experiment"), terminal.err()).toEqual([
+				"complete_experiment",
+			]);
+			expect(received.map(([name]) => name)).toEqual([
+				"upload_investigation_image",
+				spike ? "submit_spike_result" : "submit_investigation_result",
+			]);
+			expect(received[0][1]).toEqual({ data: "iVBORw0KGgo=", mimeType: "image/png" });
+			// The bridge closes with the run.
+			let submitted = received[1][1];
+			let bridgeUrl = spike
+				? submitted.url
+				: (submitted.result as { provenance: { environment: string } }).provenance.environment;
+			await expect(fetch(bridgeUrl as string, { method: "POST" })).rejects.toThrow();
+		} finally {
+			await chopin.stop(true);
+			await rm(root, { recursive: true, force: true });
+			await rm(state, { recursive: true, force: true });
+		}
+	},
+);
 
 test("Ctrl-C reports the build stopped from the terminal before the run ends", async () => {
 	let controller = new AbortController();
@@ -299,6 +336,32 @@ test("Ctrl-C ends a run at once while a report waits on Chopin", async () => {
 		state: "failed",
 		error: STOPPED,
 	}]);
+});
+
+test("Ctrl-C ends a run at once while its agent is still starting", async () => {
+	let file = join(await mkdtemp(join(tmpdir(), "chopin-starting-")), "started");
+	process.env.CHOPIN_TEST_STARTING = file;
+	let controller = new AbortController();
+	try {
+		let settled = false;
+		let running = run({}, ["--slow-start"], () => ({}), controller.signal, {
+			heartbeatMs: 10_000,
+		}).finally(() => settled = true);
+		// The agent has the connector's initialize request and will not answer it.
+		while (!settled && !await Bun.file(file).exists()) await Bun.sleep(10);
+		let interrupted = performance.now();
+		controller.abort();
+		let { id, calls } = await running;
+		expect(performance.now() - interrupted).toBeLessThan(1000);
+		expect(calls.at(-1)).toEqual(["report_implementation_build", {
+			id,
+			state: "failed",
+			error: STOPPED,
+		}]);
+	} finally {
+		delete process.env.CHOPIN_TEST_STARTING;
+		await rm(dirname(file), { recursive: true, force: true });
+	}
 });
 
 test("Ctrl-C waits at most five seconds for its stop report to reach Chopin", async () => {
@@ -446,44 +509,45 @@ function hanging(signal?: AbortSignal) {
 	});
 }
 
-test("the grace period stops the agent on time while a retry waits longer than it", async () => {
-	let lost = 0;
-	let failed = 0;
-	await run(
-		{},
-		["--hang"],
-		(name, args) => {
-			if (name === "renew_implementation_build") {
-				lost ||= performance.now();
-				throw unreachable();
-			}
-			if (args.state === "failed") failed = performance.now();
+/**
+ * A fake Chopin that goes out of reach at the run's first heartbeat, which it refuses as an
+ * unreachable server does, and stays out of reach for every later call but the run's failure
+ * report: each gets `during`. The agent's session report may arrive during the outage, and
+ * answering it would rightly tell the run Chopin is back and clear the grace period being timed.
+ */
+function outage(during: (signal?: AbortSignal) => unknown) {
+	let times = { lost: 0, failed: 0 };
+	let respond = (name: string, args: Record<string, unknown>, signal?: AbortSignal) => {
+		if (args.state === "failed") {
+			times.failed = performance.now();
 			return {};
-		},
-		undefined,
-		{ random: () => 0.999, graceMs: 100 },
-	);
+		}
+		if (times.lost) return during(signal);
+		if (name !== "renew_implementation_build") return {};
+		times.lost = performance.now();
+		throw unreachable();
+	};
+	return { times, respond };
+}
+
+test("the grace period stops the agent on time while a retry waits longer than it", async () => {
+	let { times, respond } = outage(() => {
+		throw unreachable();
+	});
+	await run({}, ["--hang"], respond, undefined, { random: () => 0.999, graceMs: 100 });
 	// The first retry would wait about a second; the agent stops when the grace period ends.
-	expect(failed - lost).toBeGreaterThanOrEqual(90);
-	expect(failed - lost).toBeLessThan(400);
+	expect(times.failed - times.lost).toBeGreaterThanOrEqual(90);
+	expect(times.failed - times.lost).toBeLessThan(400);
 });
 
 test("the grace period stops the agent on time while a heartbeat hangs in flight", async () => {
-	let lost = 0;
-	let started = performance.now();
-	let { calls } = await run(
-		{},
-		["--hang"],
-		(name, _args, signal) => {
-			if (name !== "renew_implementation_build") return {};
-			if (lost) return hanging(signal);
-			lost = performance.now();
-			throw unreachable();
-		},
-		undefined,
-		{ random: () => 0.01, graceMs: 100 },
-	);
-	expect(performance.now() - started).toBeLessThan(1500);
+	let { times, respond } = outage(hanging);
+	let { calls } = await run({}, ["--hang"], respond, undefined, {
+		random: () => 0.01,
+		graceMs: 100,
+	});
+	// Timed from the loss, which is when the grace period starts, to the end of the run.
+	expect(performance.now() - times.lost).toBeLessThan(1500);
 	expect(calls.at(-1)?.[1]).toMatchObject({
 		state: "failed",
 		error: "Chopin was out of reach for 0 seconds.",
@@ -504,6 +568,63 @@ test("a run Chopin has ended stops its agent at once", async () => {
 		error: "Chopin ended this run (build-inactive).",
 	}]);
 });
+
+test(
+	"a build carries agent activity on its heartbeat and stops when Chopin cancels it",
+	async () => {
+		let abort = new AbortController();
+		let timer = setTimeout(() => abort.abort(), 15_000);
+		try {
+			let { calls } = await run({}, ["--hang", "--activity"], (name, args) => {
+				if (name === "renew_implementation_build" && args.progress === "Running server tests") {
+					throw new ConnectorError("build-inactive", "build-inactive");
+				}
+				return {};
+			}, abort.signal);
+			expect(
+				calls.some(([name, args]) =>
+					name === "renew_implementation_build" && args.progress === "Running server tests"
+				),
+			).toBe(true);
+			expect(calls.at(-1)?.[1].error).toBe("Chopin ended this run (build-inactive).");
+		} finally {
+			clearTimeout(timer);
+		}
+	},
+	20_000,
+);
+
+test("activity follows tool updates after a permission is answered", async () => {
+	let descriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+	Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+	let question = spyOn(Permission, "ask").mockResolvedValue("1");
+	let abort = new AbortController();
+	let timer = setTimeout(() => abort.abort(), 15_000);
+	try {
+		let { calls } = await run(
+			{},
+			["--hang", "--activity", "--permission-activity"],
+			(name, args) => {
+				if (name === "renew_implementation_build" && args.progress === "Checking test results") {
+					throw new ConnectorError("build-inactive", "build-inactive");
+				}
+				return {};
+			},
+			abort.signal,
+		);
+		expect(question).toHaveBeenCalledTimes(1);
+		expect(
+			calls.some(([name, args]) =>
+				name === "renew_implementation_build" && args.progress === "Checking test results"
+			),
+		).toBe(true);
+	} finally {
+		clearTimeout(timer);
+		question.mockRestore();
+		if (descriptor) Object.defineProperty(process.stdin, "isTTY", descriptor);
+		else Reflect.deleteProperty(process.stdin, "isTTY");
+	}
+}, 20_000);
 
 test("a run whose connection a restarted server forgot stops its agent and the connector", async () => {
 	let root = await mkdtemp(join(tmpdir(), "chopin-forgotten-"));

@@ -13,10 +13,12 @@ import {
 	LinkPlusIcon,
 	LoaderIcon,
 	LockIcon,
+	MachineIcon,
 	MessageIcon,
 	MessagePlusIcon,
 	PlusIcon,
 	SearchIcon,
+	ServerIcon,
 	SignInIcon,
 	SirenIcon,
 	SparkleIcon,
@@ -76,6 +78,8 @@ const NUCLEO_ICONS: readonly IconCatalogueItem[] = [
 	{ icon: DocumentIcon, name: "Document" },
 	{ icon: SearchIcon, name: "Search" },
 	{ icon: LoaderIcon, name: "Loader" },
+	{ icon: MachineIcon, name: "Machine" },
+	{ icon: ServerIcon, name: "Server" },
 ];
 
 export function IconCatalogue() {

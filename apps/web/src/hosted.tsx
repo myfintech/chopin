@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { usePhone } from "@chopin/editor/pointer";
 import { parseChildDocumentPath, parseDocumentPath } from "@chopin/protocol/document-url";
 
@@ -8,6 +8,8 @@ import { rememberOriginRect } from "./child-origin";
 import { WorkspaceNotice } from "./workspace-notice";
 import { NavigationShell } from "./navigation-shell";
 import { PhoneDocumentSkeleton } from "./phone-skeleton";
+import { SidebarTrigger } from "./project-sidebar-chrome";
+import { WorkspaceSkeleton } from "./workspace-skeleton";
 
 import type { ReactNode } from "react";
 import type { ResearchOpener } from "@chopin/editor";
@@ -16,11 +18,14 @@ import type { ParentFocusTarget } from "./document-workspace-host";
 import type { DocumentRouteIdentitySource } from "./document-route-swap";
 import type { WorkspacePresentation } from "./workspace-model";
 
-// Document routes load their swap and host together, so neither waits on the other.
+// Load document code alongside its route, before metadata can delay the editor download.
 let DocumentRouteSwap = lazy(() => {
 	void import("./document-workspace-host");
+	void import("./room-workspace").catch(() => {});
 	return import("./document-route-view");
 });
+// /connect, the person's machines and the pairing confirmation, loads only when visited.
+let MachinesPage = lazy(() => import("./experiments/pairing"));
 // Only a failed load shows it, so it stays out of the first JavaScript a reader downloads.
 let Failure = lazy(() => import("./hosted-failure"));
 
@@ -56,6 +61,7 @@ export type HostedRoute =
 	| DocumentRouteIdentitySource
 	| { page: "repositories" }
 	| { page: "repository"; owner: string; repository: string }
+	| { page: "machines" }
 	| { page: "missing" };
 
 export type ChannelSource = Extract<DocumentRouteIdentitySource, { page: "channel" }>;
@@ -70,6 +76,7 @@ function decoded(value: string): string | undefined {
 
 export function hostedRoute(pathname: string): HostedRoute {
 	if (pathname === "/" || pathname === "") return { page: "repositories" };
+	if (/^\/connect\/?$/.test(pathname)) return { page: "machines" };
 	let child = parseChildDocumentPath(pathname);
 	if (child) return { page: "child", ...child };
 	let document = parseDocumentPath(pathname);
@@ -100,10 +107,18 @@ export function retryableChannelFailure(error: unknown): boolean {
 		|| error.status >= 500;
 }
 
-/** On a phone, a document's loading state is the workspace's own shape rather than a label. */
+/** A document's loading state is the workspace's own shape rather than a label. */
 function Loading({ document, label = "Loading" }: { document?: boolean; label?: string }) {
 	let phone = usePhone();
+	let shell = useContext(SidebarTrigger);
 	if (document && phone) return <PhoneDocumentSkeleton />;
+	// Before the session the sidebar has yet to take its width, so the ground stays blank. A child
+	// opens as a card over its parent, not in this shape, so it keeps the label.
+	if (document && hostedRoute(location.pathname).page !== "child") {
+		return shell
+			? <WorkspaceSkeleton label={label} />
+			: <p className="sr-only" role="status">{label}</p>;
+	}
 	return (
 		<div
 			className="hosted-loading flex h-full items-center justify-center bg-ground px-4 text-sm text-text-tertiary"
@@ -281,6 +296,13 @@ export function HostedApp(
 			break;
 		case "repositories":
 		case "repository":
+			break;
+		case "machines":
+			workspace = (
+				<Suspense fallback={<Loading />}>
+					<MachinesPage />
+				</Suspense>
+			);
 			break;
 		case "document":
 		case "child":

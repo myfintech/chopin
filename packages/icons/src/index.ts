@@ -62,7 +62,14 @@ export {
 } from "./line";
 export { ListIcon } from "./list";
 export { ProgressRingIcon } from "./progress";
-export { ArchiveIcon, DocumentIcon, LoaderIcon, SearchIcon } from "./system";
+export {
+	ArchiveIcon,
+	DocumentIcon,
+	LoaderIcon,
+	MachineIcon,
+	SearchIcon,
+	ServerIcon,
+} from "./system";
 export { TextStyleIcon } from "./text-style";
 export { MonitorIcon, MoonIcon, SunIcon } from "./theme";
 export { RedoIcon, UndoIcon } from "./undo";

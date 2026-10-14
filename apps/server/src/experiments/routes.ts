@@ -3,6 +3,7 @@ import { capabilities, ExperimentError, limits, sourceSchema } from "@chopin/exp
 import { publicInvestigation } from "@chopin/experiment/records";
 import type { Investigation, InvestigationProvenance } from "@chopin/experiment/records";
 import type { HostedAuth } from "../auth/routes";
+import { AdmissionDenied } from "../auth/admission";
 import { MachineError } from "../auth/machines";
 import type { GitHubTokenGrant } from "../github/client";
 import type { StoredMachine } from "../storage/model";
@@ -11,7 +12,13 @@ import type { Router } from "../http/router";
 import { canonical as canonicalReport } from "../mcp/create";
 import { parse } from "@chopin/dialect";
 import {
+	CONNECTOR_AGENT_HEADER,
+	CONNECTOR_AGENT_VERSION_HEADER,
+	CONNECTOR_HOST_HEADER,
+	CONNECTOR_PLANNER_HEADER,
+	CONNECTOR_PLATFORM_HEADER,
 	CONNECTOR_PROTOCOL_HEADER,
+	CONNECTOR_SERVICE_HEADER,
 	CONNECTOR_UPDATE_REQUIRED,
 	CONNECTOR_VERSION_HEADER,
 } from "@chopin/protocol/connector";
@@ -19,7 +26,8 @@ import { documentsPath } from "@chopin/protocol/document-url";
 import { documentUrl } from "../channels/document-url";
 import type { MachinePlanners } from "../harness/remote/machine-planners";
 import { Connections } from "./connections";
-import type { Connection } from "./connections";
+import type { About, Connection } from "./connections";
+import { PairingKeys } from "./pairing-keys";
 import { Experiments, fail } from "./service";
 import { datasetCsv } from "./export";
 import { investigationSummary } from "./document";
@@ -53,13 +61,44 @@ type Options = {
 	/** Planner credentials for paired machines; set only under HARNESS=remote with AGENT on. */
 	planners?: MachinePlanners;
 };
+
+const OSES = new Set(["linux", "darwin", "win32"]);
+const ARCHES = new Set(["x64", "arm64"]);
+const agentSchema = z.object({
+	name: z.string().trim().min(1).max(100).regex(/^[\x20-\x7e]+$/),
+	version: z.string().trim().min(1).max(50).regex(/^[\w.+-]+$/).optional(),
+}).strict();
+
+/** What a connector says about its machine as it connects; anything unexpected is dropped. */
+function aboutMachine(request: Request): About {
+	let header = (name: string) => request.headers.get(name) ?? undefined;
+	let hostname = header(CONNECTOR_HOST_HEADER);
+	let [os, arch, extra] = (header(CONNECTOR_PLATFORM_HEADER) ?? "").split(" ");
+	let agent = agentSchema.safeParse({
+		name: header(CONNECTOR_AGENT_HEADER),
+		version: header(CONNECTOR_AGENT_VERSION_HEADER),
+	});
+	return {
+		...(hostname && /^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$/.test(hostname) ? { hostname } : {}),
+		...(os && arch && !extra && OSES.has(os) && ARCHES.has(arch) ? { platform: { os, arch } } : {}),
+		service: header(CONNECTOR_SERVICE_HEADER) === "1",
+		planner: header(CONNECTOR_PLANNER_HEADER) === "1",
+		...(agent.success ? { agent: agent.data } : {}),
+	};
+}
 const label = z.string().trim().min(1).max(100);
-/** `chopin pair` names a checkout only when it runs inside one. */
+/** A name a person gives a machine: one line of at most 64 characters. */
+const machineLabel = z.string().trim().min(1).max(64).regex(/^[^\p{Cc}]+$/u);
+/**
+ * `chopin pair` names a checkout only when it runs inside one. With a pairing key it pairs at
+ * once, as the key's owner.
+ */
 const pairingSchema = z.object({
 	label,
 	repository: sourceSchema.shape.repository.optional(),
 	commit: sourceSchema.shape.commit.optional(),
 	branch: sourceSchema.shape.branch,
+	key: z.string().max(100).optional(),
 }).strict().refine(value => !value.repository === !value.commit, "invalid checkout");
 const checkoutSchema = sourceSchema.omit({ repositoryId: true }).extend({ label }).strict();
 
@@ -76,13 +115,19 @@ function bearer(request: Request) {
 const MAX_BODY_BYTES = limits.resultBytes + 64 * 1024;
 /** A spike is a quick prototype; one still running this long after its claim is interrupted. */
 export const SPIKE_DEADLINE_MS = 20 * 60_000;
-/** Screenshots a spike run may upload; distinct images, so a retried upload is free. */
-export const MAX_SPIKE_IMAGES = 3;
+/** Screenshots an investigation may upload; distinct images, so a repeated upload is free. */
+export const MAX_INVESTIGATION_IMAGES = 3;
 /**
  * The connector protocols this server speaks; a connector outside them must update first.
  * Protocol 2 pairs a machine once and connects checkouts with its stored token.
  */
-export const CONNECTOR_PROTOCOLS = { min: 2, max: 2 } as const;
+export const CONNECTOR_PROTOCOLS: { min: number; max: number } = { min: 2, max: 3 };
+
+/** The chopin release a connector says it runs; a script or source run has none. */
+function releaseVersion(request: Request): string | undefined {
+	let version = request.headers.get(CONNECTOR_VERSION_HEADER) ?? "";
+	return /^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$/.test(version) ? version : undefined;
+}
 
 /**
  * Refuse a connector speaking a protocol outside CONNECTOR_PROTOCOLS, naming what fixes it. One
@@ -103,9 +148,8 @@ function compatible(
 	let protocol = Number(header);
 	let { min, max } = CONNECTOR_PROTOCOLS;
 	if (protocol >= min && protocol <= max) return;
-	// Only a release version is echoed; a script or source run has none.
-	let version = request.headers.get(CONNECTOR_VERSION_HEADER) ?? "";
-	let release = /^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$/.test(version);
+	// Only a release version is echoed.
+	let release = releaseVersion(request);
 	let fix = !release
 		? "Download the connector again: mkdir -p ~/.chopin && curl -fsSL "
 			+ `${origin}/connector.js -o ~/.chopin/connector.js`
@@ -117,7 +161,7 @@ function compatible(
 			+ "server to update it.";
 	fail(
 		CONNECTOR_UPDATE_REQUIRED,
-		`${release ? `chopin ${version}` : "This connector"} speaks connector protocol ${protocol}, `
+		`${release ? `chopin ${release}` : "This connector"} speaks connector protocol ${protocol}, `
 			+ `but ${origin} needs protocol ${min === max ? min : `${min} to ${max}`}. ${fix}`,
 	);
 }
@@ -143,8 +187,23 @@ function json(value: unknown, status = 200) {
 	});
 }
 
+/** A machine's newest connection's account of it; null where none said. */
+function described(live: Connection[]) {
+	let about = live.at(-1)?.about ?? {};
+	return {
+		hostname: about.hostname ?? null,
+		platform: about.platform ?? null,
+		agent: live.map(value => value.about?.agent).findLast(Boolean) ?? null,
+		service: live.some(value => value.about?.service),
+		planner: live.some(value => value.about?.planner),
+	};
+}
+
 export function registerExperimentRoutes(router: Router, auth: HostedAuth, options: Options) {
 	let connections = new Connections();
+	let keys = new PairingKeys(() => auth.clock().getTime());
+	auth.pairings.authorized = (userId, sessionId, grant) => keys.authorize(userId, sessionId, grant);
+	auth.pairings.ended = sessionId => keys.ended(sessionId);
 	let changed = (id: string) => {
 		void auth.storage.channels.get(id).then(
 			channel => channel && connections.wake(channel.repositoryId),
@@ -290,10 +349,12 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 					},
 					code === "authentication-required" || code.startsWith("machine-")
 						? 401
-						: code.includes("forbidden")
+						: code.includes("forbidden") || code === "pairing-key-invalid"
 						? 403
 						: code === "not-found"
 						? 404
+						: code === "pairing-key-rate-limited"
+						? 429
 						: code === "unavailable"
 						? 503
 						: 409,
@@ -306,9 +367,78 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 	route("GET", "/api/connector/version", async () => json(versions));
 	route("POST", "/api/connector/pairings", async request => {
 		compatible(request, auth.config.origin, options.connectorVersion);
-		let created = connections.create(pairingSchema.parse(await body(request)));
+		let { key, ...input } = pairingSchema.parse(await body(request));
+		if (key !== undefined) return json(await keyed(key, input));
+		let created = connections.create(input);
 		return json({ ...created, url: `${auth.config.origin}/connect?pairing=${created.id}` });
 	});
+	/**
+	 * A signed-in person mints a single-use key that pairs one machine as them, as approving its
+	 * pairing would. Where machines hold their own GitHub authorization, GitHub authorizes the next
+	 * machine first, in the browser, and the key carries that authorization to the machine. The
+	 * key also carries the person's choice of automatic work, as the pairing card's checkbox does.
+	 */
+	route("POST", "/api/connector/pairing-keys", async request => {
+		let { autoRun } = z.object({ autoRun: z.boolean().optional() }).strict().parse(
+			await body(request),
+		);
+		let session = await auth.sessions.authenticate(request);
+		if (!session) fail("authentication-required");
+		if (auth.machines.durable && !keys.authorized(session.user.id, session.session.id)) {
+			return json({ authorize: "/auth/github/connector?key" });
+		}
+		return json(keys.mint(session.user.id, session.session.id, autoRun));
+	});
+	/**
+	 * Pair a machine with a key: approved at once as the key's owner, with automatic work as they
+	 * chose when minting it (off unless they turned it on), and
+	 * a checkout only one the owner can push to, all as approving in the browser would. The key is
+	 * spent only once those checks pass, or at once if its owner is no longer admitted here.
+	 */
+	async function keyed(key: string, input: z.infer<typeof pairingSchema>) {
+		let { userId, grant } = keys.peek(key);
+		let caller: Caller;
+		if (auth.machines.durable) {
+			if (!grant) fail("pairing-key-invalid");
+			// The allowed users and organizations, as now rather than as when the key was minted.
+			if (!await admitted(userId, grant.accessToken)) {
+				keys.take(key);
+				fail("pairing-account-forbidden");
+			}
+			caller = { userId, use: operation => operation(grant.accessToken) };
+		} else {
+			let session = await auth.sessions.forUser(userId);
+			if (!session) fail("owner-sign-in-required");
+			caller = browser(session);
+		}
+		let repository = input.repository
+			? await repositoryWrite(caller, input.repository)
+			: undefined;
+		let spent = keys.take(key);
+		let { token } = await auth.machines.pair({
+			userId,
+			label: input.label,
+			repositories: repository && input.repository && input.commit
+				? [{
+					repositoryId: repository.id,
+					repository: input.repository,
+					commit: input.commit,
+					...(input.branch ? { branch: input.branch } : {}),
+				}]
+				: [],
+			autoRun: spent.autoRun,
+			...(spent.grant && auth.machines.durable ? { grant: spent.grant } : {}),
+		});
+		return { token };
+	}
+	async function admitted(userId: string, token: string) {
+		try {
+			return (await auth.admission.user(token)).id === userId;
+		} catch (error) {
+			if (error instanceof AdmissionDenied) return false;
+			throw error;
+		}
+	}
 	/** Where the pairing page sends the person once the machine is paired. */
 	function landing(input: { repository?: string }) {
 		let [owner, name] = input.repository?.split("/") ?? [];
@@ -323,6 +453,8 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 			input: pending.input,
 			owner: session.user.login,
 			code: pending.code,
+			// Approving hands off to GitHub to authorize the machine, as approve below does.
+			authorize: auth.machines.durable,
 			...(pending.machineId && pending.approval?.owner === session.user.id
 				? { connected: landing(pending.input) }
 				: {}),
@@ -399,9 +531,11 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 				owner: machine.userId,
 				login: user?.login ?? machine.userId,
 				autoRun: machine.autoRun,
+				version: releaseVersion(request),
 			},
 			label,
 			{ ...checkout, repositoryId: repository.id },
+			aboutMachine(request),
 		);
 		await auth.machines.seen(machine);
 		connections.wake(repository.id);
@@ -411,6 +545,13 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 			connection: { id: connection.id, source: connection.source },
 			machine: machine.id,
 		});
+	});
+	/** The coding agent a connection runs, as it answered ACP initialize at its first job. */
+	route("POST", "/api/connector/agent", async request => {
+		compatible(request, auth.config.origin, options.connectorVersion);
+		let { connection } = connections.lookup(bearer(request));
+		connection.about = { ...connection.about, agent: agentSchema.parse(await body(request)) };
+		return json({ ok: true });
 	});
 	/**
 	 * `chopin connect --planner`: a short-lived credential with which the machine's Planner backend
@@ -432,6 +573,16 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		await auth.machines.seen(machine);
 		let url = new URL(await documentUrl(channel, auth.storage.channels), auth.config.origin).href;
 		return json({ ...planners.issue(machine, channel.id), document: { id: channel.id, url } });
+	});
+	/**
+	 * `chopin status`: whether Chopin still accepts this machine's token, without registering a
+	 * connection or asking GitHub anything.
+	 */
+	route("GET", "/api/connector/machine", async request => {
+		compatible(request, auth.config.origin, options.connectorVersion);
+		let machine = await machineRefusal(() => auth.machines.authenticate(bearer(request)));
+		let user = await auth.storage.users.get(machine.userId);
+		return json({ id: machine.id, label: machine.label, login: user?.login ?? null });
 	});
 	/** `chopin unpair`: the machine revokes itself with its own token. */
 	route("POST", "/api/connector/machine/revoke", async request => {
@@ -462,9 +613,19 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 				createdAt: machine.createdAt.getTime(),
 				lastSeenAt: machine.lastSeenAt.getTime(),
 				connected: connections.machine(machine.id).length > 0,
+				version: connections.machine(machine.id).find(value => value.version)?.version ?? null,
+				...described(connections.machine(machine.id)),
 				reauthorize: !!machine.reauthorizeAt,
 			})),
 		});
+	});
+	/** The owner renames a machine: the name shown in Chopin and by `chopin status`. */
+	route("POST", "/api/connector/machines/:id/label", async (request, params) => {
+		let session = await auth.sessions.authenticate(request);
+		if (!session) fail("authentication-required");
+		let { label } = z.object({ label: machineLabel }).strict().parse(await body(request));
+		if (!await auth.machines.rename(params.id, session.user.id, label)) fail("not-found");
+		return json({ label });
 	});
 	route("POST", "/api/connector/machines/:id/revoke", async (request, params) => {
 		let session = await auth.sessions.authenticate(request);
@@ -544,7 +705,6 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		if (!value || value.documentId !== params.id) fail("not-found");
 		let context = await options.context(params.id);
 		if (!context) fail("not-found");
-		let previous = (await service.store.list(params.id)).toReversed().find(item => item.input);
 		let connection = await choose(session.user.id, channel.repositoryId, params.id);
 		let result = await service.authorize(value.id, connection.id, {
 			id: value.id,
@@ -552,7 +712,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 			requester: value.requester,
 			authorizer: session.user.id,
 			brief: value.brief,
-			source: previous?.input?.source ?? connection.source,
+			source: value.input?.source ?? connection.source,
 			context: `Document revision ${context.revision}\n${context.source}`,
 		});
 		connections.use(params.id, connection.id);
@@ -732,10 +892,12 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 			...connectorSchemas(!!grant.run, spikeRun),
 			...(!grant.run && implementation ? implementationSchemas(false) : {}),
 		};
-		// Only a spike run's image upload may exceed the ordinary connector body limit.
+		// Only a run-scoped investigation's image upload may exceed the ordinary body limit.
 		let bytes = await raw(
 			request,
-			spikeRun ? Math.max(MAX_BODY_BYTES, MAX_IMAGE_REQUEST_BYTES) : MAX_BODY_BYTES,
+			grant.run && !implementationRun
+				? Math.max(MAX_BODY_BYTES, MAX_IMAGE_REQUEST_BYTES)
+				: MAX_BODY_BYTES,
 		);
 		let call = z.object({
 			jsonrpc: z.literal("2.0"),
@@ -909,7 +1071,6 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 							args.progress === undefined ? undefined : z.string().max(2000).parse(args.progress),
 						);
 					} else if (name === "upload_investigation_image") {
-						if (!current.spike) fail("tool-forbidden");
 						let prepared = prepareImage({ id: current.documentId, ...args });
 						if (!prepared) fail("invalid-image");
 						if ("refusal" in prepared) fail(prepared.refusal);
@@ -920,8 +1081,11 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 						let uploaded = uploads.get(id);
 						if (!uploaded) uploads.set(id, uploaded = new Set<string>());
 						let reserved = !uploaded.has(sha256);
-						if (reserved && uploaded.size >= MAX_SPIKE_IMAGES) {
-							fail("image-limit", `A spike may upload at most ${MAX_SPIKE_IMAGES} images.`);
+						if (reserved && uploaded.size >= MAX_INVESTIGATION_IMAGES) {
+							fail(
+								"image-limit",
+								`An investigation may upload at most ${MAX_INVESTIGATION_IMAGES} images.`,
+							);
 						}
 						uploaded.add(sha256);
 						try {
@@ -1010,6 +1174,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 	});
 	async function sweep() {
 		connections.sweep();
+		keys.sweep();
 		await service.recover();
 		await options.implementations?.()?.sweep();
 		let active = await service.store.active();
