@@ -1,4 +1,5 @@
 export { GitHubIcon } from "./brand";
+export { CommentIcon } from "./comment";
 export { CopyIcon } from "./copy";
 export { DocumentsIcon } from "./documents";
 export { ChopinIcon } from "./filled";
@@ -60,6 +61,9 @@ export {
 	WrenchIcon,
 } from "./line";
 export { ListIcon } from "./list";
+export { ProgressRingIcon } from "./progress";
 export { ArchiveIcon, DocumentIcon, LoaderIcon, SearchIcon } from "./system";
+export { TextStyleIcon } from "./text-style";
 export { MonitorIcon, MoonIcon, SunIcon } from "./theme";
+export { RedoIcon, UndoIcon } from "./undo";
 export { WarningIcon } from "./warning";

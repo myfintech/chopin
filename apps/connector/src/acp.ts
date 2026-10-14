@@ -6,6 +6,7 @@ import type {
 	RequestPermissionRequest,
 	SessionNotification,
 } from "@agentclientprotocol/sdk";
+import { VERSION } from "./version";
 
 export type AgentOptions = {
 	command: string[];
@@ -17,6 +18,8 @@ export type AgentOptions = {
 	onUpdate: (value: SessionNotification) => void;
 	permission: (request: RequestPermissionRequest) => Promise<string | undefined>;
 	stderr?: (chunk: string) => void;
+	/** Added to the agent's environment, such as Git configuration that refuses pushes. */
+	env?: Record<string, string>;
 };
 
 /** One protocol implementation; agent-specific launch arguments belong to local configuration. */
@@ -25,6 +28,7 @@ export async function runAgent(options: AgentOptions): Promise<string> {
 	if (!options.command[0]) throw new Error("An ACP command is required.");
 	let child = spawn(options.command[0], options.command.slice(1), {
 		cwd: options.cwd,
+		...(options.env ? { env: { ...process.env, ...options.env } } : {}),
 		stdio: ["pipe", "pipe", "pipe"],
 		detached: process.platform !== "win32",
 	});
@@ -70,7 +74,7 @@ export async function runAgent(options: AgentOptions): Promise<string> {
 	try {
 		let initialized = await connection.agent.request("initialize", {
 			protocolVersion: PROTOCOL_VERSION,
-			clientInfo: { name: "chopin", version: "0.1.0" },
+			clientInfo: { name: "chopin", version: VERSION },
 			clientCapabilities: {},
 		});
 		if (initialized.protocolVersion !== PROTOCOL_VERSION) {

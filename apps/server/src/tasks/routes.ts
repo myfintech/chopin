@@ -1,13 +1,13 @@
 import { documentPath } from "@chopin/protocol/document-url";
 import { z } from "zod";
-import { checkoutSchema, queueBuild } from "./builds";
+import { liveSnapshot, queueBuild, queueRebuild, requestBuild } from "./builds";
 import { implementationLifecycle } from "./lifecycle";
 import { implementationReadiness, reportImplementationLifecycle } from "./plan-graphs";
 import { exclusive } from "../plan/service";
 import { GitHubError } from "../github/client";
 import { AdmissionDenied } from "../auth/admission";
 import { implementationConnector } from "./connector";
-import type { Connections } from "../experiments/connections";
+import type { Connection, Connections } from "../experiments/connections";
 import type { HostedAuth } from "../auth/routes";
 import type { Plan } from "../plan/service";
 import type { RouteHandler, Router } from "../http/router";
@@ -16,12 +16,18 @@ import type { ImplementationSnapshot } from "@chopin/protocol/implementation";
 type Options = {
 	withPlan<T>(id: string, action: (plan: Plan) => Promise<T>): Promise<T>;
 	connections: Connections;
-	busy?: (id: string) => Promise<string[]>;
+	/** Whether an investigation is executing on a connection, in any document. */
+	busy?: (connectionId: string) => Promise<boolean>;
+	/**
+	 * Whether the document reads as ready to build, apart from its blockers. Without a judge, a
+	 * document with no blockers is ready.
+	 */
+	buildable?: (id: string, planRevision: number) => boolean;
+	/** LIVE_BUILD: builds may queue behind a prototype or another document's build. */
+	liveBuild?: boolean;
 };
 let buildSchema = z.object({
 	retryOf: z.string().uuid().optional(),
-	connectionId: z.string().uuid(),
-	checkout: checkoutSchema,
 	planRevision: z.number().int().nonnegative(),
 	graphVersion: z.number().int().positive(),
 	graphRevision: z.number().int().positive(),
@@ -59,7 +65,7 @@ async function body<T>(request: Request, schema: z.ZodType<T>): Promise<T> {
 	}
 }
 
-/** Browser approval dispatches through the existing owner-paired connector. */
+/** A browser build runs on the clicker's own connection for the document's repository. */
 export function registerImplementationRoutes(router: Router, auth: HostedAuth, options: Options) {
 	let connector = implementationConnector(
 		options.withPlan,
@@ -73,6 +79,7 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 			).href;
 		},
 		async id => !!await auth.storage.channels.get(id),
+		options.liveBuild ? options.busy : undefined,
 	);
 	let safe = (handler: RouteHandler): RouteHandler => async (request, url, params) => {
 		try {
@@ -98,16 +105,71 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 		}
 		return { session, channel, repository };
 	}
+	/**
+	 * The caller's live connections for a repository that can take a build for `id`: idle ones
+	 * first, then those still running a prototype, then those building another document, which
+	 * queue the build until theirs finishes. Within each, the one last used for this document
+	 * first, then the most recently heard from. A build already waiting on this document does not
+	 * make its connection busy, so a repeated request can return that build.
+	 */
+	async function available(owner: string, repositoryId: string, id: string) {
+		if (!options.liveBuild) {
+			// Without LIVE_BUILD a busy connection is refused, never queued.
+			let idle: Connection[] = [];
+			for (let connection of options.connections.candidates(repositoryId, owner, id)) {
+				let here = options.connections.assigned(connection.id) === id;
+				if (await options.busy?.(connection.id) || !here && await connector.busy(connection)) {
+					continue;
+				}
+				if (here) idle.unshift(connection);
+				else idle.push(connection);
+			}
+			return idle;
+		}
+		let free: Connection[] = [];
+		let prototyping: Connection[] = [];
+		let building: Connection[] = [];
+		for (let connection of options.connections.candidates(repositoryId, owner, id)) {
+			let here = options.connections.assigned(connection.id) === id
+				|| options.connections.queued(connection.id).includes(id);
+			let list = !here && await connector.busy(connection)
+				? building
+				: await options.busy?.(connection.id)
+				? prototyping
+				: free;
+			if (here) list.unshift(connection);
+			else list.push(connection);
+		}
+		return [...free, ...prototyping, ...building];
+	}
 	router.on(
 		"GET",
 		"/api/channels/:id/implementation",
 		safe(async (request, _url, { id }) => {
-			let { session } = await browser(request, id);
+			let { session, channel } = await browser(request, id);
 			connector.track(id);
-			let busy = await options.busy?.(id) ?? [];
+			// Cheap on purpose: whether one is free is decided when Build is pressed.
+			let localAgent = options.connections.list(channel.repositoryId, session.user.id).length > 0;
+			// Read before the plan lock; the experiment store has its own.
+			let queued = options.liveBuild
+				? await options.withPlan(id, async plan => plan.builds.at(-1))
+				: undefined;
+			let ahead = queued?.state === "queued"
+					&& options.connections.queued(queued.connectionId).includes(id)
+				? options.connections.assigned(queued.connectionId)
+				: undefined;
+			// The other document shares this repository, so its title is readable here.
+			let aheadTitle = ahead && (await auth.storage.channels.get(ahead))?.title;
+			let waiting = !ahead && queued?.state === "queued"
+				&& !!await options.busy?.(queued.connectionId);
 			let current = await options.withPlan(id, plan =>
 				exclusive(plan, async () => {
 					let ready = implementationReadiness(plan, plan.revision);
+					let live = liveSnapshot(
+						plan,
+						options.connections.list(channel.repositoryId),
+						session.user.id,
+					);
 					let snapshot: ImplementationSnapshot = {
 						revision: plan.persistence.revision,
 						planRevision: plan.revision,
@@ -117,20 +179,11 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 							return build.graphVersion === graph?.number && build.graphRevision === graph.revision;
 						}),
 						blockers: ready.ok ? [] : ready.blockers,
-						workspaces: options.connections.list(id).filter(item => item.owner === session.user.id)
-							.map(item => ({
-								id: item.id,
-								label: item.label,
-								checkout: {
-									repository: item.source.repository,
-									commit: item.source.commit,
-									...(item.source.branch ? { branch: item.source.branch } : {}),
-								},
-								available: !busy.includes(item.id) && !plan.builds.some(build =>
-									build.connectionId === item.id
-									&& ["queued", "starting", "running"].includes(build.state)
-								),
-							})),
+						localAgent,
+						buildReady: ready.ok && (options.buildable?.(id, plan.revision) ?? true),
+						...(waiting ? { waitingForPrototype: true as const } : {}),
+						...(ahead ? { waitingForDocument: aheadTitle ? { title: aheadTitle } : {} } : {}),
+						...(plan.buildRequested ? { buildRequested: { ...plan.buildRequested } } : {}),
 						lifecycle: plan.graph
 							? implementationLifecycle({
 								graph: plan.graph,
@@ -138,12 +191,18 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 								lifecycle: plan.lifecycle,
 							})
 							: { execution: { state: "idle" }, history: [] },
+						...(live ? { live } : {}),
 					};
 					return snapshot;
 				}));
 			// Read outside the plan lock; a missing user only loses the attribution.
 			let login = current.build && (await auth.storage.users.get(current.build.user))?.login;
-			return json(login ? { ...current, startedBy: login } : current);
+			let builder = current.live && (await auth.storage.users.get(current.live.user))?.login;
+			return json({
+				...current,
+				...(login ? { startedBy: login } : {}),
+				...(builder ? { builtBy: builder } : {}),
+			});
 		}),
 	);
 	router.on(
@@ -158,43 +217,121 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 				throw new GitHubError("repository write access is required", 403);
 			}
 			let input = await body(request, buildSchema);
-			let connection = options.connections.get(input.connectionId);
-			if (
-				!connection || connection.owner !== session.user.id || connection.documentId !== id
-				|| connection.source.repositoryId !== channel.repositoryId
-			) {
-				throw new GitHubError("workspace is unavailable", 409);
+			if (!options.connections.list(channel.repositoryId, session.user.id).length) {
+				throw new GitHubError("no-workspace", 409);
 			}
-			if (
-				input.checkout.repository.toLowerCase() !== connection.source.repository.toLowerCase()
-				|| input.checkout.branch !== connection.source.branch
-				|| input.checkout.commit !== connection.source.commit
-			) {
-				throw new GitHubError("workspace checkout changed; review again", 409);
+			let [connection] = await available(session.user.id, channel.repositoryId, id);
+			if (!connection) {
+				throw new GitHubError(
+					options.liveBuild ? "no-workspace" : "workspace is offline or busy",
+					409,
+				);
 			}
+			let checkout = {
+				repository: connection.source.repository,
+				commit: connection.source.commit,
+				...(connection.source.branch ? { branch: connection.source.branch } : {}),
+			};
 			connector.track(id);
 			return options.connections.locked(connection.id, async () => {
 				if (
 					!options.connections.get(connection.id)
-					|| (await options.busy?.(id) ?? []).includes(connection.id)
+					|| !options.liveBuild
+						&& !(await available(session.user.id, channel.repositoryId, id)).includes(connection)
 				) {
-					throw new GitHubError("workspace is offline or busy", 409);
+					throw new GitHubError(
+						options.liveBuild ? "no-workspace" : "workspace is offline or busy",
+						409,
+					);
 				}
 				return options.withPlan(id, async plan => {
 					try {
 						let build = await queueBuild(plan, {
 							...input,
 							user: session.user.id,
+							connectionId: connection.id,
 							repositoryId: channel.repositoryId,
-							checkout: input.checkout,
+							checkout,
 						});
-						options.connections.wake(id);
+						let holder = options.connections.assigned(connection.id);
+						// Another document's build holds the connection: this one starts after it.
+						if (options.liveBuild && holder && holder !== id) {
+							options.connections.enqueue(connection.id, id);
+						} else options.connections.assign(connection.id, id);
+						options.connections.use(id, connection.id);
+						options.connections.wake(channel.repositoryId);
 						return json(build);
 					} catch (error) {
 						throw new GitHubError(error instanceof Error ? error.message : "build refused", 409);
 					}
 				});
 			});
+		}),
+	);
+	// Build the edits since the last build onto its pull requests, on the presser's own agent.
+	router.on(
+		"POST",
+		"/api/channels/:id/implementation/rebuild",
+		safe(async (request, _url, { id }) => {
+			if (request.headers.get("origin") !== auth.config.origin) {
+				throw new GitHubError("origin is not allowed", 403);
+			}
+			let { session, channel, repository } = await browser(request, id);
+			if (!repository.permissions.push && !repository.permissions.admin || channel.archivedAt) {
+				throw new GitHubError("repository write access is required", 403);
+			}
+			if (!options.connections.list(channel.repositoryId, session.user.id).length) {
+				throw new GitHubError("no-workspace", 409);
+			}
+			// Like Build: a connection running a prototype or another document's build is busy.
+			let free: Connection[] = [];
+			for (
+				let connection of options.connections.candidates(channel.repositoryId, session.user.id, id)
+			) {
+				let here = options.connections.assigned(connection.id) === id;
+				if (await options.busy?.(connection.id) || !here && await connector.busy(connection)) {
+					continue;
+				}
+				free.push(connection);
+			}
+			if (!free.length) throw new GitHubError("agent-busy", 409);
+			let idle = new Set(free.map(connection => connection.id));
+			connector.track(id);
+			let result = await options.withPlan(
+				id,
+				plan =>
+					queueRebuild(plan, {
+						...options.connections,
+						get: connectionId =>
+							idle.has(connectionId) ? options.connections.get(connectionId) : undefined,
+						list: (repositoryId, owner) =>
+							options.connections.list(repositoryId, owner).filter(item => idle.has(item.id)),
+						assign: (connectionId, documentId) =>
+							options.connections.assign(connectionId, documentId),
+						assigned: connectionId => options.connections.assigned(connectionId),
+					}, { by: session.user.id }),
+			);
+			if (result.kind === "busy") throw new GitHubError("implementation is already active", 409);
+			if (result.kind === "unchanged") throw new GitHubError("nothing to build", 409);
+			if (result.kind === "blocked") throw new GitHubError(result.blockers.join(", "), 409);
+			if (result.kind === "unavailable") throw new GitHubError("no-workspace", 409);
+			options.connections.wake(channel.repositoryId);
+			return json(result.build);
+		}),
+	);
+	router.on(
+		"DELETE",
+		"/api/channels/:id/implementation/request",
+		safe(async (request, _url, { id }) => {
+			if (request.headers.get("origin") !== auth.config.origin) {
+				throw new GitHubError("origin is not allowed", 403);
+			}
+			let { channel, repository } = await browser(request, id);
+			if (!repository.permissions.push && !repository.permissions.admin || channel.archivedAt) {
+				throw new GitHubError("repository write access is required", 403);
+			}
+			await options.withPlan(id, async plan => requestBuild(plan, undefined));
+			return json({ accepted: true });
 		}),
 	);
 	router.on(

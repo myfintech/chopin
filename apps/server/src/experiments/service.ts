@@ -6,12 +6,14 @@ import {
 	parseResult,
 	requestSchema,
 } from "@chopin/experiment";
-import type { Investigation, InvestigationState } from "@chopin/experiment/records";
+import type { Investigation, InvestigationState, Spike } from "@chopin/experiment/records";
 import type { RunInput } from "@chopin/experiment";
 import { applySelection, selectionPatchSchema } from "@chopin/experiment/selection";
 import type { ExperimentStore } from "../storage/experiments";
 import type { Lease } from "../storage/model";
 import { z } from "zod";
+import * as Plan from "../plan/service";
+import { investigationDocument } from "./document";
 
 export const CLAIM_MS = 60_000;
 export function fingerprint(value: unknown) {
@@ -33,7 +35,7 @@ export class Experiments {
 		requester: string,
 		brief: string,
 		id: string = crypto.randomUUID(),
-		parentId?: string,
+		spike?: Spike,
 	) {
 		let existing = await this.store.get(id);
 		if (existing) {
@@ -51,7 +53,7 @@ export class Experiments {
 			documentId,
 			requester,
 			brief,
-			parentId,
+			...(spike ? { spike } : {}),
 			revision: 0,
 			state: "requested",
 			generation: 0,
@@ -78,6 +80,7 @@ export class Experiments {
 			value.updatedAt = this.now();
 			if (await this.store.save(value, current.revision, this.lease())) {
 				this.changed(value.documentId);
+				if (value.childId) this.changed(value.childId);
 				return value;
 			}
 		}
@@ -108,6 +111,7 @@ export class Experiments {
 			value.generation++;
 			value.expiresAt = this.now() + CLAIM_MS;
 			value.state = "running";
+			if (value.spike) value.spike.startedAt = this.now();
 		});
 	}
 	assertClaim(value: Investigation, connectionId: string, generation: number) {
@@ -128,37 +132,114 @@ export class Experiments {
 		let parsed = parseResult(result);
 		return this.mutate(id, value => {
 			this.assertClaim(value, connectionId, generation);
+			// Completion must not fail on content, so the child document is proven here.
+			investigationDocument(value.id, value.brief, parsed);
 			value.candidate = parsed;
 			value.state = "publishing";
 		});
 	}
-	complete(id: string, connectionId: string, generation: number) {
-		return this.mutate(id, value => {
+	/**
+	 * Promote the candidate and publish it as a child document in the same commit, so a ready card
+	 * never links a child that is not there yet. A spike is promoted without a child.
+	 */
+	async complete(id: string, connectionId: string, generation: number) {
+		for (let attempt = 0; attempt < 5; attempt++) {
+			let current = await this.store.get(id);
+			if (!current) fail("not-found");
 			if (
-				value.state === "completed" && value.connectionId === connectionId
-				&& value.generation === generation
-			) return;
-			this.assertClaim(value, connectionId, generation);
-			if (!value.candidate) fail("missing-result");
-			value.result = value.candidate;
+				current.state === "completed" && current.connectionId === connectionId
+				&& current.generation === generation
+			) return current;
+			this.assertClaim(current, connectionId, generation);
+			if (!current.candidate) fail("missing-result");
+			let value = structuredClone(current);
+			let result = current.candidate;
+			value.result = result;
 			delete value.candidate;
-			value.views = Object.fromEntries(
-				value.result.views.map(view => [view.key, initialState(view)]),
-			);
+			value.views = Object.fromEntries(result.views.map(view => [view.key, initialState(view)]));
 			value.state = "completed";
 			value.expiresAt = 0;
-		});
+			value.revision++;
+			value.updatedAt = this.now();
+			// A spike lands only as its inline callout; it never becomes a child document.
+			if (value.spike) {
+				if (!await this.store.save(value, current.revision, this.lease())) continue;
+				this.changed(value.documentId);
+				return value;
+			}
+			let document = investigationDocument(value.id, value.brief, result);
+			let saved = await this.store.publish(value, current.revision, {
+				title: document.title,
+				initial: await Plan.initial(document.source),
+				now: new Date(value.updatedAt),
+			}, this.lease());
+			if (saved) {
+				this.changed(saved.documentId);
+				if (saved.childId) this.changed(saved.childId);
+				return saved;
+			}
+		}
+		fail("revision-conflict");
 	}
 	stop(
 		id: string,
 		state: Extract<InvestigationState, "failed" | "cancelled" | "interrupted">,
 		progress = "",
+		/** Checked against the current record inside the write, so a stale read cannot stop work. */
+		allowed?: (value: Investigation) => void,
 	) {
 		return this.mutate(id, value => {
 			if (["completed", "cancelled", "failed", "interrupted"].includes(value.state)) return;
+			allowed?.(value);
 			value.state = state;
 			value.progress = progress.slice(0, 2000);
 			value.expiresAt = 0;
+			delete value.candidate;
+		});
+	}
+	/**
+	 * A connector's failure report. The claim is checked on the record each write attempt reads, so a
+	 * report delayed past a retry cannot fail the next attempt; the same report again is a no-op.
+	 */
+	failClaim(id: string, connectionId: string, generation: number, error: string) {
+		let progress = error.slice(0, 2000);
+		return this.mutate(id, value => {
+			if (
+				value.state === "failed" && value.connectionId === connectionId
+				&& value.generation === generation && value.progress === progress
+			) return;
+			this.assertClaim(value, connectionId, generation);
+			value.state = "failed";
+			value.progress = progress;
+			value.expiresAt = 0;
+			delete value.candidate;
+		});
+	}
+	/** Return settled, unfinished work to its card under the same identity; Run starts it again. */
+	retry(id: string) {
+		return this.mutate(id, value => {
+			if (value.state === "requested") return;
+			if (!["failed", "cancelled", "interrupted"].includes(value.state)) fail("invalid-state");
+			value.state = "requested";
+			value.progress = "";
+			value.expiresAt = 0;
+			delete value.connectionId;
+			delete value.input;
+			delete value.candidate;
+		});
+	}
+	/** Return a spike its lost connection interrupted to `requested`, for another local agent. */
+	retrySpike(id: string) {
+		return this.mutate(id, value => {
+			if (value.state !== "interrupted" || !value.spike || value.spike.dismissed) {
+				fail("invalid-state");
+			}
+			value.state = "requested";
+			value.progress = "";
+			value.expiresAt = 0;
+			value.spike.retries = (value.spike.retries ?? 0) + 1;
+			delete value.connectionId;
+			delete value.input;
 			delete value.candidate;
 		});
 	}

@@ -19,7 +19,67 @@ export type BuildRequest = {
 	state: "queued" | "starting" | "running" | "stopped" | "failed";
 	session?: string;
 	error?: string;
+	/** The connector's key for the report that set `state`, so a retry of it is recognized. */
+	reportKey?: string;
+	/** A rebuild carries edits since `baseRevision` onto a live build's pull requests. */
+	kind?: "rebuild";
+	baseRevision?: number;
+	targetRevision?: number;
 };
+/** A living document's last delivered build and its sync state, without the built source. */
+export type LiveSnapshot = {
+	buildId: string;
+	user: string;
+	repositoryId: string;
+	/** The builder's checkout; sent only to the builder. */
+	checkout?: CheckoutContext;
+	baseRevision: number;
+	pullRequests: string[];
+	/** Tasks the first build stopped short of; the next rebuild finishes them. */
+	outstanding?: string[];
+	/**
+	 * The outstanding tasks still unfinished, with any blocker. Only an edit starts the rebuild
+	 * that retries them, so an in-sync document with any of these needs attention.
+	 */
+	outstandingTasks?: Array<{
+		id: string;
+		title: string;
+		state: "queued" | "in_progress" | "blocked";
+		blocker?: string;
+	}>;
+	/** Rebuilds that landed with no commit or task: the document needed no code change. */
+	noChange?: Array<{ buildId: string; revision: number; summary: string; at: string }>;
+	commits: Array<{
+		pullRequest: string;
+		sha: string;
+		message: string;
+		/** The document revision this commit brought its pull request up to. */
+		revision: number;
+		at: string;
+	}>;
+	/** The first build's tasks, then every rebuild's, each with its last reported progress. */
+	tasks: Array<
+		NonNullable<ImplementationSnapshot["graph"]>["definition"]["tasks"][number] & {
+			progress?: Plan.ImplementationProgress["tasks"][number];
+		}
+	>;
+	/**
+	 * The latest rebuild; its state distinguishes building from failed. Only the builder sees
+	 * which connection, checkout and session ran it.
+	 */
+	rebuild?: BuildRequest | LiveRebuild;
+	/** The current document differs from the source last built onto the pull requests. */
+	outOfSync: boolean;
+	/** Top-level blocks added, removed or changed since that source; at least 1 when out of sync. */
+	changes?: number;
+	/**
+	 * A workspace of the live build's user is connected for this document. Sent only to the
+	 * builder, so others never learn when someone's laptop is online.
+	 */
+	builderConnected?: boolean;
+};
+/** A rebuild as people other than its builder see it. */
+export type LiveRebuild = Omit<BuildRequest, "connectionId" | "checkout" | "session">;
 export type ImplementationSnapshot = {
 	revision: number;
 	planRevision: number;
@@ -42,9 +102,30 @@ export type ImplementationSnapshot = {
 	build?: BuildRequest;
 	/** The GitHub login of whoever requested `build`, when it is still known. */
 	startedBy?: string;
-	workspaces: Array<{ id: string; label: string; checkout: CheckoutContext; available: boolean }>;
+	/** The GitHub login of the living document's builder (`live.user`), when it is still known. */
+	builtBy?: string;
+	/** Whether the viewer has a connected local agent for this repository; it may be busy. */
+	localAgent: boolean;
 	blockers: string[];
+	/**
+	 * The document reads as complete enough to build and nothing blocks it.
+	 * Judged in memory once edits settle, so it may lag the latest revision.
+	 */
+	buildReady: boolean;
+	/** `build` is queued on a connection that starts it once its running prototype finishes. */
+	waitingForPrototype?: true;
+	/**
+	 * `build` is queued behind another document's build on the same agent; it starts when that
+	 * one finishes. `title` names the other document when it is known.
+	 */
+	waitingForDocument?: { title?: string };
+	/**
+	 * A one-click Build plan is waiting for its tasks: `by` (a user id) pressed it at `revision`.
+	 * It holds through open decisions and reloads until the build starts or is cancelled.
+	 */
+	buildRequested?: { by: string; revision: number };
 	lifecycle: Pick<Plan.Lifecycle, "execution" | "activity" | "history">;
+	live?: LiveSnapshot;
 };
 
 /**
@@ -57,7 +138,7 @@ export type ImplementationSnapshot = {
  */
 export declare namespace Implementation {
 	export type Incoming = Request<Draft>;
-	export type Outgoing = Drafted | Drafting;
+	export type Outgoing = Drafted | Drafting | Readiness;
 
 	/** Draft or revise the tasks for the document as it now stands. */
 	export type Draft = KIND<"implementation:draft"> & {
@@ -65,6 +146,8 @@ export declare namespace Implementation {
 		requestId: string;
 		/** The revision the asker saw; the server drafts against its current revision. */
 		planRevision: number;
+		/** Asked by the one-click Build plan, which starts the tasks once they are drafted. */
+		build?: true;
 	};
 
 	/** The document's live request, new or `existing`; `ended` if its turn finished first. */
@@ -80,5 +163,11 @@ export declare namespace Implementation {
 		id: string;
 		planRevision: number;
 		state: "queued" | "running" | "ended";
+	};
+
+	/** Broadcast when a document's build readiness judgement changes; read the snapshot again. */
+	export type Readiness = KIND<"implementation:readiness"> & {
+		planRevision: number;
+		ready: boolean;
 	};
 }

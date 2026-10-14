@@ -1,9 +1,11 @@
 /** Browser coverage for the paper layout: Chat on the ground, the document as a sheet. */
 
 import { chatInput, expectChatValue } from "./chat-input";
+import { deckSeed } from "./decision-deck-fixtures";
 import { expect, ready, test } from "./room";
 import { expectNoHorizontalOverflow } from "./responsive";
 
+import type { Chat } from "../packages/protocol/index";
 import type { Locator, Page } from "@playwright/test";
 
 function box(target: Locator) {
@@ -23,7 +25,11 @@ function sheet(page: Page) {
 }
 
 function toolbar(page: Page) {
-	return root(page).locator("[data-document-toolbar]");
+	return root(page).locator("[data-document-title-bar]");
+}
+
+function title(page: Page) {
+	return toolbar(page).getByRole("group", { name: /^Document: / });
 }
 
 function resolved(page: Page, token: string) {
@@ -37,12 +43,12 @@ function resolved(page: Page, token: string) {
 	}, token);
 }
 
-test("split Chat sits on the ground without a header beside a raised sheet", async ({ join, page }) => {
+test("split Chat sits on the ground beside a raised sheet that carries the title", async ({ join, page }) => {
 	await page.setViewportSize({ width: 1440, height: 900 });
 	await join("ana");
 	let pane = chatPane(page);
-	let header = page.getByRole("banner");
 
+	await expect(page.getByRole("banner")).toHaveCount(0);
 	await expect(pane.locator("[data-chat-header]")).toHaveCount(0);
 	await expect(page.getByRole("button", { name: "Hide chat" })).toHaveCount(0);
 	await expect(page.getByRole("heading", { name: "Chat" })).toHaveClass(/sr-only/);
@@ -51,21 +57,125 @@ test("split Chat sits on the ground without a header beside a raised sheet", asy
 	await expect(field).toHaveCSS("box-shadow", "none");
 	await expect(field).toHaveCSS("background-color", await resolved(page, "--color-inset"));
 
-	let [rootBox, headerBox, paneBox, sheetBox] = await Promise.all([
+	let [rootBox, titleBox, barBox, viewsBox, paneBox, sheetBox] = await Promise.all([
 		box(root(page)),
-		box(header),
+		box(title(page)),
+		box(toolbar(page)),
+		box(root(page).locator("[data-document-toolbar]")),
 		box(pane),
 		box(sheet(page)),
 	]);
 	expect(Math.round(sheetBox.y - rootBox.y)).toBe(12);
-	expect(sheetBox.y).toBeLessThan(headerBox.y + headerBox.height);
-	expect(headerBox.x + headerBox.width).toBeLessThanOrEqual(sheetBox.x + 1);
+	expect(titleBox.x).toBeGreaterThan(sheetBox.x);
+	expect(Math.round(barBox.height)).toBe(40);
+	expect(Math.round(viewsBox.height)).toBe(40);
+	expect(Math.round(viewsBox.y)).toBe(Math.round(barBox.y + barBox.height));
 	expect(Math.round(paneBox.y)).toBe(Math.round(rootBox.y));
 	expect(Math.round(paneBox.x + paneBox.width)).toBe(Math.round(sheetBox.x));
 	await expect(sheet(page)).not.toHaveCSS("box-shadow", "none");
 });
 
-test("presence sits at the right end of the document tab row", async ({ join, page }) => {
+function edgeFade(scroller: Locator) {
+	return scroller.evaluate(element => {
+		let style = getComputedStyle(element, "::before");
+		return {
+			height: style.height,
+			opacity: style.opacity,
+			pointerEvents: style.pointerEvents,
+			position: style.position,
+		};
+	});
+}
+
+function layout(scroller: Locator) {
+	return scroller.evaluate(element => ({
+		content: element.firstElementChild!.getBoundingClientRect().top,
+		height: element.scrollHeight,
+	}));
+}
+
+test("the document and Chat dissolve under their top edges only once scrolled", async ({ join, page, seed }) => {
+	let paragraphs = Array.from(
+		{ length: 40 },
+		(_, index) => `Paragraph ${index} of a long document.`,
+	);
+	let transcript: Chat.Entry[] = Array.from({ length: 30 }, (_, index) => ({
+		id: `message-${index}`,
+		author: { kind: "member" as const, handle: "ben" },
+		text: `Message ${index} about the rollout plan and what it still needs.`,
+		ts: 1_700_000_000 + index,
+	}));
+	await seed(`# Edges\n\n${paragraphs.join("\n\n")}\n`, { transcript });
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await join("ana");
+	let document = root(page).locator('[data-document-view="plan"] [data-plan-scroll]');
+	let chat = chatPane(page).locator("[data-chat-scroll]");
+	await expect(document.getByText("Paragraph 39 of a long document.")).toBeAttached();
+	await expect(chat.getByText("Message 29", { exact: false })).toBeVisible();
+
+	// The fade sits on the views bar's lower edge, folded out of flow.
+	let [views, scroller] = await Promise.all([
+		box(root(page).locator("[data-document-toolbar]")),
+		box(document),
+	]);
+	expect(Math.round(scroller.y)).toBe(Math.round(views.y + views.height));
+	let before = await layout(document);
+	await document.evaluate(element => element.classList.add("edge-fade-probe"));
+	await page.addStyleTag({ content: ".edge-fade-probe::before { display: none !important; }" });
+	expect(await layout(document)).toEqual(before);
+	await document.evaluate(element => element.classList.remove("edge-fade-probe"));
+
+	await document.evaluate(element => element.scrollTo({ top: 0 }));
+	await expect.poll(async () => (await edgeFade(document)).opacity).toBe("0");
+	expect(await edgeFade(document)).toMatchObject({
+		height: "56px",
+		pointerEvents: "none",
+		position: "sticky",
+	});
+	await document.evaluate(element => element.scrollTo({ top: 240 }));
+	await expect.poll(async () => (await edgeFade(document)).opacity).toBe("1");
+	// The edge follows scroll state, not a scroll timeline, so motion still settles.
+	await page.waitForFunction(() =>
+		window.document.getAnimations().every(animation => animation.playState !== "running")
+	);
+
+	await chat.evaluate(element => element.scrollTo({ top: element.scrollHeight }));
+	await expect.poll(async () => (await edgeFade(chat)).opacity).toBe("1");
+	await chat.evaluate(element => element.scrollTo({ top: 0 }));
+	await expect.poll(async () => (await edgeFade(chat)).opacity).toBe("0");
+});
+
+test("reduced transparency holds the scroll edge solid before it fades", async ({ join, page, seed }) => {
+	let deck = deckSeed({ before: "Intro." }, 2);
+	await seed(deck.source, deck.state);
+	await page.setViewportSize({ width: 1440, height: 900 });
+	let cdp = await page.context().newCDPSession(page);
+	await cdp.send("Emulation.setEmulatedMedia", {
+		features: [{ name: "prefers-reduced-transparency", value: "reduce" }],
+	});
+	await join("ana");
+	let fade = (selector: string) =>
+		root(page).locator(selector).evaluate(element => {
+			let style = getComputedStyle(element, "::before");
+			return {
+				image: style.backgroundImage,
+				padding: getComputedStyle(element).paddingTop,
+				top: style.top,
+			};
+		});
+	expect((await fade('[data-document-view="plan"] [data-plan-scroll]')).image).toMatch(/ 50%, /);
+
+	await page.getByRole("group", { name: "Document view" }).getByRole("button", {
+		name: /^Decisions/,
+	})
+		.click();
+	let decisions = await fade("[data-plan-decisions-scroll]");
+	expect(decisions.image).toMatch(/ 50%, /);
+	// Sticky offsets start inside the padding, so the fade reaches back to the clip edge.
+	expect(Number.parseFloat(decisions.top)).toBe(-Number.parseFloat(decisions.padding));
+});
+
+test("presence sits at the right end of the document title bar, above the views", async ({ join, page }) => {
 	await page.setViewportSize({ width: 1440, height: 900 });
 	await join("ana");
 	let people = toolbar(page).getByRole("group", { name: /People here: ana/ });
@@ -78,7 +188,7 @@ test("presence sits at the right end of the document tab row", async ({ join, pa
 		box(toolbar(page)),
 		box(page.getByRole("group", { name: "Document view" })),
 	]);
-	expect(peopleBox.x).toBeGreaterThan(viewsBox.x + viewsBox.width);
+	expect(peopleBox.y + peopleBox.height).toBeLessThanOrEqual(viewsBox.y);
 	expect(barBox.x + barBox.width - (peopleBox.x + peopleBox.width)).toBeLessThan(24);
 });
 
@@ -93,7 +203,7 @@ test("the document expands and restores Chat from the keyboard and remembers it"
 	await draft.fill("unfinished thought");
 
 	let [expandBox, viewsBox] = await Promise.all([box(expand), box(views)]);
-	expect(expandBox.x + expandBox.width).toBeLessThanOrEqual(viewsBox.x);
+	expect(expandBox.y + expandBox.height).toBeLessThanOrEqual(viewsBox.y);
 	await expect(expand).toHaveAttribute("aria-controls", paneId!);
 	await expand.focus();
 	await page.keyboard.press("Enter");
@@ -104,18 +214,17 @@ test("the document expands and restores Chat from the keyboard and remembers it"
 	await expect(restore).toHaveText("Chat");
 	expect(await restore.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
 	await expect(restore).toHaveAttribute("aria-expanded", "false");
-	await expect(page.locator(".room-header")).toBeHidden();
+	// Expanding is width only: the title stays on the sheet.
+	await expect(title(page)).toBeVisible();
 	let frame = root(page).locator(".workspace-frame");
 	await expect.poll(async () => Math.round((await box(sheet(page))).width))
 		.toBe(Math.round((await box(frame)).width));
-	await page.keyboard.press("Shift+Tab");
-	await expect(page.locator(".room-header :focus")).toHaveCount(0);
 
 	await restore.focus();
 	await page.keyboard.press("Enter");
 	await expect(pane).toBeVisible();
 	await expect(page.getByRole("heading", { name: "Chat" })).toBeFocused();
-	await expect(page.locator(".room-header")).toBeVisible();
+	await expect(title(page)).toBeVisible();
 	await expectChatValue(draft, "unfinished thought");
 
 	await toolbar(page).getByRole("button", { name: "Expand document" }).click();
@@ -125,23 +234,14 @@ test("the document expands and restores Chat from the keyboard and remembers it"
 	await expect(toolbar(page).getByRole("button", { name: "Show chat" })).toBeVisible();
 });
 
-test("the Chat shortcut from the top bar moves focus to the Show chat button", async ({ join, page }) => {
+test("the Chat shortcut from the title keeps focus on the title", async ({ join, page }) => {
 	await page.setViewportSize({ width: 1440, height: 900 });
 	await join("ana");
-	await page.locator(".room-header").getByRole("button").first().focus();
-	await expect(page.locator(".room-header :focus")).toHaveCount(1);
+	let rename = title(page).getByRole("button", { name: /^Rename / });
+	await rename.focus();
 	await page.keyboard.press("ControlOrMeta+.");
 	await expect(chatPane(page)).toBeHidden();
-	await expect(toolbar(page).getByRole("button", { name: "Show chat" })).toBeFocused();
-});
-
-test("reduced motion swaps Chat and the top bar without transitions", async ({ join, page }) => {
-	await page.emulateMedia({ reducedMotion: "reduce" });
-	await page.setViewportSize({ width: 1440, height: 900 });
-	await join("ana");
-	await toolbar(page).getByRole("button", { name: "Expand document" }).click();
-	await expect(chatPane(page)).toBeHidden();
-	await expect(root(page).locator(".workspace-header-slot")).toHaveCSS("transition-duration", "0s");
+	await expect(rename).toBeFocused();
 });
 
 test("the expanded sheet clears a collapsed Projects sidebar trigger", async ({ join, page }) => {

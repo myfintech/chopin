@@ -1,7 +1,7 @@
 import type {
+	InvestigationChild,
 	InvestigationSummary,
 	PublishedInvestigation,
-	WorkspaceConnection,
 } from "@chopin/experiment/records";
 import { experimentRequest } from "./api";
 import type { Wire } from "../wire";
@@ -14,10 +14,13 @@ export class ExperimentStore {
 	#request = 0;
 	#details = new Map<string, number>();
 	items: InvestigationSummary[] = [];
-	connections: WorkspaceConnection[] = [];
 	values = new Map<string, PublishedInvestigation>();
 	error = "";
-	constructor(readonly documentId: string) {}
+	#published = new Set<string>();
+	constructor(
+		readonly documentId: string,
+		private onPublished: (child: InvestigationChild) => void = () => {},
+	) {}
 	readonly snapshot = () => this.#version;
 	readonly subscribe = (listener: () => void) => {
 		this.#listeners.add(listener);
@@ -36,12 +39,13 @@ export class ExperimentStore {
 		let request = ++this.#request;
 		let controller = this.#controller;
 		try {
-			let result = await experimentRequest<
-				{ experiments: InvestigationSummary[]; connections: WorkspaceConnection[] }
-			>(`/api/documents/${this.documentId}/experiments`, undefined, this.#controller.signal);
+			let result = await experimentRequest<{ experiments: InvestigationSummary[] }>(
+				`/api/documents/${this.documentId}/experiments`,
+				undefined,
+				this.#controller.signal,
+			);
 			if (request !== this.#request) return;
 			this.items = result.experiments;
-			this.connections = result.connections;
 			this.error = "";
 			this.changed();
 			for (let item of result.experiments) {
@@ -72,9 +76,7 @@ export class ExperimentStore {
 				this.#controller.signal,
 			);
 			if (this.#details.get(id) !== sequence) return;
-			let current = this.values.get(id);
-			if (!current || value.revision >= current.revision) this.values.set(id, value);
-			this.changed();
+			this.#accept(value);
 		} catch (error) {
 			if (controller === this.#controller && !controller.signal.aborted) {
 				this.error = String((error as Error).message);
@@ -89,11 +91,20 @@ export class ExperimentStore {
 			}`,
 			body,
 		);
-		let current = this.values.get(value.id);
-		if (!current || value.revision >= current.revision) this.values.set(value.id, value);
-		this.changed();
+		this.#accept(value);
 		void this.refresh();
 		return value;
+	}
+	#accept(value: PublishedInvestigation) {
+		let current = this.values.get(value.id);
+		if (current && value.revision < current.revision) return this.changed();
+		this.values.set(value.id, value);
+		// Navigation learns of a child only when this session watched it arrive.
+		if (current && !current.child && value.child && !this.#published.has(value.id)) {
+			this.#published.add(value.id);
+			this.onPublished(value.child);
+		}
+		this.changed();
 	}
 	connect(wire?: Wire) {
 		this.#controller = new AbortController();

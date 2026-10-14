@@ -10,6 +10,7 @@ import { PostgresNavigationStore } from "./navigation";
 import { PostgresBackgroundJobStore } from "./jobs";
 import { PostgresExperimentStore } from "./experiments";
 import { PostgresImageStore } from "./images";
+import { PostgresMachineStore } from "./machines";
 import { PostgresResearchWorkspaceStore } from "./research";
 import { PostgresPreferenceStore } from "../../user-preferences/postgres";
 import { PostgresProvenanceStore } from "../../document-provenance/postgres";
@@ -526,12 +527,17 @@ export class PostgresStorage implements StorageAdapter {
 		this.experiments = new PostgresExperimentStore(
 			this.#sql,
 			(sql, lease) => this.#assertLease(sql, lease),
+			(transaction, input) => this.#createAvailableChannelInTransaction(transaction, input),
 		);
 		this.navigation = new PostgresNavigationStore(
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
 		);
 		this.images = new PostgresImageStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+		);
+		this.machines = new PostgresMachineStore(
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
 		);
@@ -687,6 +693,7 @@ export class PostgresStorage implements StorageAdapter {
 	readonly jobs: BackgroundJobStore;
 	readonly research: ResearchWorkspaceStore;
 	readonly images: PostgresImageStore;
+	readonly machines: PostgresMachineStore;
 	readonly preferences: PreferenceStore;
 	readonly provenance: PostgresProvenanceStore;
 
@@ -982,6 +989,10 @@ export class PostgresStorage implements StorageAdapter {
 				if (publication) {
 					throw conflict(`channel ${id} is still published by a research workspace`);
 				}
+				let [investigation] = await transaction<{ id: string }[]>`
+					SELECT id FROM experiments WHERE child_channel_id = ${id} LIMIT 1
+				`;
+				if (investigation) throw conflict(`channel ${id} is still published by an investigation`);
 				let deleted = await transaction<{ id: string }[]>`
 					DELETE FROM channels WHERE id = ${id} RETURNING id
 				`;

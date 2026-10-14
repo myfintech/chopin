@@ -2,36 +2,73 @@ import { randomBytes } from "node:crypto";
 import type { Source } from "@chopin/experiment";
 import { fail, fingerprint } from "./service";
 
-export type PairingInput = Omit<Source, "repositoryId"> & { label: string };
+/** What a connector says about itself when it asks to pair; a checkout is optional. */
+export type PairingInput = Partial<Omit<Source, "repositoryId">> & { label: string };
+/** One owner's checkout of one repository; it serves every document in that repository. */
 export type Connection = {
 	id: string;
-	documentId: string;
 	owner: string;
 	login: string;
-	sessionId: string;
+	/** The paired machine this checkout connected through; revoking it ends the connection. */
+	machineId: string;
 	label: string;
 	source: Source;
 	expiresAt: number;
+	/**
+	 * The owner let Chopin start work on this laptop by itself (rebuilds and prototypes), when
+	 * pairing it. Without it only work a person presses Build or Run for reaches the connection.
+	 * Stored with the machine, so a reconnect keeps it.
+	 */
+	autoRun?: boolean;
+};
+/** The browser's approval of a pairing, waiting for GitHub to authorize the machine. */
+export type Approval = {
+	owner: string;
+	login: string;
+	autoRun: boolean;
+	repositoryId?: string;
 };
 type Pending = {
 	id: string;
 	input: PairingInput;
 	proof: string;
+	/** Shown by both the connector and the pairing page so a person can cross-check them. */
+	code: string;
 	expiresAt: number;
-	connection?: Connection;
+	approval?: Approval;
+	machineId?: string;
+	/** The machine token, handed once to the connector that holds the pairing secret. */
 	token?: string;
 };
 export type Grant = {
 	connectionId: string;
-	run?: { id: string; generation: number; kind?: "implementation" };
+	run?: { id: string; documentId: string; generation: number; kind?: "implementation" | "rebuild" };
 };
+
+/** A connector that stops polling is forgotten this long after it was last heard from. */
+const CONNECTION_MS = 90_000;
+/** Connectors poll at least every 20 seconds while idle and heartbeat every 10 while working. */
+const FRESH_MS = 45_000;
+
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function confirmation() {
+	let bytes = randomBytes(8);
+	let code = [...bytes].map(byte => CODE_ALPHABET[byte % CODE_ALPHABET.length]).join("");
+	return `${code.slice(0, 4)}-${code.slice(4)}`;
+}
 
 export class Connections {
 	#pending = new Map<string, Pending>();
 	#connections = new Map<string, Connection>();
 	#tokens = new Map<string, Grant>();
+	/** Tokens of revoked machines' connections, so they keep saying why instead of vanishing. */
+	#revoked = new Map<string, string>();
 	#runTokens = new Map<string, string>();
 	#waiters = new Map<string, Set<() => void>>();
+	#builds = new Map<string, string>();
+	/** Documents whose builds wait behind a connection's current one, first queued first. */
+	#queued = new Map<string, string[]>();
+	#used = new Map<string, string>();
 	#locks = new Map<string, Promise<unknown>>();
 	constructor(private now = () => Date.now()) {}
 	create(input: PairingInput) {
@@ -39,58 +76,75 @@ export class Connections {
 		if (this.#pending.size >= 100) fail("pairing-capacity");
 		let secret = randomBytes(32).toString("base64url");
 		let id = crypto.randomUUID();
+		let code = confirmation();
 		this.#pending.set(id, {
 			id,
 			input,
 			proof: fingerprint(secret),
+			code,
 			expiresAt: this.now() + 300_000,
 		});
-		return { id, secret };
+		return { id, secret, code };
 	}
 	pending(id: string) {
 		let value = this.#pending.get(id);
 		if (!value || value.expiresAt <= this.now()) fail("pairing-expired");
 		return value;
 	}
-	approve(
-		id: string,
-		owner: { id: string; login: string; sessionId: string },
-		documentId: string,
-		repositoryId: string,
-	) {
+	/** Record who approved a pairing in the browser; another account cannot take it over. */
+	approve(id: string, approval: Approval) {
 		let value = this.pending(id);
-		if (value.connection) {
-			if (value.connection.owner !== owner.id || value.connection.documentId !== documentId) {
-				fail("already-paired");
-			}
-			return value.connection;
-		}
-		if (this.list(documentId).filter(item => item.owner === owner.id).length >= 8) {
-			fail("connection-limit");
-		}
-		let { label, ...source } = value.input;
-		let connection: Connection = {
-			id: crypto.randomUUID(),
-			documentId,
-			owner: owner.id,
-			login: owner.login,
-			sessionId: owner.sessionId,
-			label,
-			source: { ...source, repositoryId },
-			expiresAt: this.now() + 90_000,
-		};
-		value.connection = connection;
-		value.token = randomBytes(32).toString("base64url");
-		this.#connections.set(connection.id, connection);
-		this.#tokens.set(fingerprint(value.token), { connectionId: connection.id });
-		return connection;
+		if (value.approval && value.approval.owner !== approval.owner) fail("already-paired");
+		if (!value.machineId) value.approval = approval;
+		return value;
+	}
+	/** The machine GitHub authorized for an approved pairing, and its token for the connector. */
+	paired(id: string, machineId: string, token: string) {
+		let value = this.pending(id);
+		value.machineId = machineId;
+		value.token = token;
 	}
 	claim(id: string, secret: string) {
 		let value = this.pending(id);
 		if (value.proof !== fingerprint(secret)) fail("pairing-forbidden");
-		return value.token ? { token: value.token, connection: value.connection } : { waiting: true };
+		return value.token ? { token: value.token } : { waiting: true as const };
+	}
+	/** A paired machine's checkout comes online; its token lives only in this process. */
+	open(
+		machine: { id: string; owner: string; login: string; autoRun: boolean },
+		label: string,
+		source: Source,
+	) {
+		this.sweep();
+		if (this.list(source.repositoryId, machine.owner).length >= 8) fail("connection-limit");
+		let connection: Connection = {
+			id: crypto.randomUUID(),
+			owner: machine.owner,
+			login: machine.login,
+			machineId: machine.id,
+			label,
+			source,
+			expiresAt: this.now() + CONNECTION_MS,
+			autoRun: machine.autoRun,
+		};
+		let token = randomBytes(32).toString("base64url");
+		this.#connections.set(connection.id, connection);
+		this.#tokens.set(fingerprint(token), { connectionId: connection.id });
+		return { connection, token };
+	}
+	/** Live connections of one paired machine. */
+	machine(machineId: string) {
+		return [...this.#connections.values()].filter(value =>
+			value.machineId === machineId && value.expiresAt > this.now()
+		);
+	}
+	/** Whether a token is a run's, which the coding agent itself presents. */
+	run(token: string) {
+		return !!this.#tokens.get(fingerprint(token))?.run;
 	}
 	lookup(token: string) {
+		let refused = this.#revoked.get(fingerprint(token));
+		if (refused) fail(refused);
 		let grant = this.#tokens.get(fingerprint(token));
 		let connection = grant && this.get(grant.connectionId);
 		if (!grant || !connection) fail("connection-unavailable");
@@ -101,14 +155,82 @@ export class Connections {
 		return value && value.expiresAt > this.now() ? value : undefined;
 	}
 	touch(connection: Connection) {
-		connection.expiresAt = this.now() + 90_000;
+		connection.expiresAt = this.now() + CONNECTION_MS;
 	}
-	list(documentId: string) {
+	/**
+	 * Heard from within about two of its long-poll or heartbeat intervals. A silent connection
+	 * stays usable until it expires, but new work should not be queued on it.
+	 */
+	fresh(connection: Connection) {
+		return connection.expiresAt - CONNECTION_MS > this.now() - FRESH_MS;
+	}
+	/** Live connections for a repository, most recently heard from first. */
+	list(repositoryId: string, owner?: string) {
 		return [...this.#connections.values()].filter(value =>
-			value.documentId === documentId && value.expiresAt > this.now()
+			value.source.repositoryId === repositoryId && value.expiresAt > this.now()
+			&& (owner === undefined || value.owner === owner)
+		).sort((a, b) => b.expiresAt - a.expiresAt);
+	}
+	/** Remember which document holds the build a connection was last given. */
+	assign(connectionId: string, documentId: string) {
+		if (this.#connections.has(connectionId)) this.#builds.set(connectionId, documentId);
+	}
+	assigned(connectionId: string) {
+		return this.#builds.get(connectionId);
+	}
+	/** Queue a document's build behind the other document's build a connection holds. */
+	enqueue(connectionId: string, documentId: string) {
+		if (!this.#connections.has(connectionId) || this.#builds.get(connectionId) === documentId) {
+			return;
+		}
+		let queue = this.#queued.get(connectionId) ?? [];
+		if (!queue.includes(documentId)) this.#queued.set(connectionId, [...queue, documentId]);
+	}
+	/** Documents whose builds wait for this connection, in the order they will start. */
+	queued(connectionId: string): string[] {
+		return [...(this.#queued.get(connectionId) ?? [])];
+	}
+	/**
+	 * Forget a finished, deleted, or unreachable build so it cannot strand the connection. The
+	 * next document queued behind it takes its place, and the connector is woken to claim it.
+	 */
+	release(connectionId: string, documentId: string) {
+		let queue = this.#queued.get(connectionId) ?? [];
+		if (this.#builds.get(connectionId) === documentId) {
+			let [next, ...rest] = queue;
+			if (next === undefined) {
+				this.#builds.delete(connectionId);
+				return;
+			}
+			this.#builds.set(connectionId, next);
+			if (rest.length) this.#queued.set(connectionId, rest);
+			else this.#queued.delete(connectionId);
+			let connection = this.#connections.get(connectionId);
+			if (connection) this.wake(connection.source.repositoryId);
+			return;
+		}
+		let rest = queue.filter(id => id !== documentId);
+		if (rest.length) this.#queued.set(connectionId, rest);
+		else this.#queued.delete(connectionId);
+	}
+	/** Remember the connection that last ran work for a document, to prefer it next time. */
+	use(documentId: string, connectionId: string) {
+		this.#used.set(documentId, connectionId);
+	}
+	/** Live connections for a repository, the one last used for `documentId` first. */
+	candidates(repositoryId: string, owner: string, documentId: string) {
+		let last = this.#used.get(documentId);
+		return this.list(repositoryId, owner).sort((a, b) =>
+			Number(b.id === last) - Number(a.id === last)
 		);
 	}
-	runToken(connectionId: string, id: string, generation: number, kind?: "implementation") {
+	runToken(
+		connectionId: string,
+		documentId: string,
+		id: string,
+		generation: number,
+		kind?: "implementation" | "rebuild",
+	) {
 		let key = `${connectionId}:${id}:${generation}:${kind ?? "experiment"}`;
 		let existing = this.#runTokens.get(key);
 		if (existing) return existing;
@@ -116,22 +238,29 @@ export class Connections {
 		this.#runTokens.set(key, token);
 		this.#tokens.set(fingerprint(token), {
 			connectionId,
-			run: { id, generation, ...(kind ? { kind } : {}) },
+			run: { id, documentId, generation, ...(kind ? { kind } : {}) },
 		});
 		return token;
 	}
 	revoke(id: string) {
 		let connection = this.#connections.get(id);
 		this.#connections.delete(id);
+		this.#builds.delete(id);
+		this.#queued.delete(id);
+		for (let [document, used] of this.#used) if (used === id) this.#used.delete(document);
 		for (let key of this.#runTokens.keys()) {
 			if (key.startsWith(`${id}:`)) this.#runTokens.delete(key);
 		}
 		for (let [key, grant] of this.#tokens) if (grant.connectionId === id) this.#tokens.delete(key);
-		if (connection) this.wake(connection.documentId);
+		if (connection) this.wake(connection.source.repositoryId);
 	}
-	revokeSession(sessionId: string) {
+	revokeMachine(machineId: string, code = "machine-revoked") {
 		for (let connection of this.#connections.values()) {
-			if (connection.sessionId === sessionId) this.revoke(connection.id);
+			if (connection.machineId !== machineId) continue;
+			for (let [key, grant] of this.#tokens) {
+				if (grant.connectionId === connection.id) this.#revoked.set(key, code);
+			}
+			this.revoke(connection.id);
 		}
 	}
 	sweep() {
@@ -142,17 +271,18 @@ export class Connections {
 			if (connection.expiresAt <= this.now()) this.revoke(id);
 		}
 	}
-	wake(documentId: string) {
-		for (let resolve of this.#waiters.get(documentId) ?? []) resolve();
+	/** Wake every connector waiting for work in a repository. */
+	wake(repositoryId: string) {
+		for (let resolve of this.#waiters.get(repositoryId) ?? []) resolve();
 	}
-	wait(documentId: string, signal: AbortSignal) {
+	wait(repositoryId: string, signal: AbortSignal) {
 		return new Promise<void>(resolve => {
-			let set = this.#waiters.get(documentId) ?? new Set();
-			this.#waiters.set(documentId, set);
+			let set = this.#waiters.get(repositoryId) ?? new Set();
+			this.#waiters.set(repositoryId, set);
 			let finish = () => {
 				clearTimeout(timer);
 				set.delete(finish);
-				if (!set.size) this.#waiters.delete(documentId);
+				if (!set.size) this.#waiters.delete(repositoryId);
 				signal.removeEventListener("abort", finish);
 				resolve();
 			};

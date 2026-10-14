@@ -5,6 +5,11 @@ description: Execute an owner-authorized Chopin investigation using the run-scop
 
 # Local investigations
 
+A person proposes an investigation by typing `/` on a document line and choosing
+**Investigate**; its card sits at that place in the document. Someone selects
+**Run** on the card, which starts this run on their own local agent. A failed or
+stopped card's **Retry** reuses the same investigation id.
+
 1. Read `read_investigation` before acting. Its sealed brief, source context and
    capability schema are authoritative for this run.
 2. Use your normal repository instructions and configured tools. Keep the work
@@ -13,7 +18,8 @@ description: Execute an owner-authorized Chopin investigation using the run-scop
 3. For performance comparisons, check correctness and measure under comparable
    conditions. Record units, samples, warm-up and aggregation. Distinguish observed,
    derived, simulated and qualitative data.
-4. Return a short report, typed datasets, supported native view mappings and useful
+4. Return a short report, led by a `#` heading that names the finding (it becomes
+   the title of the published child document), typed datasets, supported native view mappings and useful
    bounded text evidence. All required columns must be present in every row;
    nullable values are explicit and are not zero. Preserve source and capture
    provenance. Never include service credentials or indiscriminate transcripts.

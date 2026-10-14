@@ -10,14 +10,16 @@
 import { useEffect, useId, useLayoutEffect, useReducer, useRef, useState } from "react";
 
 import {
+	ChopinMark,
 	CONNECTION_GRACE,
 	MAX_RESEARCH_BRIEF,
 	SendAction,
 	useConnectionNotice,
 	usePopoverDismissal,
 } from "@chopin/editor";
+import { usePhone } from "@chopin/editor/pointer";
 import { MENTION } from "@chopin/protocol/address";
-import { ArchiveIcon, InfoIcon, LockIcon, PlusIcon, WarningIcon } from "@chopin/icons";
+import { ArchiveIcon, CloseIcon, InfoIcon, LockIcon, PlusIcon, WarningIcon } from "@chopin/icons";
 import { DraftInput } from "./draft-input";
 import type { DraftInputHandle } from "./draft-input";
 import { ModeSwitch } from "./mode-switch";
@@ -240,6 +242,7 @@ export function Chat(
 	let textarea = useRef<DraftInputHandle>(null);
 	let composerRoot = useRef<HTMLDivElement>(null);
 	let [mode, setMode] = useState(false);
+	let phone = usePhone();
 	let [historyKey, setHistoryKey] = useState(0);
 	let pendingCaret = useRef<number | { start: number; end: number } | undefined>(undefined);
 	let submission = useRef<object | undefined>(undefined);
@@ -562,10 +565,15 @@ export function Chat(
 		let end = selection.end;
 		if (effectiveMode) {
 			let removals = [...current.text.matchAll(/(^|[^\w@])@chopin\b/gi)]
-				.map(match => ({
-					start: match.index + match[1]!.length,
-					end: match.index + match[0].length,
-				}))
+				.map(match => {
+					let start = match.index + match[1]!.length;
+					let end = match.index + match[0].length;
+					// Take one following space too where the mention began the text or followed one,
+					// so removing it leaves no doubled or leading space.
+					let before = current.text[start - 1];
+					if (current.text[end] === " " && (start === 0 || before === " ")) end += 1;
+					return { start, end };
+				})
 				.filter(edit =>
 					!current.references.some(reference =>
 						edit.start < reference.end && edit.end > reference.start
@@ -798,6 +806,23 @@ export function Chat(
 						)
 						: (
 							<>
+								{/* A phone's switch shows only an icon; the chip says where the message goes. */}
+								{phone && effectiveMode && (
+									<span className="composer-chopin-row">
+										<button
+											aria-label="Remove Chopin"
+											className="composer-chopin-chip"
+											data-press="none"
+											disabled={!draftable || sending}
+											onClick={toggleMode}
+											type="button"
+										>
+											<ChopinMark />
+											<span aria-hidden="true">Chopin</span>
+											<CloseIcon aria-hidden="true" size={12} />
+										</button>
+									</span>
+								)}
 								<DraftInput
 									aria-label="Message"
 									aria-activedescendant={commandOpen

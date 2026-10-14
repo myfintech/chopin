@@ -40,6 +40,18 @@ export type ResearchStore = {
 	open(child: Research.ReadyChild, opener: ResearchOpener): void;
 };
 
+/**
+ * App-owned local investigations. The editor places an id-only reference and
+ * leaves the card, its record, and its actions to the host.
+ */
+export type InvestigationResources = {
+	create(brief: string, requestId: string): Promise<{ id: string }>;
+	cancel(id: string): Promise<unknown>;
+	/** False while the record still needs its card: unknown, queued, running or publishing. */
+	removable(id: string): boolean;
+	render(id: string, remove: () => void): ReactNode;
+};
+
 /** A GitHub reference's summary as the host last saw it, or that one is on its way. */
 export type GitHubReferenceEntry = { status: "loading" } | GitHubReferenceResult;
 
@@ -76,6 +88,8 @@ export type WidgetOptions = {
 	evidence?: (questionnaireId: string) => ReactNode | null;
 	research?: ResearchStore;
 	researchDrafts?: ResearchDraftStore;
+	investigations?: InvestigationResources;
+	investigationDrafts?: ResearchDraftStore;
 	researchLauncher?: ResearchLauncher;
 	threads?: ThreadStore;
 	changes?: ChangeStore;
@@ -89,6 +103,8 @@ export type WidgetOptions = {
 	blocked?: boolean;
 	/** Where the host docks formatting while editing on a phone, replacing the selection bubble. */
 	formatDock?: HTMLElement | null;
+	/** Told while the dock's Insert or Text style panel holds the keyboard's place. */
+	onFormatPanel?: (open: boolean) => void;
 	/** The viewer's own handle. */
 	self?: string;
 };
@@ -100,6 +116,8 @@ export type ExperimentResources = {
 	load(id: string): Promise<void>;
 	change(id: string, view: string, patch: SelectionPatch): Promise<void>;
 	place(id: string, view: string, decision?: string, remove?: boolean): Promise<void>;
+	/** Host actions under a live view, such as recording a decision from it. */
+	actions?(id: string, view: string): ReactNode;
 };
 
 export const widgets$ = Cell<WidgetOptions>({});

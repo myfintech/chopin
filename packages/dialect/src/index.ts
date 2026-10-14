@@ -44,6 +44,7 @@ export type { ConvertOptions } from "./convert";
 export { plugins, registry, tablePlugin } from "./registry";
 export type { Registry } from "./registry";
 
+export { calloutFoldState } from "./nodes/callout-fold";
 export {
 	$createColumnNode,
 	$createColumnsNode,
@@ -82,6 +83,11 @@ export {
 	MathNode,
 } from "./nodes/content";
 export { $createExperimentNode, $isExperimentNode, ExperimentNode } from "./nodes/experiment";
+export {
+	$createInvestigationNode,
+	$isInvestigationNode,
+	InvestigationNode,
+} from "./nodes/investigation";
 export { $createResearchNode, $isResearchNode, ResearchNode } from "./nodes/research";
 export type { SerializedResearch } from "./nodes/research";
 

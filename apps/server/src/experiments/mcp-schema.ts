@@ -1,16 +1,30 @@
 import { z } from "zod";
 import { resultSchema } from "@chopin/experiment";
+import { spikeSubmissionSchema } from "./spikes";
 
 export function connectorSchemas(
 	runScoped: boolean,
+	spike = false,
 ): Record<string, z.ZodType<Record<string, unknown>>> {
 	let claim = { id: z.string().uuid(), generation: z.number().int().positive() };
 	if (runScoped) {
 		return {
 			read_experiment: z.object({}).strict(),
 			read_investigation: z.object({}).strict(),
-			submit_experiment_result: z.object({ result: resultSchema }).strict(),
-			submit_investigation_result: z.object({ result: resultSchema }).strict(),
+			// A spike reports only through submit_spike_result, never as an investigation.
+			...(spike ? {} : {
+				submit_experiment_result: z.object({ result: resultSchema }).strict(),
+				submit_investigation_result: z.object({ result: resultSchema }).strict(),
+			}),
+			...(spike
+				? {
+					upload_investigation_image: z.object({
+						data: z.string().min(1),
+						mimeType: z.string().max(40),
+					}).strict(),
+					submit_spike_result: spikeSubmissionSchema,
+				}
+				: {}),
 		};
 	}
 	return {

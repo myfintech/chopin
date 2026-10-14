@@ -15,6 +15,7 @@ import type { SocketData } from "../wire";
 
 export type SeedState = {
 	graph?: import("../tasks/graphs").Graph;
+	builds?: import("@chopin/protocol/implementation").BuildRequest[];
 	revision?: number;
 	questions?: unknown[];
 	openQuestions?: unknown[];
@@ -185,6 +186,7 @@ export async function checkpointSource(
 		threads: state.threads ?? [],
 		transcript: state.transcript ?? [],
 		...(state.graph ? { graph: state.graph } : {}),
+		...(state.builds ? { builds: state.builds } : {}),
 	} as JsonValue;
 	let document = await Room.create(source);
 	let canonical = Room.project(document);
@@ -203,6 +205,25 @@ export async function checkpointSource(
 		createdAt: now,
 	});
 	document.doc.destroy();
+}
+
+/** Open another document in the same repository and storage as `context`. */
+export async function openSiblingPlan(
+	context: Awaited<ReturnType<typeof openPlan>>,
+	source = "",
+	state: SeedState = {},
+) {
+	let channel = await context.storage.channels.create({
+		repositoryId: "R_test",
+		repositoryOwner: "owner",
+		repositoryName: "repository",
+		createdBy: "U_test",
+		now: context.now,
+		id: crypto.randomUUID(),
+		title: `Sibling ${crypto.randomUUID()}`,
+	});
+	await checkpointSource(context.storage, context.lease, channel.id, source, state, context.now);
+	return Service.open(channel.id, context.backend, context.server);
 }
 
 export async function openPlan(source = "", state: SeedState = {}) {

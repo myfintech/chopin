@@ -77,6 +77,25 @@
 	background: transparent;
 }
 
+/* Investigation views and recorded decisions are interface inside the document, not its prose. */
+.plan-content .plan-evidence :is(h3, h4) {
+	margin: 0;
+	font-family: var(--font-sans);
+	font-size: var(--text-sm);
+	font-weight: var(--font-weight-semibold);
+	line-height: var(--text-sm--line-height);
+}
+
+.plan-content .plan-evidence p {
+	margin: 0;
+}
+
+/* Host detail on a ready card stays interactive above the card-wide open control. */
+.plan-research-detail {
+	position: relative;
+	z-index: 2;
+}
+
 /* The preview sits above the whole-card open button; only its links take the pointer. */
 .plan-research-preview-toggle {
 	position: relative;
@@ -340,6 +359,10 @@
 	padding-inline: 0.25rem;
 }
 
+.plan-research-track[data-steps="3"] {
+	grid-template-columns: repeat(3, 1fr);
+}
+
 .plan-research-track span {
 	position: relative;
 	overflow: hidden;
@@ -496,6 +519,7 @@
 	 * does.
 	 */
 	--plan-measure: var(--document-prose-measure);
+	--plan-table-measure: var(--document-table-measure);
 	/*
 	 * Document body text, one step down from the old 17px so prose sits
 	 * closer to chrome and chat sizes. Resolved out here because MDXEditor
@@ -539,7 +563,7 @@
 
 @container (max-width: 40rem) {
 	/* Anchor state keeps this lane stable when its marker leaves the viewport. */
-	.plan-document[data-plan-decision-lane] :is(.plan-content, .plan-preface, .plan-afterword) {
+	.plan-document[data-plan-decision-lane] :is(.plan-content, .plan-preface) {
 		--plan-leading-gutter: max(
 			calc(var(--decision-marker-size) + var(--spacing) * 2),
 			var(--plan-gutter)
@@ -547,12 +571,15 @@
 	}
 
 	/* Wide authored surfaces keep their own visible, keyboard-operable lane. */
+	/* Chromium paints these lanes only while the standard scrollbar properties are unset. */
 	.plan-content :is(pre, table, .plan-code-view, [role="tablist"]) {
 		overscroll-behavior-inline: contain;
+		scrollbar-width: auto;
+		scrollbar-color: initial;
 	}
 
 	.plan-content :is(pre, table, .plan-code-view, [role="tablist"])::-webkit-scrollbar {
-		block-size: 8px;
+		block-size: var(--scrollbar-size);
 	}
 
 	.plan-content :is(pre, table, .plan-code-view, [role="tablist"])::-webkit-scrollbar-track {
@@ -560,9 +587,14 @@
 	}
 
 	.plan-content :is(pre, table, .plan-code-view, [role="tablist"])::-webkit-scrollbar-thumb {
-		border: 2px solid var(--color-inset);
-		border-radius: var(--radius-lg);
-		background: var(--color-text-quaternary);
+		border: solid var(--color-inset);
+		border-width: var(--scrollbar-inset);
+		border-radius: var(--radius-full);
+		background: var(--color-scrollbar-thumb);
+	}
+
+	.plan-content :is(pre, table, .plan-code-view, [role="tablist"])::-webkit-scrollbar-thumb:hover {
+		background: var(--color-scrollbar-thumb-hover);
 	}
 }
 
@@ -1036,6 +1068,20 @@
 	font-variant-numeric: tabular-nums;
 }
 
+.plan-comment-group-quote {
+	display: -webkit-box;
+	overflow: hidden;
+	padding-left: 0.5rem;
+	border-left-width: calc(var(--edge-width) * 2);
+	border-left-style: solid;
+	border-left-color: var(--color-comment-underline);
+	font-size: var(--text-sm);
+	color: var(--color-text-tertiary);
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 1;
+	overflow-wrap: anywhere;
+}
+
 .plan-comment-group-note {
 	display: -webkit-box;
 	overflow: hidden;
@@ -1474,11 +1520,12 @@
 	transition-duration: var(--drawer-close-dur);
 }
 
+/* Full height so the card's percentages resolve against the document, not the pill. */
 .plan-comment-orphans {
-	pointer-events: auto;
 	position: absolute;
 	top: 0.5rem;
 	right: 0.5rem;
+	bottom: 0.5rem;
 }
 
 .plan-comment-orphan-button {
@@ -1488,8 +1535,11 @@
 }
 
 .plan-comment-orphan-card {
-	top: 2.5rem;
+	--orphan-card-offset: 2.5rem;
+	top: var(--orphan-card-offset);
 	right: 0;
+	width: min(20rem, calc(100cqi - 1rem));
+	max-height: calc(100% - var(--orphan-card-offset));
 }
 
 /* The scrim every phone sheet shares, lighter while this sheet rests at its medium detent. */
@@ -1604,8 +1654,9 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	cursor: grab;
 }
 
-/* With a pager the passage takes its own row beneath it. */
-.plan-comment-sheet-head:has(.plan-comment-sheet-pager) .plan-comment-sheet-quote {
+/* With a pager or a back row the passage takes its own row beneath it. */
+.plan-comment-sheet-head:has(.plan-comment-sheet-pager, .plan-comment-sheet-back)
+	.plan-comment-sheet-quote {
 	flex-basis: 100%;
 	order: 1;
 	margin: 0 0.75rem 0.5rem 0;
@@ -1624,6 +1675,27 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	width: var(--control-target-coarse);
 	height: var(--control-target-coarse);
 	color: var(--color-text-secondary);
+}
+
+/* A quiet pill says the position opens the list of every thread. */
+.plan-comment-sheet-pager .plan-comment-sheet-count {
+	min-height: var(--control-target-coarse);
+	padding-inline: 0.25rem;
+	background: transparent;
+	font: inherit;
+	font-variant-numeric: tabular-nums;
+	color: var(--color-text-secondary);
+
+	> span {
+		padding: 0.125rem 0.5rem;
+		border-radius: var(--radius-full);
+		background: var(--color-inset);
+	}
+}
+
+.plan-comment-sheet-pager .plan-comment-sheet-count:active > span {
+	background: var(--color-selected);
+	color: var(--color-text-primary);
 }
 
 .plan-comment-sheet-quote {
@@ -1899,10 +1971,6 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 .plan-decisions[data-phone] {
 	position: relative;
 	--plan-gutter: calc(var(--spacing) * 4);
-}
-
-.plan-decisions[data-phone] .plan-decisions-content {
-	padding-block-start: calc(var(--spacing) * 4);
 }
 
 /* Cards answered in place outside the pane, such as a child document's, save from the same bar. */
@@ -2192,6 +2260,23 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	margin-block-start: 0;
 }
 
+/* A research draft takes the empty line it was opened on; the reference replaces that line. */
+.plan
+	.plan-content
+	> :is(p, h1, h2, h3, h4, h5, h6, blockquote)[data-research-draft-anchor]:has(> br:only-child) {
+	block-size: 0;
+	margin-block: 0;
+	overflow: visible;
+}
+
+/* The draft is content in progress, so the empty-document prompt would only overlap it. */
+.plan
+	.mdxeditor-root-contenteditable:has(.plan-content[contenteditable="true"]
+		> .plan-research-draft-host)
+	> .plan-content:not([contenteditable]) {
+	display: none;
+}
+
 /* Settled lines read as a tight list; the line's own paragraph margin is dropped. */
 .plan .plan-content :is([data-plan-questionnaire], [data-plan-decision]):has([data-card-settled]) {
 	margin-block: 0.5rem;
@@ -2387,6 +2472,11 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	--plan-leading-gutter: var(--plan-gutter);
 	--plan-wide-inline-size: calc(100cqi - var(--plan-leading-gutter) - var(--plan-gutter));
 	--plan-wide-inline-offset: calc((100% - var(--plan-wide-inline-size)) / 2);
+	/* The prose column's own width, for blocks that cannot read it as a percentage. */
+	--plan-prose-inline-size: min(
+		var(--plan-measure) + var(--plan-gutter) - var(--plan-leading-gutter),
+		var(--plan-wide-inline-size)
+	);
 	/*
 	 * The trailing space is deliberate and large: the caret should never sit
 	 * against the bottom of the pane, and a plan is usually appended to.
@@ -2991,13 +3081,16 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 
 /*
  * A compact table shrink-wraps around its columns from the prose's start edge,
- * like every other block; a wide one grows to the trailing document gutter
- * before scrolling. The row and column rails are fixed overlays and sit in
- * the gutter outside it.
+ * like every other block. One wider than the prose grows evenly about the
+ * column's centre, up to the table measure or the document gutters, then
+ * scrolls.
+ * Its own width is only known to a percentage of `translate`, so the shift is
+ * paint-only; the row and column rails measure cell rectangles and follow it.
  */
 .plan-content > table {
 	inline-size: max-content;
-	max-inline-size: calc((100% + var(--plan-wide-inline-size)) / 2);
+	max-inline-size: min(var(--plan-wide-inline-size), var(--plan-table-measure));
+	translate: min(0px, var(--plan-prose-inline-size) / 2 - 50%);
 }
 
 /* Name an empty header for what it holds. Counted per header cell, out of flow. */
@@ -5438,6 +5531,11 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	animation: plan-bubble-enter var(--duration-fast) var(--ease-out);
 }
 
+/* An open comment card owns the reader's attention; a lingering selection's toolbar would cover it. */
+:root:has(.plan-comment-card.motion-comment-surface:not(.is-closing)) .plan-formatting-toolbar {
+	display: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
 	.plan-formatting-toolbar {
 		animation: none;
@@ -5532,31 +5630,12 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	}
 }
 
-.plan .plan-afterword {
-	--plan-leading-gutter: var(--plan-gutter);
-	padding: 0 var(--plan-gutter) var(--document-trailing-space);
-	padding-inline-start: var(--plan-leading-gutter);
-	margin-inline: auto;
-	max-width: calc(var(--plan-measure) + var(--plan-gutter) * 2);
-}
-
-.plan[data-plan-afterword]
-	> .plan-workspace
-	> .plan-document
-	> [data-plan-scroll]
-	> .mdxeditor
-	.plan-content {
-	padding-bottom: calc(var(--spacing) * 6);
-}
-
 /* Formatting docked above a phone's keyboard while editing; the host supplies the surface. */
 .plan-format-dock {
 	display: flex;
 	align-items: center;
-	gap: calc(var(--spacing) / 2);
 	min-width: 0;
-	height: 100%;
-	padding-inline: var(--spacing);
+	height: var(--phone-dock-height);
 	-webkit-user-select: none;
 	user-select: none;
 }
@@ -5566,7 +5645,7 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	display: flex;
 	flex: 1;
 	align-items: center;
-	justify-content: space-between;
+	/* An even rhythm from the start, as native keyboard bars have, at any width. */
 	gap: calc(var(--spacing) / 2);
 	min-width: 0;
 	overflow-x: auto;
@@ -5624,6 +5703,11 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 		color var(--duration-fast) var(--ease-out);
 }
 
+/* Hide keyboard sits at the trailing end, beside Done, however wide the bar. */
+.plan-format-dock > .plan-format-dock-button {
+	margin-inline-start: auto;
+}
+
 .plan-format-dock-button:active:not(:disabled),
 .plan-format-dock-button[aria-pressed="true"] {
 	background: var(--color-selected);
@@ -5632,4 +5716,71 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 
 .plan-format-dock-button:disabled {
 	opacity: var(--opacity-quiet);
+}
+
+/* Insert and Text style: the choices stand where the keyboard was, at its height. */
+/* Sized to what the keyboard has uncovered, down to nothing, so its edge and padding sit inside. */
+.plan-format-panel {
+	box-sizing: border-box;
+	height: var(--phone-format-panel-height);
+	overflow-y: auto;
+	overscroll-behavior: contain;
+	background: var(--color-ground);
+	-webkit-user-select: none;
+	user-select: none;
+}
+
+.plan-format-panel-grid {
+	padding: calc(var(--spacing) * 3) calc(var(--spacing) * 3)
+		calc(var(--spacing) * 3 + env(safe-area-inset-bottom));
+	border-top: var(--edge-width) solid var(--color-edge);
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: calc(var(--spacing) * 2);
+}
+
+.plan-format-panel-choice {
+	display: flex;
+	align-items: center;
+	gap: calc(var(--spacing) * 2);
+	min-width: 0;
+	min-height: calc(var(--control-target-coarse) + var(--spacing));
+	padding-inline: calc(var(--spacing) * 2.5);
+	border-radius: var(--radius-md);
+	background: var(--color-page);
+	outline: var(--edge-width) solid var(--color-edge);
+	outline-offset: calc(-1 * var(--edge-width));
+	color: var(--color-text-primary);
+	font-size: var(--text-sm);
+	text-align: left;
+	touch-action: manipulation;
+	-webkit-touch-callout: none;
+	transition: background-color var(--duration-fast) var(--ease-out);
+}
+
+.plan-format-panel-choice:active:not(:disabled) {
+	background: var(--color-selected);
+}
+
+.plan-format-panel-choice[aria-pressed="true"] {
+	background: var(--color-brand-wash);
+	color: var(--color-brand-ink);
+}
+
+.plan-format-panel-choice:disabled {
+	opacity: var(--opacity-quiet);
+}
+
+.plan-format-panel-glyph {
+	display: grid;
+	flex: none;
+	place-items: center;
+	width: calc(var(--spacing) * 6);
+	color: var(--color-text-secondary);
+	font-size: var(--text-base);
+	line-height: 1;
+}
+
+.plan-format-panel-choice[aria-pressed="true"] .plan-format-panel-glyph {
+	color: inherit;
 }

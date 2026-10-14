@@ -6,6 +6,7 @@ import { childSidecarWithoutConversation } from "../child-conversation";
 import { MemoryBackgroundJobStore } from "./jobs";
 import { MemoryExperimentStore } from "./experiments";
 import { MemoryImageStore } from "./images";
+import { MemoryMachineStore } from "./machines";
 import { MemoryResearchWorkspaceStore } from "./research";
 import { MemoryPreferenceStore } from "../../user-preferences/memory";
 import { MemoryProvenanceStore } from "../../document-provenance/memory";
@@ -51,6 +52,7 @@ import type {
 	CollaborationStore,
 	ImageStore,
 	LeaseStore,
+	MachineStore,
 	NavigationStore,
 	ResearchWorkspaceStore,
 	SessionStore,
@@ -135,6 +137,17 @@ export class MemoryStorage implements StorageAdapter {
 		exists: id => this.#channels.has(id),
 		active: id => !this.#channels.get(id)?.archivedAt,
 		fence: lease => this.#assertLease(lease),
+		channel: id => this.#channels.get(id),
+		createChannel: input =>
+			this.#createChannel({
+				...input,
+				title: availableChannelTitle(
+					input.title,
+					[...this.#channels.values()]
+						.filter(channel => channel.repositoryId === input.repositoryId)
+						.map(channel => channel.title),
+				),
+			}),
 	});
 
 	#users = new Map<string, UserRecord>();
@@ -156,6 +169,7 @@ export class MemoryStorage implements StorageAdapter {
 		userExists: id => this.#users.has(id),
 	});
 	readonly images: ImageStore = this.#images;
+	readonly machines: MachineStore = new MemoryMachineStore(id => this.#users.has(id));
 
 	readonly users: UserStore = {
 		put: input => {
@@ -554,6 +568,9 @@ export class MemoryStorage implements StorageAdapter {
 		}
 		if (this.#research.referencesChannel(id)) {
 			throw conflict(`channel ${id} is still published by a research workspace`);
+		}
+		if (this.experiments.referencesChannel(id)) {
+			throw conflict(`channel ${id} is still published by an investigation`);
 		}
 
 		this.#channels.delete(id);

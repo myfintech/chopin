@@ -66,7 +66,7 @@ export function commentSheetTop(
 export type CommentSheetHeading =
 	| { kind: "quote"; quote: string }
 	| { kind: "count"; count: number }
-	| { kind: "back"; count: number }
+	| { kind: "back"; count: number; quote?: string }
 	| { kind: "title"; title: string };
 
 export function commentSheetHeading(
@@ -82,7 +82,12 @@ export function commentSheetHeading(
 				? { kind: "quote", quote: input.quote }
 				: { kind: "title", title: "New comment" };
 		case "thread":
-			if (input.siblings > 1) return { kind: "back", count: input.siblings };
+			if (input.siblings > 1) {
+				// The back row takes the header; the passage stays beneath it for context.
+				return input.quote.trim()
+					? { kind: "back", count: input.siblings, quote: input.quote }
+					: { kind: "back", count: input.siblings };
+			}
 			return input.quote.trim()
 				? { kind: "quote", quote: input.quote }
 				: { kind: "title", title: "Comment" };
@@ -119,6 +124,8 @@ export type CommentSheetPager = {
 	/** Absent at the first thread: the pager stops at its ends rather than wrapping. */
 	onPrevious?: () => void;
 	onNext?: () => void;
+	/** Show every open thread as a list, from the count between the steps. */
+	onList?: () => void;
 };
 
 export function CommentSheet(
@@ -235,7 +242,21 @@ export function CommentSheet(
 										>
 											<ChevronIcon aria-hidden="true" className="rotate-180" size={16} />
 										</button>
-										<span aria-live="polite">{pager.index + 1} of {pager.count}</span>
+										{pager.onList
+											? (
+												<button
+													aria-label={`${pager.index + 1} of ${pager.count}, show all comments`}
+													className="plan-comment-sheet-count btn btn-sm btn-ghost"
+													data-plan-comment-pager-list=""
+													onClick={pager.onList}
+													type="button"
+												>
+													<span aria-live="polite">
+														{pager.index + 1} of {pager.count}
+													</span>
+												</button>
+											)
+											: <span aria-live="polite">{pager.index + 1} of {pager.count}</span>}
 										<button
 											aria-label="Next comment"
 											className="plan-comment-sheet-step btn btn-icon btn-ghost"
@@ -268,6 +289,11 @@ export function CommentSheet(
 										<ChevronIcon aria-hidden="true" className="rotate-180" size={16} />
 										All {heading.count} comments
 									</button>
+								)}
+								{heading.kind === "back" && heading.quote && (
+									<blockquote className="plan-comment-sheet-quote" data-plan-comment-sheet-quote>
+										{heading.quote}
+									</blockquote>
 								)}
 								<Drawer.Close
 									aria-label="Close comment"

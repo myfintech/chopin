@@ -36,16 +36,18 @@ function sidebar(page: import("@playwright/test").Page) {
 }
 
 function headerDocument(page: import("@playwright/test").Page) {
-	return page.getByRole("banner").locator('[aria-label^="Document:"]');
+	return page.getByRole("group", { name: /^Document: / });
 }
 
 function headerActions(page: import("@playwright/test").Page) {
-	return page.getByRole("banner").getByRole("button", { name: /^Actions for / });
+	return page.getByRole("group", { name: /^Document: / }).getByRole("button", {
+		name: /^Actions for /,
+	});
 }
 
 function documentRouteLayers(page: import("@playwright/test").Page, selector: string) {
 	return page.locator(selector).filter({
-		has: page.getByRole("banner", { includeHidden: true }),
+		has: page.getByRole("group", { includeHidden: true, name: /^Document: / }),
 	});
 }
 
@@ -177,11 +179,11 @@ test("header actions menu is start-aligned to its trigger", async ({ join }) => 
 	expect(layout.top).toBeGreaterThanOrEqual(triggerBox!.y + triggerBox!.height);
 });
 
-/** The header sits above Chat only, so click its trailing padding rather than a fixed offset. */
-async function clickBannerPadding(page: import("@playwright/test").Page) {
-	let banner = page.getByRole("banner");
-	let box = (await banner.boundingBox())!;
-	await banner.click({ position: { x: box.width - 4, y: 10 } });
+/** The title group runs to the bar's trailing controls, so its end is empty, unclickable padding. */
+async function clickTitlePadding(page: import("@playwright/test").Page) {
+	let title = page.getByRole("group", { name: /^Document: / });
+	let box = (await title.boundingBox())!;
+	await title.click({ position: { x: box.width - 4, y: box.height / 2 } });
 }
 
 test("account menu closes on Escape and outside click, and returns focus", async ({ join }) => {
@@ -201,9 +203,25 @@ test("account menu closes on Escape and outside click, and returns focus", async
 	await expect(account).toBeFocused();
 	await account.click();
 	await expect(menu).toBeVisible();
-	await clickBannerPadding(page);
+	await clickTitlePadding(page);
 	await expect(menu).toHaveCount(0);
 	await expect(account).toHaveAttribute("aria-expanded", "false");
+});
+
+test("the account menu takes arrow keys from the moment it appears", async ({ join }) => {
+	let page = await join("ana");
+	let menu = page.getByRole("menu").filter({
+		has: page.getByRole("menuitem", { name: "Sign out" }),
+	});
+	// A key can arrive before the next frame is drawn; it must already move through the menu.
+	await sidebar(page).locator(".project-sidebar-account").evaluate(async account => {
+		(account as HTMLElement).click();
+		await new Promise<void>(resolve => queueMicrotask(resolve));
+		document.activeElement!.dispatchEvent(
+			new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "ArrowDown" }),
+		);
+	});
+	await expect(menu.getByRole("menuitem", { name: "Keyboard shortcuts" })).toBeFocused();
 });
 
 test("document action menu motion settles keyboard opening immediately", async ({ join }) => {
@@ -252,7 +270,7 @@ test("document action menu closes when placement cannot be measured", async ({ j
 
 test("the room header renames the current document and the sidebar creates one immediately", async ({ join }) => {
 	let page = await join("ana");
-	let header = page.getByRole("banner");
+	let header = page.getByRole("group", { name: /^Document: / });
 	let trigger = headerActions(page);
 	let projects = sidebar(page);
 
@@ -287,7 +305,7 @@ test("the room header renames the current document and the sidebar creates one i
 
 test("the header names the project without adding a sidebar control", async ({ join }) => {
 	let page = await join("ana", { viewport: { width: 1440, height: 900 } });
-	let header = page.getByRole("banner");
+	let header = page.getByRole("group", { name: /^Document: / });
 	let prefix = header.getByText("score", { exact: true });
 	await expect(prefix).toBeVisible();
 	await expect(header.getByRole("button", { name: "Show score in the sidebar" })).toHaveCount(0);
@@ -306,7 +324,7 @@ test("the project prefix gives way on phones", async ({ join }) => {
 
 test("the header title renames in place with click, F2, Escape, and blur", async ({ join, room }) => {
 	let page = await join("ana");
-	let header = page.getByRole("banner");
+	let header = page.getByRole("group", { name: /^Document: / });
 	let field = page.getByRole("textbox", { name: "Document title" });
 	let title = `Inline ${room.slice(0, 8)}`;
 
@@ -322,7 +340,7 @@ test("the header title renames in place with click, F2, Escape, and blur", async
 	await button.press("F2");
 	await expect(field).toBeFocused();
 	await field.fill(title);
-	await clickBannerPadding(page);
+	await clickTitlePadding(page);
 	await expect(field).toHaveCount(0);
 	await expect(headerDocument(page)).toHaveAccessibleName(`Document: ${title}`);
 	await expect(header.getByRole("button", { name: `Rename ${title}`, exact: true })).toBeVisible();
@@ -379,7 +397,8 @@ test("leaving a rejected title reverts it without retrying", async ({ join, room
 		});
 	});
 	let before = await headerDocument(page).getAttribute("aria-label");
-	await page.getByRole("banner").getByRole("button", { name: /^Rename / }).click();
+	await page.getByRole("group", { name: /^Document: / }).getByRole("button", { name: /^Rename / })
+		.click();
 	let field = page.getByRole("textbox", { name: "Document title" });
 	await field.fill(`Taken ${room.slice(0, 8)}`);
 	await field.press("Enter");
@@ -387,7 +406,7 @@ test("leaving a rejected title reverts it without retrying", async ({ join, room
 		"A document with this title already exists. Try a different title.",
 	);
 
-	await clickBannerPadding(page);
+	await clickTitlePadding(page);
 	await expect(field).toHaveCount(0);
 	await expect(headerDocument(page)).toHaveAttribute("aria-label", before!);
 	expect(patches).toBe(1);
@@ -735,12 +754,20 @@ test("rapid document switches and history jumps settle on one visible document",
 	await settled(documents.find(document => document.title === current)!);
 });
 
-test("overlapping document workspaces keep IDs, ARIA targets, and focus instance-scoped", async ({ baseURL, join }) => {
-	let page = await join("ana", { viewport: { width: 390, height: 844 } });
+test("overlapping document workspaces keep IDs, ARIA targets, and focus instance-scoped", async ({ baseURL, join, page }) => {
 	let created = crypto.randomUUID();
 	await createChannel(Number(new URL(baseURL!).port), created);
 	let destination = roomPath(created);
+	// The incoming document reveals itself once it syncs, or 200ms after it was asked for. On a
+	// loaded machine both can pass before it is even laid out, and the swap goes straight to the
+	// outgoing route's exit, when neither workspace takes input. Holding its socket and the page's
+	// clock keeps both mounted with the outgoing one live; the frames the view change needs run below.
+	await page.routeWebSocket(new RegExp(`/ws\\?channel=${created}`), () => {});
+	await page.setViewportSize({ width: 390, height: 844 });
+	page = await join("ana");
 	await page.locator("body").dispatchEvent("pointerover", { pointerType: "mouse" });
+	await page.clock.install();
+	await page.clock.pauseAt(Date.now() + 1_000);
 	await page.evaluate(path => {
 		history.pushState(null, "", path);
 		dispatchEvent(new PopStateEvent("popstate"));
@@ -748,13 +775,19 @@ test("overlapping document workspaces keep IDs, ARIA targets, and focus instance
 
 	let routes = page.locator(".document-route-swap > [data-content-swap-state]:not([hidden])");
 	await expect(routes).toHaveCount(2);
-	let audit = await routes.evaluateAll(async layers => {
+	await expect(routes.locator(".workspace-root")).toHaveCount(2);
+	await expect(routes.and(page.locator(":not([inert])"))).toHaveCount(1);
+	await routes.evaluateAll(layers => {
 		let current = layers.find(layer => !layer.hasAttribute("inert"));
 		let decision = [...current!.querySelectorAll<HTMLButtonElement>(
 			'nav[aria-label="Workspace view"] button',
 		)].find(button => button.textContent?.includes("Decisions"));
 		decision!.click();
-		await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+	});
+	// The view change moves focus a frame later.
+	await page.clock.runFor(50);
+	let audit = await routes.evaluateAll(layers => {
+		let current = layers.find(layer => !layer.hasAttribute("inert"));
 		let roots = layers.flatMap(
 			layer => [...layer.querySelectorAll<HTMLElement>(".workspace-root")],
 		);
@@ -888,7 +921,7 @@ test("renaming the current document updates collaborators and survives reload", 
 	await expect(ana).toHaveURL(renamedPath);
 	await expect(bo).toHaveURL(renamedPath);
 	await ana.reload();
-	await expect(ana.getByRole("banner").locator(`[aria-label="Document: ${title}"]`))
+	await expect(ana.getByRole("group", { name: `Document: ${title}`, exact: true }))
 		.toBeVisible();
 	await ana.goto(previousPath);
 	await expect(ana).toHaveURL(renamedPath);
@@ -926,7 +959,7 @@ test("a delayed rename response cannot overwrite a newer collaborator rename", a
 test("read-only visitors can browse documents and get creation guidance", async ({ baseURL, page, room }) => {
 	await authenticate(page, "readonly", baseURL!);
 	await page.goto(roomPath(room));
-	await expect(page.getByRole("banner")).toBeVisible();
+	await expect(page.getByRole("group", { name: /^Document: / })).toBeVisible();
 	await expect(page.getByRole("textbox", { name: "editable markdown" })).toHaveAttribute(
 		"contenteditable",
 		"false",
@@ -980,13 +1013,20 @@ test("archiving offers Undo and archived mode names itself", async ({ join, room
 	await expect(notice).toBeVisible();
 	await expect(projects.getByRole("link", { name: title, exact: true })).toHaveCount(0);
 	await notice.getByRole("button", { name: "Undo", exact: true }).click();
-	await expect(ana.getByRole("banner").getByText("Archived", { exact: true })).toHaveCount(0);
+	await expect(
+		ana.getByRole("group", { name: /^Document: / }).getByText("Archived", { exact: true }),
+	).toHaveCount(0);
 	await expect(projects.getByRole("link", { name: title, exact: true })).toBeFocused();
 
 	await headerAction(ana, "Archive");
 	await expect(notice).toBeVisible();
-	await expect(ana.getByRole("banner").getByRole("button", { name: /^Actions for / }))
+	await expect(
+		ana.getByRole("group", { name: /^Document: / }).getByRole("button", { name: /^Actions for / }),
+	)
 		.toBeFocused();
+	// Back past the sheet's expand control, Undo is the next stop.
+	await ana.keyboard.press("Shift+Tab");
+	await expect(ana.getByRole("button", { name: "Expand document" })).toBeFocused();
 	await ana.keyboard.press("Shift+Tab");
 	let undo = notice.getByRole("button", { name: "Undo", exact: true });
 	await expect(undo).toBeFocused();
@@ -1008,8 +1048,12 @@ test("writers can archive, restore, and permanently delete a document", async ({
 	let projects = sidebar(ana);
 
 	await headerAction(ana, "Archive");
-	await expect(ana.getByRole("banner").getByText("Archived", { exact: true })).toBeVisible();
-	await expect(bo.getByRole("banner").getByText("Archived", { exact: true })).toBeVisible();
+	await expect(
+		ana.getByRole("group", { name: /^Document: / }).getByText("Archived", { exact: true }),
+	).toBeVisible();
+	await expect(
+		bo.getByRole("group", { name: /^Document: / }).getByText("Archived", { exact: true }),
+	).toBeVisible();
 	await expect(ana.getByText("Archived. Restore it to keep chatting."))
 		.toBeVisible();
 	await expect(ana.getByPlaceholder("Use @chopin to ask Chopin")).toHaveCount(0);
@@ -1030,10 +1074,15 @@ test("writers can archive, restore, and permanently delete a document", async ({
 	await expect(archivedButton).toBeFocused();
 	await archivedButton.click();
 
-	await ana.getByRole("banner").getByRole("button", { name: "Restore", exact: true }).click();
+	await ana.getByRole("group", { name: /^Document: / }).getByRole("button", {
+		name: "Restore",
+		exact: true,
+	}).click();
 	await expect(content(ana)).toHaveAttribute("contenteditable", "true");
 	await expect(content(bo)).toHaveAttribute("contenteditable", "true");
-	await expect(ana.getByRole("banner").getByText("Archived", { exact: true })).toHaveCount(0);
+	await expect(
+		ana.getByRole("group", { name: /^Document: / }).getByText("Archived", { exact: true }),
+	).toHaveCount(0);
 	await expect(chatInput(ana)).toBeVisible();
 	await expect(projects.getByRole("button", { name: "Archived", exact: true })).toBeVisible();
 	await expect(projects.getByRole("link", { name: title, exact: true })).toBeVisible();
@@ -1070,7 +1119,7 @@ test(
 		await expect(notice).toBeVisible();
 		let [noticeBox, headerBox] = await Promise.all([
 			notice.boundingBox(),
-			page.getByRole("banner").boundingBox(),
+			page.getByRole("group", { name: /^Document: / }).boundingBox(),
 		]);
 		expect(headerBox!.y).toBeGreaterThanOrEqual(noticeBox!.y + noticeBox!.height);
 		let draft = chatInput(page);

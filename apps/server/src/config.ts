@@ -6,7 +6,8 @@
  * than a puzzling behaviour three screens later.
  */
 
-import { delimiter } from "node:path";
+import { readFileSync } from "node:fs";
+import { delimiter, join } from "node:path";
 
 import { loadAuth } from "./auth/config";
 
@@ -57,6 +58,17 @@ export type Config = {
 	conversationPlanTimeoutMs?: number;
 	/** Explicitly enables Jev-routed foreground visual authoring. */
 	plannerVisuals?: boolean;
+	/** The chopin release `chopin update` installs from this server, and a refusal names. */
+	connectorVersion?: string;
+	/** Keep a finished build's document as the source for later rebuilds. */
+	liveBuild?: boolean;
+	/** Let the editor's local agent prototype uncertain passages before the first build. */
+	liveSpikes?: boolean;
+	/**
+	 * LIVE_SPIKES_REGEX_JUDGE=on: without Jev, judge passages by explicit uncertainty words.
+	 * Off by default, so a deployment without Jev starts no spikes.
+	 */
+	liveSpikesRegexJudge?: boolean;
 	/**
 	 * Origin of a running Vite, when developing.
 	 *
@@ -146,11 +158,30 @@ function storage(): StorageConfig {
 	return { driver, url: raw };
 }
 
+/**
+ * CONNECTOR_VERSION, or the version of the connector built beside this server. A release tag's
+ * `cli-v` or `v` prefix is dropped.
+ */
+function connectorVersion() {
+	let raw = process.env.CONNECTOR_VERSION
+		?? (JSON.parse(
+			readFileSync(join(import.meta.dir, "../../connector/package.json"), "utf8"),
+		) as { version: string }).version;
+	let version = raw.replace(/^cli-/, "").replace(/^v/, "");
+	if (!/^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$/.test(version)) {
+		throw new Error("CONNECTOR_VERSION must be a chopin release version like 0.2.0");
+	}
+	return version;
+}
+
 export function load(): Config {
 	let agent = process.env.AGENT !== "off";
 	let backgroundJobs = process.env.BACKGROUND_JOBS !== "off";
 	let conversationPlan = process.env.CONVERSATION_PLAN === "on";
 	let plannerVisuals = process.env.PLANNER_VISUALS === "on" && agent;
+	let liveBuild = process.env.LIVE_BUILD === "on";
+	let liveSpikes = process.env.LIVE_SPIKES === "on";
+	let liveSpikesRegexJudge = liveSpikes && process.env.LIVE_SPIKES_REGEX_JUDGE === "on";
 	let conversationPlanModel = process.env.JEV_MODEL || "jev-latest";
 	let timeoutRaw = process.env.JEV_TIMEOUT_MS;
 	let conversationPlanTimeoutMs = timeoutRaw === undefined ? 30_000 : Number(timeoutRaw);
@@ -217,6 +248,10 @@ export function load(): Config {
 		conversationPlanModel,
 		conversationPlanTimeoutMs,
 		plannerVisuals,
+		connectorVersion: connectorVersion(),
+		liveBuild,
+		liveSpikes,
+		liveSpikesRegexJudge,
 		devClient: process.env.DEV_CLIENT || undefined,
 		storage: storage(),
 		auth: loadAuth(serverPort, selection.host),
@@ -263,6 +298,8 @@ export function describe(config: Config): string {
 		config.plannerVisuals
 			? `Planner visuals: ${config.conversationPlanModel}`
 			: "Planner visuals: off",
+		config.liveBuild ? "live build: on" : "live build: off",
+		config.liveSpikes ? "live spikes: on" : "live spikes: off",
 		admission,
 		`storage: ${config.storage.driver}`,
 	];

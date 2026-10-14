@@ -1,3 +1,4 @@
+import { Machines } from "../auth/machines";
 import { afterEach, expect, test } from "bun:test";
 
 import { ActiveOwnerBindings } from "../agent/active-owner";
@@ -52,6 +53,11 @@ async function setup() {
 		sessions,
 		clock: () => new Date(),
 		admission: new Admission(authConfig, github),
+		machines: new Machines(storage, () => new Date(), {
+			origin: "https://chopin.test",
+			clientId: "test",
+		}),
+		pairings: {},
 	};
 	let channel = await storage.channels.create({
 		id: crypto.randomUUID(),
@@ -208,6 +214,31 @@ test("a task draft is refused without a Planner or when the notice cannot be sav
 	expect(prompts).toEqual([]);
 });
 
+test("a task draft is refused while no remote Planner is attached, and runs once one is", async () => {
+	let { context, events, prompts, releases, saves, turnOpened } = await setup();
+	context.plannerNotAttached = async () => "No Planner is attached.";
+	expect(await Chat.draftTasks(context, "ana", 1, "Prepare.", "@ana asked.")).toEqual({
+		ok: false,
+		reason: "No Planner is attached.",
+		code: "planner-not-attached",
+	});
+	expect(context.chat.draft).toBeUndefined();
+	expect(context.chat.waiting).toEqual([]);
+	expect(drafting(events)).toEqual([]);
+	expect(saves()).toBe(0);
+	expect(prompts).toEqual([]);
+
+	// Attached: this harness stands in for the attached Planner owning the turn.
+	context.plannerNotAttached = undefined;
+	let started = turnOpened();
+	expect(await Chat.draftTasks(context, "ana", 1, "Prepare.", "@ana asked.")).toMatchObject({
+		ok: true,
+	});
+	await started;
+	expect(prompts).toHaveLength(1);
+	releases.forEach(release => release());
+});
+
 test("a task draft takes the same limits as a Chat message, even with the Planner idle", async () => {
 	let { context, prompts } = await setup();
 	context.chat.pendingSends = 20;
@@ -266,6 +297,16 @@ test("the draft instruction comes from the plan and refuses an unsettled one", a
 	expect(prepare.text).toContain("Prepare an implementation graph");
 	expect(prepare.text).toContain("Do not approve or start implementation.");
 	expect(prepare.said).toBe("@ana asked Chopin to break the plan into tasks.");
+	let built = draftInstruction(plan, "ana", true);
+	expect(built.text).toContain("Chopin approves and starts these tasks automatically");
+	expect(built.text).toContain("do not describe them as unapproved or unstarted");
+	expect(built.text).toContain("do not add a task that prototypes that passage again");
+	for (let title of ["“Prototype queued”", "“Prototyping…”", "“Prototype paused”"]) {
+		expect(built.text).toContain(title);
+	}
+	expect(prepare.text).not.toContain("Prototyping");
+	expect(built.text).not.toContain("Do not approve or start implementation.");
+	expect(built.said).toBe(prepare.said);
 	expect(draftRefusal(plan)).toBeUndefined();
 	let revised = await implementationGraphs().revise(plan, {
 		planRevision: plan.revision,
@@ -287,6 +328,9 @@ test("the draft instruction comes from the plan and refuses an unsettled one", a
 	let revise = draftInstruction(plan, "ana");
 	expect(revise.text).toContain("Revise the implementation graph");
 	expect(revise.said).toBe("@ana asked Chopin to update the tasks.");
+	expect(revise.text).toContain("Do not approve or start implementation.");
+	expect(draftInstruction(plan, "ana", true).text)
+		.toContain("Chopin approves and starts these tasks automatically");
 	plan.builds = [{ state: "running" } as never];
 	expect(draftRefusal(plan)).toBe("implementation is already active");
 });

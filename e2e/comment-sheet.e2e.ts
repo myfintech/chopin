@@ -7,6 +7,7 @@
  */
 
 import { storedResolvedComment } from "../apps/server/src/testing/plan";
+import { titleChannel } from "./database";
 import { content, expect, openIsolatedRoom, test } from "./room";
 import { expectInsideViewport } from "./responsive";
 import { installVisualViewport, setVisualViewport } from "./visual-viewport";
@@ -583,4 +584,87 @@ test("a phone marker reaches 44px into the empty margin without covering the nex
 		].map(([x, y]) => !!document.elementFromPoint(x!, y!)?.closest("[data-plan-comment-button]"));
 	}, { chip, paragraph });
 	expect(hits).toEqual([true, true, false]);
+});
+
+test("the phone top bar lists every open thread, leads into each one and back", async ({ baseURL, join, room, seed }) => {
+	await seed(SOURCE, {
+		threads: [
+			await open("review the pilot", ["Is two weeks enough?"], 1),
+			await open("starting with the docs team", ["Which team is next?", "Support."], 0),
+		],
+	});
+	// A title wider than the room between equal sides shifts away from the wider side, as a
+	// navigation bar's does. The generated "Test 1a2b3c4d" sits at that edge, so whether it was
+	// centred depended on its digits; six of them fit with room to spare, and stay unique.
+	await titleChannel(Number(new URL(baseURL!).port), room, room.slice(0, 6));
+	let page = await join("ana", IPHONE);
+	let comments = page.locator(".phone-top-bar").getByRole("button", { name: "2 open comments" });
+	let commentsBox = await size(comments);
+	expect(commentsBox.width).toBeGreaterThanOrEqual(44);
+	expect(commentsBox.height).toBeGreaterThanOrEqual(44);
+	// The title stays centred with a second button on the right.
+	let [documents, actions] = await Promise.all([
+		size(page.locator(".phone-top-bar").getByRole("button", { name: "Documents", exact: true })),
+		size(page.locator(".phone-top-bar").getByRole("button", { name: /^Actions for/ })),
+	]);
+	expect(documents.x).toBeLessThan(commentsBox.x);
+	expect(commentsBox.x + commentsBox.width).toBeLessThanOrEqual(actions.x + 1);
+	let title = await size(page.locator(".phone-top-bar-center"));
+	expect(Math.abs(title.x + title.width / 2 - 390 / 2)).toBeLessThanOrEqual(1);
+
+	await comments.tap();
+	let list = page.getByRole("dialog", { name: "Comments" });
+	await settled(list);
+	await expect(list.getByText("2 comments", { exact: true })).toHaveCount(1);
+	// In reading order, each item saying which passage it is about.
+	let items = list.locator("[data-plan-comment-group-item]");
+	await expect(items).toHaveCount(2);
+	await expect(items.nth(0)).toContainText("starting with the docs team");
+	await expect(items.nth(0)).toContainText("Which team is next?");
+	await expect(items.nth(0)).toContainText("1 reply");
+	await expect(items.nth(1)).toContainText("review the pilot");
+	// The list opens at the medium detent, leaving the document in view above it.
+	expect((await size(list)).y).toBeGreaterThan(844 * 0.3);
+	expect((await size(items.nth(1))).height).toBeGreaterThanOrEqual(44);
+
+	await items.nth(1).click();
+	let thread = page.getByRole("dialog", { name: "Comment thread" });
+	await expect(thread).toContainText("Is two weeks enough?");
+	let back = thread.getByRole("button", { name: "All 2 comments" });
+	await expect(back).toBeFocused();
+	// The passage stays in view beneath the back row.
+	await expect(thread.locator("[data-plan-comment-sheet-quote]")).toHaveText("review the pilot");
+	await back.click();
+	let again = page.getByRole("dialog", { name: "Comments" });
+	await expect(again.getByRole("button", { name: /Is two weeks enough\?/ })).toBeFocused();
+
+	await again.getByRole("button", { name: "Close comment" }).click();
+	await expect(again).toHaveCount(0);
+	await expect(comments).toBeFocused();
+});
+
+test("a phone thread's position in the pager opens the list of every thread", async ({ join, seed }) => {
+	await seed(SOURCE, {
+		threads: [
+			await open("starting with the docs team", ["Which team is next?"], 0),
+			await open("review the pilot", ["Is two weeks enough?"], 1),
+		],
+	});
+	let page = await join("ana", IPHONE);
+	await page.getByRole("button", { name: /^Comment on “review the pilot”/ }).tap();
+	let sheet = page.getByRole("dialog", { name: "Comment thread" });
+	let position = sheet.getByRole("button", { name: "2 of 2, show all comments" });
+	await expect(position).toHaveText("2 of 2");
+	expect((await size(position)).height).toBeGreaterThanOrEqual(44);
+	await position.click();
+	let list = page.getByRole("dialog", { name: "Comments" });
+	await expect(list.locator("[data-plan-comment-group-item]")).toHaveCount(2);
+	await expect(list.getByRole("button", { name: /Is two weeks enough\?/ })).toBeFocused();
+});
+
+test("the desktop header has no comments list button", async ({ join, seed }) => {
+	await seed(SOURCE, { threads: [await open("review the pilot", ["Is two weeks enough?"])] });
+	let page = await join("ana", { viewport: { width: 1440, height: 900 } });
+	await expect(page.getByRole("button", { name: /^Comment on “review the pilot”/ })).toBeVisible();
+	await expect(page.getByRole("button", { name: /open comments?$/ })).toHaveCount(0);
 });

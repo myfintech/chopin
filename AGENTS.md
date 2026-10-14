@@ -59,8 +59,10 @@ on 8797) alongside them, then runs Chromium. The local-auth test starts its own
 application on port 8791 against the fourth database. Set `E2E_SKIP_BUILD=1`
 only when the existing client build is known to match the checkout.
 
-CI has three independent jobs: validation, browser integration, and a Docker
-image build. A documentation-only change should still pass `bun run ci`.
+CI has four independent jobs: validation, browser integration, a Docker image
+build, and the `chopin` CLI binary build with its bridge smoke test (whose
+Windows binary is then started once on Windows, where `install.ps1` is also
+tested). A documentation-only change should still pass `bun run ci`.
 
 Before opening a PR or repairing CI, use the repository's
 [PR readiness skill](.agents/skills/chopin-pr-readiness/SKILL.md).
@@ -130,7 +132,9 @@ collaborative state and external implementation runs are durable.
   data for callers with push or administration access.
 - **Planner ownership is process-bound.** The first eligible Planner or
   model-backed research request supplies its GitHub App token and Copilot
-  entitlement. The database stores only a token-free owner reference and durable
+  entitlement. Server-authored turns nobody typed (re-linking decisions after a
+  build, settling a prototyped passage) never claim an owner; under
+  `HARNESS=remote` they also wait for an attached Planner. The database stores only a token-free owner reference and durable
   context.
 - **Planner tools are repository-fixed under `copilot-sdk` and `pi`.** Those
   Planners have no shell, checkout, host filesystem, skills, plugins, or arbitrary
@@ -148,10 +152,22 @@ collaborative state and external implementation runs are durable.
   the account's live browser login the document's Planner owner, one client per
   document; nothing else claims ownership. `@chopin` and `invoke_planner` on a
   document without one fail with `planner-not-attached`. Signing out the
-  owner's login, its expiry, or a Planner reset closes the link. See
+  owner's login, its expiry, or a Planner reset closes the link. A paired
+  machine's Planner backend attaches with a document-scoped credential instead
+  and owns through a cookie-less login carrying the machine's own GitHub token,
+  which only revoking the machine or its authorization ends. See
   [Hosted agent](docs/hosted-agent.md#remote-planner).
 - **Repository node IDs are authoritative.** Owner and repository names resolve
   GitHub requests but never replace the stored node identity.
+- **Automatic local work needs consent.** `LIVE_BUILD` rebuilds (and, where
+  enabled, prototypes) dispatch only to a connection whose owner opted in on
+  the pairing page, for their own live build's repository; manual Build and
+  Run do not need it. Rebuild checks are scheduled only by persisted edits
+  from writers or work a writer started. Document text in agent prompts is
+  data. See [Living documents](docs/implementation-lifecycle.md#living-documents-live_build).
+  `LIVE_SPIKES` prototypes run only passages the consenting editor changed, on a
+  push-refusing throwaway worktree, under hourly caps and a 20-minute deadline;
+  see [Prototype spikes](docs/local-experiments.md#prototype-spikes-live_spikes).
 - **Persistence should precede publication.** Do not acknowledge or broadcast a
   domain mutation before its fenced durable commit.
 
@@ -268,6 +284,14 @@ destination. The ordinary MCP read path exposes graphs for MCP-created documents
 plan can approve and dispatch a graph through the owner-paired ACP connector;
 its run-scoped bridge exposes the document and lifecycle reporting tools. The
 Planner cannot approve, lock, or start a graph. See docs/local-launcher.md.
+
+A person's press is the approval. **Build plan** approves and starts the
+drafted graph. Once a build has delivered, with or without `LIVE_BUILD`, a
+rebuild appends its tasks as an approved, completed graph version from the
+coding agent's report, with no separate review: without `LIVE_BUILD` that
+approval is the person pressing **Build** (or **Retry**) on the changes, which
+the server refuses while decisions or accepted comments are open; under
+`LIVE_BUILD` it is the Build plan press that made the document live.
 
 An approved graph binds one plan revision, graph version, and graph revision.
 `start_implementation` atomically claims those values and locks the graph. Task,

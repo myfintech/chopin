@@ -1,15 +1,26 @@
 import { describe, expect, it } from "bun:test";
+import { createHeadlessEditor } from "@lexical/headless";
+import { $createListItemNode, $createListNode, ListItemNode, ListNode } from "@lexical/list";
+import { $createHeadingNode, $createQuoteNode, HeadingNode, QuoteNode } from "@lexical/rich-text";
+import {
+	$createTableCellNode,
+	$createTableNode,
+	$createTableRowNode,
+	TableCellNode,
+	TableNode,
+	TableRowNode,
+} from "@lexical/table";
+import { $createResearchNode, ResearchNode } from "@chopin/dialect";
+import { $createParagraphNode, $createTextNode, $getRoot, $isTextNode } from "lexical";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
+import { $draftAttachment, $insertResearch } from "./research";
+
+import type { ElementNode, LexicalNode } from "lexical";
 import type { ComponentType, PropsWithChildren } from "react";
 
 type DraftLayerModule = {
-	attachmentBlock?: <Block>(
-		resolved: Block,
-		offset: number,
-		previous: Block | undefined,
-	) => Block;
 	ResearchDraftShell?: ComponentType<PropsWithChildren>;
 	retainDraftBlock?: <Block>(resolved: Block | undefined, previous: Block | undefined) =>
 		| Block
@@ -50,16 +61,81 @@ describe("research draft layer", () => {
 		expect(retain(undefined, previous)).toBe(previous);
 	});
 
-	it("attaches a zero-offset boundary after the preceding block", async () => {
-		let attach = (await draftLayer()).attachmentBlock;
-		expect(typeof attach).toBe("function");
-		if (!attach) return;
-		let previous = { key: "previous" };
-		let resolved = { key: "resolved" };
-
-		expect(attach(resolved, 0, previous)).toBe(previous);
-		expect(attach(resolved, 1, previous)).toBe(resolved);
-		expect(attach(resolved, 0, undefined)).toBe(resolved);
+	it("shows the draft where the reference will be inserted", () => {
+		// "split" marks a point inside a block: the reference splits it, the draft follows all of it.
+		let cases: [string, (blocks: ElementNode[]) => LexicalNode, number, "split"?][] = [
+			["empty paragraph", blocks => blocks[1]!, 0],
+			["empty heading", blocks => blocks[5]!, 0],
+			["empty quote", blocks => blocks[6]!, 0],
+			["start of a paragraph", blocks => blocks[2]!.getFirstDescendant()!, 0],
+			["middle of a paragraph", blocks => blocks[2]!.getFirstDescendant()!, 2, "split"],
+			["start of the first list item", blocks => blocks[3]!.getFirstDescendant()!, 0],
+			["start of a later list item", blocks => blocks[3]!.getLastDescendant()!, 0],
+			["table cell", blocks => blocks[4]!.getLastDescendant()!, 1],
+		];
+		for (let [label, at, offset, split] of cases) {
+			let editor = createHeadlessEditor({
+				nodes: [
+					HeadingNode,
+					QuoteNode,
+					ListNode,
+					ListItemNode,
+					TableNode,
+					TableRowNode,
+					TableCellNode,
+					ResearchNode,
+				],
+				onError: error => {
+					throw error;
+				},
+			});
+			let follows: string | undefined;
+			let inserted: { previous?: string; parent?: string } = {};
+			editor.update(() => {
+				let cell = (text: string) =>
+					$createTableCellNode().append($createParagraphNode().append($createTextNode(text)));
+				let blocks: ElementNode[] = [
+					$createHeadingNode("h1").append($createTextNode("Heading")),
+					$createParagraphNode(),
+					$createParagraphNode().append($createTextNode("Para")),
+					$createListNode("bullet").append(
+						$createListItemNode().append($createTextNode("one")),
+						$createListItemNode().append($createTextNode("two")),
+					),
+					$createTableNode().append($createTableRowNode().append(cell("A"), cell("B"))),
+					$createHeadingNode("h2"),
+					$createQuoteNode(),
+				];
+				$getRoot().append(...blocks);
+				let node = at(blocks);
+				let attachment = $draftAttachment(node.getKey(), offset)!;
+				let children = $getRoot().getChildren();
+				let index = children.findIndex(block => block.getKey() === attachment.key);
+				// The block the draft visibly follows. An empty anchor line collapses under the draft.
+				let after = attachment.placement === "before" || !children[index]!.getTextContentSize()
+					? index - 1
+					: index;
+				follows = children[after]?.getTextContent();
+				if ($isTextNode(node)) node.select(offset, offset);
+				else node.selectStart();
+				$insertResearch($createResearchNode("r"));
+			}, { discrete: true });
+			editor.read(() => {
+				let reference = [...editor.getEditorState()._nodeMap.values()]
+					.find(node => node.getType() === "plan-research");
+				inserted = {
+					previous: reference?.getPreviousSibling()?.getTextContent(),
+					parent: reference?.getParent()?.getType(),
+				};
+			});
+			expect({ label, parent: inserted.parent }).toEqual({ label, parent: "root" });
+			if (split) {
+				expect({ label, follows: follows?.startsWith(inserted.previous!) })
+					.toEqual({ label, follows: true });
+			} else {
+				expect({ label, follows }).toEqual({ label, follows: inserted.previous });
+			}
+		}
 	});
 
 	it("explains an unresolved saved position without blocking submission", async () => {

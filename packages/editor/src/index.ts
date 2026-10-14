@@ -61,6 +61,7 @@ export { PlanStatus } from "./status";
 export type { PlanStatusProps } from "./status";
 export {
 	handlesOpenComment,
+	openCommentList,
 	openCommentThread,
 	openOutcome,
 	openRequest,
@@ -80,13 +81,16 @@ export type { PresenceAction, PresencePhase, TransitionPresence } from "./transi
 export type { Connection, Transport, Unsubscribe } from "./transport";
 export type {
 	CommentPresentation,
+	ExperimentResources,
 	GitHubReferenceEntry,
 	GitHubReferenceStore,
+	InvestigationResources,
 	QuestionStepMotion,
 	ResearchOpener,
 	ResearchStore,
 } from "./widget-options";
 export {
+	InvestigationCard,
 	QuestionnaireCard,
 	register as registerPlanWidgets,
 	ResearchBrief,
@@ -94,4 +98,5 @@ export {
 	ResearchComposer,
 	ResearchReference,
 } from "./widgets";
+export type { InvestigationCardProps } from "./widgets";
 export { DecisionCard } from "./widgets/decision";

@@ -8,9 +8,17 @@ import {
 	useState,
 	useSyncExternalStore,
 } from "react";
-import { flushSync } from "react-dom";
+import { createPortal, flushSync } from "react-dom";
 import { documentPath } from "@chopin/protocol/document-url";
-import { ArchiveIcon, CheckIcon, ChevronIcon, DocumentIcon, PencilIcon } from "@chopin/icons";
+import {
+	ArchiveIcon,
+	CheckIcon,
+	ChevronIcon,
+	CloseIcon,
+	DocumentIcon,
+	MagnifierIcon,
+	PencilIcon,
+} from "@chopin/icons";
 import { Badge } from "@chopin/visuals";
 import {
 	advanceDecisionView,
@@ -26,6 +34,7 @@ import {
 	Face,
 	firstOpenDecision,
 	GitHubReferencesProvider,
+	openCommentList,
 	opensEditing,
 	PlanEditor,
 	PlanStatus,
@@ -40,10 +49,13 @@ import {
 	visibleDecisionView,
 } from "@chopin/editor";
 
+import { BuildGlyph, BuildPlanButton, useBuildPlan } from "./build-plan-button";
+import { useLiveBuild } from "./live-build";
 import { BuildView } from "./build-view";
 import { Chat } from "./chat/chat";
 import { ChildPhoneChromeContext, sameEditState } from "./child-phone-chrome";
 import { ChildProvenance } from "./child-provenance";
+import { ChildTitleContext } from "./child-title";
 import { shouldShowResearchActionError, useResearchOfferLinks } from "./chat/research-offer";
 import type { ResearchDraftController } from "./chat/research-draft-controller";
 import { useDocumentEditing } from "./document-editing";
@@ -56,7 +68,11 @@ import type { CardLink } from "./conversation-plan/links";
 import type { ExcerptCorrectionAction } from "./conversation-plan/analysis-overview";
 import { ConversationPlanStore, useConversationPlan } from "./conversation-plan/store";
 import { rememberChannel } from "./channel-recovery";
-import { DecisionViewControl, useDecisionAttention } from "./decision-view-control";
+import {
+	BUILD_UNAVAILABLE,
+	DecisionViewControl,
+	useDecisionAttention,
+} from "./decision-view-control";
 import {
 	advanceDocumentActivity,
 	ANSWER_FOLLOW_MS,
@@ -79,8 +95,8 @@ import { ResearchRequestStore } from "./research-requests";
 import { GitHubReferenceCache } from "./github-references";
 import { Wire } from "./wire";
 import { ExperimentStore } from "./experiments/store";
-import { InlineInvestigations } from "./experiments/inline";
-import { EvidenceDecisions } from "./experiments/evidence";
+import { InvestigationReference, removableInvestigation } from "./experiments/card";
+import { EvidenceDecisions, ViewDecision } from "./experiments/evidence";
 import { useWorkspaceIds, useWorkspaceLayout, useWorkspaceState, Workspace } from "./workspace";
 import { initialDocumentView, presentWorkspace, workspaceProfile } from "./workspace-model";
 
@@ -88,15 +104,17 @@ import type { ConversationPlan, Plan, Question, Research, Session } from "@chopi
 import type {
 	DecisionView,
 	DecisionViewState,
+	ExperimentResources,
+	InvestigationResources,
 	PlanState,
 	Refusal,
 	ResearchLaunchResult,
 } from "@chopin/editor";
-import type { ReactNode } from "react";
 import type { DocumentMetadata } from "./document-actions";
 import type { DocumentAction } from "./document-actions-menu";
 import type { TitleEdit } from "./title-edit";
 import type { HostedWorkspaceProps } from "./hosted";
+import type { ReactNode } from "react";
 import type { Status } from "./wire";
 import type { ChatDestination } from "./conversation-plan/source";
 import type { SourceDestination } from "./conversation-plan/card-parts";
@@ -152,39 +170,63 @@ export function RoomMembers(
 					+{people.length - 3}
 				</span>
 			)}
+			{/* A narrow title bar keeps one face and counts the rest. */}
+			{people.length > 1 && (
+				<span
+					aria-hidden="true"
+					className="room-member-overflow-narrow ml-1 hidden text-xs text-text-tertiary"
+				>
+					+{people.length - 1}
+				</span>
+			)}
 		</div>
 	);
 }
 
-export function Header(
+type TitleProps = {
+	archivedAt?: string;
+	canManage: boolean;
+	editing?: TitleEdit;
+	label: string;
+	onAction: (action: DocumentAction) => void;
+	onEditingChange: (editing?: TitleEdit) => void;
+	onRenamed: (channel: DocumentMetadata) => void;
+	project?: { id: string; name: string };
+	room: string;
+};
+
+/** An open Zoom child: this title becomes a crumb back, and the child's title follows it. */
+type TitlePath = {
+	child: string;
+	onReturn: () => void;
+	/** Set while the root shows another view: the child crumb then brings Document back. */
+	onShowChild?: () => void;
+	slot: (element: HTMLElement | null) => void;
+};
+
+/**
+ * Titles renamed from their own field. A child's card is keyed by its slug, so a rename remounts
+ * it; the new title takes the caret back on mount.
+ */
+let renamedFromField = new Map<string, number>();
+
+/** The document's project, title, rename and actions menu, wherever its chrome puts them. */
+export function DocumentTitle(
 	{
 		archivedAt,
 		canManage,
 		editing,
-		members,
+		icon,
 		label,
 		onAction,
 		onEditingChange,
 		onRenamed,
+		path,
 		project,
 		room,
-		tools,
-	}: {
-		archivedAt?: string;
-		canManage: boolean;
-		editing?: TitleEdit;
-		members?: Session.Member[];
-		label: string;
-		onAction: (action: DocumentAction) => void;
-		onEditingChange: (editing?: TitleEdit) => void;
-		onRenamed: (channel: DocumentMetadata) => void;
-		project?: { id: string; name: string };
-		room: string;
-		/** Document view controls beside the people here. */
-		tools?: ReactNode;
-	},
+	}: TitleProps & { icon?: boolean; path?: TitlePath },
 ) {
-	let header = useRef<HTMLElement>(null);
+	let group = useRef<HTMLDivElement>(null);
 	let title = useRef<HTMLButtonElement>(null);
 	let previousEdit = useRef(editing);
 	useEffect(() => {
@@ -193,12 +235,19 @@ export function Header(
 		// Hand the caret back only when the field took it with it, not after a blur commit.
 		if (!editing && previous && document.activeElement === document.body) title.current?.focus();
 	}, [editing]);
+	useEffect(() => {
+		let renamed = renamedFromField.get(room);
+		renamedFromField.delete(room);
+		if (renamed === undefined || performance.now() - renamed > 2000) return;
+		let active = document.activeElement;
+		if (!active || active === document.body) title.current?.focus();
+	}, [room]);
 	// Also runs as a save starts, not after it: keys typed while the rename travels would
 	// otherwise land in a field that is about to close.
 	let handOff = () => {
 		// Naming a new document leads into writing it, unless the user already clicked elsewhere.
-		if (editing === "new" && header.current?.contains(document.activeElement)) {
-			header.current.closest(".workspace-root")
+		if (editing === "new" && group.current?.contains(document.activeElement)) {
+			group.current.closest(".workspace-root")
 				?.querySelector<HTMLElement>(".plan-content[contenteditable='true']")
 				?.focus();
 		}
@@ -207,96 +256,163 @@ export function Header(
 		handOff();
 		onEditingChange();
 	};
-	return (
-		<header
-			className="room-header relative flex shrink-0 flex-nowrap items-center px-2 py-2 sm:px-5 sm:py-0"
-			ref={header}
+	let identity = (
+		<div
+			aria-label={`Document: ${label}`}
+			className={`document-title flex min-w-0 items-center gap-0.5 ${
+				path ? "flex-initial" : "flex-1"
+			}`}
+			ref={group}
+			role="group"
 		>
-			<div
-				aria-label={`Document: ${label}`}
-				className="flex min-w-0 flex-1 items-center gap-0.5"
-			>
-				<DocumentIcon className="shrink-0" />
-				{project && (
-					<>
-						<span className="document-project-prefix truncate text-xs font-medium">
-							{project.name}
-						</span>
-						<span aria-hidden="true" className="document-project-separator text-xs">/</span>
-					</>
-				)}
-				<div className="title-control min-w-0 text-xs font-medium">
-					{editing && canManage && !archivedAt
-						? (
-							<DocumentRename
-								channel={{ id: room, title: label }}
-								inline
-								onCancel={finishEdit}
-								// The body took focus as the save started; a refusal needs the field back.
-								onErrorChange={error =>
-									error !== undefined
-									&& header.current?.querySelector<HTMLInputElement>(".document-title-input")
-										?.focus()}
-								onSavingChange={saving => saving && handOff()}
-								replay={editing === "new"}
-								onRenamed={detail => {
-									onRenamed(detail.channel);
-									finishEdit();
-								}}
-							/>
-						)
-						: canManage && !archivedAt
-						? (
-							<button
-								aria-label={`Rename ${label}`}
-								className="title-control-label document-title-trigger"
-								onClick={() => onEditingChange("rename")}
-								onKeyDown={event => {
-									if (event.key !== "F2") return;
-									event.preventDefault();
-									onEditingChange("rename");
-								}}
-								ref={title}
-								type="button"
-							>
-								<span className="truncate">{label}</span>
-							</button>
-						)
-						: <span className="title-control-label truncate">{label}</span>}
-					{canManage && (
-						<DocumentActionsMenu
-							align="start"
-							channel={{ archivedAt, title: label }}
-							className="title-control-action"
-							onAction={action =>
-								action === "rename" ? onEditingChange("rename") : onAction(action)}
-							trigger={
-								<ChevronIcon
-									aria-hidden="true"
-									className="rotate-90"
-									size={12}
-								/>
-							}
-						/>
-					)}
-				</div>
-				{archivedAt && (
-					<span className="document-archived-status">
-						<Badge icon={ArchiveIcon} label="Archived" size="sm" textSize="2xs" tone="warning" />
-						{canManage && (
-							<button
-								className="btn btn-compact btn-outline"
-								onClick={() => onAction("restore")}
-								type="button"
-							>
-								Restore
-							</button>
-						)}
+			{icon && <DocumentIcon className="shrink-0" />}
+			{project && (
+				<>
+					<span className="document-project-prefix truncate text-xs font-medium">
+						{project.name}
 					</span>
+					<span aria-hidden="true" className="document-project-separator text-xs">/</span>
+				</>
+			)}
+			{path && (
+				<button
+					aria-label={`Back to ${label}`}
+					className="document-title-crumb btn btn-compact btn-ghost min-w-0"
+					onClick={path.onReturn}
+					type="button"
+				>
+					<span className="truncate">{label}</span>
+				</button>
+			)}
+			<div className="title-control min-w-0 text-xs font-medium" hidden={!!path}>
+				{editing && canManage && !archivedAt
+					? (
+						<DocumentRename
+							channel={{ id: room, title: label }}
+							inline
+							onCancel={finishEdit}
+							// The body took focus as the save started; a refusal needs the field back.
+							onErrorChange={error =>
+								error !== undefined
+								&& group.current?.querySelector<HTMLInputElement>(".document-title-input")
+									?.focus()}
+							onSavingChange={saving => {
+								if (!saving) return;
+								if (editing !== "new" && group.current?.contains(document.activeElement)) {
+									renamedFromField.set(room, performance.now());
+								}
+								handOff();
+							}}
+							replay={editing === "new"}
+							onRenamed={detail => {
+								onRenamed(detail.channel);
+								finishEdit();
+							}}
+						/>
+					)
+					: canManage && !archivedAt
+					? (
+						<button
+							aria-label={`Rename ${label}`}
+							className="title-control-label document-title-trigger"
+							onClick={() => onEditingChange("rename")}
+							onKeyDown={event => {
+								if (event.key !== "F2") return;
+								event.preventDefault();
+								onEditingChange("rename");
+							}}
+							ref={title}
+							type="button"
+						>
+							<span className="truncate">{label}</span>
+						</button>
+					)
+					: <span className="title-control-label truncate">{label}</span>}
+				{canManage && (
+					<DocumentActionsMenu
+						align="start"
+						channel={{ archivedAt, title: label }}
+						className="title-control-action"
+						onAction={action => action === "rename" ? onEditingChange("rename") : onAction(action)}
+						trigger={
+							<ChevronIcon
+								aria-hidden="true"
+								className="rotate-90"
+								size={12}
+							/>
+						}
+					/>
 				)}
 			</div>
-			{tools}
-			{members && <RoomMembers members={members} ring="ground" />}
+			{archivedAt && (
+				<span className="document-archived-status">
+					<Badge icon={ArchiveIcon} label="Archived" size="sm" textSize="2xs" tone="warning" />
+					{canManage && (
+						<button
+							className="btn btn-compact btn-outline"
+							onClick={() => onAction("restore")}
+							type="button"
+						>
+							Restore
+						</button>
+					)}
+				</span>
+			)}
+		</div>
+	);
+	if (!path) return identity;
+	// The child's title is its own Document group, beside the root's rather than inside it.
+	return (
+		<>
+			{identity}
+			<ChevronIcon aria-hidden="true" className="document-title-crumb-chevron" size={12} />
+			{path.onShowChild && (
+				<button
+					aria-current="page"
+					className="document-title-crumb document-title-child-crumb btn btn-compact btn-ghost min-w-0"
+					onClick={path.onShowChild}
+					type="button"
+				>
+					<span className="truncate">{path.child}</span>
+				</button>
+			)}
+			<div className="document-child-title-slot" hidden={!!path.onShowChild} ref={path.slot} />
+		</>
+	);
+}
+
+/** The ground-level header of the compact workspace, which has no sheet to carry the title. */
+export function Header(
+	props: TitleProps & {
+		members?: Session.Member[];
+		/** Build plan or the build capsule, left of the people here. */
+		build?: ReactNode;
+		/** Document view controls beside the people here. */
+		tools?: ReactNode;
+	},
+) {
+	let members = props.members;
+	return (
+		<header className="room-header relative flex shrink-0 flex-nowrap items-center px-2 py-2 sm:px-5 sm:py-0">
+			<DocumentTitle
+				archivedAt={props.archivedAt}
+				canManage={props.canManage}
+				editing={props.editing}
+				icon
+				label={props.label}
+				onAction={props.onAction}
+				onEditingChange={props.onEditingChange}
+				onRenamed={props.onRenamed}
+				project={props.project}
+				room={props.room}
+			/>
+			{(props.build || props.tools || members) && (
+				<div className="ml-auto flex shrink-0 items-center gap-3 pl-2">
+					{props.build}
+					{props.tools}
+					{members && <RoomMembers members={members} ring="ground" />}
+				</div>
+			)}
 		</header>
 	);
 }
@@ -365,6 +481,8 @@ export function RoomWorkspace(
 	// survives tab changes and reconnects, and the next document opens reading again.
 	let [editing, setEditing] = useState(() => opensEditing({ renaming: titleEdit === "new" }));
 	let [formatDock, setFormatDock] = useState<HTMLElement | null>(null);
+	// The dock's Insert or Text style panel stands where the keyboard was.
+	let [formatPanel, setFormatPanel] = useState(false);
 	let keyboardOpen = useKeyboardOpen();
 	useEffect(() => {
 		let listen = (event: Event) => {
@@ -416,10 +534,14 @@ export function RoomWorkspace(
 	let [implementation, setImplementation] = useState<Plan.ImplementationStatus>({
 		revision: -1,
 		locked: false,
+		hasGraph: false,
 	});
 	let [showImplementation, setShowImplementation] = useState(false);
+	/** Which end of the capsule-to-Build-tab link is hovered, so the other lights up. */
+	let [buildHover, setBuildHover] = useState<"capsule" | "tab">();
+	let liveBuild = useLiveBuild();
 	useEffect(() => {
-		setImplementation({ revision: -1, locked: false });
+		setImplementation({ revision: -1, locked: false, hasGraph: false });
 		let update = (value: Plan.ImplementationStatus) => {
 			setImplementation(current => value.revision >= current.revision ? value : current);
 		};
@@ -445,7 +567,10 @@ export function RoomWorkspace(
 		return () => removeEventListener("hashchange", followTask);
 	}, [profile.implementation]);
 	let [questions] = useState(() => new QuestionnaireStore());
-	let experiments = useMemo(() => new ExperimentStore(room), [room]);
+	let experiments = useMemo(
+		() => new ExperimentStore(room, child => onResearchChildPublished(room, child)),
+		[onResearchChildPublished, room],
+	);
 	useSyncExternalStore(experiments.subscribe, experiments.snapshot);
 	useEffect(() => experiments.connect(wire), [experiments, wire]);
 	let [cardMeta] = useState(() => new CardMetaStore());
@@ -508,8 +633,39 @@ export function RoomWorkspace(
 		};
 	});
 	let typing = useDocumentEditing(room);
+	let build = useBuildPlan({
+		canEdit: effectiveCanEdit && !(archivedAt ?? metadata.archivedAt) && status === "connected",
+		connected: status === "connected",
+		enabled: profile.implementation,
+		hasContent: hasPlanContent,
+		live: liveBuild,
+		planner: agent,
+		plannerDetached: plannerAttachment.wire === wire && !!plannerAttachment.planner
+			&& plannerAttachment.planner.state !== "attached",
+		room,
+		unanswered,
+		userId,
+		wire,
+	});
+	// Touch has no tooltips, so a phone tap on Build, or on the build slot, says why it can't open.
+	let buildUnavailable = build.look.kind === "plan" && build.look.blocked
+		? build.look.blocked
+		: BUILD_UNAVAILABLE;
+	let [buildHint, setBuildHint] = useState<{ text: string; at: number }>();
+	useEffect(() => {
+		if (!buildHint) return;
+		let timer = window.setTimeout(() => setBuildHint(undefined), 4000);
+		return () => window.clearTimeout(timer);
+	}, [buildHint]);
+	let explainBuild = (text = buildUnavailable) => setBuildHint({ text, at: Date.now() });
+	// Build opens once there is a build; a reload may restore it before the first read.
+	// A child someone opened is what they came to read, so a blank root's routing to Decisions
+	// waits until it closes; an explicit choice of view still applies.
 	let view: WorkspaceDocumentView = showImplementation && profile.implementation
+			&& (build.tabReady || !build.snapshot)
 		? "build"
+		: presentation.type === "parent-with-child" && decisionView.phase !== "complete"
+		? "plan"
 		: visibleDecisionView(decisionView, hasPlanContent, unanswered, typing);
 	let attention = useDecisionAttention(unanswered);
 	let latestCanEdit = useRef(canEdit);
@@ -982,6 +1138,9 @@ export function RoomWorkspace(
 	let loading = phone && !arrived && !planState.failed;
 	// A child on a phone borrows its parent's tab bar (see child-phone-chrome.ts).
 	let childChrome = useContext(ChildPhoneChromeContext);
+	// Where this room's title goes when it is an open child, and where its own child's goes.
+	let childTitle = useContext(ChildTitleContext);
+	let [childTitleSlot, setChildTitleSlot] = useState<HTMLElement | null>(null);
 	let childRoom = presentation.type === "child";
 	let childOpen = presentation.type === "parent-with-child";
 	// A child opening over this document takes the pencil, so this one goes back to reading.
@@ -1000,7 +1159,9 @@ export function RoomWorkspace(
 	// What this room's own editor shows: a child is on screen only while its parent's Document is.
 	let shown = childRoom ? !!childChrome?.visible : planVisible && !childOpen;
 	// Only the document's own keyboard gets formatting: never Chat, a comment reply, or the title.
-	let docked = editMode === "editing" && keyboardOpen && shown && editorFocused;
+	// A panel lets the keyboard go on purpose, so it keeps the dock up in the keyboard's place.
+	let docked = editMode === "editing" && shown
+		&& (formatPanel || (keyboardOpen && editorFocused));
 	let toggleEditing = () => {
 		// Synchronous, so the editor takes focus inside the tap and iOS raises the keyboard.
 		flushSync(() => {
@@ -1030,6 +1191,46 @@ export function RoomWorkspace(
 		}),
 		[formatDock, planVisible, reportChildEdit],
 	);
+	let investigationsEditable = !!workspaceCanEdit && status === "connected";
+	let investigations = useMemo<InvestigationResources>(() => ({
+		create: (brief, requestId) => experiments.action("", "", { id: requestId, brief }),
+		cancel: id => experiments.action(id, "cancel", {}),
+		removable: id => removableInvestigation(experiments, id),
+		render: (id, remove) => (
+			<InvestigationReference
+				store={experiments}
+				id={id}
+				userId={userId}
+				canEdit={investigationsEditable}
+				locked={implementation.locked}
+				onRemove={remove}
+				onOpen={(child, opener) => onResearchChildOpen(room, child, { current: opener })}
+			/>
+		),
+	}), [
+		experiments,
+		userId,
+		investigationsEditable,
+		implementation.locked,
+		onResearchChildOpen,
+		room,
+	]);
+	let experimentResources = useMemo<ExperimentResources>(() => ({
+		subscribe: experiments.subscribe,
+		snapshot: experiments.snapshot,
+		get: id => experiments.get(id),
+		load: id => experiments.load(id),
+		change: (id, view, patch) => experiments.change(id, view, patch),
+		place: (id, view, decision, remove) => experiments.place(id, view, decision, remove),
+		actions: (id, view) => (
+			<ViewDecision
+				store={experiments}
+				id={id}
+				view={view}
+				disabled={!investigationsEditable || implementation.locked}
+			/>
+		),
+	}), [experiments, investigationsEditable, implementation.locked]);
 	let actOnResearchOffer = (
 		offerId: string,
 		choice: "research" | "dismiss" | "resume",
@@ -1096,6 +1297,11 @@ export function RoomWorkspace(
 	}
 	let acceptedComments =
 		threadState.threads.filter(item => item.thread.status === "accepted" && !item.applied).length;
+	// The threads a phone's list of comments can show: open, with a passage left to stand on.
+	let openComments =
+		threadState.threads.filter(item =>
+			item.thread.status === "open" && !item.orphaned && !item.drifted
+		).length;
 
 	let statusNotices = (
 		<>
@@ -1160,15 +1366,8 @@ export function RoomWorkspace(
 	let plan = (
 		<GitHubReferencesProvider value={githubReferences}>
 			<PlanEditor
-				experiments={experiments}
-				afterword={
-					<InlineInvestigations
-						store={experiments}
-						userId={userId}
-						canEdit={!!workspaceCanEdit && status === "connected"}
-						locked={implementation.locked}
-					/>
-				}
+				experiments={experimentResources}
+				investigations={profile.research ? investigations : undefined}
 				cardMeta={cardMeta}
 				evidence={showEvidence}
 				onCardSource={showCardSource}
@@ -1182,6 +1381,7 @@ export function RoomWorkspace(
 				disclosureMotion={motionContract("collapse")}
 				editMode={editMode}
 				formatDock={docked ? childRoom ? childChrome?.formatDock : formatDock : undefined}
+				onFormatPanel={setFormatPanel}
 				motionImmediately={settleMotionImmediately}
 				onScrollTop={setPlanScrollTop}
 				onState={setPlanState}
@@ -1210,7 +1410,20 @@ export function RoomWorkspace(
 			/>
 		</GitHubReferencesProvider>
 	);
+	let titleProps: TitleProps = {
+		archivedAt: workspaceArchivedAt,
+		canManage: effectiveCanManage,
+		editing: titleEdit,
+		label: metadata.title,
+		onAction: action => onDocumentAction(room, action),
+		onEditingChange: setTitleEdit,
+		onRenamed: updateMetadata,
+		project: { id: repository.id, name: repository.name },
+		room,
+	};
+
 	if (presentation.type === "child") {
+		let childTitleControl = <DocumentTitle {...titleProps} project={undefined} />;
 		return (
 			<div
 				className="child-document flex h-full min-h-0 flex-col bg-page"
@@ -1221,6 +1434,27 @@ export function RoomWorkspace(
 				<p aria-live="polite" className="sr-only" role="status">
 					<span key={announcement.sequence}>{announcement.text}</span>
 				</p>
+				{childTitle?.slot && createPortal(childTitleControl, childTitle.slot)}
+				{childTitle?.motion === "lift" && (
+					<div
+						className="document-title-bar panel-header flex shrink-0 items-center px-(--panel-toolbar-padding-inline) hairline-b"
+						data-child-title-bar
+					>
+						<span className="child-title-icon">
+							<MagnifierIcon aria-hidden="true" size={14} />
+						</span>
+						<div className="document-title-slot">{childTitleControl}</div>
+						<button
+							aria-label={`Back to ${presentation.parent?.label ?? "parent document"}`}
+							className="btn btn-icon btn-ghost shrink-0"
+							data-tooltip={`Back to ${presentation.parent?.label ?? "parent document"}`}
+							onClick={presentation.onClose}
+							type="button"
+						>
+							<CloseIcon aria-hidden="true" size={14} />
+						</button>
+					</div>
+				)}
 				<div className="child-document-status">{statusNotices}</div>
 				<section
 					aria-label="Document"
@@ -1234,6 +1468,44 @@ export function RoomWorkspace(
 		);
 	}
 
+	// Only the split workspace has title bars; compact and phones keep the stack bar.
+	let zoomChild: TitlePath | undefined =
+		presentation.type === "parent-with-child" && presentation.motion === "zoom" && mode === "split"
+			? {
+				child: presentation.path.at(-1)!.label,
+				onReturn: presentation.onChildClose,
+				// Off Document the child is out of sight, so its crumb leads back to it rather than
+				// offering a rename that would act on a document the pane isn't showing.
+				onShowChild: view === "plan" ? undefined : () => {
+					selectDestination("plan");
+					requestAnimationFrame(() => {
+						document.querySelector<HTMLElement>(
+							`[data-workspace-room="${room}"] .anchored-child-card:last-of-type`,
+						)?.focus({ preventScroll: true });
+					});
+				},
+				slot: setChildTitleSlot,
+			}
+			: undefined;
+	let childTitleValue = presentation.type === "parent-with-child" && mode === "split"
+		? { motion: presentation.motion, slot: zoomChild ? childTitleSlot : null }
+		: undefined;
+	// Build plan or the build capsule sits beside the people here; a child open beside its parent
+	// has no build of its own.
+	let buildSlot = profile.implementation && presentation.type !== "parent-with-child" && (
+		<BuildPlanButton
+			build={build}
+			canEdit={!!workspaceCanEdit && status === "connected"}
+			compact={mode !== "split"}
+			hot={buildHover === "tab"}
+			onExplain={phone ? explainBuild : undefined}
+			phone={phone}
+			onHover={on => setBuildHover(on ? "capsule" : undefined)}
+			onOpen={() => selectDestination("build")}
+			tabReady={build.tabReady}
+		/>
+	);
+
 	// The tab bar's pencil edits the document on screen: an open child, or else this one.
 	let barEdit = childOpen
 		? childEdit && { ...childEdit, toggle: () => childToggle.current?.() }
@@ -1241,190 +1513,216 @@ export function RoomWorkspace(
 
 	return (
 		<ChildPhoneChromeContext.Provider value={childChromeValue}>
-			<p aria-live="polite" className="sr-only" role="status">
-				<span key={announcement.sequence}>{announcement.text}</span>
-			</p>
-			<Workspace
-				available={available}
-				buildEnabled={hasPlanContent}
-				frame={frame}
-				chat={
-					<Chat
-						active={chatActive}
-						agent={agent}
-						focus={presentation.type === "parent-with-child" ? presentation.childId : undefined}
-						onOpenChild={presentation.onChildOpen}
-						connected={status === "connected"}
-						readonly={!workspaceCanEdit}
-						archived={!!workspaceArchivedAt}
-						handle={handle}
-						onActivity={onChatActivity}
-						notice={workspaceArchivedAt
-							? effectiveCanManage
-								? "Archived. Restore it to keep chatting."
-								: "This document is archived."
-							: !workspaceCanEdit
-							? "You have read-only access to this document."
-							: undefined}
-						onShowDecisions={() => selectDestination("decisions")}
-						onResearch={researchEnabled ? startResearch : undefined}
-						onShowResearch={showResearchDraft}
-						people={peopleHere(members)}
-						conversationPlan={conversation.state}
-						conversationPlanJobs={conversation.jobs}
-						onCardLink={showCard}
-						onAddExcerpt={addExcerpt}
-						onRetryAnalysis={retryAnalysis}
-						onRetryJob={retryJob}
-						sourceDestination={sourceDestination}
-						researchOffers={researchEnabled && conversation.enabled
-							? {
-								links: researchLinks.links,
-								busy: researchBusy,
-								errors: researchErrors,
-								canAct: status === "connected" && !!wire?.connected && !!workspaceCanEdit,
-								canCheckLink: status === "connected" && !!wire?.connected,
-								canExecute: researchExecution,
+			<ChildTitleContext.Provider value={childTitleValue}>
+				<p aria-live="polite" className="sr-only" role="status">
+					<span key={announcement.sequence}>{announcement.text}</span>
+				</p>
+				<Workspace
+					available={available}
+					buildEnabled={build.tabReady}
+					buildGlyph={<BuildGlyph look={build.look} />}
+					buildHot={buildHover === "capsule"}
+					buildUnavailable={buildUnavailable}
+					onBuildHover={on => setBuildHover(on ? "tab" : undefined)}
+					onBuildUnavailable={() => explainBuild()}
+					phoneHint={buildHint?.text}
+					frame={frame}
+					chat={
+						<Chat
+							active={chatActive}
+							agent={agent}
+							focus={presentation.type === "parent-with-child" ? presentation.childId : undefined}
+							onOpenChild={presentation.onChildOpen}
+							connected={status === "connected"}
+							readonly={!workspaceCanEdit}
+							archived={!!workspaceArchivedAt}
+							handle={handle}
+							onActivity={onChatActivity}
+							notice={workspaceArchivedAt
+								? effectiveCanManage
+									? "Archived. Restore it to keep chatting."
+									: "This document is archived."
+								: !workspaceCanEdit
+								? "You have read-only access to this document."
+								: undefined}
+							onShowDecisions={() => selectDestination("decisions")}
+							onResearch={researchEnabled ? startResearch : undefined}
+							onShowResearch={showResearchDraft}
+							people={peopleHere(members)}
+							conversationPlan={conversation.state}
+							conversationPlanJobs={conversation.jobs}
+							onCardLink={showCard}
+							onAddExcerpt={addExcerpt}
+							onRetryAnalysis={retryAnalysis}
+							onRetryJob={retryJob}
+							sourceDestination={sourceDestination}
+							researchOffers={researchEnabled && conversation.enabled
+								? {
+									links: researchLinks.links,
+									busy: researchBusy,
+									errors: researchErrors,
+									canAct: status === "connected" && !!wire?.connected && !!workspaceCanEdit,
+									canCheckLink: status === "connected" && !!wire?.connected,
+									canExecute: researchExecution,
+									wire,
+									controllers: researchDrafts,
+									handle,
+									onSource: source =>
+										showSource({
+											source: { ...source, role: "support" },
+											itemId: source.messageId,
+										}),
+									store: research,
+									onAction: actOnResearchOffer,
+									onRetryLink: offerId => researchLinks.refresh(offerId, true),
+								}
+								: undefined}
+							decisions={{
+								questions,
+								meta: cardMeta,
 								wire,
-								controllers: researchDrafts,
-								handle,
-								onSource: source =>
-									showSource({ source: { ...source, role: "support" }, itemId: source.messageId }),
-								store: research,
-								onAction: actOnResearchOffer,
-								onRetryLink: offerId => researchLinks.refresh(offerId, true),
-							}
-							: undefined}
-						decisions={{
-							questions,
-							meta: cardMeta,
-							wire,
-							connected: treatAsConnected,
-							canEdit: workspaceCanEdit,
-							onOpenCard: showDecisionCard,
-						}}
-						referencesEnabled={chatReferences.wire === wire && chatReferences.enabled}
-						repository={repository}
-						room={room}
-						sendAcknowledgements={chatSendAcks.wire === wire && chatSendAcks.enabled}
-						planner={plannerAttachment.wire === wire ? plannerAttachment.planner : undefined}
-						wire={wire}
-					/>
-				}
-				chatActivity={chatActivity}
-				documentActivity={documentActivity(documentWatch, chatActivity.busy)}
-				header={phone
-					? (
-						<PhoneHeader
-							archivedAt={workspaceArchivedAt}
-							canManage={effectiveCanManage}
-							editing={titleEdit}
-							editingDocument={!!barEdit?.editing}
-							label={metadata.title}
-							onAction={action => onDocumentAction(room, action)}
-							onEditingChange={setTitleEdit}
-							onRenamed={updateMetadata}
-							presentation={presentation}
+								connected: treatAsConnected,
+								canEdit: workspaceCanEdit,
+								onOpenCard: showDecisionCard,
+							}}
+							referencesEnabled={chatReferences.wire === wire && chatReferences.enabled}
+							repository={repository}
 							room={room}
+							sendAcknowledgements={chatSendAcks.wire === wire && chatSendAcks.enabled}
+							planner={plannerAttachment.wire === wire ? plannerAttachment.planner : undefined}
+							wire={wire}
 						/>
-					)
-					: (
-						<Header
-							archivedAt={workspaceArchivedAt}
-							canManage={effectiveCanManage}
-							editing={titleEdit}
-							members={mode === "split" ? undefined : members}
-							label={metadata.title}
-							onAction={action => onDocumentAction(room, action)}
-							onEditingChange={setTitleEdit}
-							onRenamed={updateMetadata}
-							project={{ id: repository.id, name: repository.name }}
+					}
+					chatActivity={chatActivity}
+					documentActivity={documentActivity(documentWatch, chatActivity.busy)}
+					header={phone
+						? (
+							<PhoneHeader
+								archivedAt={workspaceArchivedAt}
+								canManage={effectiveCanManage}
+								comments={openComments}
+								editing={titleEdit}
+								editingDocument={!!barEdit?.editing}
+								label={metadata.title}
+								onAction={action => onDocumentAction(room, action)}
+								onComments={() => {
+									// The list stands over the document, so it opens from any tab onto it.
+									selectDestination("plan");
+									openCommentList(room);
+								}}
+								onEditingChange={setTitleEdit}
+								onRenamed={updateMetadata}
+								presentation={presentation}
+								room={room}
+								build={buildSlot}
+							/>
+						)
+						: (
+							<Header
+								{...titleProps}
+								build={buildSlot}
+								members={members}
+								tools={<AuthorshipToggle store={authorship} />}
+							/>
+						)}
+					title={
+						<DocumentTitle
+							{...titleProps}
+							icon
+							path={zoomChild}
+						/>
+					}
+					controls={
+						<>
+							<DecisionViewControl
+								attention={attention}
+								buildEnabled={profile.implementation ? build.tabReady : undefined}
+								buildGlyph={<BuildGlyph look={build.look} />}
+								buildHot={buildHover === "capsule"}
+								onBuildHover={on => setBuildHover(on ? "tab" : undefined)}
+								documentActivity={documentActivity(documentWatch, chatActivity.busy)}
+								onView={selectDestination}
+								unanswered={unanswered}
+								view={view}
+							/>
+						</>
+					}
+					status={statusNotices}
+					ids={workspaceIds}
+					phoneAction={barEdit && (
+						<button
+							aria-label={barEdit.editing ? "Done editing" : "Edit document"}
+							className="phone-tab-action"
+							data-editing={barEdit.editing || undefined}
+							onClick={barEdit.toggle}
+							type="button"
+						>
+							<PencilIcon aria-hidden="true" data-edit-icon="edit" size={24} />
+							<CheckIcon aria-hidden="true" data-edit-icon="done" size={24} />
+						</button>
+					)}
+					// Formatting rides above the keyboard while typing. With the keyboard down the tabs
+					// return, and a selection gets the ordinary bubble instead.
+					phoneToolbar={barEdit?.docked && <div className="contents" ref={setFormatDock} />}
+					identity={room}
+					mode={mode}
+					presence={
+						<>
+							{mode === "split" && buildSlot}
+							<AuthorshipToggle store={authorship} />
+							<RoomMembers members={members} ring="page" />
+						</>
+					}
+					phone={phone}
+					onDesktopChatOpen={setDesktopChatOpen}
+					onChatOpen={open => dispatch({ type: "set-chat", open })}
+					onDestination={selectDestination}
+					build={profile.implementation && (
+						<BuildView
+							active={workspacePresentation.documentVisible && view === "build"}
+							build={build}
+							canEdit={!!workspaceCanEdit && status === "connected"}
+							comments={acceptedComments}
+							onShowDecisions={() => selectDestination("decisions")}
+							onShowDocument={() => selectDestination("plan")}
 							room={room}
-							tools={<AuthorshipToggle store={authorship} />}
+							unanswered={unanswered}
+							userId={userId}
 						/>
 					)}
-				controls={
-					<>
-						<DecisionViewControl
-							attention={attention}
-							buildEnabled={profile.implementation ? hasPlanContent : undefined}
-							documentActivity={documentActivity(documentWatch, chatActivity.busy)}
-							onView={selectDestination}
-							unanswered={unanswered}
-							view={view}
+					decisions={
+						<Decisions
+							additional={
+								<EvidenceDecisions
+									store={experiments}
+									canEdit={!!workspaceCanEdit && status === "connected"}
+								/>
+							}
+							hasAdditional={[...experiments.values.values()].some(item =>
+								item.decisions.length > 0
+							)}
+							cardMeta={cardMeta}
+							canEdit={workspaceCanEdit}
+							connected={treatAsConnected && workspaceCanEdit}
+							headingId={workspaceIds.heading.decisions}
+							motion={motionContract("collapse")}
+							motionImmediately={settleMotionImmediately}
+							onShowPlan={showPlan}
+							planner={agent}
+							questionMotion={QUESTION_MOTION}
+							reveal={reveal}
+							self={handle}
+							store={questions}
+							wire={wire}
 						/>
-					</>
-				}
-				status={statusNotices}
-				ids={workspaceIds}
-				phoneAction={barEdit && (
-					<button
-						aria-label={barEdit.editing ? "Done editing" : "Edit document"}
-						className="phone-tab-action"
-						data-editing={barEdit.editing || undefined}
-						onClick={barEdit.toggle}
-						type="button"
-					>
-						<PencilIcon aria-hidden="true" data-edit-icon="edit" size={24} />
-						<CheckIcon aria-hidden="true" data-edit-icon="done" size={24} />
-					</button>
-				)}
-				// Formatting rides above the keyboard while typing. With the keyboard down the tabs
-				// return, and a selection gets the ordinary bubble instead.
-				phoneToolbar={barEdit?.docked && <div className="h-full" ref={setFormatDock} />}
-				identity={room}
-				mode={mode}
-				presence={<RoomMembers members={members} ring="page" />}
-				phone={phone}
-				onDesktopChatOpen={setDesktopChatOpen}
-				onChatOpen={open => dispatch({ type: "set-chat", open })}
-				onDestination={selectDestination}
-				build={profile.implementation && (
-					<BuildView
-						active={workspacePresentation.documentVisible && view === "build"}
-						canEdit={!!workspaceCanEdit && status === "connected"}
-						chatLoaded={chatActivity.loaded}
-						comments={acceptedComments}
-						onShowDecisions={() => selectDestination("decisions")}
-						onShowDocument={() => selectDestination("plan")}
-						planner={agent}
-						plannerBusy={chatActivity.busy}
-						room={room}
-						unanswered={unanswered}
-						userId={userId}
-						wire={wire}
-					/>
-				)}
-				decisions={
-					<Decisions
-						additional={
-							<EvidenceDecisions
-								store={experiments}
-								canEdit={!!workspaceCanEdit && status === "connected"}
-							/>
-						}
-						hasAdditional={[...experiments.values.values()].some(item => item.decisions.length > 0)}
-						cardMeta={cardMeta}
-						canEdit={workspaceCanEdit}
-						connected={treatAsConnected && workspaceCanEdit}
-						headingId={workspaceIds.heading.decisions}
-						motion={motionContract("collapse")}
-						motionImmediately={settleMotionImmediately}
-						onShowPlan={showPlan}
-						planner={agent}
-						questionMotion={QUESTION_MOTION}
-						reveal={reveal}
-						self={handle}
-						store={questions}
-						wire={wire}
-					/>
-				}
-				plan={plan}
-				state={workspace}
-				presentation={presentation}
-				unanswered={unanswered}
-				view={view}
-			/>
+					}
+					plan={plan}
+					state={workspace}
+					presentation={presentation}
+					unanswered={unanswered}
+					view={view}
+				/>
+			</ChildTitleContext.Provider>
 		</ChildPhoneChromeContext.Provider>
 	);
 }

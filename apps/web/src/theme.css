@@ -2,6 +2,7 @@
 @import "@chopin/visuals/theme.css";
 @import "./conversation-plan/source.css";
 @import "./build-view.css";
+@import "./local-agent-note.css";
 
 /*
  * Sibling packages that build on these utilities.
@@ -43,6 +44,81 @@
 			-webkit-user-select: none;
 			user-select: none;
 			-webkit-touch-callout: none;
+		}
+	}
+}
+
+/*
+ * Quiet scrollbars. The standard properties keep each engine's own behaviour,
+ * including macOS overlay scrollbars that hide at rest. Where the system shows
+ * classic scrollbars instead (`data-scrollbars`, measured by scrollbars.ts),
+ * WebKit and Chromium paint an inset, rounded thumb that darkens under the
+ * pointer. Chromium ignores `::-webkit-scrollbar` while either standard
+ * property is set, so that branch resets both. It names `html`, not `:root`:
+ * both engines drop scrollbar `:hover` under a `:root` selector. Forced colours
+ * keep the system's.
+ */
+@layer base {
+	@media not (forced-colors: active) {
+		:root {
+			scrollbar-color: var(--color-scrollbar-thumb) transparent;
+		}
+
+		* {
+			scrollbar-width: thin;
+		}
+
+		/* Firefox has no thumb hover, so its classic scrollbars rest one step stronger. */
+		@supports (-moz-appearance: none) {
+			:root {
+				scrollbar-color: var(--color-scrollbar-thumb-static) transparent;
+			}
+		}
+
+		@supports selector(::-webkit-scrollbar) {
+			html[data-scrollbars="classic"],
+			html[data-scrollbars="classic"] :where(*) {
+				scrollbar-width: auto;
+				scrollbar-color: initial;
+			}
+
+			html[data-scrollbars="classic"]::-webkit-scrollbar,
+			html[data-scrollbars="classic"] :not([data-scrollbar-probe])::-webkit-scrollbar {
+				width: var(--scrollbar-size);
+				height: var(--scrollbar-size);
+				background: transparent;
+			}
+
+			html[data-scrollbars="classic"]::-webkit-scrollbar-track,
+			html[data-scrollbars="classic"] :not([data-scrollbar-probe])::-webkit-scrollbar-track {
+				margin: var(--scrollbar-end-margin);
+				background: transparent;
+			}
+
+			html[data-scrollbars="classic"]::-webkit-scrollbar-thumb,
+			html[data-scrollbars="classic"] :not([data-scrollbar-probe])::-webkit-scrollbar-thumb {
+				min-width: var(--scrollbar-thumb-min);
+				min-height: var(--scrollbar-thumb-min);
+				border: solid transparent;
+				border-width: var(--scrollbar-inset);
+				border-radius: var(--radius-full);
+				background: var(--color-scrollbar-thumb) padding-box;
+			}
+
+			html[data-scrollbars="classic"]::-webkit-scrollbar-thumb:hover,
+			html[data-scrollbars="classic"] :not([data-scrollbar-probe])::-webkit-scrollbar-thumb:hover {
+				background-color: var(--color-scrollbar-thumb-hover);
+			}
+
+			html[data-scrollbars="classic"]::-webkit-scrollbar-thumb:active,
+			html[data-scrollbars="classic"] :not([data-scrollbar-probe])::-webkit-scrollbar-thumb:active {
+				background-color: var(--color-scrollbar-thumb-active);
+			}
+
+			html[data-scrollbars="classic"]::-webkit-scrollbar-corner,
+			html[data-scrollbars="classic"] :not([data-scrollbar-probe])::-webkit-scrollbar-corner {
+				background: transparent;
+			}
 		}
 	}
 }
@@ -518,6 +594,11 @@ body {
 	block-size: var(--panel-header-height);
 }
 
+/* The bar clips overflow, so touch grows it to keep its controls' expanded hit areas whole. */
+:root[data-plan-coarse-pointer] {
+	--panel-header-height: calc(var(--control-target-coarse) + var(--edge-width));
+}
+
 .panel-header-control {
 	margin-inline-start: calc(-1 * var(--panel-header-control-offset));
 }
@@ -631,43 +712,15 @@ body {
 	min-width: 9rem;
 }
 
-/*
- * Split: Chat and its top bar sit on the ground; the document is the only sheet.
- * The frame spans both rows so the sheet rises to the top margin beside the bar.
- */
-.workspace-root[data-workspace-mode="split"] {
-	display: grid;
-	grid-template-columns: minmax(0, 1fr);
-	grid-template-rows: var(--document-shell-header-height) minmax(0, 1fr);
-}
-
-.workspace-root[data-workspace-mode="split"] > .workspace-header-slot {
-	z-index: 1;
-	grid-area: 1 / 1;
-	width: var(--chat-width, 0px);
-	min-width: 0;
-	transition: opacity var(--panel-open-dur) var(--motion-smooth-out);
-}
-
-.workspace-root[data-workspace-mode="split"][data-header-hidden] > .workspace-header-slot {
-	opacity: 0;
-	visibility: hidden;
-	transition:
-		opacity var(--panel-close-dur) var(--motion-smooth-out),
-		visibility 0s linear var(--panel-close-dur);
-}
-
-.workspace-root[data-workspace-mode="split"] > .workspace-frame {
-	grid-area: 1 / 1 / 3 / 2;
-}
-
-/* A visible header while expanded (a child is open) keeps the sheet below its row. */
-.workspace-root[data-workspace-mode="split"][data-document-expanded]:not([data-header-hidden])
-	> .workspace-frame {
-	grid-area: 2 / 1;
-}
-
+/* Split: Chat sits on the ground and the document is the only sheet, rising to the top margin. */
 .workspace-root[data-workspace-mode="split"] .workspace-chat-panel {
+	padding-top: calc(var(--spacing) * 3);
+}
+
+/* The floating Show sidebar trigger sits over Chat's top corner, so Chat starts below it. */
+.navigation-content[data-project-sidebar-trigger]
+	.workspace-root[data-workspace-mode="split"]
+	.workspace-chat-panel {
 	padding-top: var(--document-shell-header-height);
 }
 
@@ -694,18 +747,154 @@ body {
 }
 
 /*
- * A covered Lift sheet's tab row is one Back control. The button fills the row beneath its
- * controls, so a click between tabs and keyboard focus both reach it.
+ * The sheet's title bar: Chat toggle | project / title ... status | people. Fixed height, no
+ * vertical padding, so its dividers run the bar's full height.
  */
-[data-document-toolbar]:has(> .workspace-tab-row-return) {
+.document-title-bar {
+	position: relative;
+	gap: calc(var(--spacing) * 2);
+	container: document-title-bar / inline-size;
+}
+
+.document-title-slot {
+	display: flex;
+	min-width: 0;
+	flex: 1;
+	align-items: center;
+}
+
+/* After the Chat toggle's rule, the project sits as far in as the toggle's glyph sits from the edge. */
+.workspace-surface-toggle-slot + .document-title-slot {
+	padding-inline-start: var(--control-padding-inline);
+}
+
+/* Both bars read at one size: the views' control text. */
+.document-title-bar
+	:is(.document-project-prefix, .document-project-separator, .document-title-crumb, .title-control) {
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
+}
+
+/* The repository glyph sits as far from the project as the Chat toggle's glyph from its label. */
+.document-title-bar .document-title > [data-nucleo-icon] {
+	margin-inline-end: calc(var(--spacing) / 2);
+	color: var(--color-text-tertiary);
+}
+
+.document-title-trailing {
+	display: flex;
+	align-self: stretch;
+	flex-shrink: 0;
+	align-items: center;
+}
+
+/* Status keeps its live regions mounted, so the rule before the faces follows visible notices. */
+.document-title-status {
+	display: flex;
+	align-items: center;
+	gap: calc(var(--spacing) * 2);
+}
+
+.document-title-status:has(> :not(.sr-only, [data-level="hidden"])) {
+	padding-inline-end: calc(var(--spacing) * 2);
+}
+
+.document-title-status:has(> :not(.sr-only, [data-level="hidden"])) + .room-members {
+	align-self: stretch;
+	padding-inline-start: calc(var(--spacing) * 2);
+	border-inline-start: var(--edge-width) solid var(--color-divider);
+}
+
+.document-title-bar .title-control {
+	color: var(--color-text-primary);
+}
+
+/* A covered Lift root's title dims with the rest of its bar. */
+.workspace-document-panel[data-child-covered] .document-title-bar .title-control {
+	color: inherit;
+}
+
+/* The project keeps its name while the title truncates first. */
+.document-title-bar .document-project-prefix {
+	flex-shrink: 0;
+}
+
+/* Bar 2 holds the views and sits directly on the paper, so it has no rule beneath it. */
+.document-views-bar {
+	gap: calc(var(--spacing) * 1.5);
+	transition:
+		block-size var(--child-close-dur) var(--child-ease),
+		opacity var(--child-close-dur) var(--child-ease);
+}
+
+/* A Zoom child has no views of its own, so the root's fold away while it is open. */
+.document-views-bar[data-folded] {
+	block-size: 0;
+	opacity: 0;
+	transition-duration: var(--child-open-dur);
+}
+
+/* Zoom's path: the root is a quiet crumb back, and the child's own title control follows. */
+.document-title-crumb {
+	flex: 0 1 auto;
+	max-width: var(--label-measure-compact);
+	color: var(--color-text-tertiary);
+}
+
+/* Off Document, the hidden child is a crumb back to it, still marked as where the path ends. */
+.document-title-child-crumb {
+	max-width: none;
+	color: var(--color-text-primary);
+}
+
+.document-title-crumb-chevron {
+	flex: none;
+	color: var(--color-text-quaternary);
+}
+
+.document-child-title-slot {
+	display: flex;
+	min-width: 0;
+	flex: 1;
+}
+
+.child-title-icon {
+	display: grid;
+	align-self: stretch;
+	flex: none;
+	place-items: center;
+	padding-inline: calc(var(--spacing) * 1.5) calc(var(--spacing) * 3.5);
+	border-inline-end: var(--edge-width) solid var(--color-divider);
+	color: var(--color-text-tertiary);
+}
+
+/* The title truncates first; then status labels fold to their glyphs; then one face remains. */
+@container document-title-bar (max-width: 40rem) {
+	.document-title-status [data-status-label] {
+		display: none;
+	}
+}
+
+@container document-title-bar (max-width: 26rem) {
+	.document-title-bar .room-member-face:nth-child(n+2),
+	.document-title-bar .room-member-overflow {
+		display: none;
+	}
+
+	.document-title-bar .room-member-overflow-narrow {
+		display: inline;
+	}
+}
+
+/*
+ * A covered Lift sheet's title bar is one Back control. The button fills the bar beneath its
+ * controls, so a click on the title and keyboard focus both reach it.
+ */
+[data-document-title-bar] > :not(.workspace-tab-row-return) {
 	position: relative;
 }
 
-[data-document-toolbar]:has(> .workspace-tab-row-return) > * {
-	position: relative;
-}
-
-[data-document-toolbar] > .workspace-tab-row-return {
+[data-document-title-bar] > .workspace-tab-row-return {
 	position: absolute;
 	inset: 0;
 	cursor: pointer;
@@ -716,25 +905,144 @@ body {
 	outline-offset: calc(-1 * var(--focus-ring-width));
 }
 
+/* The divider spans the bar's full height, so the slot stretches rather than centring. */
 .workspace-surface-toggle-slot {
-	padding-inline-end: var(--spacing);
-	margin-inline-end: var(--spacing);
+	align-self: stretch;
+	padding-inline-end: calc(var(--spacing) * 2);
 	border-inline-end: var(--edge-width) solid var(--color-divider);
 }
 
-/* The restore state carries a label, so it trades the square icon size for padding. */
-.surface-toggle-restore {
-	width: auto;
-	gap: calc(var(--spacing) * 1.5);
-	padding-inline: calc(var(--spacing) * 2) calc(var(--spacing) * 2.5);
-	border: var(--edge-width) solid var(--color-edge);
-	background: var(--color-inset);
-	color: var(--color-text-secondary);
+/* Compact, to match the tabs' height and keep an equal inset inside the bar. */
+.workspace-surface-toggle-slot .chat-toggle {
+	width: var(--icon-button-size-compact);
+	height: var(--icon-button-size-compact);
+	padding: calc((var(--icon-button-size-compact) - var(--icon-size-default)) / 2);
 }
 
-.surface-toggle-restore:hover {
-	background: var(--color-selected);
-	color: var(--color-text-primary);
+/* The restore state carries a label, so it trades the square icon size for padding. */
+.workspace-surface-toggle-slot .surface-toggle-restore {
+	width: auto;
+	gap: calc(var(--spacing) * 1.5);
+	padding-inline: var(--control-padding-inline);
+}
+
+/*
+ * Scroll edge: content dissolves into the surface as it passes under the top chrome, instead of
+ * being cut by the scroller's edge. A sticky first child of each pane's scroller, folded out of
+ * flow by its negative margin. It fades in once content has scrolled under the edge, so nothing
+ * is veiled at rest; without scroll-state queries it stays hidden. Phones already scroll under a
+ * translucent bar.
+ */
+.workspace-root {
+	--scroll-edge-surface: var(--color-page);
+}
+
+.workspace-chat-panel {
+	--scroll-edge-surface: var(--color-chat-pane);
+}
+
+.workspace-root[data-workspace-mode="split"] .workspace-chat-panel {
+	--scroll-edge-surface: var(--color-ground);
+}
+
+/* Each scroller's own top padding, which the sticky edge must reach past. */
+:is([data-plan-decisions-scroll], [data-build-view-scroll]) {
+	--scroll-edge-inset: var(--document-decisions-top-inset);
+}
+
+[data-chat-scroll] {
+	--scroll-edge-inset: calc(var(--spacing) * 3);
+}
+
+.workspace-root:not([data-workspace-phone])
+	:is([data-plan-scroll], [data-plan-decisions-scroll]:not(.plan-decisions-content--empty), [data-build-view-scroll], [data-chat-scroll])::before {
+	content: "";
+	position: sticky;
+	z-index: 3;
+	/* Sticky offsets start inside the scroller's padding, so this reaches back to its edge. */
+	top: calc(-1 * var(--scroll-edge-inset, 0px));
+	display: block;
+	flex: none;
+	block-size: var(--scroll-edge-fade-size);
+	margin-block-end: calc(-1 * var(--scroll-edge-fade-size));
+	/* An eased (scrim) curve, so the fade has no visible band edge. */
+	background: linear-gradient(
+		color-mix(in srgb, var(--scroll-edge-surface) 100%, transparent) 0%,
+		color-mix(in srgb, var(--scroll-edge-surface) 73.8%, transparent) 19%,
+		color-mix(in srgb, var(--scroll-edge-surface) 54.1%, transparent) 34%,
+		color-mix(in srgb, var(--scroll-edge-surface) 38.2%, transparent) 47%,
+		color-mix(in srgb, var(--scroll-edge-surface) 27.8%, transparent) 56.5%,
+		color-mix(in srgb, var(--scroll-edge-surface) 19.4%, transparent) 65%,
+		color-mix(in srgb, var(--scroll-edge-surface) 12.5%, transparent) 73%,
+		color-mix(in srgb, var(--scroll-edge-surface) 7.6%, transparent) 80.2%,
+		color-mix(in srgb, var(--scroll-edge-surface) 4.2%, transparent) 86.1%,
+		color-mix(in srgb, var(--scroll-edge-surface) 2.1%, transparent) 91%,
+		color-mix(in srgb, var(--scroll-edge-surface) 0.8%, transparent) 95.2%,
+		color-mix(in srgb, var(--scroll-edge-surface) 0%, transparent) 100%
+	);
+	opacity: 0;
+	pointer-events: none;
+	transition: opacity var(--duration-fast) var(--ease-out);
+}
+
+/*
+ * A scroll-state query rather than a scroll-driven animation: a scroll timeline would keep an
+ * animation running forever, and settled-motion checks wait for every animation to finish.
+ */
+.workspace-root:not([data-workspace-phone])
+	:is([data-plan-scroll], [data-plan-decisions-scroll]:not(.plan-decisions-content--empty), [data-build-view-scroll], [data-chat-scroll]) {
+	container-type: scroll-state;
+}
+
+/* The document scroller also measures its width for wide blocks. */
+.workspace-root:not([data-workspace-phone]) .plan [data-plan-scroll] {
+	container-type: inline-size scroll-state;
+}
+
+@container scroll-state(scrollable: top) {
+	.workspace-root:not([data-workspace-phone])
+		:is([data-plan-scroll], [data-plan-decisions-scroll]:not(.plan-decisions-content--empty), [data-build-view-scroll], [data-chat-scroll])::before {
+		opacity: 1;
+	}
+}
+
+/* Less see-through: the surface holds solid for half the edge before it fades. */
+@media (prefers-reduced-transparency: reduce) {
+	.workspace-root:not([data-workspace-phone])
+		:is([data-plan-scroll], [data-plan-decisions-scroll]:not(.plan-decisions-content--empty), [data-build-view-scroll], [data-chat-scroll])::before {
+		background: linear-gradient(var(--scroll-edge-surface) 50%, transparent);
+	}
+}
+
+/* Unread and new-change marks: one solid petrol dot, still so it never competes with reading. */
+.activity-dot {
+	display: block;
+	flex: none;
+	width: calc(var(--spacing) * 2);
+	height: calc(var(--spacing) * 2);
+	border-radius: var(--radius-full);
+	background: var(--color-brand);
+}
+
+/* On an icon's corner, a ring in the surface colour cuts the dot out of the glyph beneath. */
+.activity-badge {
+	position: absolute;
+	top: calc(var(--spacing) * -0.75);
+	right: calc(var(--spacing) * -0.75);
+	outline-style: solid;
+	outline-width: calc(var(--spacing) / 2);
+	outline-color: var(--activity-badge-ring, var(--color-page));
+}
+
+/* The ring follows the ghost button's own fill so the knockout never shows as a halo. */
+@media (hover: hover) {
+	.btn-ghost:hover:not(:disabled) {
+		--activity-badge-ring: var(--color-gray-200);
+	}
+}
+
+.btn-ghost:active:not(:disabled) {
+	--activity-badge-ring: var(--color-gray-300);
 }
 
 /* On the ground a white composer is the brightest thing in the column. */
@@ -1798,11 +2106,6 @@ button.question-add:disabled {
 	border-radius: var(--radius-full);
 }
 
-@media (prefers-reduced-motion: no-preference) {
-	.document-activity-dot[data-document-activity="writing"] {
-		animation: chat-work-dot calc(var(--duration-base) * 8) var(--motion-move) infinite;
-	}
-}
 @media (prefers-reduced-motion: reduce) {
 	.chat-work-lattice > span,
 	.chat-work-headline-motion,
@@ -1826,11 +2129,6 @@ button.question-add:disabled {
 	}
 
 	.workspace-root[data-workspace-mode="split"] .workspace-chat-panel[data-pane-moving] {
-		transition: none;
-	}
-
-	.workspace-root[data-workspace-mode="split"] > .workspace-header-slot,
-	.workspace-root[data-workspace-mode="split"][data-header-hidden] > .workspace-header-slot {
 		transition: none;
 	}
 

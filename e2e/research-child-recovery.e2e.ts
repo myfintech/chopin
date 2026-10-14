@@ -319,21 +319,22 @@ test(
 			let paragraph = document.querySelector<HTMLElement>("[data-research-draft-anchor]")!;
 			let prose = paragraph.getBoundingClientRect();
 			let draft = element.getBoundingClientRect();
+			// A caret at the start of a passage puts the draft before it, otherwise after.
+			let follows = paragraph.nextElementSibling?.contains(element) === true;
 			return {
 				position: getComputedStyle(element).position,
 				proseWidth: prose.width,
 				width: draft.width,
 				left: draft.left,
 				proseLeft: prose.left,
-				top: draft.top,
-				proseBottom: prose.bottom,
+				clear: follows ? draft.top - prose.bottom : prose.top - draft.bottom,
 			};
 		});
 		expect(layout.position).toBe("static");
 		expect(layout.proseWidth).toBeCloseTo(650, 0);
 		expect(layout.width).toBeCloseTo(layout.proseWidth, 0);
 		expect(layout.left).toBeCloseTo(layout.proseLeft, 0);
-		expect(layout.top).toBeGreaterThanOrEqual(layout.proseBottom);
+		expect(layout.clear).toBeGreaterThanOrEqual(0);
 		await opened.screenshot({ path: testInfo.outputPath("research-draft-layout.png") });
 		let before = await composer.boundingBox();
 		let travelled = await editor.evaluate(element => {
@@ -488,7 +489,7 @@ test("inline research publishes one ordinary child and opens it", async ({ baseU
 	await expect(surface.locator(`[data-workspace-room="${child.id}"]`)).toBeVisible();
 	await expect(surface.getByRole("button", { name: `Close ${childTitle}` })).toHaveCount(0);
 	await expect(surface.getByText("Discuss this report here.")).toHaveCount(0);
-	// Lift's peeking root tab row is the way back; Enter on it closes and refocuses the opener.
+	// The title bar's Back to the root closes the child and refocuses the opener.
 	let back = opened.getByRole("button", { name: /^Back to / });
 	await surface.evaluate(async element => {
 		let finite = element.getAnimations({ subtree: true })
@@ -769,8 +770,9 @@ test("parent metadata keeps a child route while its document is loading", async 
 		});
 		expect(response.ok()).toBe(true);
 		let renamed = (await response.json()) as { channel: { slug: string } };
-		await expect(page.locator(`[data-workspace-room="${room}"] .room-header`))
-			.toContainText(title);
+		await expect(
+			page.locator(`[data-workspace-room="${room}"]`).getByRole("group", { name: /^Document: / }),
+		).toContainText(title);
 		await expect(page).toHaveURL(url =>
 			url.pathname === `/documents/octo-org/score/${renamed.channel.slug}/children/${child.slug}`
 		);
