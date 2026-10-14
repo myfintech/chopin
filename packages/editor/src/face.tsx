@@ -21,6 +21,7 @@
 import { useState } from "react";
 
 import { color } from "./cursor";
+import { isDemoHandle, personName, profiles } from "./people";
 
 /** Retina-sharp at the rendered size. */
 function photograph(handle: string, size: number): string {
@@ -77,12 +78,15 @@ function Portrait(
 	let [failed, setFailed] = useState(false);
 	let [loaded, setLoaded] = useState(false);
 	let tone = color(handle);
+	let name = personName(handle);
+	let local = profiles.get(handle)?.avatar;
+	let source = local ?? (isDemoHandle(handle) ? undefined : photograph(handle, size));
 	let edge = `${FACE_RADIUS_CLASS[faceCorner(size)]} ${ring ? FACE_RING_CLASS[ring] : ""}`;
 
 	return (
 		<span
 			aria-hidden={decorative || undefined}
-			aria-label={decorative ? undefined : handle}
+			aria-label={decorative ? undefined : name}
 			role={decorative ? undefined : "img"}
 			className={`relative grid shrink-0 place-items-center overflow-hidden ${
 				textSize === "2xs" ? "text-2xs" : "text-xs"
@@ -93,17 +97,17 @@ function Portrait(
 				background: `color-mix(in srgb, ${tone} 18%, var(--color-page))`,
 				color: `color-mix(in srgb, ${tone} 80%, var(--color-text-primary))`,
 			}}
-			title={titled ? handle : undefined}
+			title={titled ? name : undefined}
 		>
-			{!loaded && <span aria-hidden="true">{handle.slice(0, 1)}</span>}
-			{!failed && (
+			{!loaded && <span aria-hidden="true">{name.slice(0, 1)}</span>}
+			{!failed && source && (
 				<img
 					alt=""
 					className={`absolute inset-0 size-full object-cover ${loaded ? "" : "opacity-0"}`}
 					onError={() => setFailed(true)}
 					onLoad={() => setLoaded(true)}
 					referrerPolicy="no-referrer"
-					src={photograph(handle, size)}
+					src={source}
 				/>
 			)}
 		</span>

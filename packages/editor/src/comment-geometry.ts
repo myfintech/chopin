@@ -209,7 +209,9 @@ export type CardPoint = Point & { width: number; side: CardSide; maxHeight?: num
  * When the gutter right of the prose column holds the card beyond the marker
  * lane, it sits there beside the passage's first line. Otherwise it sits
  * directly below the passage, or above it when only that side has room, aligned
- * to the passage's left edge and kept inside the column. When neither side
+ * to the column's right edge so it opens beneath the marker that raised it. A
+ * draft has no marker yet: `align: "passage"` keeps it at the selection's left
+ * edge instead, inside the column. When neither side
  * holds the whole card, the roomier side caps its height so it scrolls instead.
  * A passage scrolled out of view lets the card clamp back inside the document.
  */
@@ -219,7 +221,8 @@ export function commentCardPoint(
 	host: Rect,
 	width: number,
 	height: number,
-	{ gap = 8, inset = 12, lane = 56, minWidth = 264 }: {
+	{ align = "column", gap = 8, inset = 12, lane = 56, minWidth = 264 }: {
+		align?: "column" | "passage";
 		gap?: number;
 		inset?: number;
 		lane?: number;
@@ -229,20 +232,20 @@ export function commentCardPoint(
 	let gutter = host.right - inset - (column.right + lane);
 	if (gutter >= minWidth) {
 		let fitted = Math.min(width, gutter);
+		let room = host.height - inset * 2;
 		return {
 			top: clamp(passage.top - host.top, inset, host.height - height - inset),
 			left: column.right + lane - host.left,
 			width: fitted,
 			side: "right",
+			...(height > room ? { maxHeight: room } : {}),
 		};
 	}
 
 	let fitted = Math.min(width, column.width);
-	let left = clamp(
-		passage.left - host.left,
-		column.left - host.left,
-		column.right - host.left - fitted,
-	);
+	let left = align === "passage"
+		? clamp(passage.left - host.left, column.left - host.left, column.right - host.left - fitted)
+		: clamp(column.right - host.left - fitted, 0, host.width - fitted);
 	let below = host.bottom - inset - (passage.bottom + gap);
 	let above = passage.top - gap - (host.top + inset);
 	let point: CardPoint = {

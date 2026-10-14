@@ -23,15 +23,15 @@ test("a graph already within its lane keeps the authored layout", () => {
 	expect(renderDiagram(spec, { availableWidth: 900 })).toEqual(renderDiagram(spec));
 });
 
-test("semantic lane, stage and chart layouts retain their native axes", () => {
-	for (let type of ["swimlane", "medallion", "sequence", "bar"]) {
+test("semantic lane and stage layouts retain their native axes", () => {
+	for (let type of ["swimlane", "medallion", "sequence"]) {
 		let spec = DIAGRAM_FIXTURES.find(fixture => fixture.type === type)!.spec;
 		expect(renderDiagram(spec, { availableWidth: 300 })).toEqual(renderDiagram(spec));
 	}
 });
 
-test("fit retains a readable lower bound for dense diagrams and never enlarges small diagrams", () => {
-	expect(fitDiagram(2000, 300)).toBe(0.85);
+test("fit shows the whole width and never enlarges small diagrams", () => {
+	expect(fitDiagram(2000, 300)).toBe(0.15);
 	expect(fitDiagram(1000, 900)).toBe(0.9);
 	expect(fitDiagram(500, 900)).toBe(1);
 });

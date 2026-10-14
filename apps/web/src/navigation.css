@@ -56,6 +56,70 @@
 	padding-left: calc(44px - var(--spacing) * 3);
 }
 
+/*
+ * A workspace notice (workspace-notice.tsx) keeps the document's frame: split puts its sheet at
+ * the top margin, clear of the floating Show sidebar trigger as an expanded document is; compact
+ * keeps the ground header above it. Split starts with a 700px frame, as `workspaceSizing` does.
+ */
+.workspace-notice {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	background: var(--color-ground);
+	container: workspace-notice / inline-size;
+
+	& > .room-header {
+		display: none;
+	}
+}
+
+.workspace-notice-frame {
+	display: flex;
+	flex: 1;
+	min-height: 0;
+	margin: calc(var(--spacing) * 3) calc(var(--spacing) * 3 + env(safe-area-inset-right))
+		calc(var(--spacing) * 3) calc(var(--spacing) * 3 + env(safe-area-inset-left));
+}
+
+.navigation-content[data-project-sidebar-trigger] .workspace-notice-frame {
+	padding-left: calc(44px - var(--spacing) * 3);
+}
+
+.workspace-notice-sheet {
+	display: flex;
+	flex: 1;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: var(--spacing);
+	min-width: 0;
+	padding-inline: calc(var(--spacing) * 4);
+	overflow: hidden;
+	border-radius: var(--radius-panel);
+	background: var(--color-ground);
+	box-shadow: var(--shadow-raised);
+	outline: var(--edge-width) solid var(--color-edge);
+	outline-offset: calc(-1 * var(--edge-width));
+	text-align: center;
+}
+
+@container workspace-notice (width < 724px) {
+	.workspace-notice > .room-header {
+		display: block;
+		flex: none;
+	}
+
+	.navigation-content[data-project-sidebar-trigger] .workspace-notice-frame,
+	.workspace-notice-frame {
+		margin: calc(var(--spacing) * 2);
+		padding-left: 0;
+	}
+
+	.workspace-notice-sheet {
+		box-shadow: var(--shadow-resting);
+	}
+}
+
 .anchored-child-host {
 	position: relative;
 	height: 100%;
@@ -639,6 +703,52 @@
 	> .project-sidebar-action {
 	--icon-button-reveal: 1;
 	overflow: visible;
+}
+
+/* Machines in the sidebar and the phone documents sheet: paired count, and a dot while connected. */
+.machines-entry-icon {
+	flex: none;
+	color: var(--color-text-tertiary);
+}
+
+/* On /connect the entry is the current page, marked as a current document is. */
+.project-sidebar-primary-action[aria-current="page"] {
+	background: var(--project-sidebar-selected);
+	color: var(--color-text-primary);
+
+	& .machines-entry-icon {
+		color: var(--color-text-secondary);
+	}
+}
+
+.machines-entry-count {
+	display: flex;
+	flex: 0 0 auto;
+	align-items: center;
+	gap: calc(var(--spacing) * 1.5);
+	margin-left: auto;
+}
+
+/*
+ * A machine's state as a small solid dot, the same in the sidebar, the Machines table, its phone
+ * list and a machine's own view: success when connected, tertiary ink when not, warning when it
+ * needs pairing again. Static, as Tailscale's is; the words beside it stay quiet.
+ */
+.status-dot {
+	display: inline-block;
+	flex: none;
+	width: calc(var(--spacing) * 2);
+	height: calc(var(--spacing) * 2);
+	border-radius: var(--radius-full);
+	background: var(--color-text-tertiary);
+
+	&[data-state="connected"] {
+		background: var(--color-success);
+	}
+
+	&[data-state="reauthorize"] {
+		background: var(--color-warning);
+	}
 }
 
 .project-sidebar-count {
@@ -1255,6 +1365,14 @@
 	--item-gap: var(--menu-item-gap-compact);
 }
 
+/* A title with a line of description under it, its icon level with the title. */
+.app-menu-item[data-density="detailed"] {
+	--item-padding-block: calc(var(--spacing) * 2.5);
+	--item-padding-inline: calc(var(--spacing) * 3);
+	--item-gap: calc(var(--spacing) * 3);
+	align-items: flex-start;
+}
+
 .app-menu-item:is(:hover:not(:disabled), :focus-visible) {
 	background: var(--color-hover);
 	color: var(--color-text-primary);
@@ -1341,7 +1459,8 @@
 
 :root[data-plan-coarse-pointer]
 	:where(.document-actions-menu, .navigation-account-menu)
-	:is(button, a) {
+	:is(button, a),
+:root[data-plan-coarse-pointer] .app-menu-item {
 	min-height: var(--control-target-coarse);
 }
 

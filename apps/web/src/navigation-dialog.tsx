@@ -15,6 +15,7 @@ export type NavigationDialogMotion = Pick<
 export function NavigationDialog(
 	{
 		children,
+		className = "",
 		initialFocus,
 		motion,
 		onDismiss,
@@ -22,6 +23,8 @@ export function NavigationDialog(
 		title,
 	}: {
 		children: ReactNode;
+		/** Extra classes for the dialog itself, such as a wider size. */
+		className?: string;
 		initialFocus?: RefObject<HTMLElement | null>;
 		motion: NavigationDialogMotion;
 		onDismiss: () => void;
@@ -52,7 +55,9 @@ export function NavigationDialog(
 				<div
 					aria-labelledby={titleId}
 					aria-modal="true"
-					className={`navigation-modal-content${palette ? " navigation-palette" : ""}`}
+					className={`navigation-modal-content${palette ? " navigation-palette" : ""}${
+						className ? ` ${className}` : ""
+					}`}
 					ref={dialog}
 					role="dialog"
 					tabIndex={-1}

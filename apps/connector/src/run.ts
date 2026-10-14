@@ -1,17 +1,24 @@
 import { requestSchema } from "@chopin/experiment";
 import type { BuildRequest } from "@chopin/protocol/implementation";
 import { remote } from "./mcp";
-import { ConnectorStopped } from "./connection";
+import { ConnectorStopped, redacted } from "./connection";
 import { errorCode } from "./machine";
 import { backoff, delay, forgottenMessage, RUN_GRACE_MS, runReports } from "./reconnect";
 import { bridgeCommand } from "./bridge";
 import { runAgent } from "./acp";
+import type { AgentInfo } from "./acp";
 import { serveLocalBridge } from "./local-bridge";
 import { createOutput } from "./output";
 import type { Output } from "./output";
 import { ask, describePermission, permissionMemory } from "./permission";
 import { stopProcessesIn } from "./processes";
-import { discardWorkspace, git, noPushEnvironment, prepareWorkspace } from "./workspace";
+import {
+	discardWorkspace,
+	git,
+	noPushEnvironment,
+	prepareWorkspace,
+	type StartFailures,
+} from "./workspace";
 import {
 	implementationPrompt,
 	liveImplementationPrompt,
@@ -20,6 +27,8 @@ import {
 } from "./implementation";
 
 type Options = {
+	/** Called with the agent's name and version once it has answered ACP initialize. */
+	onAgent?: (info: AgentInfo) => void;
 	root: string;
 	directory: string;
 	command: string[];
@@ -40,6 +49,10 @@ type Options = {
 	forgetMs?: number;
 	/** The jitter source for retries, for tests. */
 	random?: () => number;
+	/** Where an agent that fails to start is recorded for `chopin status`. */
+	failures?: StartFailures;
+	/** The `--env` variables connect saved, for the agent. */
+	env?: Record<string, string>;
 };
 export const STOPPED = "Stopped from the connector terminal.";
 
@@ -82,12 +95,14 @@ export async function runWork(
 	let permissions = options.permissions ?? permissionMemory();
 	// Kept so a failed start can show why without echoing every agent log line.
 	let agentTail: string[] = [];
+	let agentMessage = "";
 	let identity = implementation ? { id: input.id } : { id: input.id, generation: claim.generation };
 	let abort = new AbortController();
 	let cancel = () => abort.abort();
 	options.signal.addEventListener("abort", cancel, { once: true });
 	if (options.signal.aborted) abort.abort();
 	let latestProgress = "Preparing checkout";
+	let pendingPermissions = 0;
 	/** Why the connector stopped the agent itself, when Chopin ended the run or stayed out of reach. */
 	let ended: string | undefined;
 	/** Chopin forgot this connection, so the connector must stop once the run has reported. */
@@ -127,7 +142,12 @@ export async function runWork(
 			try {
 				let result = await reports.attempt(
 					implementation ? "renew_implementation_build" : "renew_experiment",
-					{ ...identity, ...(!implementation ? { progress: latestProgress } : {}) },
+					{
+						...identity,
+						progress: pendingPermissions
+							? "Waiting for permission in the owner's terminal"
+							: latestProgress,
+					},
 					beat,
 				);
 				failures = 0;
@@ -153,7 +173,12 @@ export async function runWork(
 	let prepared: Awaited<ReturnType<typeof prepareWorkspace>> | undefined;
 	let agentStop: string | undefined;
 	try {
-		prepared = await prepareWorkspace(options.root, options.directory, input);
+		prepared = await prepareWorkspace(
+			options.root,
+			options.directory,
+			input,
+			implementation ? undefined : claim.generation,
+		);
 		let path = prepared.path;
 		// A rebuild commits onto the existing pull request branches the agent checks out itself.
 		if (implementation && !rebuild) {
@@ -173,9 +198,19 @@ export async function runWork(
 			path,
 		);
 		let stop = await runAgent({
+			...(options.onAgent ? { onInfo: options.onAgent } : {}),
 			command: options.command,
 			cwd: path,
-			...(claim.spike ? { env: noPushEnvironment() } : {}),
+			...(claim.spike || options.env
+				? { env: { ...options.env, ...(claim.spike ? noPushEnvironment() : {}) } }
+				: {}),
+			onStart: failure =>
+				void (failure
+					? options.failures?.failed(
+						{ kind: "agent", ...failure, at: Date.now() },
+						Object.values(options.env ?? {}),
+					)
+					: options.failures?.started()),
 			prompt: rebuild
 				? rebuildPrompt
 				: implementation
@@ -189,12 +224,16 @@ export async function runWork(
 				: "Use read_investigation from the Chopin MCP server to read the authorized request. "
 					+ "Perform that investigation using your normal project instructions and tools. "
 					+ "Submit a bounded result with submit_investigation_result, then finish. "
+					+ "If screenshots are requested, install project dependencies as needed, capture "
+					+ "the real UI, upload at most three images (1 MiB each) with "
+					+ "upload_image_file({path}), and embed the returned "
+					+ "paths as Markdown images in result.report. "
 					+ "Do not commit or push unless the authorized brief specifically requests it.",
-			// A spike needs the connector-local upload_image_file, so its tools come from this process:
+			// Investigations need the local upload_image_file, so their tools come from this process:
 			// a loopback HTTP bridge when the agent accepts HTTP servers, the stdio bridge otherwise.
 			mcpServers(http) {
 				let name = implementation ? "chopin-implementation" : "chopin-investigation";
-				if (http && claim.spike) {
+				if (http && !implementation) {
 					let tools: ReturnType<typeof relay> | undefined;
 					local = serveLocalBridge(() => {
 						tools ??= (bridgeApi ??= remote(options.url, claim.runToken))
@@ -226,8 +265,7 @@ export async function runWork(
 					env: [
 						{ name: "CHOPIN_BRIDGE_ORIGIN", value: options.url },
 						{ name: "CHOPIN_BRIDGE_TOKEN", value: claim.runToken },
-						{ name: "CHOPIN_BRIDGE_KIND", value: claim.spike ? "spike" : kind },
-						...(claim.spike ? [{ name: "CHOPIN_BRIDGE_ROOT", value: path }] : []),
+						...(!implementation ? [{ name: "CHOPIN_BRIDGE_ROOT", value: path }] : []),
 					],
 				}];
 			},
@@ -242,31 +280,44 @@ export async function runWork(
 					}).then(() => {})
 				: undefined,
 			onUpdate(value) {
-				if (value.update.sessionUpdate === "tool_call") {
-					latestProgress = value.update.title.slice(0, 2000);
+				if (value.update.sessionUpdate === "tool_call") agentMessage = "";
+				if (
+					(value.update.sessionUpdate === "tool_call"
+						|| value.update.sessionUpdate === "tool_call_update") && value.update.title
+				) {
+					latestProgress = value.update.title.trim().slice(0, 2000) || latestProgress;
+				} else if (
+					value.update.sessionUpdate === "agent_message_chunk"
+					&& value.update.content.type === "text"
+				) {
+					agentMessage = (agentMessage + value.update.content.text).slice(-1500);
 				}
 			},
 			async permission(request) {
 				let remembered = permissions.remembered(request);
 				if (remembered) return remembered;
-				latestProgress = "Waiting for permission in the owner's terminal";
 				if (!process.stdin.isTTY) return undefined;
-				let [heading, ...detail] = describePermission(request);
-				output.say(
-					"",
-					`  ${output.style.bold(`Allow ${heading}?`)}`,
-					...detail.map(line => `    ${line}`),
-					...request.options.map((option, index) => `  ${index + 1}. ${option.name}`),
-				);
-				let answer = await ask("  Select option (blank cancels): ", {
-					input: process.stdin,
-					output: process.stdout,
-					signal: abort.signal,
-					interrupt: options.interrupt ?? (() => abort.abort()),
-				});
-				let chosen = request.options[Number(answer) - 1]?.optionId;
-				permissions.chose(request, chosen);
-				return chosen;
+				pendingPermissions++;
+				try {
+					let [heading, ...detail] = describePermission(request);
+					output.say(
+						"",
+						`  ${output.style.bold(`Allow ${heading}?`)}`,
+						...detail.map(line => `    ${line}`),
+						...request.options.map((option, index) => `  ${index + 1}. ${option.name}`),
+					);
+					let answer = await ask("  Select option (blank cancels): ", {
+						input: process.stdin,
+						output: process.stdout,
+						signal: abort.signal,
+						interrupt: options.interrupt ?? (() => abort.abort()),
+					});
+					let chosen = request.options[Number(answer) - 1]?.optionId;
+					permissions.chose(request, chosen);
+					return chosen;
+				} finally {
+					pendingPermissions--;
+				}
 			},
 			stderr(text) {
 				agentTail = [...agentTail, ...text.split("\n").filter(Boolean)].slice(-10);
@@ -286,15 +337,22 @@ export async function runWork(
 		// Ctrl-C reports why before the connector disconnects, so Chopin knows at once. An agent
 		// that cancelled its own turn was interrupted too, unless the connector cancelled it.
 		let stopped = options.signal.aborted || agentStop === "cancelled" && !ended;
+		let missing = !implementation && errorCode(error) === "missing-result";
 		let message = stopped
 			? STOPPED
 			: ended
 			? ended
+			: missing
+			? "The local agent finished without submitting an investigation result."
+				+ (agentMessage.trim() ? `\n\n${agentMessage.trim()}` : "")
 			: error instanceof Error
 			? error.message
 			: "Local work failed";
 		if (stopped) output.stopped();
-		else output.failed(message, agentTail);
+		else {
+			let secrets = Object.values(options.env ?? {});
+			output.failed(message, agentTail.map(line => redacted(line, secrets)));
+		}
 		// After Ctrl-C, or out of reach for the whole grace period, the failure gets one bounded attempt.
 		let send = stopped || reports.expired() ? reports.final : reports.deliver;
 		await send(implementation ? "report_implementation_build" : "fail_experiment", {

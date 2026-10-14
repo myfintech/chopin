@@ -342,8 +342,21 @@ function CommentSurface(
 	},
 ) {
 	let lifecycle = useCommentPresence(value, compact ? 180 : 150, immediately);
-	if (lifecycle.presence.phase === "closed") return null;
-	let surface = lifecycle.presence.value;
+	let surface = lifecycle.presence.phase === "closed" ? undefined : lifecycle.presence.value;
+	let element = useRef<HTMLDivElement | null>(null);
+	let measure = useRef(surface?.onMeasure);
+	measure.current = surface?.onMeasure;
+	let open = !!surface;
+	// Content can grow after the card is placed, as when a long thread unfolds its replies,
+	// so the card is measured again and re-placed rather than running off the document.
+	useLayoutEffect(() => {
+		let card = element.current;
+		if (!open || !card) return;
+		let observer = new ResizeObserver(() => measure.current?.(card));
+		for (let child of card.children) observer.observe(child);
+		return () => observer.disconnect();
+	}, [open, surface?.id]);
+	if (!surface) return null;
 	return (
 		<div
 			aria-hidden={lifecycle.ariaHidden}
@@ -356,7 +369,10 @@ function CommentSurface(
 			inert={lifecycle.inert}
 			onMouseEnter={surface.onMouseEnter}
 			onMouseLeave={surface.onMouseLeave}
-			ref={surface.onMeasure}
+			ref={node => {
+				element.current = node;
+				surface.onMeasure?.(node);
+			}}
 			role="dialog"
 			style={surface.style}
 		>
@@ -1083,14 +1099,14 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 	let editorRoot = editor.getRootElement();
 	let column = editorRoot ? proseColumn(editorRoot) : page;
 	let cardWidth = Math.min(320, host.clientWidth - 24);
-	let cardPlacement = (passage: Rect, id: string) => {
+	let cardPlacement = (passage: Rect, id: string, align?: "passage") => {
 		let { side, ...style } = commentCardPoint(
 			passage,
 			column,
 			page,
 			cardWidth,
 			cardHeights[id] ?? 0,
-			{ lane: MARKER_LANE },
+			{ align, lane: MARKER_LANE },
 		);
 		return { side, style };
 	};
@@ -1131,6 +1147,7 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 			<DraftCard
 				onCancel={cancelDraft}
 				onSend={(text, to) => store.start(text, to)}
+				planner={options.commentPlanner !== false}
 				sheet
 			/>
 		);
@@ -1390,11 +1407,12 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 							<DraftCard
 								onCancel={cancelDraft}
 								onSend={(text, to) => store.start(text, to)}
+								planner={options.commentPlanner !== false}
 							/>
 						),
 						className: "plan-comment-card",
 						onMeasure: element => rememberHeight("draft", element),
-						...cardPlacement(draft.placement, "draft"),
+						...cardPlacement(draft.placement, "draft", "passage"),
 					}
 					: undefined}
 			/>

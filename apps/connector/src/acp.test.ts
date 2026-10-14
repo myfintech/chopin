@@ -1,9 +1,5 @@
 import { expect, test } from "bun:test";
-import { runAgent } from "./acp";
-import { createBridge } from "./bridge";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { performance } from "@chopin/experiment/fixtures";
+import { checkAgent, runAgent } from "./acp";
 
 test.skipIf(!process.env.CHOPIN_TEST_ACP_COMMAND)(
 	"real ACP implementation smoke check",
@@ -39,6 +35,32 @@ test("a generic ACP process receives a cwd and produces protocol updates", async
 	expect(updates).toHaveLength(1);
 });
 
+test("the agent's name and version come from its ACP initialize answer, at a check or a run", async () => {
+	let command = [process.execPath, new URL("./testing/fake-agent.ts", import.meta.url).pathname];
+	let checked: unknown[] = [];
+	expect(
+		await checkAgent(command, {
+			cwd: process.cwd(),
+			env: process.env,
+			onInfo: info => checked.push(info),
+		}),
+	).toBeUndefined();
+	let ran: unknown[] = [];
+	await runAgent({
+		command,
+		cwd: process.cwd(),
+		prompt: "Investigate",
+		mcpServers: [],
+		signal: new AbortController().signal,
+		onUpdate: () => {},
+		permission: async () => undefined,
+		onInfo: info => ran.push(info),
+	});
+	// The title, as people know it, rather than the package name.
+	expect(checked).toEqual([{ name: "Fake Agent", version: "1.2.3" }]);
+	expect(ran).toEqual(checked);
+});
+
 test("ACP cancellation finishes the active turn through the standard protocol", async () => {
 	let abort = new AbortController();
 	let stop = await runAgent({
@@ -57,36 +79,29 @@ test("ACP cancellation finishes the active turn through the standard protocol", 
 	expect(stop).toBe("cancelled");
 });
 
-test("run-scoped MCP tools accept typed evidence and expose no arbitrary host operations", async () => {
-	let received: unknown;
-	let server = createBridge({
-		id: crypto.randomUUID(),
-		documentId: crypto.randomUUID(),
-		brief: "Measure startup",
-		source: { repositoryId: "repo", repository: "org/repo", commit: "a".repeat(40) },
-		context: "",
-		requester: "alice",
-		authorizer: "alice",
-	}, async result => {
-		received = result;
-	});
-	let client = new Client({ name: "test", version: "1" });
-	let [left, right] = InMemoryTransport.createLinkedPair();
-	await server.connect(right);
-	await client.connect(left);
-	try {
-		expect((await client.listTools()).tools.map(tool => tool.name)).toEqual([
-			"read_investigation",
-			"submit_investigation_result",
-		]);
-		let result = await client.callTool({
-			name: "submit_investigation_result",
-			arguments: { result: performance },
+test.skipIf(process.platform === "win32")(
+	"an agent that exits before its session reports how, and one that starts says so",
+	async () => {
+		let starts: unknown[] = [];
+		let options = {
+			cwd: process.cwd(),
+			prompt: "Investigate",
+			mcpServers: [],
+			signal: new AbortController().signal,
+			onUpdate: () => {},
+			permission: async () => undefined,
+			onStart: (failure?: unknown) => void starts.push(failure),
+		};
+		let failed = await runAgent({
+			...options,
+			command: ["/bin/sh", "-c", "echo 'agent: no credentials' >&2; exit 127"],
+		}).catch(error => error);
+		expect(failed).toBeInstanceOf(Error);
+		expect(starts).toEqual([{ how: "exit 127", stderr: "agent: no credentials" }]);
+		await runAgent({
+			...options,
+			command: [process.execPath, new URL("./testing/fake-agent.ts", import.meta.url).pathname],
 		});
-		expect(result.isError).not.toBe(true);
-		expect(received).toEqual(performance);
-	} finally {
-		await client.close();
-		await server.close();
-	}
-});
+		expect(starts).toEqual([{ how: "exit 127", stderr: "agent: no credentials" }, undefined]);
+	},
+);

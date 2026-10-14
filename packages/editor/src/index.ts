@@ -40,6 +40,8 @@ export { AgentFace, Face } from "./face";
 export type { FaceProps } from "./face";
 export { GitHubReferencesProvider } from "./github-references";
 export type { Refusal } from "./history";
+export { isDemoHandle, personName, setFaceProfiles } from "./people";
+export type { FaceProfile } from "./people";
 export { PlanEditor } from "./plan-editor";
 export type { PlanEditorProps, PlanState } from "./plan-editor";
 export { isPhone, usePhone, usePointerCapabilities } from "./pointer";

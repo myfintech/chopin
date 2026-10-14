@@ -15,10 +15,19 @@ let cancelled = () => {};
 let app = new AgentApp()
 	.onRequest(
 		"initialize",
-		() => ({
-			protocolVersion: PROTOCOL_VERSION,
-			agentCapabilities: process.argv.includes("--http") ? { mcpCapabilities: { http: true } } : {},
-		}),
+		async () => {
+			if (process.argv.includes("--slow-start")) {
+				// An agent still starting, as one fetching itself on first launch is; it never answers.
+				await writeFile(process.env.CHOPIN_TEST_STARTING!, "");
+				await new Promise(() => {});
+			}
+			return {
+				protocolVersion: PROTOCOL_VERSION,
+				agentCapabilities: process.argv.includes("--http")
+					? { mcpCapabilities: { http: true } }
+					: {},
+			};
+		},
 	)
 	.onRequest("session/new", ({ params }) => {
 		servers = params.mcpServers;
@@ -26,7 +35,7 @@ let app = new AgentApp()
 		return { sessionId: "implementation-acp-session" };
 	})
 	.onNotification("session/cancel", () => cancelled())
-	.onRequest("session/prompt", async ({ params }) => {
+	.onRequest("session/prompt", async ({ params, client: ownerClient }) => {
 		if (process.argv.includes("--orphan")) {
 			// A dev server in its own process group, as `vite &` from an agent's shell tool is.
 			let server = spawn("sleep", ["600"], { cwd, detached: true, stdio: "ignore" });
@@ -37,6 +46,35 @@ let app = new AgentApp()
 		// The agent's own turn interrupted, as when Ctrl-C reaches it with the connector.
 		if (process.argv.includes("--self-cancel")) return { stopReason: "cancelled" as const };
 		if (process.argv.includes("--hang")) {
+			if (process.argv.includes("--activity")) {
+				await ownerClient.notify("session/update", {
+					sessionId: params.sessionId,
+					update: {
+						sessionUpdate: "tool_call",
+						toolCallId: "tests",
+						title: "Running server tests",
+						kind: "execute",
+						status: "in_progress",
+					},
+				});
+				if (process.argv.includes("--permission-activity")) {
+					let answer = await ownerClient.request("session/request_permission", {
+						sessionId: params.sessionId,
+						toolCall: { toolCallId: "tests", title: "Running server tests", kind: "execute" },
+						options: [{ optionId: "allow", name: "Allow once", kind: "allow_once" }],
+					});
+					if (answer.outcome.outcome !== "selected") throw new Error("Permission was refused");
+					await ownerClient.notify("session/update", {
+						sessionId: params.sessionId,
+						update: {
+							sessionUpdate: "tool_call_update",
+							toolCallId: "tests",
+							title: "Checking test results",
+							status: "in_progress",
+						},
+					});
+				}
+			}
 			await new Promise<void>(resolve => cancelled = resolve);
 			return { stopReason: "cancelled" as const };
 		}

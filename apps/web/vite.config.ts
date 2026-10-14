@@ -38,6 +38,9 @@ export default defineConfig({
 		tsconfigPaths(),
 		initialJavaScriptBudget(MANTL_INITIAL_JAVASCRIPT_BUDGET),
 	],
+	optimizeDeps: {
+		esbuildOptions: { minifyWhitespace: true, minifySyntax: true },
+	},
 
 	resolve: {
 		// Only what this app resolves itself. Lexical and Yjs belong to the

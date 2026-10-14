@@ -204,33 +204,45 @@ function overlaps(card: CardPoint, height: number, target: Rect, page: Rect): bo
 		&& right > target.left;
 }
 
-test("places a comment card directly below its passage, at the passage's left edge", () => {
+test("places a comment card directly below its passage, at the column's right edge", () => {
 	expect(commentCardPoint(passage(200), column, host, 320, 200))
-		.toEqual({ top: 132, left: 200, width: 320, side: "below" });
+		.toEqual({ top: 132, left: 280, width: 320, side: "below" });
 });
 
-test("keeps a comment card inside the prose column", () => {
-	expect(commentCardPoint(passage(200, 600, 690), column, host, 320, 200).left).toBe(280);
-	expect(commentCardPoint(passage(200), { ...column, width: 280 }, host, 320, 200).width)
-		.toBe(280);
+test("right-aligns a comment card to the column wherever its passage starts", () => {
+	for (let left of [200, 300, 600]) {
+		let card = commentCardPoint(passage(200, left, 690), column, host, 320, 200);
+		expect(host.left + card.left + card.width).toBe(column.right);
+	}
+	let narrow = commentCardPoint(passage(200), { ...column, left: 420, width: 280 }, host, 320, 200);
+	expect(narrow).toMatchObject({ left: 320, width: 280 });
+});
+
+test("keeps a draft at its selection's left edge, inside the column", () => {
+	let options = { align: "passage" as const };
+	expect(commentCardPoint(passage(200), column, host, 320, 200, options))
+		.toEqual({ top: 132, left: 200, width: 320, side: "below" });
+	expect(commentCardPoint(passage(200, 600, 690), column, host, 320, 200, options).left).toBe(280);
 });
 
 test("flips a comment card above its passage when there is no room below", () => {
 	expect(commentCardPoint(passage(600), column, host, 320, 200))
-		.toEqual({ top: 292, left: 200, width: 320, side: "above" });
+		.toEqual({ top: 292, left: 280, width: 320, side: "above" });
 });
 
 test("caps a card that fits neither side to the roomier side of its passage", () => {
 	expect(commentCardPoint(passage(300), column, host, 320, 500))
-		.toEqual({ top: 232, left: 200, width: 320, side: "below", maxHeight: 356 });
+		.toEqual({ top: 232, left: 280, width: 320, side: "below", maxHeight: 356 });
 	expect(commentCardPoint(passage(500), column, host, 320, 500))
-		.toEqual({ top: 12, left: 200, width: 320, side: "above", maxHeight: 380 });
+		.toEqual({ top: 12, left: 280, width: 320, side: "above", maxHeight: 380 });
 });
 
 test("puts a comment card in a wide gutter beside the passage's first line", () => {
 	let wide = { ...host, right: 1_300, width: 1_200 };
 	expect(commentCardPoint(passage(200), column, wide, 320, 200))
 		.toEqual({ top: 100, left: 656, width: 320, side: "right" });
+	expect(commentCardPoint(passage(200), column, wide, 320, 900))
+		.toEqual({ top: 12, left: 656, width: 320, side: "right", maxHeight: 576 });
 	let snug = { ...host, right: 1_036, width: 936 };
 	expect(commentCardPoint(passage(200), column, snug, 320, 200).width).toBe(268);
 });

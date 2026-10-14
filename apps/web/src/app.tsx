@@ -1,12 +1,12 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 
 import * as Api from "./api";
+import { actorResolutionNeeded } from "./active-actor";
 import { HostedApp, HostedFailure, HostedLoading, hostedRoute } from "./hosted";
 import { clearRepositoryCache } from "./repository-cache";
 
 let loadHostedLogin = () => import("./hosted-login");
 let HostedLogin = lazy(() => loadHostedLogin().then(module => ({ default: module.HostedLogin })));
-let PairingPage = lazy(() => import("./experiments/pairing"));
 let LocalLogin = lazy(() =>
 	import("./local-login").then(module => ({ default: module.LocalLogin }))
 );
@@ -33,20 +33,31 @@ export function App() {
 
 	useEffect(() => {
 		if (!session) return;
-		let parameters = new URLSearchParams(location.search);
-		let accessChanged = parameters.get("repository_access") === "changed";
-		if (!session.user) clearRepositoryCache();
-		else if (accessChanged) clearRepositoryCache(session.user.id);
-		if (accessChanged) {
-			parameters.delete("repository_access");
-			let query = parameters.toString();
-			history.replaceState(
-				null,
-				"",
-				`${location.pathname}${query ? `?${query}` : ""}${location.hash}`,
-			);
-		}
-		setRepositoryCacheReady(true);
+		let active = true;
+		let roster = session.user ? session.demo?.actors ?? [] : [];
+		(async () => {
+			if (actorResolutionNeeded(location.search, roster.length, sessionStorage)) {
+				(await import("./demo-actor")).adoptActor(roster);
+			}
+			if (!active) return;
+			let parameters = new URLSearchParams(location.search);
+			let accessChanged = parameters.get("repository_access") === "changed";
+			if (!session.user) clearRepositoryCache();
+			else if (accessChanged) clearRepositoryCache(session.user.id);
+			if (accessChanged) {
+				parameters.delete("repository_access");
+				let query = parameters.toString();
+				history.replaceState(
+					null,
+					"",
+					`${location.pathname}${query ? `?${query}` : ""}${location.hash}`,
+				);
+			}
+			setRepositoryCacheReady(true);
+		})().catch(setError);
+		return () => {
+			active = false;
+		};
 	}, [session]);
 
 	if (error) {
@@ -69,12 +80,6 @@ export function App() {
 			</Suspense>
 		);
 	}
-	if (location.pathname === "/connect") {
-		return (
-			<Suspense fallback={<HostedLoading />}>
-				<PairingPage />
-			</Suspense>
-		);
-	}
+	// Signed in, /connect is a page inside the navigation like any other (hosted.tsx).
 	return <HostedApp agent={session.agent} user={session.user} />;
 }

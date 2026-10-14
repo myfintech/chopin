@@ -1,19 +1,21 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { parseArgs } from "./args";
+import { updateConfig } from "./config";
 import { classifyConnectorError, connectorMessage, machineFile, pair } from "./machine";
 import { createOutput } from "./output";
 import { ConnectorError } from "./mcp";
 import { git, stateDirectory } from "./workspace";
 
 const MACHINE_TOKEN = `chopin_m_${"T".repeat(43)}`;
+const PAIRING_KEY = `chopin_k_${"K".repeat(43)}`;
 const MAIN = join(import.meta.dir, "main.ts");
 
 let cleanup: Array<() => Promise<unknown> | unknown> = [];
@@ -41,11 +43,15 @@ async function checkout() {
 
 /**
  * A Chopin server that pairs, registers checkouts and serves wait_for_work, recording calls. It
- * refuses any machine token but the one it paired with `stale`, machine-revoked by default.
+ * refuses any machine token but the one it paired with `stale`, machine-revoked by default. It
+ * takes PAIRING_KEY once.
  */
 function fakeChopin(options: { connections?: () => Response; stale?: string } = {}) {
-	let calls: Array<{ path: string; bearer: string; body: unknown }> = [];
+	let calls: Array<
+		{ path: string; bearer: string; body: unknown; about?: Record<string, string> }
+	> = [];
 	let waited = Promise.withResolvers<void>();
+	let spent = false;
 	let server = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
@@ -56,9 +62,22 @@ function fakeChopin(options: { connections?: () => Response; stale?: string } = 
 				let body = request.method === "POST"
 					? await request.json().catch(() => undefined)
 					: undefined;
-				calls.push({ path, bearer, body });
+				let about = Object.fromEntries(
+					[...request.headers].filter(([name]) =>
+						/^chopin-connector-(host|platform|service|planner|agent)/.test(name)
+					),
+				);
+				calls.push({ path, bearer, body, ...(Object.keys(about).length ? { about } : {}) });
 			}
 			if (path === "/api/connector/pairings") {
+				let key = (calls.at(-1)!.body as { key?: string }).key;
+				if (key !== undefined) {
+					if (key !== PAIRING_KEY || spent) {
+						return Response.json({ error: "pairing-key-invalid" }, { status: 403 });
+					}
+					spent = true;
+					return Response.json({ token: MACHINE_TOKEN });
+				}
 				return Response.json({
 					id: "pairing",
 					secret: "s".repeat(43),
@@ -105,9 +124,27 @@ function fakeChopin(options: { connections?: () => Response; stale?: string } = 
 	return { url: `http://127.0.0.1:${server.port}`, calls, waited: waited.promise };
 }
 
-function cli(args: string[], home: string, url: string) {
+/** Agents the connects below name; chopin finds them before it pairs, and they never run. */
+const PROGRAMS = await mkdtemp(join(tmpdir(), "chopin-machine-programs-"));
+for (let name of ["agent", "agent-that-never-runs"]) {
+	await writeFile(
+		join(PROGRAMS, process.platform === "win32" ? `${name}.cmd` : name),
+		"#!/bin/sh\n",
+		{ mode: 0o755 },
+	);
+}
+afterAll(() => rm(PROGRAMS, { recursive: true, force: true }));
+
+function cli(args: string[], home: string, url: string, env: Record<string, string> = {}) {
 	let child = Bun.spawn([process.execPath, MAIN, ...args], {
-		env: { ...process.env, CHOPIN_URL: url, CHOPIN_HOME: home, CHOPIN_CONNECTOR_STATE_DIR: "" },
+		env: {
+			...process.env,
+			CHOPIN_URL: url,
+			CHOPIN_HOME: home,
+			CHOPIN_CONNECTOR_STATE_DIR: "",
+			...env,
+			PATH: [env.PATH ?? process.env.PATH, PROGRAMS].join(delimiter),
+		},
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -217,7 +254,34 @@ test("connect reuses a stored machine token without pairing again", async () => 
 		bearer: MACHINE_TOKEN,
 		body: { repository: "octo-org/score" },
 	});
+	// It says which machine it is, for its owner's list: no agent yet, as none has run here.
+	expect(chopin.calls[0]!.about).toEqual({
+		"chopin-connector-host": hostname(),
+		"chopin-connector-platform": `${process.platform} ${process.arch}`,
+	});
 	expect(chopin.calls.map(call => call.path)).toContain("tool:wait_for_work");
+});
+
+test("connect names the agent it learned of at an earlier check or job, and the service", async () => {
+	let home = await scratch("chopin-home-");
+	let root = await checkout();
+	let chopin = fakeChopin();
+	expect(await cli(["pair"], home, chopin.url).exited).toBe(0);
+	await writeFile(
+		join(home, "config.json"),
+		JSON.stringify({
+			agents: { "agent-that-never-runs": { name: "Never Runs", version: "2.0.1" } },
+		}),
+	);
+	chopin.calls.length = 0;
+	let connected = cli(["connect", root, "--", "agent-that-never-runs"], home, chopin.url);
+	await Promise.race([chopin.waited, connected.exited]);
+	connected.child.kill("SIGINT");
+	expect(await connected.exited, await connected.output).toBe(0);
+	expect(chopin.calls[0]!.about).toMatchObject({
+		"chopin-connector-agent": "Never Runs",
+		"chopin-connector-agent-version": "2.0.1",
+	});
 });
 
 test("connect pairs first when this machine has no token for the server", async () => {
@@ -236,6 +300,108 @@ test("connect pairs first when this machine has no token for the server", async 
 	expect(chopin.calls[0]!.body).toMatchObject({ repository: "octo-org/score" });
 	expect(JSON.parse(await readFile(join(home, "machine.json"), "utf8")).servers[chopin.url].token)
 		.toBe(MACHINE_TOKEN);
+});
+
+/** Every file under `directory`, read whole, so a test can say a secret is in none of them. */
+async function everything(directory: string) {
+	let files = await Array.fromAsync(new Bun.Glob("**/*").scan({ cwd: directory, dot: true }));
+	return (await Promise.all(files.map(file => readFile(join(directory, file), "utf8")))).join("\n");
+}
+
+test("pair --key pairs at once, with no browser and no terminal, and keeps the key nowhere", async () => {
+	let home = await scratch("chopin-home-");
+	let chopin = fakeChopin();
+	// Spawned without a terminal, as over plain SSH or under a service.
+	let paired = cli(["pair", "--label", "build-box", "--key", PAIRING_KEY], home, chopin.url);
+	expect(await paired.exited, await paired.output).toBe(0);
+	let output = await paired.output;
+	expect(output).toContain("✓ Paired.");
+	expect(output).not.toContain("/connect?pairing=");
+	expect(output).not.toContain(PAIRING_KEY);
+	expect(chopin.calls).toEqual([
+		{ path: "/api/connector/pairings", bearer: "", body: { label: "build-box", key: PAIRING_KEY } },
+	]);
+	expect(JSON.parse(await readFile(machineFile(home), "utf8"))).toEqual({
+		servers: { [chopin.url]: { token: MACHINE_TOKEN, label: "build-box" } },
+	});
+	expect(await everything(home)).not.toContain(PAIRING_KEY);
+});
+
+test("connect takes the key from CHOPIN_PAIRING_KEY, pairs with no browser, and keeps it nowhere", async () => {
+	let home = await scratch("chopin-home-");
+	let root = await checkout();
+	let chopin = fakeChopin();
+	let connected = cli(["connect", root, "--", "agent-that-never-runs"], home, chopin.url, {
+		CHOPIN_PAIRING_KEY: PAIRING_KEY,
+	});
+	await Promise.race([chopin.waited, connected.exited]);
+	connected.child.kill("SIGINT");
+	expect(await connected.exited, await connected.output).toBe(0);
+	let output = await connected.output;
+	expect(output).not.toContain(PAIRING_KEY);
+	expect(output).not.toContain("/connect?pairing=");
+	expect(chopin.calls.map(call => call.path).slice(0, 2)).toEqual([
+		"/api/connector/pairings",
+		"/api/connector/connections",
+	]);
+	expect(chopin.calls[0]!.body).toMatchObject({ repository: "octo-org/score", key: PAIRING_KEY });
+	expect(await everything(home)).not.toContain(PAIRING_KEY);
+	expect(await everything(home)).toContain(MACHINE_TOKEN);
+});
+
+test("a refused pairing key stops with what to do instead of falling back to the browser", async () => {
+	let home = await scratch("chopin-home-");
+	let chopin = fakeChopin();
+	let other = `chopin_k_${"O".repeat(43)}`;
+	let refused = cli(["pair", "--key", other], home, chopin.url);
+	expect(await refused.exited).toBe(1);
+	let output = await refused.output;
+	expect(output).toContain("Chopin refused the pairing key");
+	expect(output).toContain("Add a machine");
+	expect(output).not.toContain(other);
+	expect(chopin.calls.map(call => call.path)).toEqual(["/api/connector/pairings"]);
+	expect(await Bun.file(machineFile(home)).exists()).toBe(false);
+
+	// Something that isn't a key at all is refused before Chopin is asked.
+	chopin.calls.length = 0;
+	let typo = cli(["pair", "--key", "chopin_m_not-a-key"], home, chopin.url);
+	expect(await typo.exited).toBe(1);
+	expect(await typo.output).toContain("isn't a pairing key");
+	expect(chopin.calls).toEqual([]);
+});
+
+test("connect on a machine already paired leaves the pairing key unspent", async () => {
+	let home = await scratch("chopin-home-");
+	let root = await checkout();
+	let chopin = fakeChopin();
+	expect(await cli(["pair"], home, chopin.url).exited).toBe(0);
+	chopin.calls.length = 0;
+	let connected = cli(
+		["connect", root, "--key", PAIRING_KEY, "--", "agent-that-never-runs"],
+		home,
+		chopin.url,
+	);
+	await Promise.race([chopin.waited, connected.exited]);
+	connected.child.kill("SIGINT");
+	expect(await connected.exited, await connected.output).toBe(0);
+	expect(await connected.output).toContain("already paired");
+	expect(chopin.calls.map(call => call.path)).not.toContain("/api/connector/pairings");
+});
+
+test("a key given to connect with an agent that isn't installed is never sent, so it still works", async () => {
+	let home = await scratch("chopin-home-");
+	let root = await checkout();
+	let chopin = fakeChopin();
+	let missing = cli(
+		["connect", root, "--key", PAIRING_KEY, "--", "no-such-agent"],
+		home,
+		chopin.url,
+	);
+	expect(await missing.exited).toBe(1);
+	expect(await missing.output).toContain("no-such-agent isn't on your PATH");
+	expect(chopin.calls).toEqual([]);
+	// The same key pairs once the agent is there.
+	expect(await cli(["pair", "--key", PAIRING_KEY], home, chopin.url).exited).toBe(0);
 });
 
 const REVOKED_TOKEN = `chopin_m_${"R".repeat(43)}`;
@@ -275,6 +441,40 @@ for (let code of ["machine-revoked", "machine-reauthorize"]) {
 	});
 }
 
+test("the service's connect, started again after its token was forgotten, stops without pairing", async () => {
+	let home = await scratch("chopin-home-");
+	let root = await checkout();
+	let chopin = fakeChopin();
+	await revokedMachine(home, chopin.url);
+	// The settings `chopin service install` copied, which the service runs.
+	await updateConfig(home, value => {
+		value.service = {
+			executable: "/opt/chopin",
+			directory: home,
+			version: "0.0.1",
+			installedAt: 1,
+			settings: {
+				server: chopin.url,
+				checkout: root,
+				command: ["agent"],
+				planners: [],
+				plannerCommand: [],
+			},
+		};
+	});
+	let revoked = cli(["connect", "--service"], home, chopin.url);
+	expect(await revoked.exited).toBe(1);
+	expect(await revoked.output).toContain("no longer paired");
+	// The service manager starts it again, with no token stored and no terminal to pair on.
+	let again = cli(["connect", "--service"], home, chopin.url);
+	expect(await Promise.race([again.exited, Bun.sleep(3000).then(() => "still running")]))
+		.toBe(1);
+	let output = await again.output;
+	expect(output).toContain(`This machine is not paired with ${chopin.url}.`);
+	expect(output).toMatch(/pair` at a terminal/);
+	expect(chopin.calls.map(call => call.path)).toEqual(["/api/connector/connections"]);
+});
+
 test("on a terminal, connect with a revoked token forgets it and pairs again", async () => {
 	let home = await scratch("chopin-home-");
 	let root = await checkout();
@@ -287,6 +487,7 @@ test("on a terminal, connect with a revoked token forgets it and pairs again", a
 			CHOPIN_URL: chopin.url,
 			CHOPIN_HOME: home,
 			CHOPIN_CONNECTOR_STATE_DIR: "",
+			PATH: [process.env.PATH, PROGRAMS].join(delimiter),
 		},
 		terminal: {
 			cols: 200,

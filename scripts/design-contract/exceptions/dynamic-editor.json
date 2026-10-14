@@ -11,7 +11,7 @@
 				1
 			]
 		],
-		"sourceHash": "15e75053a320e6d67b970ae2ad4ef973c0059c5cb85bb74ac44e30449a559272"
+		"sourceHash": "597e6ae2f29f356bb4ed6bf6704357ee048e265a2b79f37ecbb037ae9a0f80b8"
 	},
 	{
 		"file": "packages/editor/src/card.tsx",
@@ -25,7 +25,7 @@
 				1
 			]
 		],
-		"sourceHash": "15e75053a320e6d67b970ae2ad4ef973c0059c5cb85bb74ac44e30449a559272"
+		"sourceHash": "597e6ae2f29f356bb4ed6bf6704357ee048e265a2b79f37ecbb037ae9a0f80b8"
 	},
 	{
 		"file": "packages/editor/src/content-swap.tsx",
@@ -102,7 +102,7 @@
 				1
 			]
 		],
-		"sourceHash": "5808e40b60d5785d699d6bd83d3a25e2fffbf657bf434d36eb03e1fd823a9627"
+		"sourceHash": "ee755d675aab961554c2afbbc08de932bd1ba2ece56fbe81c015aee10d5a0011"
 	},
 	{
 		"file": "packages/editor/src/toolbar/bubble.tsx",
@@ -172,7 +172,7 @@
 				4
 			]
 		],
-		"sourceHash": "e661834fae291b0f83fcfd6ddfa49012435a546b0d298fbed09d1d6ab3e6738d"
+		"sourceHash": "289fc341575dd4b9600351d5fba3c79b6fe31782d22c1d6671306849be785397"
 	},
 	{
 		"file": "packages/editor/src/widgets/research-motion.tsx",
@@ -214,7 +214,7 @@
 				1
 			]
 		],
-		"sourceHash": "b3ba35a387b51602f42db5f1158514b31146e1f33679e17d88f8400ca115db30"
+		"sourceHash": "7f01bfcc9dcc37a99ca2959f36125ca913dc0583d59024f2c53597c53e5bf652"
 	},
 	{
 		"file": "packages/editor/src/comment-layer.tsx",
@@ -242,7 +242,7 @@
 				1
 			]
 		],
-		"sourceHash": "b3ba35a387b51602f42db5f1158514b31146e1f33679e17d88f8400ca115db30"
+		"sourceHash": "7f01bfcc9dcc37a99ca2959f36125ca913dc0583d59024f2c53597c53e5bf652"
 	},
 	{
 		"file": "packages/editor/src/table/rails.tsx",
@@ -361,7 +361,7 @@
 				2
 			]
 		],
-		"sourceHash": "195358c8332d251edc25f81a5e859c4044bf9754e61db83159e688689800e92f"
+		"sourceHash": "5acf6913551f6409559012dc4886a3d22392eb43d2c8f3835b5384e6d20039a7"
 	},
 	{
 		"file": "packages/editor/src/collaboration.tsx",
@@ -382,7 +382,7 @@
 				1
 			]
 		],
-		"sourceHash": "22c33a6f68fa66902159bda6643bc6d81acfa36107e722e428580d970f60e142"
+		"sourceHash": "abe90d6bc426ffea321f1c207d1e394e51101de33dd1b23f12ee78c681b58cea"
 	},
 	{
 		"file": "packages/editor/src/widgets/questionnaire.tsx",
@@ -403,7 +403,7 @@
 				1
 			]
 		],
-		"sourceHash": "b4d7af43fdc69c771a65f63b5fc0beda6ef389db041b3bcc947e2449aa19a7d3"
+		"sourceHash": "f756270292adf55235e1b5c6ae1b0511349fd8e62e9303ca944ea30166106980"
 	},
 	{
 		"file": "packages/editor/src/widgets/code-view.tsx",
@@ -466,7 +466,7 @@
 				1
 			]
 		],
-		"sourceHash": "b4d7af43fdc69c771a65f63b5fc0beda6ef389db041b3bcc947e2449aa19a7d3"
+		"sourceHash": "f756270292adf55235e1b5c6ae1b0511349fd8e62e9303ca944ea30166106980"
 	},
 	{
 		"file": "packages/editor/src/resolved-layer.tsx",

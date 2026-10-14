@@ -232,12 +232,15 @@ test("a narrow split document keeps the desktop comment popover", async ({ join,
 	await seed(PROSE);
 	let page = await join("ana");
 	await page.setViewportSize({ width: 1_024, height: 800 });
+	await page.mouse.move(0, 0);
 	let card = await thread(page);
 	let paragraph = content(page).locator("p").first();
 
 	await expect(card).not.toHaveAttribute("aria-modal", "true");
 	await expect(page.locator("[data-plan-comment-sheet]")).toHaveCount(0);
-	// No gutter is wide enough here, so the card sits below the passage inside its column.
+	// No gutter is wide enough here, so the card sits below the passage, under its marker:
+	// right-aligned with the paragraph.
+	await expect(card).toHaveAttribute("data-side", "below");
 	await expect.poll(async () => {
 		let cardBox = await card.boundingBox();
 		let paragraphBox = await paragraph.boundingBox();
@@ -245,8 +248,20 @@ test("a narrow split document keeps the desktop comment popover", async ({ join,
 		return cardBox.width <= 320
 			&& cardBox.y >= paragraphBox.y + paragraphBox.height
 			&& cardBox.x >= paragraphBox.x - 1
-			&& cardBox.x + cardBox.width <= paragraphBox.x + paragraphBox.width + 1;
+			&& Math.abs(cardBox.x + cardBox.width - (paragraphBox.x + paragraphBox.width)) <= 2;
 	}).toBe(true);
+	// Resolve is one click from opening the card, without pointing at the card first.
+	let resolve = card.getByRole("button", { name: "Resolve", exact: true });
+	await expect(resolve).toBeVisible();
+	await expect.poll(() =>
+		resolve.evaluate(element => {
+			let opacity = 1;
+			for (let at: Element | null = element; at; at = at.parentElement) {
+				opacity *= Number(getComputedStyle(at).opacity);
+			}
+			return opacity;
+		})
+	).toBe(1);
 });
 
 test(
@@ -638,16 +653,16 @@ test("decision cards save independently with progressive custom answers", async 
 	field = scope.getByRole("textbox", { name: "New option" });
 	await field.fill("Only collaborative anchors");
 	await field.press("Enter");
-	// It joins everyone's list as the next lettered row and is not chosen for anyone.
+	// It joins everyone's list as the next lettered row, already chosen by its author.
 	let added = scope.getByRole("checkbox", { name: "Only collaborative anchors" });
 	await expect(added).toBeVisible();
-	await expect(added).not.toBeChecked();
+	await expect(added).toBeChecked();
 	await expect(scope.locator("label", { hasText: "Only collaborative anchors" })).toContainText(
 		"D",
 	);
-	await expect(addRow).toBeFocused();
-	await expect(saveScope).toBeDisabled();
-	await added.check();
+	await expect(added).toBeFocused();
+	await expect(addRow).toBeVisible();
+	await expect(saveScope).toBeEnabled();
 	await scope.getByRole("checkbox", { name: /^Anchors/ }).check();
 	await saveScope.click();
 
@@ -890,11 +905,11 @@ test("an option one member adds is shared, durable, and choosable by another", a
 	await field.fill("In PostgreSQL");
 	await field.press("Enter");
 
-	// Everyone sees it as the next lettered row, chosen by nobody.
+	// Everyone sees it as the next lettered row, chosen in the shared draft by its author.
 	for (let page of [ana, bo]) {
 		let row = storage(page).getByRole("radio", { name: "In PostgreSQL" });
 		await expect(row).toBeVisible();
-		await expect(row).not.toBeChecked();
+		await expect(row).toBeChecked();
 		await expect(storage(page).locator("label", { hasText: "In PostgreSQL" })).toContainText("C");
 	}
 	await expect(storage(ana).getByRole("textbox", { name: "New option" })).toHaveCount(0);

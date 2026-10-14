@@ -32,7 +32,7 @@
 				1
 			]
 		],
-		"sourceHash": "3f93ab499db8fcae05e3f0b6b69d770b1e03ad7c1f47af4e8ef04ce302058271"
+		"sourceHash": "8e37facd44c8bddb814c02657e345721ff1425dd589196d2ab05c51b856fa12b"
 	},
 	{
 		"file": "packages/question/src/react/resolved-actions.tsx",
@@ -84,6 +84,20 @@
 				"dynamic",
 				"*",
 				"props",
+				"unresolved JSX props > MachineIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ServerIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
 				"unresolved JSX props > SearchIcon > <LineIcon>",
 				1
 			],
@@ -95,7 +109,7 @@
 				1
 			]
 		],
-		"sourceHash": "81931c163dae45bdf46196e0a5c8080f81d50712b99445e3ab2cc7f88b4cba6b"
+		"sourceHash": "b08339820a9ffff53f4820e01aafc570facbef7ad9b0cdb9d987b09498b604c1"
 	},
 	{
 		"file": "packages/icons/src/line.tsx",

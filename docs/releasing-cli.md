@@ -4,8 +4,7 @@ The `chopin` CLI is the connector in `apps/connector`, compiled into one
 executable per platform. It is released as GitHub release assets of this
 repository by [`.github/workflows/release-cli.yml`](../.github/workflows/release-cli.yml),
 and installed with the scripts in `apps/connector/install`. See
-[Install the chopin CLI](local-experiments.md#install-the-chopin-cli) for the
-user side.
+[Use your own machine with Chopin](chopin-cli.md) for the user side.
 
 ## One-time setup
 
@@ -122,3 +121,9 @@ published release: its `checksums.txt` and attestations name their digests.
 
 The binaries are not code-signed or notarized. Installs through `curl` and
 `irm` carry no download mark, so neither Gatekeeper nor SmartScreen blocks them.
+
+## Notes for the next release
+
+- Development builds that installed a service must run `chopin connect`, then
+  `chopin service install` again: the service now runs its own copy of the
+  settings, which older builds never saved.

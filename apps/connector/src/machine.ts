@@ -1,6 +1,16 @@
 import { chmod, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { hostname } from "node:os";
 import { join } from "node:path";
-import { CONNECTOR_UPDATE_REQUIRED } from "@chopin/protocol/connector";
+import {
+	CONNECTOR_AGENT_HEADER,
+	CONNECTOR_AGENT_VERSION_HEADER,
+	CONNECTOR_HOST_HEADER,
+	CONNECTOR_PLANNER_HEADER,
+	CONNECTOR_PLATFORM_HEADER,
+	CONNECTOR_SERVICE_HEADER,
+	CONNECTOR_UPDATE_REQUIRED,
+} from "@chopin/protocol/connector";
+import { redacted } from "./connection";
 import { CONNECTOR_HEADERS, ConnectorError, refusal } from "./mcp";
 import type { Output } from "./output";
 
@@ -17,7 +27,30 @@ const MESSAGES: Record<string, string> = {
 		+ "then connect again.",
 	"machine-reauthorize": "GitHub no longer accepts this machine's authorization. "
 		+ `Run \`${SELF} pair\` to authorize it again.`,
+	"pairing-key-invalid": "Chopin refused the pairing key: it was used, replaced by a newer one, "
+		+ "or expired. Copy a new command from Machines → Add a machine in Chopin, then run it again.",
+	"pairing-account-forbidden": "The account that made the pairing key isn't allowed to use this "
+		+ "Chopin any more. Ask whoever runs it to let your GitHub account or organization in, then "
+		+ "copy a new command from Machines → Add a machine.",
 };
+
+const PAIRING_KEY = /^chopin_k_[A-Za-z0-9_-]{43}$/;
+
+/**
+ * The pairing key from `--key`, else CHOPIN_PAIRING_KEY, which is then cleared so no process this
+ * one starts inherits it. Something that isn't one is refused before Chopin is asked.
+ */
+export function pairingKey(flag: string | undefined): string | undefined {
+	let key = flag ?? (process.env.CHOPIN_PAIRING_KEY || undefined);
+	delete process.env.CHOPIN_PAIRING_KEY;
+	if (key !== undefined && !PAIRING_KEY.test(key)) {
+		throw new Error(
+			"That isn't a pairing key, which starts chopin_k_. Copy the command again from Machines → "
+				+ "Add a machine in Chopin.",
+		);
+	}
+	return key;
+}
 
 /** What a checkout tells Chopin when it connects. */
 export type Checkout = { repository: string; commit: string; branch?: string; label: string };
@@ -123,16 +156,29 @@ async function staleLock(path: string): Promise<boolean> {
 	}
 }
 
+/** The label this machine was paired under for one Chopin server, without its token. */
+export async function machineLabel(directory: string, origin: string) {
+	let entry = (await stored(directory)).servers[origin];
+	return entry?.token ? entry.label : undefined;
+}
+
 /** The machine token stored for one Chopin server. */
 export async function machineToken(directory: string, origin: string) {
 	return (await stored(directory)).servers[origin]?.token;
 }
 
-async function post(url: string, body: unknown, token?: string, signal?: AbortSignal) {
+async function post(
+	url: string,
+	body: unknown,
+	token?: string,
+	signal?: AbortSignal,
+	headers: Record<string, string> = {},
+) {
 	let response = await fetch(url, {
 		method: "POST",
 		headers: {
 			"content-type": "application/json",
+			...headers,
 			...CONNECTOR_HEADERS,
 			...(token ? { authorization: `Bearer ${token}` } : {}),
 		},
@@ -154,8 +200,9 @@ async function post(url: string, body: unknown, token?: string, signal?: AbortSi
 }
 
 /**
- * Pair this machine with a Chopin server: print the link and code, wait for the owner to confirm
- * in the browser, and store the machine token. Returns undefined when stopped first.
+ * Pair this machine with a Chopin server and store the machine token. With a pairing key it pairs
+ * at once; otherwise it prints the link and code and waits for the owner to confirm in the
+ * browser. Returns undefined when stopped first. The key is sent once and kept nowhere.
  */
 export async function pair(options: {
 	url: string;
@@ -164,34 +211,102 @@ export async function pair(options: {
 	output: Output;
 	signal: AbortSignal;
 	checkout?: Omit<Checkout, "label">;
+	key?: string;
 }) {
-	let pairing = await post(
-		options.url + "/api/connector/pairings",
-		{ ...options.checkout, label: options.label },
-		undefined,
-		options.signal,
-	) as { id: string; secret: string; url: string; code: string };
-	options.output.pairing(
-		options.checkout?.repository ?? options.label,
-		pairing.url,
-		pairing.code,
-	);
+	try {
+		return await pairOnce(options);
+	} catch (error) {
+		throw pairingFailure(error, options.url, options.checkout?.repository);
+	}
+}
+
+/** What stopped a pairing, in words that say what to do next. */
+function pairingFailure(error: unknown, url: string, repository?: string) {
+	let again = "then run this command again.";
+	let code = errorCode(error);
+	if (code === "repository-forbidden") {
+		return new Error(
+			`The account that made the key can't push to ${repository ?? "this repository"} on GitHub, `
+				+ `so Chopin won't connect this checkout. Ask an owner for write access, ${again}`,
+		);
+	}
+	if (code === "owner-sign-in-required") {
+		return new Error(`Sign in to Chopin at ${url} in a browser, ${again}`);
+	}
+	if (!(error instanceof ConnectorError) && classifyConnectorError(error) === "retry") {
+		let cause = error instanceof Error ? redacted(error.message).split("\n")[0] : "no answer";
+		return new Error(
+			`Can't reach Chopin at ${url} (${cause}). Check CHOPIN_URL, your network and any proxy, `
+				+ again,
+		);
+	}
+	return error;
+}
+
+async function pairOnce(options: Parameters<typeof pair>[0]) {
 	let token: string | undefined;
-	while (!options.signal.aborted && !token) {
-		let claim = await post(
-			`${options.url}/api/connector/pairings/${pairing.id}/claim`,
-			{ secret: pairing.secret },
+	if (options.key) {
+		let paired = await post(
+			options.url + "/api/connector/pairings",
+			{ ...options.checkout, label: options.label, key: options.key },
 			undefined,
 			options.signal,
 		);
-		token = typeof claim.token === "string" ? claim.token : undefined;
-		if (!token) await delay(1000, options.signal);
+		if (typeof paired.token !== "string") throw new Error("Missing machine token.");
+		token = paired.token;
+	} else {
+		let pairing = await post(
+			options.url + "/api/connector/pairings",
+			{ ...options.checkout, label: options.label },
+			undefined,
+			options.signal,
+		) as { id: string; secret: string; url: string; code: string };
+		options.output.pairing(
+			options.checkout?.repository ?? options.label,
+			pairing.url,
+			pairing.code,
+		);
+		while (!options.signal.aborted && !token) {
+			let claim = await post(
+				`${options.url}/api/connector/pairings/${pairing.id}/claim`,
+				{ secret: pairing.secret },
+				undefined,
+				options.signal,
+			);
+			token = typeof claim.token === "string" ? claim.token : undefined;
+			if (!token) await delay(1000, options.signal);
+		}
 	}
 	if (!token) return undefined;
+	let paired = token;
 	await update(options.directory, value => {
-		value.servers[options.url] = { token, label: options.label };
+		value.servers[options.url] = { token: paired, label: options.label };
 	});
 	return token;
+}
+
+/** What a connector tells its owner's Chopin about the machine as it connects a checkout. */
+export type About = {
+	service?: boolean;
+	planner?: boolean;
+	agent?: { name: string; version?: string };
+};
+
+/** `about` and this machine's hostname and platform, as headers; a value headers can't carry goes. */
+function aboutHeaders(about: About): Record<string, string> {
+	let headers: Record<string, string | undefined> = {
+		[CONNECTOR_HOST_HEADER]: hostname(),
+		[CONNECTOR_PLATFORM_HEADER]: `${process.platform} ${process.arch}`,
+		...(about.service ? { [CONNECTOR_SERVICE_HEADER]: "1" } : {}),
+		...(about.planner ? { [CONNECTOR_PLANNER_HEADER]: "1" } : {}),
+		[CONNECTOR_AGENT_HEADER]: about.agent?.name,
+		[CONNECTOR_AGENT_VERSION_HEADER]: about.agent?.version,
+	};
+	return Object.fromEntries(
+		Object.entries(headers).filter((entry): entry is [string, string] =>
+			!!entry[1] && /^[\x20-\x7e]+$/.test(entry[1])
+		),
+	);
 }
 
 /** Connect one checkout with the machine token; the returned token lasts while the server runs. */
@@ -200,10 +315,22 @@ export async function register(
 	token: string,
 	checkout: Checkout,
 	signal?: AbortSignal,
+	about: About = {},
 ) {
-	let value = await post(url + "/api/connector/connections", checkout, token, signal);
+	let value = await post(
+		url + "/api/connector/connections",
+		checkout,
+		token,
+		signal,
+		aboutHeaders(about),
+	);
 	if (typeof value.token !== "string") throw new Error("Missing connection token.");
 	return value.token;
+}
+
+/** Tell Chopin which agent a connection runs, learned at its first job; best-effort. */
+export async function reportAgent(url: string, token: string, agent: About["agent"] & {}) {
+	await post(url + "/api/connector/agent", agent, token).catch(() => {});
 }
 
 /** A short-lived credential for this machine's Planner backend to attach one document. */

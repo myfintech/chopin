@@ -175,12 +175,28 @@ describe("displayName", () => {
 });
 
 describe("Sending to Chopin", () => {
-	it("offers Send to Chopin, unticked, beside the send", () => {
+	it("offers Send to Chopin, ticked, beside the send of a new comment", () => {
 		let markup = renderToStaticMarkup(<DraftCard onCancel={() => {}} onSend={() => {}} />);
 
 		expect(markup).toContain("Send to Chopin");
+		expect(markup).toMatch(/<input[^>]*\bchecked\b/);
+		expect(markup).toContain('class="plan-comment-address-chip"');
+	});
+
+	it("leaves a new comment's Send to Chopin unticked where no Planner runs", () => {
+		let markup = renderToStaticMarkup(
+			<DraftCard onCancel={() => {}} onSend={() => {}} planner={false} />,
+		);
+
 		expect(markup).toMatch(/<input[^>]*type="checkbox"/);
-		expect(markup).not.toMatch(/<input[^>]*checked/);
+		expect(markup).not.toMatch(/<input[^>]*\bchecked\b/);
+		expect(markup).not.toContain("plan-comment-address-chip");
+	});
+
+	it("leaves a reply's Send to Chopin unticked", () => {
+		let markup = render(view(), true);
+
+		expect(markup).not.toMatch(/<input[^>]*\bchecked\b/);
 	});
 
 	it("keeps the reply's Send to Chopin folded away until the field is used", () => {

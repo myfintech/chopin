@@ -18,6 +18,9 @@
  * bottom of the card.
  */
 
+import { displayName } from "./display-name";
+import { isDemoHandle } from "./people";
+
 import type { ComponentProps, ReactNode } from "react";
 
 export type SidecarCardProps = {
@@ -52,7 +55,7 @@ export function SidecarCard(
 	return (
 		<article
 			aria-label={label}
-			className={`flex flex-col overflow-hidden rounded-lg ring-hairline ${surface} ${
+			className={`flex flex-col overflow-clip rounded-lg ring-hairline ${surface} ${
 				focused ? "bg-selected" : ""
 			} ${className ?? ""}`}
 			data-focus-boundary=""
@@ -103,7 +106,8 @@ export function Provenance({ at, by, verb }: ProvenanceProps) {
 
 	return (
 		<span className="text-sm text-text-tertiary tabular-nums">
-			{verb} by <span className="text-brand-ink">@{by}</span>
+			{verb} by{" "}
+			<span className="text-brand-ink">{isDemoHandle(by) ? displayName(by) : `@${by}`}</span>
 			{stamp && ` · ${stamp}`}
 		</span>
 	);

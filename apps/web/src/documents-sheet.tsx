@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { Drawer } from "@base-ui/react/drawer";
-import { Face } from "@chopin/editor";
+import { Face } from "@chopin/editor/face";
 import { childDocumentPath, documentPath } from "@chopin/protocol/document-url";
 import {
 	ArchiveIcon,
@@ -18,6 +18,7 @@ import {
 import { ActionSheet } from "./action-sheet";
 import { unansweredDecisionsLabel } from "./decision-view-control";
 import { DocumentActionsMenu } from "./document-actions-menu";
+import { MachinesEntry } from "./machines-entry";
 import {
 	browserStorage,
 	documentGroups,
@@ -47,6 +48,7 @@ export function DocumentsSheet(
 		activeRepositoryId,
 		catalogueMode,
 		currentDocumentId,
+		machinesCurrent,
 		onAddProject,
 		onCatalogueModeChange,
 		onCreateDocument,
@@ -64,6 +66,8 @@ export function DocumentsSheet(
 		activeRepositoryId?: string;
 		catalogueMode: "active" | "archived";
 		currentDocumentId?: string;
+		/** /connect is open, so the Machines row is the current page. */
+		machinesCurrent?: boolean;
 		onAddProject: () => void;
 		onCatalogueModeChange: (mode: "active" | "archived") => void;
 		onCreateDocument: (project: Api.NavigationProject) => void;
@@ -381,6 +385,9 @@ export function DocumentsSheet(
 												<span className="truncate">Archived</span>
 												<ChevronIcon aria-hidden="true" className="ml-auto" size={14} />
 											</button>
+										</li>
+										<li className="documents-sheet-row" data-current={machinesCurrent || undefined}>
+											<MachinesEntry current={machinesCurrent} placement="sheet" />
 										</li>
 										<li className="documents-sheet-row">
 											<button

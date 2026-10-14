@@ -7,159 +7,30 @@ tables and charts, shares selections, and records decisions against fixed eviden
 
 ## Connect a checkout
 
-From your project folder, download the connector this Chopin server serves and
-connect the checkout:
+Connect a checkout of the document's repository with the `chopin` CLI, as
+[Use your own machine with Chopin](chopin-cli.md) describes.
 
-```sh
-mkdir -p ~/.chopin \
-  && curl -fsSL https://your-chopin-instance.example/connector.js -o ~/.chopin/connector.js \
-  && CHOPIN_URL=https://your-chopin-instance.example \
-    bun --no-env-file --config=/dev/null \
-      ~/.chopin/connector.js connect . -- copilot --acp --allow-all
-```
+The command after `--` is your agent's ACP launch command. Chopin uses one ACP
+client implementation; it does not invoke a vendor-specific SDK. The agent must
+support local stdio ACP sessions and MCP tools through either advertised HTTP
+support or the default stdio transport.
 
-`--no-env-file` and `--config=/dev/null` stop Bun from loading the project folder's
-`.env` and `bunfig.toml`: a checkout must not choose which server the connector pairs
-with or run code through a `preload`. The `chopin` binary below ignores both by itself.
+One connection serves every document in the checkout's repository; there is no
+per-document pairing. Under `AUTH_MODE=local`, which has no client secret to
+authorize a machine with, connector calls use your live browser login instead
+and wait while you are signed out.
 
-The Build view and an investigation card show this command with your server's
-origin filled in when no local agent is connected. `GET /connector.js` serves one
-bundled file with no sign-in; `bun run build` and the Docker image produce it, and
-a development server bundles it from source. Chopin contributors can still run
+`GET /connector.js` serves the connector as one bundled file with no sign-in;
+`bun run build` and the Docker image produce it, and a development server
+bundles it from source. Chopin contributors can still run
 `bun run connector connect /path/to/project -- copilot --acp` from a Chopin
 checkout.
 
-The command after `--` is your agent's ACP launch command. Chopin uses one ACP
-client implementation; it does not invoke a vendor-specific SDK. The connector
-requires [Bun](https://bun.sh) 1.4.2 and Git. The agent must support local stdio ACP sessions and
-MCP tools through either advertised HTTP support or the default stdio transport. Authenticate the agent normally before connecting it.
+## Run chopin as a service
 
-The first time, the connector pairs this machine with Chopin. Open the printed
-pairing link, sign into Chopin with push access to the checkout's repository,
-check that the page shows the same confirmation code as your terminal, and
-choose **Connect**. GitHub then authorizes the machine on its own, which takes
-no extra step for an App you already authorized, and the page says
-**Connected.** One connection serves every document in that repository; there
-is no per-document pairing. Both the browser and connector contact the server
-over outbound requests. The browser does not access your filesystem.
-
-Pairing stores a machine token in `machine.json` in the connector's state
-directory, readable only by you (mode `0600`; on Windows, your user profile's
-permissions). The token is never printed. Chopin keeps only a hash of it, plus
-the machine's own GitHub authorization encrypted like a browser login's. Later
-`connect` commands, also after a server restart, a deploy or signing out of the
-browser, use the stored token and do not pair again. On each connector call the
-server rechecks your push access with the machine's own GitHub authorization.
-
-A machine stays paired until you disconnect it: choose **Disconnect machine**
-for it under **Your machines** at `/connect` and confirm, or run `chopin unpair` on the
-machine. Either way its connector stops at once with `machine-revoked`, does
-not retry, and deletes the token from `machine.json`. The next `chopin connect`
-on a terminal then pairs again, as on a machine never paired; without a
-terminal, as when run as a service, it stops with the same message instead of
-waiting on a browser. GitHub allows ten active authorizations per account for an App. A
-new sign-in or pairing beyond that silently retires the oldest one, which can be
-a machine's. Chopin then marks that machine as needing pairing again
-(`machine-reauthorize`) rather than revoking it, its connector stops and
-forgets the token in the same way, and `chopin pair`, or `chopin connect` on a
-terminal, authorizes it again. Under `AUTH_MODE=local`, which has no
-client secret to authorize a machine with, connector calls instead use your
-live browser login and wait while you are signed out.
-
-The terminal prints the pairing link and confirmation code, then
-**✓ Connected.** and a line for each job it starts, finishes or fails. Styling
-appears only on an interactive terminal and is off under `NO_COLOR`. The agent's
-own log output is hidden unless `CHOPIN_DEBUG=1`; its last lines are shown when a
-job fails.
-
-### Install the chopin CLI
-
-The connector is also released as `chopin`, one executable for Linux, macOS
-(x64 or arm64) and Windows (x64) that runs without Bun. Install it with:
-
-```sh
-curl -fsSL https://github.com/githubnext/chopin/releases/latest/download/install.sh | sh
-```
-
-On Windows, in PowerShell:
-
-```powershell
-irm https://github.com/githubnext/chopin/releases/latest/download/install.ps1 | iex
-```
-
-Then, from your project folder:
-
-```sh
-export CHOPIN_URL=https://your-chopin-instance.example
-chopin pair --label build-box      # once per machine; optional, connect pairs first if needed
-chopin connect . -- copilot --acp --allow-all
-```
-
-Until the first `cli-v*` release is published, those install commands have
-nothing to download, and the `curl … connector.js` and `bun` command above
-remains the way to connect.
-
-`chopin pair` pairs this machine and stores its token; `--label` names it in
-Chopin (default: the hostname), and pairing again replaces the token.
-`chopin connect` runs work exactly as `bun connector.js connect` does, pairing
-first only when the machine has no token for that server, and `chopin` uses
-`https://chopin.githubnext.com` when `CHOPIN_URL` is unset. `chopin unpair`
-revokes the machine in Chopin and deletes its token. Every command takes
-`--base-dir <dir>` (or `CHOPIN_HOME`) for where the token, locks and worktrees
-live. `chopin --version` prints the CLI version and the connector protocol it
-speaks, and `chopin help` lists the commands. On a server running
-`HARNESS=remote` (not `AUTH_MODE=local`), `chopin connect --planner <document URL>` (repeatable) with
-`--planner-command <command>` also runs that command as each document's Planner,
-with no browser sign-in; see
-[Planner backend commands](planner-link.md#planner-backend-commands). The binary ignores any `.env` or
-`bunfig.toml` in the folder it runs in.
-
-The installer puts `chopin` in `~/.local/bin` (on Windows,
-`%LOCALAPPDATA%\chopin\bin`, which it adds to your user PATH) and never needs
-administrator rights. It installs the newest release unless you name a version,
-either as an argument (`… | sh -s -- 0.2.0`) or with `CHOPIN_VERSION`. Before
-installing, it checks the download against the release's `checksums.txt`, and,
-when the [GitHub CLI](https://cli.github.com) is installed, runs
-`gh attestation verify <file> -R githubnext/chopin` to confirm the release
-workflow built it; `CHOPIN_VERIFY_ATTESTATION=0` skips that second check. When
-`~/.local/bin` is not on your `PATH`, the installer prints the line to add to
-your shell profile.
-
-`chopin update` replaces the installed `chopin` with the release your Chopin
-server recommends, which it reads from `CHOPIN_URL`'s
-`/api/connector/version`. When the server cannot be reached, it says so and
-installs the newest release instead. `chopin update 0.2.0` installs that
-release. It verifies the download as the installer does, with `checksums.txt`
-and, when `gh` is installed, `gh attestation verify`, then swaps the binary in
-place and prints the old and new versions. On Windows the running `chopin.exe`
-is renamed to `chopin.exe.old`, which the next `chopin` deletes. If an update
-on Windows is interrupted and leaves only `chopin.exe.old`, run the installer
-again to put a fresh `chopin.exe` in place. Updating to the version already
-installed does nothing.
-
-Moving to an older release than the installed one, whether named or
-recommended, needs `--allow-downgrade`; without it `chopin update` prints the
-command with the flag and changes nothing. On a terminal, `chopin update` asks
-before replacing itself unless you pass `--yes`. Without a terminal, as in a
-script, it goes ahead without asking: an upgrade needs no confirmation, and a
-downgrade has already been confirmed by `--allow-downgrade`. Running the
-installer again also updates `chopin`.
-
-The connector sends its version and connector protocol when it pairs and on
-every request. A server that does not speak that protocol refuses it with
-`connector-update-required` and says what to run: `chopin update <version>`
-with the release the server recommends, or downloading `connector.js` again for
-the script. The connector prints that message and exits instead of retrying. A
-`connector.js` from before this check sends no version; it is treated as
-protocol 1, which predates machine pairing, and is told to download
-`connector.js` again.
-
-To build the binaries from a Chopin checkout instead, run
-`bun run --cwd apps/connector build:binaries --host` for this machine, or
-without `--host` for every target. They are written to `apps/connector/dist`:
-`chopin-linux-x64`, `chopin-linux-arm64`, `chopin-darwin-x64`,
-`chopin-darwin-arm64` and `chopin-windows-x64.exe`. See
-[Releasing the chopin CLI](releasing-cli.md) for how releases are made.
+To keep a connection running in the background, and to start the Windows task
+at boot, see [Keep it running](chopin-cli.md#keep-it-running) and
+[Start the Windows task at boot](chopin-cli-reference.md#start-the-windows-task-at-boot).
 
 ## Run and inspect work
 
@@ -201,12 +72,19 @@ in between interrupts the investigation instead of stalling the connector. A
 build is itself that lock, so builds do not check it. Other document writers can inspect published results,
 change shared selections, and record decisions.
 
-The first authorized investigation supplies the document's default experiment
-commit. Later runs use that recorded source baseline. The connector creates a
+Each new investigation uses the selected connection's checkout commit. Retrying an
+investigation keeps its original source commit, even after the connection changes.
+Other investigations in the document do not choose its baseline. The connector creates a
 detached worktree and preserves existing local edits. Its local state defaults to
 `$XDG_STATE_HOME/chopin/connector` or `~/.local/state/chopin/connector`; override it
 with `--base-dir`, `CHOPIN_HOME` or `CHOPIN_CONNECTOR_STATE_DIR`. Worktrees are retained there for inspection.
 Remove an unwanted worktree with Git's normal `worktree remove` command.
+
+Manual investigations can upload up to three distinct screenshots, at most 1 MiB each.
+The agent saves PNG, JPEG or WebP files in its worktree and calls `upload_image_file({path})`.
+The connector refuses paths outside that worktree, including symlinks. The agent embeds the
+returned hosted paths as Markdown images in the submitted report. The run-scoped server tool
+is `upload_investigation_image`; the connector handles reading and encoding the local file.
 
 Local execution uses the agent's ordinary OS permissions, skills and configured
 services. A worktree organizes edits; it is not a sandbox. Standard ACP permission
@@ -322,7 +200,8 @@ The connector has deleted the refused token. Run `chopin connect` again on a
 terminal, which pairs first, or `chopin pair` and then connect.
 
 **`script not found: connector`.** `bun run connector` only works inside a Chopin
-checkout. Use the `curl … connector.js` command above from your project folder.
+checkout. From your project folder, use `chopin connect` or the `connector.js`
+command in [Run without installing](chopin-cli-reference.md#run-without-installing).
 
 **"Your local agent isn't connected" (HTTP 409 `no-workspace`).** No connector of
 yours is connected for this document's repository. Start the command shown, open
@@ -336,13 +215,17 @@ repository differs from the authorized one. If a run's recorded commit is not in
 your checkout, the connector fetches it from `origin`; push or fetch the commit
 if that fails.
 
-**Connector version mismatch after a deploy.** Rerun the whole command. It
-downloads the connector again, so it matches the server.
+**Connector version mismatch after a deploy.** Run `chopin update`, or rerun the
+whole `connector.js` command, which downloads the connector again so it matches
+the server.
 
 **Stale lock after a crash.** Each checkout has a lock in the connector's state
 directory, `$XDG_STATE_HOME/chopin/connector` or `~/.local/state/chopin/connector`
-(or `--base-dir`, `CHOPIN_HOME` or `CHOPIN_CONNECTOR_STATE_DIR`). A lock whose process has exited is replaced
-automatically. If the connector still reports _Workspace already locked_, confirm
+(or `--base-dir`, `CHOPIN_HOME` or `CHOPIN_CONNECTOR_STATE_DIR`). The lock
+records when its connector's process started. A lock whose process has exited
+is replaced automatically, even when another process has since been given the
+same pid: a process with that pid that started at another time is not the
+connector. If the connector still reports _Workspace already locked_, confirm
 no connector is running for that checkout and delete the `.lock` file the error
 names.
 

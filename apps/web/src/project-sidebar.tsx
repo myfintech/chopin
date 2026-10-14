@@ -4,6 +4,7 @@ import documentActionsIcon from "./assets/figma/navigation/document-actions.svg"
 import { unansweredDecisionsLabel, useDecisionAttention } from "./decision-view-control";
 import { DocumentActionsMenu } from "./document-actions-menu";
 import { IconButton } from "./icon-button";
+import { MachinesEntry } from "./machines-entry";
 import { MenuItem, MenuSeparator } from "./menu-item";
 import { ProjectSidebarSkeleton } from "./project-sidebar-chrome";
 import { motionContract } from "./motion-contract";
@@ -12,7 +13,9 @@ import { documentGroups } from "./documents-sheet-model";
 import { canManageProject } from "./navigation-model";
 import { currentShortcutPlatform, shortcutLabel } from "./shortcuts";
 import { ThemeToggle } from "./theme-toggle";
-import { Count, Face, MotionDisclosure, MotionDisclosureIcon } from "@chopin/editor";
+import { Count } from "@chopin/editor/count";
+import { Face } from "@chopin/editor/face";
+import { MotionDisclosure, MotionDisclosureIcon } from "@chopin/editor/disclosure-motion";
 import { childDocumentPath, documentPath } from "@chopin/protocol/document-url";
 import { useSidebarRowPresence } from "./sidebar-row-presence";
 
@@ -437,6 +440,7 @@ export function ProjectSidebar(
 		currentDocumentId,
 		onAccount,
 		focusProjectId,
+		machinesCurrent,
 		onAddProject,
 		onFocusedProject,
 		onCollapse,
@@ -468,6 +472,8 @@ export function ProjectSidebar(
 		newDocumentPhase?: DocumentCreationPhase | "loading";
 		pendingCreations: ReadonlyMap<string, DocumentCreationPhase>;
 		currentDocumentId?: string;
+		/** /connect is open, so the Machines entry is the current page. */
+		machinesCurrent?: boolean;
 		onAccount: () => void;
 		focusProjectId?: string;
 		onAddProject: () => void;
@@ -623,9 +629,9 @@ export function ProjectSidebar(
 				)}
 		</div>
 	);
-	let archiveFooter = !archiveMode
-		? (
-			<div className="project-sidebar-footer-actions">
+	let footer = (
+		<div className="project-sidebar-footer-actions">
+			{!archiveMode && (
 				<button
 					className="project-sidebar-primary-action"
 					onClick={() => {
@@ -638,9 +644,10 @@ export function ProjectSidebar(
 					<ArchiveIcon />
 					<span>Archived</span>
 				</button>
-			</div>
-		)
-		: null;
+			)}
+			<MachinesEntry current={machinesCurrent} placement="sidebar" />
+		</div>
+	);
 	return (
 		<aside
 			aria-label="Projects"
@@ -715,7 +722,7 @@ export function ProjectSidebar(
 					</ul>
 				</nav>
 			</div>
-			{archiveFooter}
+			{footer}
 			<div className="project-sidebar-account-wrap" ref={accountWrapRef}>
 				<button
 					aria-controls={accountMenu ? accountMenuId : undefined}
