@@ -101,7 +101,7 @@
 				1
 			]
 		],
-		"sourceHash": "98024b0351e351837030a2d7fc5bf1f8b95d6952d55f6f7ac022737689ead0ad"
+		"sourceHash": "a243b136337faa8ec8b1878605d907c8830a6fd8bc75116045debcf8cfbcf9ee"
 	},
 	{
 		"file": "apps/web/src/project-sidebar.tsx",
@@ -115,7 +115,7 @@
 				1
 			]
 		],
-		"sourceHash": "98024b0351e351837030a2d7fc5bf1f8b95d6952d55f6f7ac022737689ead0ad"
+		"sourceHash": "a243b136337faa8ec8b1878605d907c8830a6fd8bc75116045debcf8cfbcf9ee"
 	},
 	{
 		"file": "apps/web/src/design-audit/icons.tsx",
