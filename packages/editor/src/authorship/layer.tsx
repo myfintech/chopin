@@ -435,11 +435,10 @@ function AuthorshipCard(
 					? <p>Written before authorship was recorded.</p>
 					: (
 						<>
-							{(detail || latest) && (
+							{detail && <p className="authorship-detail">{detail}</p>}
+							{latest && (
 								<p className="authorship-detail">
-									{detail}
-									{detail && latest ? " · " : ""}
-									{latest && `rev ${latest.fromRevision} → ${latest.toRevision}`}
+									rev {latest.fromRevision} → {latest.toRevision}
 								</p>
 							)}
 							{changed
@@ -469,7 +468,7 @@ function AuthorshipCard(
 				<div className="authorship-history">
 					<p className="authorship-heading">
 						History of this block{block.contributors > 1
-							? ` · ${block.contributors} contributors`
+							? ` by ${block.contributors} contributors`
 							: ""}
 					</p>
 					<ol>
