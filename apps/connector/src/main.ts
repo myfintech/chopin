@@ -1,8 +1,8 @@
 import { appendFileSync, closeSync, existsSync, openSync, readSync } from "node:fs";
 import { hostname } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { AGENTS, nodeMajor, nodeOlder } from "@chopin/protocol/agents";
+import { acpCommand, AGENTS, nodeMajor, nodeOlder } from "@chopin/protocol/agents";
 import type { CodingAgent } from "@chopin/protocol/agents";
 import { checkAgent } from "./acp";
 import type { AgentInfo } from "./acp";
@@ -22,7 +22,7 @@ import {
 } from "./machine";
 import { createOutput } from "./output";
 import { permissionMemory } from "./permission";
-import { commandWords, servePlanners } from "./planner";
+import { commandWords, dispatchedPlanners, servePlanners } from "./planner";
 import { runWork } from "./run";
 import { implementationBridge } from "./implementation";
 import { readConfig, updateConfig } from "./config";
@@ -44,7 +44,16 @@ import {
 import { collectStatus, formatStatus, type ServerSource } from "./status";
 import { removeReplaced, update } from "./update";
 import { VERSION } from "./version";
-import { connectors, lockWorkspace, startFailures, stateDirectory, workspace } from "./workspace";
+import {
+	chosenPlanners,
+	connectors,
+	githubFallback,
+	lockWorkspace,
+	pruneRuns,
+	startFailures,
+	stateDirectory,
+	workspace,
+} from "./workspace";
 
 const DEFAULT_URL = "https://chopin.githubnext.com";
 
@@ -178,29 +187,30 @@ async function unpairCommand(args: string[]) {
 }
 
 /**
- * `command` with its program, or the one behind `env`, by its stable path when this shell finds
- * it only through a per-shell or temporary directory, as fnm's, saying so. One with no stable
- * path is kept, with a warning, as service install would refuse it.
+ * `command` with its program, or the one behind `env`, by the full path this shell finds it at,
+ * so service install runs that program whatever its own PATH finds. One this shell finds only
+ * through a per-shell or temporary directory, as fnm's, is saved by its stable path, saying so;
+ * one with no stable path is saved with a warning, as service install would refuse it.
  */
-async function stableCommand(command: string[], base: string) {
+async function savedCommand(command: string[], base: string) {
 	let at = programAt(command);
 	let word = command[at]!;
 	let found = /[\\/]/.test(word) ? resolve(base, word) : which(word);
 	if (!found) return command;
 	let host = systemHost();
 	let seen = await stablePath(host.platform, host.env, found);
-	if (!seen) return command;
-	if ("fleeting" in seen) {
+	if (seen && "fleeting" in seen) {
 		createOutput().error(
 			`${word} is ${found}, which lasts only as long as this shell, so chopin service install `
 				+ "will refuse it.",
 		);
-		return command;
+	} else if (seen) {
+		createOutput().say(
+			`Saved ${word} as ${seen.stable}, since ${found} lasts only as long as this shell.`,
+		);
+		found = seen.stable;
 	}
-	createOutput().say(
-		`Saved ${word} as ${seen.stable}, since ${found} lasts only as long as this shell.`,
-	);
-	return [...command.slice(0, at), seen.stable, ...command.slice(at + 1)];
+	return [...command.slice(0, at), found, ...command.slice(at + 1)];
 }
 
 /** The PATH as it is now, which a process (or a test) may have changed since it started. */
@@ -319,6 +329,35 @@ function environment(words: string[]) {
 	return env;
 }
 
+/** A mistake in how a command was called, which exits 2. */
+class UsageError extends Error {}
+
+/** The built-in agent `--agent` names, or a refusal listing the ids it may name. */
+function builtInAgent(id: string) {
+	let agent = AGENTS.find(item => item.id === id);
+	if (agent) return agent;
+	throw new UsageError(
+		`There is no built-in agent ${id}. Use --agent with one of: `
+			+ `${
+				AGENTS.map(item => item.id).join(", ")
+			}; or give any other ACP agent's command after --.`,
+	);
+}
+
+/** How many finished runs' worktrees connect keeps without --keep-runs. */
+const KEEP_RUNS = 15;
+
+/** `--keep-runs <n>`: a whole number, 0 keeping every run; undefined when not given. */
+function runsToKeep(value: string | undefined) {
+	if (value === undefined) return undefined;
+	if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) {
+		throw new Error(
+			`--keep-runs takes a whole number of finished runs to keep, 0 for all; not "${value}".`,
+		);
+	}
+	return Number(value);
+}
+
 /**
  * `connect`. `--service` marks the connector the installed service runs, which runs what install
  * copied. `--install-service` installs the service once connected, then stops; `injected` stands
@@ -330,7 +369,7 @@ export async function connect(
 ) {
 	let parsed = parseArgs(args, {
 		flags: ["service", "install-service", "skip-check"],
-		options: ["planner-command", "key"],
+		options: ["planner-command", "key", "name", "keep-runs", "agent"],
 		lists: ["planner", "env"],
 	});
 	let service = parsed.flags.has("service");
@@ -340,7 +379,9 @@ export async function connect(
 		service
 		&& (parsed.positional.length || parsed.rest || parsed.lists.size
 			|| parsed.options.has("planner-command") || parsed.options.has("key")
-			|| parsed.flags.has("install-service") || parsed.flags.has("skip-check"))
+			|| parsed.options.has("name") || parsed.options.has("keep-runs")
+			|| parsed.options.has("agent") || parsed.flags.has("install-service")
+			|| parsed.flags.has("skip-check"))
 	) {
 		throw new Error(
 			`${SELF} connect --service takes no other arguments; it runs what ${SELF} service install saved.`,
@@ -349,12 +390,19 @@ export async function connect(
 	if (service && !saved) throw new Error(CONNECT_FIRST);
 	// Read once and cleared from the environment, so neither the agent nor the service sees it.
 	let key = pairingKey(parsed.options.get("key"));
+	/** The machine's name in Chopin, used only if this connect pairs it. */
+	let name = parsed.options.get("name");
 	let installing = parsed.flags.has("install-service");
 	let executable = injected.executable ?? installedChopin();
 	if (installing && !executable) throw new ServiceError(NOT_INSTALLED);
 	/** Set once connected under --install-service, which then stops to install. */
 	let install = false;
-	let command = saved?.command ?? parsed.rest ?? JSON.parse(process.env.CHOPIN_ACP_COMMAND ?? "[]");
+	/** `--agent <id>`: a built-in agent, whose command takes what follows `--` as extra arguments. */
+	let agentId = saved ? saved.agent : parsed.options.get("agent");
+	let builtIn = !saved && agentId !== undefined ? builtInAgent(agentId) : undefined;
+	let command = saved?.command
+		?? (builtIn ? acpCommand(builtIn, parsed.rest ?? []) : parsed.rest)
+		?? JSON.parse(process.env.CHOPIN_ACP_COMMAND ?? "[]");
 	if (
 		!Array.isArray(command) || !command.length
 		|| command.some(item => typeof item !== "string" || !item)
@@ -366,16 +414,18 @@ export async function connect(
 	let plannerCommand = saved?.plannerCommand ?? (plannerLine === undefined
 		? JSON.parse(process.env.CHOPIN_PLANNER_COMMAND ?? "[]")
 		: commandWords(plannerLine));
+	// A Planner command alone lets Chopin ask this machine to run the Planner of a document its
+	// owner chose it for; --planner documents always need one.
 	if (
 		!Array.isArray(plannerCommand)
 		|| plannerCommand.some(item => typeof item !== "string" || !item)
-		|| !!plannerDocuments.length !== !!plannerCommand.length
+		|| plannerDocuments.length > 0 && !plannerCommand.length
 	) {
-		throw new Error(
-			`--planner <document URL> and --planner-command <command> go together.\n\n${USAGE}`,
-		);
+		throw new Error(`--planner <document URL> needs --planner-command <command>.\n\n${USAGE}`);
 	}
-	let env = saved?.env ?? environment(parsed.lists.get("env") ?? []);
+	// A built-in agent's own variables come first, so an --env for one of them wins.
+	let env = saved?.env ?? environment([...builtIn?.env ?? [], ...parsed.lists.get("env") ?? []]);
+	let keepRuns = saved ? saved.keepRuns : runsToKeep(parsed.options.get("keep-runs"));
 	if (!service) {
 		requireProgram(command, process.cwd());
 		if (plannerCommand.length) requireProgram(plannerCommand, resolve(parsed.positional[0] ?? "."));
@@ -383,18 +433,11 @@ export async function connect(
 	if (service && process.platform === "win32") appendOutput(logPath("win32", directory));
 	let url = saved?.server ?? await server();
 	let info = await workspace(resolve(saved?.checkout ?? parsed.positional[0] ?? "."));
-	// The service runs what a terminal's connect saves. A relative agent path would resolve
-	// against the service's own working directory.
-	let agent = command[0]!;
+	// The service runs what a terminal's connect saves, by the full paths this shell found.
 	let saving = service ? { command, plannerCommand } : {
-		command: await stableCommand(
-			!isAbsolute(agent) && (agent.includes("/") || agent.includes(sep))
-				? [resolve(agent), ...command.slice(1)]
-				: command,
-			process.cwd(),
-		),
+		command: await savedCommand(command, process.cwd()),
 		plannerCommand: plannerCommand.length
-			? await stableCommand(plannerCommand, info.root)
+			? await savedCommand(plannerCommand, info.root)
 			: plannerCommand,
 	};
 	let save = () =>
@@ -402,10 +445,12 @@ export async function connect(
 			value.connect = {
 				server: url,
 				checkout: info.root,
+				...(agentId === undefined ? {} : { agent: agentId }),
 				command: saving.command,
 				planners: plannerDocuments,
 				plannerCommand: saving.plannerCommand,
 				...(Object.keys(env).length ? { env } : {}),
+				...(keepRuns === undefined ? {} : { keepRuns }),
 			};
 		});
 	if (
@@ -436,6 +481,23 @@ export async function connect(
 			value.agents = { ...value.agents, [program]: agent };
 		}).catch(() => {});
 		if (token) await reportAgent(url, token, agent);
+	};
+	/**
+	 * Ask the agent its name and version once per connection, as the start check does, so Chopin
+	 * knows them before any job. It runs beside the connection, never holding it up; an agent that
+	 * doesn't answer within 10 seconds is left unnamed until a job or the next connection.
+	 */
+	let probeAgent = (token: string, signal: AbortSignal) => {
+		let started = [...saving.command];
+		let at = programAt(started);
+		started[at] = which(started[at]!) ?? started[at]!;
+		void checkAgent(started, {
+			cwd: info.root,
+			env: { ...process.env, ...env },
+			timeoutMs: 10_000,
+			signal,
+			onInfo: agent => void rememberAgent(agent, token),
+		}).catch(() => {});
 	};
 	// An agent that asks permission in the terminal can't run unattended; say so before it pairs.
 	if (installing && known && known.unattended !== true) {
@@ -476,8 +538,18 @@ export async function connect(
 			);
 		}
 	}
-	let release = await lockWorkspace(info.root, directory, { service, planners: plannerDocuments });
+	let release = await lockWorkspace(info.root, directory, {
+		service,
+		planners: plannerDocuments,
+		plannerCommand: plannerCommand.length > 0,
+	});
 	let failures = startFailures(directory, info.root);
+	let keep = keepRuns ?? KEEP_RUNS;
+	// Older finished runs go as the connector starts and after each run; never one still going.
+	let prune = () => pruneRuns(directory, keep).then(() => {}, () => {});
+	await prune();
+	let chosen = chosenPlanners(directory, info.root);
+	let fallback = githubFallback(directory, info.root);
 	let abort = new AbortController();
 	// The first Ctrl-C reports running work as stopped, then disconnects; a second forces exit.
 	let stop = () => {
@@ -491,6 +563,10 @@ export async function connect(
 	let unwatch = service ? onStopRequest(directory, stop) : () => {};
 	let output = createOutput();
 	let permissions = permissionMemory();
+	// Said once a connector, and kept for chopin status, when the GitHub App can't push here.
+	let githubRefused = (message: string) => {
+		if (fallback.record(info.repository)) output.say(output.style.dim(message));
+	};
 	try {
 		let { root: _root, ...source } = info;
 		let checkout = { ...source, label: basename(info.root) };
@@ -510,10 +586,16 @@ export async function connect(
 						+ `it for the account that made the key, run \`${SELF} unpair\`, then this command again.`,
 				);
 			}
+			if (stored && name !== undefined) {
+				output.say(
+					`This machine is already paired with ${url}, so --name wasn't used. To rename it, use `
+						+ "Edit machine name in its menu on Chopin's Machines page.",
+				);
+			}
 			let machine = stored
 				?? await pair({
 					url,
-					label: hostname(),
+					label: name || hostname(),
 					directory,
 					output,
 					signal: abort.signal,
@@ -523,21 +605,30 @@ export async function connect(
 			if (!machine) return;
 			// A key pairs once; pairing again after a revocation goes by the browser.
 			key = undefined;
+			name = undefined;
 			let announced = false;
 			// Planner backends run beside the work loop with this machine token and stop with it, so
 			// none outlives a revoked token and a machine paired again starts them with its new one.
 			let planners = new AbortController();
-			let planning = servePlanners({
+			let backends = {
 				url,
 				machine,
 				documents: plannerDocuments,
 				command: plannerCommand,
 				cwd: info.root,
+				directory,
+				repository: info.repository,
 				output,
 				signal: AbortSignal.any([abort.signal, planners.signal]),
 				failures,
 				env,
-			});
+				githubRefused,
+			};
+			let planning = servePlanners(backends);
+			// The Planners Chopin asks for, of documents this machine's owner chose it for.
+			let dispatched = plannerCommand.length
+				? dispatchedPlanners({ ...backends, chosen })
+				: undefined;
 			try {
 				await serveWork({
 					// Every connection registers anew with the machine token: a connection token lasts only
@@ -546,9 +637,11 @@ export async function connect(
 						connectionToken = await register(url, machine, checkout, signal, {
 							service,
 							planner: plannerDocuments.length > 0,
+							plannerCommand: plannerCommand.length > 0,
 							agent: (await readConfig(directory)).agents?.[program],
 						});
 						let api = await remote(url, connectionToken, signal);
+						probeAgent(connectionToken, AbortSignal.any([abort.signal, signal]));
 						if (!announced) {
 							output.connected(info.repository);
 							// Only a connect that got this far saves its settings for service install.
@@ -564,6 +657,7 @@ export async function connect(
 					},
 					signal: abort.signal,
 					output,
+					...(dispatched ? { planners: dispatched } : {}),
 					run: (api, kind, claim) =>
 						runWork(api, kind, claim, {
 							onAgent: agent => void rememberAgent(agent, connectionToken),
@@ -577,7 +671,9 @@ export async function connect(
 							interrupt: stop,
 							failures,
 							env,
-						}),
+							machine,
+							githubRefused,
+						}).finally(prune),
 				});
 				break;
 			} catch (error) {
@@ -591,7 +687,7 @@ export async function connect(
 				output.say("This machine needs pairing with Chopin again.");
 			} finally {
 				planners.abort();
-				await planning;
+				await Promise.all([planning, dispatched?.stop()]);
 			}
 		}
 	} catch (error) {
@@ -714,8 +810,10 @@ async function serviceCommand(args: string[]) {
 
 const USAGE =
 	`Usage: CHOPIN_URL=https://your-instance ${SELF} connect [checkout] [--key <pairing key>] `
+	+ "[--name <label>] "
 	+ "[--planner <document URL>]... [--planner-command <command>] [--env KEY=VALUE]... "
-	+ "[--install-service [--skip-check]] -- agent [ACP arguments]";
+	+ "[--keep-runs <n>] "
+	+ "[--install-service [--skip-check]] (--agent <id> [-- <extra arguments>] | -- <ACP command>)";
 
 const HELP = [
 	`Usage: ${SELF} <command> [--base-dir <dir>]`,
@@ -728,17 +826,28 @@ const HELP = [
 	"      machine, with no browser; without one you approve the pairing in a browser.",
 	"  unpair",
 	"      Revoke this machine's token in Chopin and delete it here.",
-	"  connect [checkout] [--key <pairing key>] -- <agent> [ACP arguments]",
+	"  connect [checkout] [--key <pairing key>] [--name <label>] --agent <id> [-- <arguments>]",
 	"      Run the work you start in the checkout's documents with a local ACP agent.",
+	`      --agent names a built-in agent (${
+		AGENTS.map(agent => agent.id).join(", ")
+	}) and runs its ACP command with the`,
+	"      variables it needs; arguments after -- are added to its command. For any other ACP",
+	"      agent, give its command after -- instead of --agent.",
 	"      Pairs this machine first if it isn't paired yet, with --key or CHOPIN_PAIRING_KEY as",
-	"      pair does. Once connected, saves what it runs for service install (never the key). A",
-	"      program this shell finds only through a version manager's per-shell directory is saved",
-	"      by its stable path.",
+	"      pair does. --name <label> names it in Chopin as it pairs (default: the hostname); a",
+	"      machine paired already keeps its name, which its menu on the Machines page changes.",
+	"      Once connected, saves what it runs for service install (never the key), with the",
+	"      agent and Planner command by the full path this shell finds them at. One found only",
+	"      through a version manager's per-shell directory is saved by its stable path.",
 	"      --planner <document URL> (repeatable) with --planner-command <command> also runs that",
 	"      command in the checkout as each document's Planner under HARNESS=remote, and starts it",
 	"      again whenever it exits. CHOPIN_PLANNER_COMMAND may hold the command as a JSON array.",
+	"      --planner-command alone lets Chopin start the Planner of a document you choose this",
+	"      machine for, and stop it when you choose another.",
 	"      --env KEY=VALUE (repeatable) sets a variable for the agent and the Planner. It is saved",
 	"      in config.json, so keep secrets in the agent's own login. CHOPIN_* and PATH are refused.",
+	"      --keep-runs <n> keeps the worktrees of the n most recently finished runs (default 15, 0",
+	"      for all) and removes older ones as it starts and after each run.",
 	"      --install-service connects once, then stops and runs service install, so one command",
 	"      sets up the service. --skip-check passes on to it.",
 	"  status [--json]",
@@ -763,8 +872,8 @@ const HELP = [
 	"  version    Print the CLI version.",
 	"  help       Show this help.",
 	"",
-	"--base-dir (or CHOPIN_HOME) is where the machine token, locks and worktrees live",
-	"(default ~/.local/state/chopin/connector).",
+	"--base-dir (or CHOPIN_HOME) is where the machine token, locks, runs and Planner worktrees",
+	"live (default ~/.local/state/chopin/connector).",
 	"CHOPIN_URL names your Chopin instance for connect, which saves it for the other commands",
 	`and the service (default: ${DEFAULT_URL}).`,
 ].join("\n");
@@ -800,7 +909,7 @@ if (import.meta.main) {
 			createOutput().error(
 				connectorMessage(error) ?? (error instanceof Error ? error.message : "Connector failed"),
 			);
-			process.exitCode = 1;
+			process.exitCode = error instanceof UsageError ? 2 : 1;
 		}
 	}
 }

@@ -301,6 +301,16 @@ describe("first build", () => {
 		expect(buildRefusalCopy("reviewed graph has changed")).toBe("The tasks changed. Try again");
 		expect(buildRefusalCopy("unanswered questionnaires")).toBe("Answer the open decisions first");
 		expect(buildRefusalCopy("something internal")).toBe("The build couldn’t start. Try again");
+		// The person's machine choice cannot be read; the Build never goes to another machine.
+		expect(buildRefusalCopy("Can't read your machine choice right now. Try again.")).toBe(
+			"Can't read your machine choice right now. Try again",
+		);
+		// The server names the machine the person chose; the copy keeps the name.
+		expect(
+			buildRefusalCopy(
+				"build-box is offline. Start chopin connect on it, or choose another machine.",
+			),
+		).toBe("build-box is offline");
 		expect(draftRefusalCopy("No Planner is attached to this document. To attach one, …"))
 			.toBe("Connect a Planner to this document to build.");
 		expect(draftRefusalCopy("anything", "planner-not-attached"))
@@ -460,7 +470,7 @@ describe("living document sync", () => {
 		let edited = live({ outstandingTasks, outOfSync: true });
 		expect(syncStatus(edited)).toEqual({ kind: "out-of-sync", reason: "pending", outstanding: 2 });
 		expect(syncHint(syncStatus(edited), edited, "me"))
-			.toBe("Changes will build shortly · will also retry 2 blocked tasks");
+			.toBe("Changes will build shortly. 2 blocked tasks will retry too");
 		// Syncing beats needing attention.
 		expect(syncStatus(live({ outstandingTasks, rebuild: rebuild("running") })))
 			.toEqual({ kind: "building" });
@@ -654,6 +664,24 @@ describe("build status", () => {
 	let look = (value: ImplementationSnapshot | undefined, change = {}) =>
 		buildLook(value, { ...context, ...change });
 
+	it("names decisions and investigations together instead of a hidden completeness veto", () => {
+		expect(look(
+			snapshot({
+				blockers: ["unanswered questionnaires", "required investigations"],
+				buildInvestigations: [{
+					id: "investigation",
+					brief: "Measure startup",
+					reason: "Choose approach",
+				}],
+			}),
+			{ unanswered: 2 },
+		)).toEqual({
+			kind: "plan",
+			blocked: "Waiting on 2 decisions and 1 investigation",
+		});
+		expect(look(snapshot({ buildReady: false }))).toEqual({ kind: "plan", blocked: undefined });
+	});
+
 	it("offers Build plan before the first build, inert with its reason", () => {
 		expect(look(snapshot())).toEqual({ kind: "plan", blocked: undefined });
 		expect(look(snapshot(), { hasContent: false })).toEqual({
@@ -661,12 +689,12 @@ describe("build status", () => {
 			blocked: "Write the document first",
 		});
 		expect(look(snapshot({ blockers: ["unanswered questionnaires"] }), { unanswered: 2 }))
-			.toEqual({ kind: "plan", blocked: "Answer 2 open decisions first" });
+			.toEqual({ kind: "plan", blocked: "Waiting on 2 decisions" });
 		expect(look(snapshot({ blockers: ["accepted comments awaiting plan changes"] })).kind)
 			.toBe("plan");
 		expect(look(snapshot({ buildReady: false }))).toEqual({
 			kind: "plan",
-			blocked: "Add more detail before building",
+			blocked: undefined,
 		});
 		expect(look(snapshot({ graph: undefined }), { planner: false })).toEqual({
 			kind: "plan",
@@ -695,7 +723,7 @@ describe("build status", () => {
 		});
 		let building = look(running);
 		expect(building).toMatchObject({ kind: "building", done: 1, total: 3 });
-		expect(buildLabel(building)).toBe("Building · 1 of 3");
+		expect(buildLabel(building)).toBe("Building 1 of 3");
 	});
 
 	it("reads a delivered build as built, and a stopped first build as stopped with Retry", () => {
@@ -715,7 +743,7 @@ describe("build status", () => {
 			snapshot({ lifecycle: { execution: { state: "idle" }, history: [reported] } }),
 		);
 		expect(early).toEqual({ kind: "building", done: 0, total: 1, tip: "0 of 1 tasks built" });
-		expect(buildLabel(early)).toBe("Building · 0 of 1");
+		expect(buildLabel(early)).toBe("Building 0 of 1");
 		let failed = look(snapshot({ build: build("failed") }));
 		expect(failed).toMatchObject({ kind: "stopped", retry: true });
 		expect(buildLabel(failed)).toBe("Build stopped");
@@ -728,7 +756,7 @@ describe("build status", () => {
 			tip: "Your local agent isn’t connected. Open Build for the command that starts it.",
 			retry: true,
 		});
-		expect(buildLabel(noAgent)).toBe("Start your local agent");
+		expect(buildLabel(noAgent)).toBe("Agent offline");
 		expect(buildTabReady(snapshot(), noAgent)).toBe(true);
 		expect(retryAction(noAgent)).toBe("Retry");
 		expect(retryAction(failed)).toBe("Retry");
@@ -747,9 +775,9 @@ describe("build status", () => {
 		let stale = live({ outOfSync: true, changes: 3, rebuild: rebuild("stopped") });
 		let manual = look(stale);
 		expect(manual).toMatchObject({ kind: "stale", changes: 3, live: false, build: true });
-		expect(buildLabel(manual)).toBe("3 changes to build");
+		expect(buildLabel(manual)).toBe("3 changes ready");
 		expect(manual).toMatchObject({ tip: "Edits since the last build" });
-		expect(buildLabel(look(live({ outOfSync: true, changes: 1 })))).toBe("1 change to build");
+		expect(buildLabel(look(live({ outOfSync: true, changes: 1 })))).toBe("1 change ready");
 		expect(look(stale, { canEdit: false })).toMatchObject({ build: false });
 		// Under LIVE_BUILD the edits build themselves, so there is nothing to press.
 		expect(look(stale, { live: true })).toMatchObject({
@@ -773,7 +801,7 @@ describe("build status", () => {
 		expect(look(blocked, { unanswered: 1 })).toMatchObject({
 			kind: "stale",
 			build: true,
-			blocked: "Answer 1 open decision first",
+			blocked: "Waiting on 1 decision",
 		});
 		let failed = live({ outOfSync: true, rebuild: rebuild("failed") });
 		failed.blockers = ["accepted comments awaiting plan changes"];
@@ -781,6 +809,19 @@ describe("build status", () => {
 			retry: true,
 			blocked: "Update the document for accepted comments first",
 		});
+	});
+
+	it("names live rebuild blockers even without a manual Build action", () => {
+		let blocked = live({ outOfSync: true, changes: 2 });
+		blocked.blockers = ["required investigations", "unanswered questionnaires"];
+		blocked.buildInvestigations = [{ id: "evidence", brief: "Measure startup", reason: "Choose" }];
+		let result = look(blocked, { live: true, unanswered: 2 });
+		expect(result).toMatchObject({
+			kind: "stale",
+			build: false,
+			tip: "Waiting on 2 decisions and 1 investigation",
+		});
+		expect(buildLabel(result)).toBe("Waiting to build");
 	});
 
 	it("says building runs on your agent only to someone who can build", () => {
@@ -799,7 +840,7 @@ describe("build status", () => {
 		expect(failed).toMatchObject({ retry: true });
 		expect(buildLabel(look(live()))).toBe("Built");
 		expect(look({ ...live(), builtBy: "maggie" }, { userId: "other" }))
-			.toMatchObject({ tip: "Every pull request matches the document · built by @maggie" });
+			.toMatchObject({ tip: "Built by @maggie. Every pull request matches the document" });
 		// An unknown builder is left unnamed rather than called “the builder”.
 		expect(look(live(), { userId: "other" }))
 			.toMatchObject({ tip: "Every pull request matches the document" });

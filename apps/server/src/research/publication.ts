@@ -1,3 +1,4 @@
+import { displayTitle, documentTitleText, parse } from "@chopin/dialect";
 import * as Plan from "../plan/service";
 import { plannerAuthored } from "../document-provenance";
 import { StorageError } from "../storage/errors";
@@ -60,6 +61,8 @@ export async function publishInitialResearchChild(input: {
 }): Promise<"published" | "pending"> {
 	let initial = await plannerAuthored(Plan.initial)(
 		researchReportSource(input.report, input.sources),
+		undefined,
+		input.title,
 	);
 	let published;
 	try {
@@ -67,7 +70,7 @@ export async function publishInitialResearchChild(input: {
 			channelId: input.workspace.channelId,
 			workspaceId: input.workspace.id,
 			answerJobId: input.answerJobId,
-			title: input.title,
+			title: displayTitle(documentTitleText(parse(initial.source)) ?? input.title),
 			initial,
 			now: input.now,
 			lease: input.lease,

@@ -1,3 +1,4 @@
+import { resetPlannerJobs } from "./planner-jobs";
 import { authenticate, content, expect, roomPath, test } from "./room";
 import { openJevWire, sendChat, wireFrames, wireRequest, wireState } from "./jev-wire";
 
@@ -69,6 +70,10 @@ async function scopedChoiceReady(ana: Page, bo: Page, room: string) {
 			item => item.kind === "option",
 		).length
 	).toBe(2);
+	for (let page of [ana, bo]) {
+		await page.getByRole("group", { name: "Document view" })
+			.getByRole("button", { name: /^Document(?:,|$)/ }).click();
+	}
 	return (await wireState(ana))!.threads[0]!.questionnaireId!;
 }
 
@@ -81,7 +86,16 @@ async function settled(ana: Page, bo: Page, room: string) {
 	await waitForEvent(ana, "option.added");
 	await sendChat(bo, "Let's just go with a small pilot.");
 	await waitForEvent(ana, "settle.suggested");
+	await waitForEvent(ana, "card.linked");
+	for (let page of [ana, bo]) {
+		await page.getByRole("group", { name: "Document view" })
+			.getByRole("button", { name: /^Document(?:,|$)/ }).click();
+	}
 }
+
+test.beforeEach(async () => {
+	await resetPlannerJobs({ heading: true, suggest: true });
+});
 
 test("one member's choice posts a live Save decision prompt for everyone", async ({ join, room }) => {
 	let ana = await join("ana");
@@ -101,7 +115,7 @@ test("one member's choice posts a live Save decision prompt for everyone", async
 		actor: { kind: "member", handle: "ana" },
 	});
 	for (let page of [ana, bo]) {
-		await expectRetiredPrompts(page, `Decided: ${OPTION} · @ana`);
+		await expectRetiredPrompts(page, `Decided by @ana: ${OPTION}`);
 	}
 });
 
@@ -145,6 +159,8 @@ test("one person's scoped choice saves through the authenticated wire and surviv
 		let reader = await readerContext.newPage();
 		await authenticate(reader, "readonly", baseURL!);
 		await reader.goto(roomPath(room));
+		await reader.getByRole("group", { name: "Document view" })
+			.getByRole("button", { name: /^Document(?:,|$)/ }).click();
 		await expect(content(reader)).toHaveAttribute("contenteditable", "false");
 		await openJevWire(reader, room);
 		await expect(scopedPrompt(reader)).toBeVisible();
@@ -152,7 +168,8 @@ test("one person's scoped choice saves through the authenticated wire and surviv
 			scopedPrompt(reader).getByRole("button", {
 				name: "Save for this spike",
 			}),
-		).toBeDisabled();
+		).toHaveCount(0);
+		await expect(scopedPrompt(reader)).toContainText("This document is read-only.");
 		let denied = await wireRequest(reader, {
 			kind: "conversation-plan:scoped-choice-save",
 			actionId: crypto.randomUUID(),
@@ -182,6 +199,8 @@ test("one person's scoped choice saves through the authenticated wire and surviv
 	await expect(cardById(ana, cardId)).toBeVisible();
 
 	await ana.reload();
+	await ana.getByRole("group", { name: "Document view" })
+		.getByRole("button", { name: /^Document(?:,|$)/ }).click();
 	await expect(content(ana)).toHaveAttribute("contenteditable", "true");
 	await openJevWire(ana, room);
 	await expect(scopedPrompt(ana)).toBeVisible();
@@ -416,7 +435,7 @@ test("a remote human card selection overrides the live prompt", async ({ join, r
 		origin: "human",
 	});
 	for (let page of [ana, bo]) {
-		await expectRetiredPrompts(page, "Decided: Ship to everyone · @ana");
+		await expectRetiredPrompts(page, "Decided by @ana: Ship to everyone");
 	}
 });
 
@@ -462,11 +481,14 @@ test("an old prompt retires after Save and Reopen before a new suggestion", asyn
 	await prompt(ana).getByRole("button", { name: "Save decision" }).click();
 	let decided = await waitForEvent(ana, "decision.recorded");
 	let cardId = decided.threads[0]!.questionnaireId!;
-	await expectRetiredPrompts(ana, `Decided: ${OPTION} · @ana`);
+	await expectRetiredPrompts(ana, `Decided by @ana: ${OPTION}`);
 	let retiredCount = await ana.locator("[data-decision-prompt]").count();
 
 	await ana.getByRole("button", { name: /^Decisions/ }).click();
-	await ana.getByRole("button", { name: "1 resolved" }).click();
+	await expect(ana.getByRole("button", { name: "1 resolved" })).toHaveAttribute(
+		"aria-expanded",
+		"true",
+	);
 	let resolved = ana.locator(
 		`[data-document-view="decisions"] article[data-plan-sidecar-questionnaire="${cardId}"]`,
 	);
@@ -502,6 +524,8 @@ test("a read-only prompt keeps Save disabled while Open in plan stays available"
 		let reader = await context.newPage();
 		await authenticate(reader, "readonly", baseURL!);
 		await reader.goto(roomPath(room));
+		await reader.getByRole("group", { name: "Document view" })
+			.getByRole("button", { name: /^Document(?:,|$)/ }).click();
 		await expect(content(reader)).toHaveAttribute("contenteditable", "false");
 		await expect(prompt(reader)).toBeVisible();
 		await expect(prompt(reader).getByRole("button", { name: "Save decision" })).toHaveCount(0);

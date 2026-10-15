@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { changedBlocks } from "./changes";
 import { approveGraph, validate } from "./graphs";
-import { implementationReadiness } from "./plan-graphs";
+import { planningReadiness } from "./plan-graphs";
 import {
 	claimEligibility,
 	historyFor,
@@ -209,7 +209,7 @@ export async function queueBuild(plan: Plan, input: BuildInput): Promise<BuildRe
 				plan.execution
 				|| plan.builds.some(build => ["queued", "starting", "running"].includes(build.state))
 			) throw new Error("implementation is already active");
-			let ready = implementationReadiness(plan, input.planRevision);
+			let ready = await planningReadiness(plan, input.planRevision);
 			if (!ready.ok) throw new Error(ready.blockers.join(", "));
 			let id = crypto.randomUUID();
 			let eligibility = claimEligibility(plan.lifecycle, version, id);
@@ -249,6 +249,8 @@ export type RebuildConnections = {
 	list: (repositoryId: string, owner?: string) => Connection[];
 	assign: (connectionId: string, documentId: string) => void;
 	assigned: (connectionId: string) => string | undefined;
+	/** Whether the connection may take its owner's work on this document: their machine choice. */
+	allows?: (documentId: string, connection: Connection) => boolean;
 };
 
 export type RebuildResult =
@@ -296,8 +298,8 @@ export async function queueRebuild(
 		if (options.automatic && stoppedForRevision(plan)) return { kind: "unavailable" };
 		if (buildActive(plan)) return { kind: "busy" };
 		if (source(plan) === live.baseSource) return { kind: "unchanged" };
-		if (options.by) {
-			let ready = implementationReadiness(plan, plan.revision);
+		{
+			let ready = await planningReadiness(plan, plan.revision);
 			if (!ready.ok) return { kind: "blocked", blockers: ready.blockers };
 		}
 		let owner = options.by ?? live.user;
@@ -307,6 +309,7 @@ export async function queueRebuild(
 			return !!connection && connection.owner === owner
 				&& connection.source.repositoryId === live.repositoryId
 				&& (!options.automatic || connection.autoRun === true)
+				&& (connections.allows?.(plan.id, connection) ?? true)
 				&& (assigned === undefined || assigned === plan.id);
 		};
 		let connection = original && connections.get(original.connectionId);

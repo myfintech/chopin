@@ -29,6 +29,7 @@ function spawn(
 		env: {
 			...process.env,
 			AGENT: "off",
+			JEV_API_KEY: "synthetic-test-key",
 			APP_ORIGIN: `http://127.0.0.1:${port}`,
 			DATABASE_URL: database!,
 			GITHUB_APP_SLUG: "chopin-test",
@@ -54,7 +55,7 @@ async function started(child: Subprocess): Promise<void> {
 	let reader = output.getReader();
 	let content = "";
 	try {
-		while (!content.includes("chopin  ·")) {
+		while (!content.includes("chopin http")) {
 			let next = await reader.read();
 			if (next.done) throw new Error("server exited before startup completed");
 			content += new TextDecoder().decode(next.value);

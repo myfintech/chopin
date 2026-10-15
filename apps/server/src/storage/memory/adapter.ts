@@ -1,6 +1,6 @@
+import { finalizeTitleReceipt } from "../title";
 import { conflict, missing } from "../errors";
 import { documentSlug, documentSlugCandidate } from "../../channels/slug";
-import { availableChannelTitle } from "../../channels/title";
 import { sidecarUnansweredDecisions } from "../../questions/unanswered";
 import { childSidecarWithoutConversation } from "../child-conversation";
 import { MemoryBackgroundJobStore } from "./jobs";
@@ -141,12 +141,7 @@ export class MemoryStorage implements StorageAdapter {
 		createChannel: input =>
 			this.#createChannel({
 				...input,
-				title: availableChannelTitle(
-					input.title,
-					[...this.#channels.values()]
-						.filter(channel => channel.repositoryId === input.repositoryId)
-						.map(channel => channel.title),
-				),
+				title: input.title,
 			}),
 	});
 
@@ -169,7 +164,10 @@ export class MemoryStorage implements StorageAdapter {
 		userExists: id => this.#users.has(id),
 	});
 	readonly images: ImageStore = this.#images;
-	readonly machines: MachineStore = new MemoryMachineStore(id => this.#users.has(id));
+	readonly machines: MachineStore = new MemoryMachineStore(
+		id => this.#users.has(id),
+		id => this.#channels.has(id),
+	);
 
 	readonly users: UserStore = {
 		put: input => {
@@ -372,12 +370,7 @@ export class MemoryStorage implements StorageAdapter {
 				createAvailableChannel: input =>
 					this.#createChannel({
 						...input,
-						title: availableChannelTitle(
-							input.title,
-							[...this.#channels.values()]
-								.filter(channel => channel.repositoryId === input.repositoryId)
-								.map(channel => channel.title),
-						),
+						title: input.title,
 					}),
 			}),
 		assertLease: held => this.#assertLease(held),
@@ -481,12 +474,6 @@ export class MemoryStorage implements StorageAdapter {
 				throw conflict(`channel ${input.parentChannelId} cannot parent another child`);
 			}
 		}
-		if (
-			[...this.#channels.values()].some(channel =>
-				channel.repositoryId === input.repositoryId
-				&& channel.title.toLowerCase() === input.title.toLowerCase()
-			)
-		) throw conflict(`channel title ${input.title} already exists in this repository`);
 		let { initial, now, ...record } = input;
 		let slug = this.#reserveSlug(input.repositoryId, input.id, input.title);
 		let saved: ChannelRecord = {
@@ -520,13 +507,6 @@ export class MemoryStorage implements StorageAdapter {
 		if (!found) throw missing(`channel ${input.id} does not exist`);
 		if (found.archivedAt) throw conflict(`channel ${input.id} is archived`);
 		if (found.title === input.title) return { channel: channel(found), changed: false };
-		if (
-			[...this.#channels.values()].some(value =>
-				value.id !== found.id
-				&& value.repositoryId === found.repositoryId
-				&& value.title.toLowerCase() === input.title.toLowerCase()
-			)
-		) throw conflict(`channel title ${input.title} already exists in this repository`);
 		let updatedAt = input.now > found.updatedAt
 			? input.now
 			: new Date(found.updatedAt.getTime() + 1);
@@ -888,6 +868,14 @@ export class MemoryStorage implements StorageAdapter {
 
 		let sequence = this.#sequences.get(input.channelId) ?? 1;
 		let revision = found.revision + 1;
+		let title = input.title ?? found.title;
+		let sidecar = input.sidecar;
+		if (input.finalizeTitleReceipt && sidecar !== undefined) {
+			sidecar = finalizeTitleReceipt(sidecar, { ...found, title, revision });
+		}
+		let slug = title === found.title
+			? found.slug
+			: this.#reserveSlug(found.repositoryId, found.id, title);
 		if (input.update) {
 			let updates = this.#updates.get(input.channelId) ?? [];
 			updates.push({
@@ -899,7 +887,10 @@ export class MemoryStorage implements StorageAdapter {
 			});
 			this.#updates.set(input.channelId, updates);
 		}
-		if (input.sidecar !== undefined) this.#sidecars.set(input.channelId, json(input.sidecar));
+		if (input.finalizeTitleReceipt && sidecar !== undefined) {
+			sidecar = finalizeTitleReceipt(sidecar, { ...found, title, slug, revision });
+		}
+		if (sidecar !== undefined) this.#sidecars.set(input.channelId, json(sidecar));
 		if (input.events.length > 0) {
 			existingEvents.push(...input.events.map((event, ordinal) => ({
 				...event,
@@ -913,6 +904,8 @@ export class MemoryStorage implements StorageAdapter {
 		}
 		this.#channels.set(input.channelId, {
 			...found,
+			title,
+			slug,
 			revision,
 			updatedAt: new Date(Math.max(found.updatedAt.getTime(), input.now.getTime())),
 			...(input.sidecar !== undefined
@@ -921,7 +914,15 @@ export class MemoryStorage implements StorageAdapter {
 		});
 		this.#sequences.set(input.channelId, sequence + 1);
 		if (input.provenance) this.provenance.record(input.channelId, input.provenance, input.now);
-		let result = { revision, sequence, repeated: false };
+		let result = {
+			revision,
+			sequence,
+			repeated: false,
+			...(input.finalizeTitleReceipt && sidecar !== undefined ? { sidecar } : {}),
+			...(input.title !== undefined
+				? { channel: channel(this.#channels.get(input.channelId)!) }
+				: {}),
+		};
 		operations.set(input.operationId, result);
 		return Promise.resolve(result);
 	}
@@ -967,6 +968,10 @@ export class MemoryStorage implements StorageAdapter {
 		}
 		let sequence = this.#sequences.get(input.channelId) ?? 1;
 		let revision = found.revision + 1;
+		let title = input.title ?? found.title;
+		let slug = title === found.title
+			? found.slug
+			: this.#reserveSlug(found.repositoryId, found.id, title);
 		this.#sidecars.set(input.channelId, json(input.sidecar));
 		this.#snapshots.set(input.channelId, {
 			channelId: input.channelId,
@@ -983,12 +988,21 @@ export class MemoryStorage implements StorageAdapter {
 		this.#updates.set(input.channelId, []);
 		this.#channels.set(input.channelId, {
 			...found,
+			title,
+			slug,
 			revision,
 			updatedAt: new Date(Math.max(found.updatedAt.getTime(), input.now.getTime())),
 			unansweredDecisions: sidecarUnansweredDecisions(input.sidecar),
 		});
 		this.#sequences.set(input.channelId, sequence + 1);
-		let result = { revision, sequence, repeated: false };
+		let result = {
+			revision,
+			sequence,
+			repeated: false,
+			...(input.title !== undefined
+				? { channel: channel(this.#channels.get(input.channelId)!) }
+				: {}),
+		};
 		operations.set(input.operationId, result);
 		return Promise.resolve(result);
 	}

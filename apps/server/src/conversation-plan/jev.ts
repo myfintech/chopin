@@ -1,4 +1,6 @@
 /** Bounded TypeSafe SystemOne transport. Only validated answers leave this boundary. */
+import { askDecisions, decisionsConfigured } from "../openai-decisions";
+
 export type JevQuestion =
 	| { type: "noul"; instructions: string; criteria?: { true: string; false: string } }
 	| { type: "choice"; instructions: string; criteria: Record<string, string> }
@@ -168,6 +170,7 @@ function validateRequest(request: JevRequest): void {
 
 export async function askJev(request: JevRequest, options: JevOptions = {}): Promise<JevResult> {
 	validateRequest(request);
+	if (decisionsConfigured()) return askDecisions(request, options);
 	let apiKey = options.apiKey ?? process.env.JEV_API_KEY ?? process.env.TYPESAFE_API_KEY;
 	if (!apiKey) throw new Error("Jev API key is not configured");
 	let model = options.model ?? "jev-latest";

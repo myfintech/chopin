@@ -1,0 +1,22 @@
+.design-audit-resolved-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
+	gap: 1.5rem 1rem;
+}
+
+.design-audit-resolved-sample {
+	display: grid;
+	min-width: 0;
+	align-content: start;
+	gap: 0.5rem;
+}
+
+/* Room for the positioned popover surface, which sits out of flow as it does beside prose. */
+.design-audit-resolved-slot {
+	position: relative;
+	min-height: 9rem;
+}
+
+.design-audit-resolved-slot[data-pinned] {
+	min-height: 14rem;
+}

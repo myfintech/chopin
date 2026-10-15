@@ -11,7 +11,7 @@
 				1
 			]
 		],
-		"sourceHash": "597e6ae2f29f356bb4ed6bf6704357ee048e265a2b79f37ecbb037ae9a0f80b8"
+		"sourceHash": "6b1b7a49e39a872b5ebd4b375b3ed56ec802711a5872b85f40926b298e651c38"
 	},
 	{
 		"file": "packages/editor/src/card.tsx",
@@ -25,7 +25,7 @@
 				1
 			]
 		],
-		"sourceHash": "597e6ae2f29f356bb4ed6bf6704357ee048e265a2b79f37ecbb037ae9a0f80b8"
+		"sourceHash": "6b1b7a49e39a872b5ebd4b375b3ed56ec802711a5872b85f40926b298e651c38"
 	},
 	{
 		"file": "packages/editor/src/content-swap.tsx",
@@ -74,7 +74,21 @@
 				1
 			]
 		],
-		"sourceHash": "5a578d3960aca2da3da87c7c80757b338402221713687734a4249d53eb7e2529"
+		"sourceHash": "366a82590508a11c0582b1704748398f0ce66ec5b1e84add381e630c50120a4e"
+	},
+	{
+		"file": "packages/editor/src/static-plan-editor.tsx",
+		"reason": "Component forwards or combines caller class names; static call-site classes are scanned. Runtime/cross-module values require review at this exact component boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"class",
+				"className",
+				"class > StaticPlanEditor > <section>",
+				1
+			]
+		],
+		"sourceHash": "366a82590508a11c0582b1704748398f0ce66ec5b1e84add381e630c50120a4e"
 	},
 	{
 		"file": "packages/editor/src/toolbar/slash.tsx",
@@ -102,7 +116,7 @@
 				1
 			]
 		],
-		"sourceHash": "ee755d675aab961554c2afbbc08de932bd1ba2ece56fbe81c015aee10d5a0011"
+		"sourceHash": "ee95ee327039ab440bfdc4484ecc59b5e852689fc5bc641e6d48889ff05eef81"
 	},
 	{
 		"file": "packages/editor/src/toolbar/bubble.tsx",
@@ -172,7 +186,7 @@
 				4
 			]
 		],
-		"sourceHash": "289fc341575dd4b9600351d5fba3c79b6fe31782d22c1d6671306849be785397"
+		"sourceHash": "0c6320c0c396562d88ceb7661b868fe53435a0a576f7fb66dce36f3ee607aef7"
 	},
 	{
 		"file": "packages/editor/src/widgets/research-motion.tsx",
@@ -214,7 +228,7 @@
 				1
 			]
 		],
-		"sourceHash": "7f01bfcc9dcc37a99ca2959f36125ca913dc0583d59024f2c53597c53e5bf652"
+		"sourceHash": "b407049da3918eccef652e8f37d3364690df1cd7df62b7262b022f43cf7028db"
 	},
 	{
 		"file": "packages/editor/src/comment-layer.tsx",
@@ -242,7 +256,7 @@
 				1
 			]
 		],
-		"sourceHash": "7f01bfcc9dcc37a99ca2959f36125ca913dc0583d59024f2c53597c53e5bf652"
+		"sourceHash": "b407049da3918eccef652e8f37d3364690df1cd7df62b7262b022f43cf7028db"
 	},
 	{
 		"file": "packages/editor/src/table/rails.tsx",
@@ -361,7 +375,7 @@
 				2
 			]
 		],
-		"sourceHash": "fe1a8ee7b56a5e725a928ce99c686646de983ec543d6007ab3fa9e5880542517"
+		"sourceHash": "91da2b7370f622c60d74adf822c87f89c7bd769cf182f04548d5bb8be85d9bcb"
 	},
 	{
 		"file": "packages/editor/src/collaboration.tsx",
@@ -403,7 +417,7 @@
 				1
 			]
 		],
-		"sourceHash": "f756270292adf55235e1b5c6ae1b0511349fd8e62e9303ca944ea30166106980"
+		"sourceHash": "371ad14e7c9fce7fd17bf263b4e92a2592866672d1f9634fb1510b0c297c11b5"
 	},
 	{
 		"file": "packages/editor/src/widgets/code-view.tsx",
@@ -452,7 +466,7 @@
 				1
 			]
 		],
-		"sourceHash": "b66eda9493a332f0c5d39b5fc2c07df09de7d45457d7ac45c2a839d1651e1f86"
+		"sourceHash": "f1900f314ea54c974e0583c70876f2c90f57b8c124fc24ae6457a5ff4406b094"
 	},
 	{
 		"file": "packages/editor/src/widgets/questionnaire.tsx",
@@ -466,7 +480,7 @@
 				1
 			]
 		],
-		"sourceHash": "f756270292adf55235e1b5c6ae1b0511349fd8e62e9303ca944ea30166106980"
+		"sourceHash": "371ad14e7c9fce7fd17bf263b4e92a2592866672d1f9634fb1510b0c297c11b5"
 	},
 	{
 		"file": "packages/editor/src/resolved-layer.tsx",
@@ -480,7 +494,7 @@
 				1
 			]
 		],
-		"sourceHash": "dc998b993e2f8ca0980fc0424b635126eb34027828dee1f926d86892d543065e"
+		"sourceHash": "85d00794b43d155d0fc0c27007362f29a3285cae4ab07b03c24b3a2f9035db18"
 	},
 	{
 		"file": "packages/editor/src/resolved-layer.tsx",
@@ -494,6 +508,20 @@
 				1
 			]
 		],
-		"sourceHash": "dc998b993e2f8ca0980fc0424b635126eb34027828dee1f926d86892d543065e"
+		"sourceHash": "85d00794b43d155d0fc0c27007362f29a3285cae4ab07b03c24b3a2f9035db18"
+	},
+	{
+		"file": "packages/editor/src/blank-behind-decisions.tsx",
+		"reason": "The derived body placeholder stays outside contenteditable; its top, left and width are measured from the first body paragraph relative to the editor host, so title wrapping and resize preserve alignment. No design values or document content enter this object.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"position",
+				"unresolved style > BlankBehindDecisions > <div>",
+				1
+			]
+		],
+		"sourceHash": "7be7c4960d4f135d6966504efdedeb1ffbb1b18bad0ffbd26d64084843d3a0b2"
 	}
 ]

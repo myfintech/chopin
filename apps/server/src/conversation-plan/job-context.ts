@@ -55,7 +55,7 @@ export function createJobContexts() {
 					for (let id of effect.sourceMessageIds ?? []) needed.add(id);
 				}
 				if (effect.kind === "insert-card") {
-					// Linking the card creates a refine job from the original question source.
+					// Initial title generation uses the original question source.
 					let thread = work.conversationPlan?.threads.find(item => item.id === effect.threadId);
 					let source = thread?.questionSources[0];
 					if (source) needed.add(source.messageId);
@@ -146,7 +146,8 @@ export function createJobContexts() {
 		claim(plan: Plan, job: Job): { context: Chat.Room; claimantSessionId: string } | undefined {
 			prune(plan);
 			let byMessage = byPlan.get(plan);
-			let triggered = byMessage?.get(job.trigger);
+			let triggered = byMessage?.get(job.trigger)
+				?? (job.kind === "heading" ? [...(byMessage?.values() ?? [])].at(-1) : undefined);
 			let owner = plan.chat.owner?.sessionId;
 			if (job.kind === "prose" && !triggered) return undefined;
 			if (owner) {

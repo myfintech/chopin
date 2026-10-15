@@ -32,7 +32,7 @@
 				1
 			]
 		],
-		"sourceHash": "8e37facd44c8bddb814c02657e345721ff1425dd589196d2ab05c51b856fa12b"
+		"sourceHash": "b2d6afd54a515be66fed2a6604c2db03d0cf131e0eeaeb704d6f132191c61343"
 	},
 	{
 		"file": "packages/question/src/react/resolved-actions.tsx",
@@ -46,7 +46,7 @@
 				1
 			]
 		],
-		"sourceHash": "bd0b6b0b4e5b16f71f129dd4a840314d64268da7f640105563c50417a1248df2"
+		"sourceHash": "7937988eea411309cd8392a30b460554915453fb1ecce42a3292201789156835"
 	},
 	{
 		"file": "packages/icons/src/icon.tsx",
@@ -60,7 +60,7 @@
 				1
 			]
 		],
-		"sourceHash": "1d0601ddb8e0ba1f301841e5c51343da3df2393fe16c7e97906b5665c7009bab"
+		"sourceHash": "af4e8327106390bb8054bc6e9a2f89703673605fac5f561f705a1e4eeb3fb9ec"
 	},
 	{
 		"file": "packages/icons/src/system.tsx",
@@ -109,7 +109,7 @@
 				1
 			]
 		],
-		"sourceHash": "b08339820a9ffff53f4820e01aafc570facbef7ad9b0cdb9d987b09498b604c1"
+		"sourceHash": "d437ae11044c046716a6df5efcd040835bb6f732aae5d99e7bdefbedebd55c65"
 	},
 	{
 		"file": "packages/icons/src/line.tsx",
@@ -211,6 +211,13 @@
 				"*",
 				"props",
 				"unresolved JSX props > SparkleIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > StarIcon > <LineIcon>",
 				1
 			],
 			[
@@ -410,7 +417,7 @@
 				1
 			]
 		],
-		"sourceHash": "7f9aee6935f77a6940153f60fb9aaa7850a3e33f4dc1864614091c028a850618"
+		"sourceHash": "ff0dccde87b5d7d52fe7df839f4b7d55a07ac1e1de73384b6acce853dcefcd4c"
 	},
 	{
 		"file": "packages/icons/src/warning.tsx",
@@ -802,7 +809,7 @@
 				1
 			]
 		],
-		"sourceHash": "332e0f7dd19c48d5a89ab024403a47f849d3161b0ed80c4553d279b2dc052512"
+		"sourceHash": "d2a3c24674c1bcddb49e81910059198048a79b0f5536905c86728f699bd2c205"
 	},
 	{
 		"file": "packages/visuals/src/ui/select.tsx",
@@ -837,7 +844,7 @@
 				1
 			]
 		],
-		"sourceHash": "332e0f7dd19c48d5a89ab024403a47f849d3161b0ed80c4553d279b2dc052512"
+		"sourceHash": "d2a3c24674c1bcddb49e81910059198048a79b0f5536905c86728f699bd2c205"
 	},
 	{
 		"file": "packages/dialect/src/nodes/content.ts",
@@ -921,7 +928,7 @@
 				1
 			]
 		],
-		"sourceHash": "5c9709fd97d4f6777205da118ce8b24123537b0ae7e56d3fa4490db8538081bf"
+		"sourceHash": "c66ae2a5f9f5b8e32a95267a1256a7e2258df66aa56bc30235582d723076b517"
 	},
 	{
 		"file": "packages/visuals/src/ui/unfold.tsx",
@@ -942,7 +949,7 @@
 				1
 			]
 		],
-		"sourceHash": "098bf723d102ac3e909c8ad91445adbce4d7a76a37ba324956866cdde04f4d68"
+		"sourceHash": "83e59f27ea48e4e8137d59d681b3a8938007cb972e71e552491f9d13e4f821e2"
 	},
 	{
 		"file": "packages/visuals/src/ui/unfold.tsx",
@@ -956,7 +963,7 @@
 				1
 			]
 		],
-		"sourceHash": "098bf723d102ac3e909c8ad91445adbce4d7a76a37ba324956866cdde04f4d68"
+		"sourceHash": "83e59f27ea48e4e8137d59d681b3a8938007cb972e71e552491f9d13e4f821e2"
 	},
 	{
 		"file": "packages/visuals/src/ui/unfold.tsx",
@@ -984,6 +991,20 @@
 				1
 			]
 		],
-		"sourceHash": "098bf723d102ac3e909c8ad91445adbce4d7a76a37ba324956866cdde04f4d68"
+		"sourceHash": "83e59f27ea48e4e8137d59d681b3a8938007cb972e71e552491f9d13e4f821e2"
+	},
+	{
+		"file": "packages/icons/src/investigation.tsx",
+		"reason": "Icon wrapper forwards SVG accessibility, sizing, and caller styling props. Literal style/class call sites are scanned; no ambient rendering code is executed.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > InvestigationIcon > <LineIcon>",
+				1
+			]
+		],
+		"sourceHash": "7c0d739dacfc022855c92a4136f0ff1c3645780461787ae82b66bae98aa5a4b4"
 	}
 ]

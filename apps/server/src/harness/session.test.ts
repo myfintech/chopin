@@ -206,18 +206,26 @@ describe("openPlannerSession", () => {
 		expect(destroyed.sandbox).toBe(0);
 	});
 
-	it("preserves a missing GitHub tool error without opening a sandbox", async () => {
-		let { owner, channel, deps, destroyed } = fixture();
-		deps.githubTools = async () => ({
-			ok: false,
-			error: { kind: "MissingTool", name: "pull_request_read" },
-		});
-		let result = await openPlannerSession(owner, channel, deps);
-		expect(result).toEqual({
-			ok: false,
-			error: { kind: "MissingTool", name: "pull_request_read" },
-		});
-		expect(destroyed.sandbox).toBe(0);
+	it("opens a document session while GitHub discovery is unresolved", async () => {
+		let { owner, channel, deps } = fixture();
+		let discovery = Promise.withResolvers<
+			Awaited<ReturnType<NonNullable<typeof deps.githubTools>>>
+		>();
+		let invoked = Promise.withResolvers<void>();
+		deps.githubTools = () => {
+			invoked.resolve();
+			return discovery.promise;
+		};
+		let pending = openPlannerSession(owner, channel, deps);
+		let first = await Promise.race([
+			pending.then(() => "opened" as const),
+			invoked.promise.then(() => "discovery invoked" as const),
+		]);
+		discovery.resolve({ ok: true, value: {} });
+		let opened = await pending;
+		if (opened.ok) await opened.value.destroy();
+		expect(opened.ok).toBe(true);
+		expect(first).toBe("opened");
 	});
 
 	for (
@@ -313,9 +321,9 @@ describe("Planner workspaces", () => {
 			expect({ attempt, cwd: registered?.cwd }).toEqual({ attempt, cwd: path });
 			expect(registered?.humanInput.questionnaire).toBeFunction();
 			expect(instructions).toContain(`${path}, is a local checkout of owner/repo`);
-			expect(instructions).toContain("proceed on your best judgement");
+			expect(instructions).toContain("Expiry is not an answer or approval");
 			expect(instructions).toContain("never tell them to use `/workflow connect`");
-			expect(instructions).toContain("Chat shows a card for each run");
+			expect(instructions).toContain("Chat shows a card for each workflow run you start");
 			expect(instructions).toContain("`intercom` tool can reach other sessions");
 			expect(instructions).toContain("one working in a checkout of owner/repo");
 			expect(instructions).not.toContain("You have no shell");
@@ -348,9 +356,9 @@ describe("Planner workspaces", () => {
 			expect(instructions).toContain(`${cwd}, is a scratch directory Chopin keeps`);
 			expect(instructions).toContain("holds no repository files");
 			expect(instructions).toContain("`read_repository_file`");
-			expect(instructions).toContain("proceed on your best judgement");
+			expect(instructions).toContain("Expiry is not an answer or approval");
 			expect(instructions).toContain("never tell them to use `/workflow connect`");
-			expect(instructions).toContain("Chat shows a card for each run");
+			expect(instructions).toContain("Chat shows a card for each workflow run you start");
 			expect(instructions).toContain("one working in a checkout of owner/repo");
 		}
 		forgetWorkspaces();
@@ -367,13 +375,13 @@ describe("Planner workspaces", () => {
 		await expect(open("planted", "atomic")).rejects.toThrow();
 	});
 
-	it("keeps copilot-sdk and pi Planner sessions isolated, whatever the channel remembers", async () => {
+	it("keeps copilot-sdk Planner sessions isolated, whatever the channel remembers", async () => {
 		rememberCheckout("channel", await checkout("workgit:owner/repo.git"));
-		for (let harness of ["copilot-sdk", "pi", undefined]) {
+		for (let harness of ["copilot-sdk", undefined]) {
 			let { registered, instructions } = await open("channel", harness);
 			expect(registered).toBeUndefined();
 			expect(instructions).toContain("You have no shell");
-			expect(instructions).not.toContain("proceed on your best judgement");
+			expect(instructions).not.toContain("Expiry is not an answer or approval");
 			expect(instructions).not.toContain("/workflow connect");
 			expect(instructions).not.toContain("intercom");
 		}

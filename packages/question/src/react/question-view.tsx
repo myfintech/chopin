@@ -179,7 +179,7 @@ function Presence(
 function DecisionHeading() {
 	return (
 		<header className="flex items-center gap-2 px-3 py-2.5 hairline-b">
-			<CheckIcon aria-hidden="true" size={14} />
+			<CheckIcon aria-hidden="true" size={16} />
 			<span className="text-sm font-medium text-text-primary">Decision</span>
 		</header>
 	);
@@ -643,6 +643,11 @@ function Resolved(
 											<InlineCode text={answer.question} />
 										</Related>
 									</h4>
+									{question?.description && (
+										<p className="question-hint">
+											<InlineCode text={question.description} />
+										</p>
+									)}
 								</div>
 							</header>
 							<div className="question-options">
@@ -1119,10 +1124,16 @@ export function QuestionView(props: QuestionViewProps) {
 										<InlineCode text={current.question} />
 									</Related>
 								</h4>
+								{current.description && (
+									<p className="question-hint">
+										<InlineCode text={current.description} />
+									</p>
+								)}
 								{current.multiple && <p className="question-hint">Choose any</p>}
 								{previousAnswer && (
 									<p className="question-hint">
-										Previously: {plainInlineList(previousAnswer.labels)} · @{previousAnswer.by}
+										Previously chosen by @{previousAnswer.by}:{" "}
+										{plainInlineList(previousAnswer.labels)}
 									</p>
 								)}
 								{refining && <p className="question-hint" role="status">Chopin is refining…</p>}

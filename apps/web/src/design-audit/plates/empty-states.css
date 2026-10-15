@@ -1,0 +1,39 @@
+.design-audit-empty-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr));
+	gap: 1rem;
+}
+
+.design-audit-empty-grid > div {
+	display: flex;
+	min-height: 13rem;
+	align-items: center;
+	justify-content: center;
+	flex-direction: column;
+	gap: 0.5rem;
+	padding: 1.25rem;
+	border: var(--edge-width) solid var(--color-edge);
+	border-radius: var(--radius-lg);
+	text-align: center;
+}
+
+.design-audit-empty-grid > div > strong {
+	font-size: var(--text-lg);
+}
+
+.design-audit-empty-grid > div > span {
+	max-width: 18rem;
+	font-size: var(--text-sm);
+	color: var(--color-text-secondary);
+}
+
+.design-audit-empty-grid > .design-audit-empty-live {
+	align-items: stretch;
+	justify-content: flex-start;
+	text-align: start;
+}
+
+.design-audit-empty-live > div {
+	display: grid;
+	gap: 0.5rem;
+}

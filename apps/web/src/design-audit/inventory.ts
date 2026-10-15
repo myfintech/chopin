@@ -25,7 +25,7 @@ export const AUDIT_INVENTORY: readonly AuditGroup[] = [
 				id: "shared-adoption",
 				label: "One foundation, gradual adoption",
 				source: "apps/web/src/design-audit/adoption.tsx",
-				states: ["shared-foundation", "audit-field-select"],
+				states: ["shared-foundation", "no-adopted-controls"],
 			},
 			{
 				id: "colours",
@@ -121,8 +121,8 @@ export const AUDIT_INVENTORY: readonly AuditGroup[] = [
 			{
 				id: "dropdowns",
 				label: "Dropdowns",
-				source: "apps/web/src/document-picker.tsx",
-				states: ["closed", "open", "selected", "loading", "error"],
+				source: "apps/web/src/account-menu.tsx",
+				states: ["closed", "open"],
 			},
 		],
 	},
@@ -130,6 +130,12 @@ export const AUDIT_INVENTORY: readonly AuditGroup[] = [
 		id: "surfaces",
 		label: "Application surfaces",
 		items: [
+			{
+				id: "build-blockers",
+				label: "Build blockers",
+				source: "apps/web/src/build-blocker-popover.tsx",
+				states: ["decisions", "investigations", "mixed", "hover", "keyboard"],
+			},
 			{
 				id: "interactive-document-actions",
 				label: "Interactive document actions",
@@ -145,14 +151,14 @@ export const AUDIT_INVENTORY: readonly AuditGroup[] = [
 			{
 				id: "lists",
 				label: "Lists",
-				source: "apps/web/src/document-picker.tsx",
-				states: ["default", "hover", "selected", "empty"],
+				source: "apps/web/src/document-search-dialog.tsx",
+				states: ["default", "highlighted", "archived"],
 			},
 			{
 				id: "navigation",
 				label: "Navigation",
 				source: "apps/web/src/project-sidebar.tsx",
-				states: ["default", "current", "ancestor", "archived", "loading"],
+				states: ["current", "ancestor", "unanswered", "loading", "empty"],
 			},
 			{
 				id: "chat",
@@ -170,26 +176,26 @@ export const AUDIT_INVENTORY: readonly AuditGroup[] = [
 				id: "identity",
 				label: "Identity and collaboration",
 				source: "packages/editor/src/face.tsx",
-				states: ["avatar-loading", "editing-question"],
+				states: ["photograph", "initial", "demo-actor", "presence-overflow", "room-members"],
 			},
 			{
 				id: "decisions",
 				label: "Decisions",
 				source: "packages/editor/src/decisions.tsx",
-				states: ["unanswered", "answered", "resolved", "orphaned", "empty"],
+				states: ["deck", "single", "resolved", "orphaned", "deliberately-empty", "empty"],
 			},
 			{
 				id: "resolved-comments",
 				label: "Resolved comments",
-				source: "packages/editor/src/comments.tsx",
-				states: ["resolved", "deliberately-empty", "orphaned"],
+				source: "packages/editor/src/resolved-comment.tsx",
+				states: ["preview", "pinned", "reopen-error"],
 			},
 			{ id: "loading", label: "Loading", source: "apps/web/src/hosted.tsx", states: ASYNC },
 			{
 				id: "empty",
 				label: "Empty states",
-				source: "apps/web/src/repository-picker.tsx",
-				states: ["first-use", "no-results", "unavailable"],
+				source: "apps/web/src/project-sidebar.tsx",
+				states: ["first-use", "no-documents", "no-results", "unavailable"],
 			},
 			{
 				id: "errors",

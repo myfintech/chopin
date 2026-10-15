@@ -22,6 +22,8 @@ export type Connection = {
 	autoRun?: boolean;
 	/** The chopin release that opened it, when it said; known only while it is connected. */
 	version?: string;
+	/** The connector protocol it spoke as it connected; 4 and up can run Planners on request. */
+	protocol?: number;
 	/** What the connector said about its machine as it connected. */
 	about?: About;
 };
@@ -32,6 +34,8 @@ export type About = {
 	platform?: { os: string; arch: string };
 	service?: boolean;
 	planner?: boolean;
+	/** It has a Planner command, so it can run the Planner of a document it is chosen for. */
+	plannerCommand?: boolean;
 	agent?: { name: string; version?: string };
 };
 /** The browser's approval of a pairing, waiting for GitHub to authorize the machine. */
@@ -82,7 +86,17 @@ export class Connections {
 	/** Documents whose builds wait behind a connection's current one, first queued first. */
 	#queued = new Map<string, string[]>();
 	#used = new Map<string, string>();
+	/** Each person's machine for a document, keyed by document and person; none is automatic. */
+	#choices = new Map<string, string>();
+	/** Each person's favorite machine, which Automatic prefers, by person. */
+	#favorites = new Map<string, string>();
+	/** False from unread() until restore(): the stored choices could not be read yet. */
+	#choicesRead = true;
 	#locks = new Map<string, Promise<unknown>>();
+	/** What each machine's newest connection said about it, kept once it disconnects. */
+	#about = new Map<string, About>();
+	/** Called once with each connection that ends: disconnected, expired, or its machine revoked. */
+	onEnded?: (connection: Connection) => void;
 	constructor(private now = () => Date.now()) {}
 	create(input: PairingInput) {
 		this.sweep();
@@ -124,7 +138,14 @@ export class Connections {
 	}
 	/** A paired machine's checkout comes online; its token lives only in this process. */
 	open(
-		machine: { id: string; owner: string; login: string; autoRun: boolean; version?: string },
+		machine: {
+			id: string;
+			owner: string;
+			login: string;
+			autoRun: boolean;
+			version?: string;
+			protocol?: number;
+		},
 		label: string,
 		source: Source,
 		about: About = {},
@@ -141,10 +162,12 @@ export class Connections {
 			expiresAt: this.now() + CONNECTION_MS,
 			autoRun: machine.autoRun,
 			...(machine.version ? { version: machine.version } : {}),
+			...(machine.protocol !== undefined ? { protocol: machine.protocol } : {}),
 			about,
 		};
 		let token = randomBytes(32).toString("base64url");
 		this.#connections.set(connection.id, connection);
+		this.#about.set(machine.id, about);
 		this.#tokens.set(fingerprint(token), { connectionId: connection.id });
 		return { connection, token };
 	}
@@ -153,6 +176,10 @@ export class Connections {
 		return [...this.#connections.values()].filter(value =>
 			value.machineId === machineId && value.expiresAt > this.now()
 		);
+	}
+	/** What a machine last said about itself while this server ran, connected or not. */
+	about(machineId: string): About | undefined {
+		return this.#about.get(machineId);
 	}
 	/** Whether a token is a run's, which the coding agent itself presents. */
 	run(token: string) {
@@ -233,12 +260,85 @@ export class Connections {
 	use(documentId: string, connectionId: string) {
 		this.#used.set(documentId, connectionId);
 	}
-	/** Live connections for a repository, the one last used for `documentId` first. */
-	candidates(repositoryId: string, owner: string, documentId: string) {
+	/**
+	 * Live connections for a repository that may take `owner`'s work on `documentId`. A chosen
+	 * machine's connections only, so an offline choice leaves none rather than falling back to
+	 * another machine. Automatic offers all of them: the owner's favorite machine first, then the
+	 * one last used for the document.
+	 */
+	candidates(
+		repositoryId: string,
+		owner: string,
+		documentId: string,
+		/** Null asks what automatic would pick, whatever the person chose. */
+		chosen: string | null | undefined = this.chosen(documentId, owner),
+	) {
+		// Until the stored choices are read, nobody knows which machine may take the work.
+		if (!this.#choicesRead && chosen !== null) return [];
 		let last = this.#used.get(documentId);
-		return this.list(repositoryId, owner).sort((a, b) =>
-			Number(b.id === last) - Number(a.id === last)
-		);
+		let favorite = chosen ? undefined : this.#favorites.get(owner);
+		return this.list(repositoryId, owner).filter(value => !chosen || value.machineId === chosen)
+			.sort((a, b) =>
+				Number(b.machineId === favorite) - Number(a.machineId === favorite)
+				|| Number(b.id === last) - Number(a.id === last)
+			);
+	}
+	/** Whether a connection may take its owner's work on `documentId`, as candidates() decides. */
+	allows(documentId: string, connection: Connection) {
+		if (!this.#choicesRead) return false;
+		let chosen = this.chosen(documentId, connection.owner);
+		return chosen === undefined || connection.machineId === chosen;
+	}
+	/**
+	 * Whether the stored choices have been read. Until they are, no connection takes anyone's
+	 * work: a choice that cannot be read is never taken for automatic.
+	 */
+	get choicesRead() {
+		return this.#choicesRead;
+	}
+	/** The stored choices are not read yet; work waits for restore(). */
+	unread() {
+		this.#choicesRead = false;
+	}
+	/** The stored choices and favorites, read; work may be routed again. */
+	restore(
+		choices: { channelId: string; userId: string; machineId: string }[],
+		favorites: { userId: string; machineId: string }[] = [],
+	) {
+		for (let value of choices) this.choose(value.channelId, value.userId, value.machineId);
+		for (let value of favorites) this.favor(value.userId, value.machineId);
+		this.#choicesRead = true;
+	}
+	/** The machine `owner` prefers when a document is on Automatic, if any. */
+	favorite(owner: string) {
+		return this.#favorites.get(owner);
+	}
+	/** Remember a stored favorite; without a machine, the person has none. */
+	favor(owner: string, machineId?: string) {
+		if (machineId) this.#favorites.set(owner, machineId);
+		else this.#favorites.delete(owner);
+	}
+	/** The machine `owner` chose for `documentId`, or undefined for automatic. */
+	chosen(documentId: string, owner: string) {
+		return this.#choices.get(`${documentId}\n${owner}`);
+	}
+	/** Remember a stored choice; without a machine, the person is back to automatic. */
+	choose(documentId: string, owner: string, machineId?: string) {
+		let key = `${documentId}\n${owner}`;
+		if (machineId) this.#choices.set(key, machineId);
+		else this.#choices.delete(key);
+	}
+	/** The documents whose work someone chose a machine for. */
+	choosing(machineId: string) {
+		return [...this.#choices].filter(([, value]) => value === machineId).map(([key]) => {
+			let [documentId, owner] = key.split("\n") as [string, string];
+			return { documentId, owner };
+		});
+	}
+	/** A revoked machine is nobody's choice, or favorite, any more. */
+	unchoose(machineId: string) {
+		for (let [key, value] of this.#choices) if (value === machineId) this.#choices.delete(key);
+		for (let [key, value] of this.#favorites) if (value === machineId) this.#favorites.delete(key);
 	}
 	runToken(
 		connectionId: string,
@@ -268,7 +368,10 @@ export class Connections {
 			if (key.startsWith(`${id}:`)) this.#runTokens.delete(key);
 		}
 		for (let [key, grant] of this.#tokens) if (grant.connectionId === id) this.#tokens.delete(key);
-		if (connection) this.wake(connection.source.repositoryId);
+		if (connection) {
+			this.wake(connection.source.repositoryId);
+			this.onEnded?.(connection);
+		}
 	}
 	revokeMachine(machineId: string, code = "machine-revoked") {
 		for (let connection of this.#connections.values()) {

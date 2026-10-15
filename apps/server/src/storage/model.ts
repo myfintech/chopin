@@ -126,6 +126,14 @@ export type StoredMachine = {
 };
 export type CreateMachine = Omit<StoredMachine, "reauthorizeAt" | "revokedAt">;
 
+/**
+ * Which of a person's machines works on one document for them. No row is the automatic choice:
+ * their live connection last used for the document, else the first idle one.
+ */
+export type MachineChoice = { channelId: string; userId: string; machineId: string };
+/** The one machine a person prefers when a document is on Automatic. */
+export type MachineFavorite = { userId: string; machineId: string };
+
 export type ChannelDescription = {
 	value: string;
 	revision: number;
@@ -299,6 +307,10 @@ export type StoredChannel = {
 };
 
 export type CommitChannel = {
+	/** Finalize the new rewrite receipt using this transaction's canonical slug. */
+	finalizeTitleReceipt?: boolean;
+	/** Authored title committed with the document delta; absent for sidecar-only callers. */
+	title?: string;
 	channelId: string;
 	lease: Lease;
 	expectedRevision: number;
@@ -326,6 +338,9 @@ export class ResearchProjectionConflict extends StorageError {
 }
 
 export type CommitResult = {
+	sidecar?: JsonValue;
+	/** Present when the operation synchronizes an authored title. */
+	channel?: ChannelRecord;
 	revision: number;
 	sequence: number;
 	repeated: boolean;
@@ -339,6 +354,7 @@ export type SaveCheckpoint = Omit<ChannelSnapshot, "channelId"> & {
 
 /** Atomically rotate a channel to a complete new Yjs epoch. */
 export type ReplaceChannel = {
+	title?: string;
 	channelId: string;
 	lease: Lease;
 	expectedRevision: number;

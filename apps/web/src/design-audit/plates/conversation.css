@@ -1,0 +1,27 @@
+/* The plate's frame only: the real workspace wrappers inside carry the Chat pane's styles. */
+.design-audit-chat-stage {
+	height: 33rem;
+	max-height: 70dvh;
+	border: var(--edge-width) solid var(--color-control-edge);
+	border-radius: var(--radius-xl);
+}
+
+.design-audit-composer-states {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(min(100%, 22rem), 1fr));
+	gap: 1rem;
+	margin-block-start: 1rem;
+	padding: 1rem 0.5rem;
+	border: var(--edge-width) solid var(--color-control-edge);
+	border-radius: var(--radius-xl);
+}
+
+.design-audit-composer-states > div {
+	display: grid;
+	align-content: start;
+	gap: 0.5rem;
+}
+
+.design-audit-composer-states .design-audit-state {
+	padding-inline: 0.625rem;
+}

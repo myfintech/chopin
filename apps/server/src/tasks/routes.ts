@@ -2,7 +2,7 @@ import { documentPath } from "@chopin/protocol/document-url";
 import { z } from "zod";
 import { liveSnapshot, queueBuild, queueRebuild, reportBuild, requestBuild } from "./builds";
 import { implementationLifecycle } from "./lifecycle";
-import { implementationReadiness, reportImplementationLifecycle } from "./plan-graphs";
+import { planningReadiness, reportImplementationLifecycle } from "./plan-graphs";
 import { exclusive } from "../plan/service";
 import { GitHubError } from "../github/client";
 import { AdmissionDenied } from "../auth/admission";
@@ -18,13 +18,14 @@ type Options = {
 	connections: Connections;
 	/** Whether an investigation is executing on a connection, in any document. */
 	busy?: (connectionId: string) => Promise<boolean>;
-	/**
-	 * Whether the document reads as ready to build, apart from its blockers. Without a judge, a
-	 * document with no blockers is ready.
-	 */
-	buildable?: (id: string, planRevision: number) => boolean;
+	/** Opening the snapshot may schedule Planner help; it never contributes a hidden veto. */
+	assess?: (id: string, planRevision: number) => void;
 	/** LIVE_BUILD: builds may queue behind a prototype or another document's build. */
 	liveBuild?: boolean;
+	/** Throws `machine-offline` naming the machine the person chose, else `no-workspace`. */
+	refuseOffline?: (owner: string, documentId: string) => Promise<never>;
+	/** Reads the stored machine choices, or throws `machine-choice-unavailable`. */
+	machineChoices?: () => Promise<void>;
 };
 let buildSchema = z.object({
 	retryOf: z.string().uuid().optional(),
@@ -65,6 +66,16 @@ async function body<T>(request: Request, schema: z.ZodType<T>): Promise<T> {
 	}
 }
 
+/**
+ * The person's machine choice refuses the work: the machine they chose is offline (409), or their
+ * choice cannot be read right now (503). The message says which.
+ */
+class MachineRefused extends Error {
+	constructor(readonly code: string, message: string, readonly status: number) {
+		super(message);
+	}
+}
+
 /** A browser build runs on the clicker's own connection for the document's repository. */
 export function registerImplementationRoutes(router: Router, auth: HostedAuth, options: Options) {
 	let connector = implementationConnector(
@@ -85,6 +96,9 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 		try {
 			return await handler(request, url, params);
 		} catch (error) {
+			if (error instanceof MachineRefused) {
+				return json({ error: error.code, message: error.message }, error.status);
+			}
 			if (error instanceof GitHubError) return json({ error: error.message }, error.status);
 			if (error instanceof AdmissionDenied) return json({ error: error.message }, 403);
 			console.error("chopin: implementation request failed", error);
@@ -142,6 +156,25 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 		}
 		return [...free, ...prototyping, ...building];
 	}
+	/**
+	 * Refuse a Build that nothing can take: `machine-offline` naming the machine the person chose
+	 * for the document, never silently another, `machine-choice-unavailable` while that choice
+	 * cannot be read, or else `no-workspace`.
+	 */
+	async function unavailable(owner: string, repositoryId: string, id: string): Promise<void> {
+		try {
+			await options.machineChoices?.();
+			if (options.connections.candidates(repositoryId, owner, id).length) return;
+			await options.refuseOffline?.(owner, id);
+		} catch (error) {
+			let code = (error as { code?: unknown } | undefined)?.code;
+			if (code === "machine-offline" || code === "machine-choice-unavailable") {
+				let message = (error as Error).message;
+				throw new MachineRefused(code, message, code === "machine-offline" ? 409 : 503);
+			}
+		}
+		throw new GitHubError("no-workspace", 409);
+	}
 	router.on(
 		"GET",
 		"/api/channels/:id/implementation",
@@ -164,7 +197,8 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 				&& !!await options.busy?.(queued.connectionId);
 			let current = await options.withPlan(id, plan =>
 				exclusive(plan, async () => {
-					let ready = implementationReadiness(plan, plan.revision);
+					let ready = await planningReadiness(plan, plan.revision);
+					if (!channel.archivedAt) options.assess?.(id, plan.revision);
 					let live = liveSnapshot(
 						plan,
 						options.connections.list(channel.repositoryId),
@@ -178,9 +212,10 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 							let graph = plan.graph?.versions.at(-1);
 							return build.graphVersion === graph?.number && build.graphRevision === graph.revision;
 						}),
-						blockers: ready.ok ? [] : ready.blockers,
+						blockers: ready.blockers,
+						buildInvestigations: ready.investigations,
 						localAgent,
-						buildReady: ready.ok && (options.buildable?.(id, plan.revision) ?? true),
+						buildReady: ready.ok,
 						...(waiting ? { waitingForPrototype: true as const } : {}),
 						...(ahead ? { waitingForDocument: aheadTitle ? { title: aheadTitle } : {} } : {}),
 						...(plan.buildRequested ? { buildRequested: { ...plan.buildRequested } } : {}),
@@ -217,9 +252,7 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 				throw new GitHubError("repository write access is required", 403);
 			}
 			let input = await body(request, buildSchema);
-			if (!options.connections.list(channel.repositoryId, session.user.id).length) {
-				throw new GitHubError("no-workspace", 409);
-			}
+			await unavailable(session.user.id, channel.repositoryId, id);
 			let [connection] = await available(session.user.id, channel.repositoryId, id);
 			if (!connection) {
 				throw new GitHubError(
@@ -280,9 +313,7 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 			if (!repository.permissions.push && !repository.permissions.admin || channel.archivedAt) {
 				throw new GitHubError("repository write access is required", 403);
 			}
-			if (!options.connections.list(channel.repositoryId, session.user.id).length) {
-				throw new GitHubError("no-workspace", 409);
-			}
+			await unavailable(session.user.id, channel.repositoryId, id);
 			// Like Build: a connection running a prototype or another document's build is busy.
 			let free: Connection[] = [];
 			for (
@@ -309,6 +340,7 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 						assign: (connectionId, documentId) =>
 							options.connections.assign(connectionId, documentId),
 						assigned: connectionId => options.connections.assigned(connectionId),
+						allows: (documentId, connection) => options.connections.allows(documentId, connection),
 					}, { by: session.user.id }),
 			);
 			if (result.kind === "busy") throw new GitHubError("implementation is already active", 409);

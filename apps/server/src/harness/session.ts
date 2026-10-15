@@ -8,7 +8,8 @@ import {
 	visualPlannerAgent,
 } from "./agents";
 import { extensionTools } from "../planner-extensions";
-import { githubTools, type GitHubToolsError, type Result } from "./github-tools";
+import { fullAtomicPlanner } from "../isolated-planner";
+import { githubTools, type GitHubToolsError, lazyGithubTools, type Result } from "./github-tools";
 import { registerCredential } from "./harnesses";
 import {
 	type FullPlanner,
@@ -141,13 +142,7 @@ export async function openPlannerSession(
 	} catch (cause) {
 		return { ok: false, error: { kind: "Unavailable", cause } };
 	}
-	let tools: Awaited<ReturnType<typeof githubTools>>;
-	try {
-		tools = await (deps.githubTools ?? githubTools)(owner);
-	} catch (cause) {
-		return { ok: false, error: { kind: "Unavailable", cause } };
-	}
-	if (!tools.ok) return tools;
+	let tools = lazyGithubTools(owner, deps.githubTools ?? githubTools);
 	let extensions = await (deps.extensionTools ?? extensionTools)(channel.repository);
 	let sandbox: Sandbox;
 	try {
@@ -165,7 +160,7 @@ export async function openPlannerSession(
 		let sessionId = crypto.randomUUID();
 		unregister = (deps.registerCredential ?? registerCredential)(sessionId, owner.currentToken);
 		// Background jobs keep the isolated boundary; only a Planner turn may run as a full session.
-		let workspace = channel.harness === "atomic" && !job
+		let workspace = channel.harness === "atomic" && !job && fullAtomicPlanner()
 			? await plannerWorkspace(channel.room.id, channel.repository)
 			: undefined;
 		let planner: FullPlanner | undefined;
@@ -289,7 +284,7 @@ export async function openPlannerSession(
 							...channel,
 							instructions,
 							owner,
-							githubTools: tools.value,
+							githubTools: tools,
 							extensionTools: extensions,
 							...(hostTools ? { toolSignal: hostTools.signal } : {}),
 						},

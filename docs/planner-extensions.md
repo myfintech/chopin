@@ -159,7 +159,8 @@ purpose:
 ## Not supported yet
 
 - Per-user credentials or OAuth for a configured server.
-- Pi extensions (`HARNESS=pi` extension factories).
+- Atomic extensions for an [isolated Planner](isolated-planner.md). Upstream's
+  `HARNESS_EXTENSIONS` loads them only in a full Atomic session.
 - Per-tool description overrides, and extensions for background workers.
 
 ## Implementation

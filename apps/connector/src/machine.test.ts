@@ -284,6 +284,63 @@ test("connect names the agent it learned of at an earlier check or job, and the 
 	});
 });
 
+test.skipIf(process.platform === "win32")(
+	"connect asks the agent its name and version as it connects, before any job, and tells Chopin",
+	async () => {
+		let home = await scratch("chopin-home-");
+		let root = await checkout();
+		let bin = await scratch("chopin-agent-bin-");
+		let agent = join(import.meta.dir, "testing/fake-agent.ts");
+		await writeFile(join(bin, "fake-acp"), `#!/bin/sh\nexec ${process.execPath} ${agent}\n`, {
+			mode: 0o755,
+		});
+		let chopin = fakeChopin();
+		expect(await cli(["pair"], home, chopin.url).exited).toBe(0);
+		chopin.calls.length = 0;
+		let connected = cli(["connect", root, "--", "fake-acp"], home, chopin.url, {
+			PATH: [bin, process.env.PATH].join(delimiter),
+		});
+		let reported = async () => chopin.calls.find(call => call.path === "/api/connector/agent");
+		for (let deadline = Date.now() + 15_000; !await reported() && Date.now() < deadline;) {
+			await Bun.sleep(50);
+		}
+		connected.child.kill("SIGINT");
+		expect(await connected.exited, await connected.output).toBe(0);
+		// No job ran; the connection's own probe learned it.
+		expect(chopin.calls.map(call => call.path)).not.toContain("tool:claim_work");
+		expect(await reported()).toEqual({
+			path: "/api/connector/agent",
+			bearer: "connection-token",
+			body: { name: "Fake Agent", version: "1.2.3" },
+		});
+		// Kept for the next connection's headers.
+		expect(JSON.parse(await readFile(join(home, "config.json"), "utf8")).agents).toEqual({
+			"fake-acp": { name: "Fake Agent", version: "1.2.3" },
+		});
+	},
+	30_000,
+);
+
+test("an agent that never answers ACP initialize doesn't hold up the connection", async () => {
+	let home = await scratch("chopin-home-");
+	let root = await checkout();
+	let bin = await scratch("chopin-agent-bin-");
+	await writeFile(join(bin, "silent-acp"), "#!/bin/sh\nexec sleep 60\n", { mode: 0o755 });
+	let chopin = fakeChopin();
+	expect(await cli(["pair"], home, chopin.url).exited).toBe(0);
+	chopin.calls.length = 0;
+	let connected = cli(["connect", root, "--", "silent-acp"], home, chopin.url, {
+		PATH: [bin, process.env.PATH].join(delimiter),
+	});
+	let started = Date.now();
+	await Promise.race([chopin.waited, connected.exited]);
+	expect(Date.now() - started).toBeLessThan(5_000);
+	expect(chopin.calls.map(call => call.path)).toContain("tool:wait_for_work");
+	connected.child.kill("SIGINT");
+	expect(await connected.exited, await connected.output).toBe(0);
+	expect(chopin.calls.map(call => call.path)).not.toContain("/api/connector/agent");
+}, 30_000);
+
 test("connect pairs first when this machine has no token for the server", async () => {
 	let home = await scratch("chopin-home-");
 	let root = await checkout();
@@ -386,6 +443,50 @@ test("connect on a machine already paired leaves the pairing key unspent", async
 	expect(await connected.exited, await connected.output).toBe(0);
 	expect(await connected.output).toContain("already paired");
 	expect(chopin.calls.map(call => call.path)).not.toContain("/api/connector/pairings");
+});
+
+test("connect --name names the machine it pairs, as pair --label does", async () => {
+	let home = await scratch("chopin-home-");
+	let root = await checkout();
+	let chopin = fakeChopin();
+	let connected = cli(
+		["connect", root, "--name", "build box", "--key", PAIRING_KEY, "--", "agent-that-never-runs"],
+		home,
+		chopin.url,
+	);
+	await Promise.race([chopin.waited, connected.exited]);
+	connected.child.kill("SIGINT");
+	expect(await connected.exited, await connected.output).toBe(0);
+	expect(chopin.calls[0]).toMatchObject({
+		path: "/api/connector/pairings",
+		body: { label: "build box", key: PAIRING_KEY },
+	});
+	expect(JSON.parse(await readFile(machineFile(home), "utf8")).servers[chopin.url].label)
+		.toBe("build box");
+	expect(await connected.output).not.toContain("--name wasn't used");
+});
+
+test("connect --name on a machine already paired keeps its name and says where to rename it", async () => {
+	let home = await scratch("chopin-home-");
+	let root = await checkout();
+	let chopin = fakeChopin();
+	expect(await cli(["pair", "--label", "old-name"], home, chopin.url).exited).toBe(0);
+	chopin.calls.length = 0;
+	let connected = cli(
+		["connect", root, "--name", "new-name", "--", "agent-that-never-runs"],
+		home,
+		chopin.url,
+	);
+	await Promise.race([chopin.waited, connected.exited]);
+	connected.child.kill("SIGINT");
+	expect(await connected.exited, await connected.output).toBe(0);
+	let output = await connected.output;
+	expect(output).toContain("This machine is already paired with");
+	expect(output).toContain("so --name wasn't used");
+	expect(output).toContain("Machines page");
+	expect(chopin.calls.map(call => call.path)).not.toContain("/api/connector/pairings");
+	expect(JSON.parse(await readFile(machineFile(home), "utf8")).servers[chopin.url].label)
+		.toBe("old-name");
 });
 
 test("a key given to connect with an agent that isn't installed is never sent, so it still works", async () => {

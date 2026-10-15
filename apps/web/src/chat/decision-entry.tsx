@@ -37,6 +37,7 @@ function definition(value: Questionnaire | undefined): Definition | undefined {
 			id: question.id,
 			header: question.header,
 			question: question.prompt,
+			...(question.description === undefined ? {} : { description: question.description }),
 			multiple: question.multiple,
 			options: question.options.map(option => ({
 				id: option.id,
@@ -75,7 +76,7 @@ function decidedText(value: Questionnaire | undefined, meta: Question.CardMeta):
 	}) ?? [];
 	if (labels.length === 0 && question?.answer) labels = [question.answer];
 	let owner = meta.owner ?? value?.by;
-	return `Decided: ${labels.join(", ") || "Saved decision"}${owner ? ` · @${owner}` : ""}`;
+	return `Decided${owner ? ` by @${owner}` : ""}: ${labels.join(", ") || "Saved decision"}`;
 }
 
 export function promptView(
@@ -117,7 +118,7 @@ function OpenInPlan({ id, onOpenCard }: { id: string; onOpenCard: (id: string) =
 			title="Open in plan"
 			type="button"
 		>
-			<DocumentIcon aria-hidden="true" size={14} />
+			<DocumentIcon aria-hidden="true" size={16} />
 		</button>
 	);
 }
@@ -139,7 +140,7 @@ export function DecisionPrompt(props: DecisionEntryProps) {
 	if (view.state === "collapsed") {
 		return (
 			<div className="flex items-center gap-2 text-sm text-text-tertiary" data-decision-prompt={id}>
-				<DecisionIcon aria-hidden="true" size={14} />
+				<DecisionIcon aria-hidden="true" size={16} />
 				<span className="min-w-0 flex-1 truncate">{view.text}</span>
 				<OpenInPlan id={id} onOpenCard={onOpenCard} />
 			</div>
@@ -229,7 +230,7 @@ export function ActivityLine({ entry, onOpenCard }: DecisionEntryProps) {
 			data-chat-system
 			data-decision-activity
 		>
-			<SparkleIcon aria-hidden="true" className="mt-0.5 shrink-0" size={14} />
+			<SparkleIcon aria-hidden="true" className="mt-0.5 shrink-0" size={16} />
 			<p className="m-0 min-w-0 text-sm break-words">
 				{content}
 			</p>

@@ -12,7 +12,13 @@ import {
 } from "./machine-setup";
 import { expiryLabel, usePairingKey } from "./pairing-key";
 import { keyProblem } from "./pairing-problems";
-import { runsAsService, setupCommand, shellFor } from "./setup-commands";
+import {
+	isSetupAgent,
+	runsAsService,
+	setupAgentCommand,
+	setupCommand,
+	shellFor,
+} from "./setup-commands";
 
 import type { ReactNode } from "react";
 import type { CodingAgent } from "@chopin/protocol/agents";
@@ -22,7 +28,7 @@ import type { SetupSystem } from "./setup-commands";
 /** The server page's choices, kept for this tab across the trip to GitHub and back. */
 const SETTINGS_KEY = "chopin:machines:server";
 
-type Settings = { system?: SetupSystem; background?: boolean; autoRun?: boolean };
+type Settings = { system?: SetupSystem; background?: boolean; autoRun?: boolean; name?: string };
 
 function storedSettings(): Settings {
 	try {
@@ -84,7 +90,7 @@ function Generate(
 			<InlineNotice
 				actions={problem.retry && (
 					<button
-						className="btn btn-compact btn-outline"
+						className="btn btn-xs btn-outline"
 						onClick={() => generate(autoRun)}
 						type="button"
 					>
@@ -149,6 +155,33 @@ function Expiry({ expiresAt }: { expiresAt: number }) {
 	return <span className="machines-key-expiry">{expiryLabel(expiresAt, now)}</span>;
 }
 
+/** The machine's name in Chopin, optional: chopin uses the machine's hostname without one. */
+function MachineName({ name, onChange }: { name: string; onChange: (name: string) => void }) {
+	let fieldId = useId();
+	let helpId = useId();
+	return (
+		<div className="machines-setting">
+			<div className="machines-name">
+				<label htmlFor={fieldId}>Machine name</label>
+				<input
+					aria-describedby={helpId}
+					autoComplete="off"
+					className="field"
+					id={fieldId}
+					maxLength={64}
+					onChange={event => onChange(event.currentTarget.value)}
+					placeholder="hostname"
+					spellCheck={false}
+					value={name}
+				/>
+			</div>
+			<p className="machines-setting-detail" id={helpId}>
+				Optional. Without one, Chopin names the machine after its hostname.
+			</p>
+		</div>
+	);
+}
+
 /** Why an agent that asks permission in the terminal can't run as the background service. */
 function foreground(agent: CodingAgent) {
 	if (agent.unattended === true) return undefined;
@@ -156,7 +189,7 @@ function foreground(agent: CodingAgent) {
 }
 
 /**
- * Add a server: choose the agent, whether it runs in the background and whether Chopin may build
+ * Add a server: name the machine if you like, choose the agent, whether it runs in the background and whether Chopin may build
  * and prototype on it by itself, then generate an install script with a single-use key, which
  * pairs the machine with no browser. The key is made only when Generate is pressed. The page ends
  * at the command; the machine appears in the Machines table when it connects.
@@ -164,38 +197,47 @@ function foreground(agent: CodingAgent) {
 export function AddServerPage() {
 	let [saved] = useState(storedSettings);
 	let [system, setSystem] = useSystem(saved.system);
-	let [agent, setAgent] = useAgent();
+	let { agent, options, choose } = useAgent("server");
 	let [background, setBackground] = useState(saved.background ?? true);
 	let [autoRun, setAutoRun] = useState(saved.autoRun ?? false);
+	let [name, setName] = useState(saved.name ?? "");
 	let { key: pairing, generate, reset } = usePairingKey();
 	useEffect(() => {
 		try {
-			sessionStorage.setItem(SETTINGS_KEY, JSON.stringify({ system, background, autoRun }));
+			sessionStorage.setItem(
+				SETTINGS_KEY,
+				JSON.stringify({ system, background, autoRun, name }),
+			);
 		} catch {
 			// Without storage the page starts from its defaults after GitHub.
 		}
-	}, [system, background, autoRun]);
+	}, [system, background, autoRun, name]);
 	let shell = shellFor(system);
-	let unattended = runsAsService(agent);
-	let runsInBackground = unattended && background;
+	// A setup agent's own command decides how the machine connects, service included.
+	let setup = isSetupAgent(agent) ? agent : undefined;
+	let builtIn = isSetupAgent(agent) ? undefined : agent;
+	let runsInBackground = !!builtIn && runsAsService(builtIn) && background;
 	return (
 		<ol className="machines-steps">
 			<li className="machines-step">
 				<h2 className="machines-step-title">Set up the machine</h2>
 				<div className="machines-settings">
+					<MachineName name={name} onChange={setName} />
 					<div className="machines-setting">
-						<AgentChoice agent={agent} onChange={setAgent} />
-						<Needs agent={agent} shell={shell} />
+						<AgentChoice agent={agent} onChange={choose} options={options} />
+						<Needs agent={agent} system={system} />
 					</div>
-					<Setting
-						checked={runsInBackground}
-						disabled={foreground(agent)}
-						onChange={setBackground}
-						title="Run in the background"
-					>
-						chopin runs as a service that starts with the machine and stays connected after you log
-						out.
-					</Setting>
+					{builtIn && (
+						<Setting
+							checked={runsInBackground}
+							disabled={foreground(builtIn)}
+							onChange={setBackground}
+							title="Run in the background"
+						>
+							chopin runs as a service that starts with the machine and stays connected after you
+							log out.
+						</Setting>
+					)}
 					<Setting
 						checked={autoRun}
 						onChange={value => {
@@ -231,12 +273,21 @@ export function AddServerPage() {
 							<Command
 								label="install script"
 								place={shellPlace(shell)}
-								text={setupCommand(location.origin, shell, agent, {
-									key: pairing.key,
-									background: runsInBackground,
-								})}
+								text={setup
+									? setupAgentCommand(setup, system, {
+										origin: location.origin,
+										key: pairing.key,
+										name,
+									})!
+									: setupCommand(location.origin, shell, builtIn!, {
+										key: pairing.key,
+										background: runsInBackground,
+										name,
+									})}
 							/>
-							{!runsInBackground && <p className="machines-detail">Keep the terminal open.</p>}
+							{!setup && !runsInBackground && (
+								<p className="machines-detail">Keep the terminal open.</p>
+							)}
 						</div>
 					)
 					: <Generate autoRun={autoRun} generate={generate} pairing={pairing} />}

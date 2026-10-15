@@ -655,11 +655,11 @@
 	object-fit: contain;
 }
 
-.app-icon-button[data-tone="nested"]:is(:hover:not(:disabled), :focus-visible) {
+.app-icon-button[data-tone="nested"]:is(:hover:not(:disabled), :focus-visible, [data-force-state]) {
 	background: var(--color-hover-nested);
 }
 
-.app-icon-button[data-tone="ghost"]:is(:hover:not(:disabled), :focus-visible) {
+.app-icon-button[data-tone="ghost"]:is(:hover:not(:disabled), :focus-visible, [data-force-state]) {
 	background: var(--color-selected-strong);
 }
 
@@ -711,7 +711,7 @@
 	color: var(--color-text-tertiary);
 }
 
-/* On /connect the entry is the current page, marked as a current document is. */
+/* On /machines the entry is the current page, marked as a current document is. */
 .project-sidebar-primary-action[aria-current="page"] {
 	background: var(--project-sidebar-selected);
 	color: var(--color-text-primary);
@@ -1349,7 +1349,7 @@
 	width: 100%;
 	align-items: center;
 	gap: var(--item-gap);
-	border-radius: var(--radius-sm);
+	border-radius: var(--radius-md);
 	padding: var(--item-padding-block) var(--item-padding-inline);
 	min-height: var(--item-height);
 	font-size: var(--text-sm);
@@ -1373,9 +1373,33 @@
 	align-items: flex-start;
 }
 
-.app-menu-item:is(:hover:not(:disabled), :focus-visible) {
+.app-menu-item:is(:hover:not(:disabled, [aria-disabled="true"]), :focus-visible) {
 	background: var(--color-hover);
 	color: var(--color-text-primary);
+}
+
+/* A chosen row of a choice is tinted, never checked. */
+.app-menu-item[aria-checked="true"] {
+	background: var(--color-selected);
+	color: var(--color-text-primary);
+}
+
+.app-menu-item[aria-disabled="true"] {
+	opacity: 0.55;
+	cursor: default;
+}
+
+/* Secondary detail on the item's own line, right-aligned in tertiary ink. */
+.app-menu-item-meta {
+	margin-inline-start: auto;
+	flex: none;
+	font-size: var(--text-xs);
+	color: var(--color-text-tertiary);
+}
+
+.app-menu-item-chevron {
+	flex: none;
+	color: var(--color-text-tertiary);
 }
 
 .app-menu-item[data-tone="destructive"],
@@ -1383,8 +1407,9 @@
 	color: var(--color-destructive-ink);
 }
 
+/* Runs through the panel's padding to its edges. */
 .app-menu-separator {
-	margin: var(--menu-separator-margin) 0;
+	margin: var(--menu-separator-margin) calc(var(--menu-padding) * -1);
 	height: var(--edge-width);
 	background: var(--color-edge);
 }

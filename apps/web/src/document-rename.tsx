@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { boundDocumentTitle, normalizeDocumentTitle } from "@chopin/dialect";
 
 import * as Api from "./api";
 import { heldTyping, holdTyping } from "./title-edit";
@@ -61,9 +62,10 @@ export function DocumentRename(
 			if (replay) holdTyping(false);
 			if (held?.text) {
 				// Key presses after focus append to the held prefix, not replace it.
-				field.value = held.text;
-				field.setSelectionRange(held.text.length, held.text.length);
-				setTitle(held.text);
+				let text = boundDocumentTitle(held.text);
+				field.value = text;
+				field.setSelectionRange(text.length, text.length);
+				setTitle(text);
 			} else field.select();
 			if (held?.enter) void save(held.text || channel.title);
 		};
@@ -86,14 +88,13 @@ export function DocumentRename(
 	}
 
 	async function save(value: string) {
-		let next = value.trim();
+		let next = normalizeDocumentTitle(value);
 		if (busy.current || cancelled.current) return;
-		if (inline && (!next || next === channel.title)) {
+		if (inline && next === channel.title) {
 			cancelled.current = true;
 			onCancel();
 			return;
 		}
-		if (!next) return;
 		busy.current = true;
 		setSaving(true);
 		onSavingChange?.(true);
@@ -125,7 +126,6 @@ export function DocumentRename(
 					aria-invalid={error === undefined ? undefined : true}
 					className="title-control-label document-title-input text-xs font-medium"
 					id={`document-title-${channel.id}`}
-					maxLength={120}
 					onBlur={() => {
 						// Leaving a rejected title reverts it rather than repeating the failure.
 						if (error === undefined) void submit();
@@ -135,7 +135,7 @@ export function DocumentRename(
 						}
 					}}
 					onChange={event => {
-						setTitle(event.target.value);
+						setTitle(boundDocumentTitle(event.target.value));
 						if (error !== undefined) report(undefined);
 					}}
 					onKeyDown={keyDown}
@@ -160,14 +160,12 @@ export function DocumentRename(
 				aria-invalid={error === undefined ? undefined : true}
 				className="field h-8 min-w-0 w-full px-2 text-sm"
 				id={`document-title-${channel.id}`}
-				maxLength={120}
 				onChange={event => {
-					setTitle(event.target.value);
+					setTitle(boundDocumentTitle(event.target.value));
 					if (error !== undefined) report(undefined);
 				}}
 				onKeyDown={keyDown}
 				ref={input}
-				required
 				value={title}
 			/>
 			{error !== undefined && (
@@ -186,7 +184,7 @@ export function DocumentRename(
 				</button>
 				<button
 					className="btn btn-md btn-primary"
-					disabled={!title.trim() || saving}
+					disabled={saving}
 					type="submit"
 				>
 					{saving ? "Saving..." : "Save"}

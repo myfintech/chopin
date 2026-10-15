@@ -28,7 +28,7 @@ export function ResolvedActions(
 			{onDiscard && confirming
 				? (
 					<>
-						<p className="m-0 mr-auto text-sm text-text-secondary">Discard this decision?</p>
+						<p className="m-0 mr-auto text-xs text-text-secondary">Discard this decision?</p>
 						<button
 							className="btn btn-sm btn-secondary"
 							data-resolved-action="keep"

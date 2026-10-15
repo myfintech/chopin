@@ -1,3 +1,5 @@
+import { documentTitleText } from "../../packages/dialect/src/title";
+import { parse } from "../../packages/dialect/src/parse";
 import {
 	held,
 	readScript,
@@ -112,8 +114,32 @@ export function createPromptScriptedHarness(
 					let driving = (async () => {
 						try {
 							if (finished) return;
-							let { kind, target } = scriptContext(options.prompt);
-							let script = await readScript(dir, kind);
+							let { kind, target, initialQuestion } = scriptContext(options.prompt);
+							let script;
+							try {
+								script = await readScript(dir, kind);
+							} catch (error) {
+								if (
+									(error as NodeJS.ErrnoException).code !== "ENOENT"
+									|| initialQuestion === undefined
+								) throw error;
+								if (!initialQuestion.trim() || initialQuestion.length > 100) {
+									throw new Error(
+										"Script an explicit concise title for this initial decision card.",
+										{ cause: error },
+									);
+								}
+								// Ordinary browser fixtures need a valid model answer before a card exists.
+								// Explicit scripts, including failure and empty scripts, always take precedence.
+								script = [{
+									tool: "refine_decision",
+									args: {
+										revision: "$revision",
+										id: "$target",
+										title: initialQuestion,
+									},
+								}];
+							}
 							if (!current()) return finish();
 							entered.resolve();
 							let gate = await held(dir, kind, stop.signal);
@@ -125,7 +151,12 @@ export function createPromptScriptedHarness(
 								let read = await request("read_plan", {});
 								if (!read || !current()) return finish();
 								let revision = readRevision(read);
-								await request(call.tool, substitute(call.args, revision, target));
+								let input = substitute(call.args, revision, target) as Record<string, unknown>;
+								if (call.tool === "draft_heading" && input.title === "$currentTitle") {
+									let document = JSON.parse(String(read.output)) as { source: string };
+									input.title = documentTitleText(parse(document.source)) ?? "";
+								}
+								await request(call.tool, input);
 							}
 							finish();
 						} catch (error) {

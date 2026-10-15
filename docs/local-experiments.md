@@ -23,7 +23,7 @@ and wait while you are signed out.
 `GET /connector.js` serves the connector as one bundled file with no sign-in;
 `bun run build` and the Docker image produce it, and a development server
 bundles it from source. Chopin contributors can still run
-`bun run connector connect /path/to/project -- copilot --acp` from a Chopin
+`bun run connector connect /path/to/project --agent copilot` from a Chopin
 checkout.
 
 ## Run chopin as a service
@@ -108,6 +108,17 @@ available when the laptop disconnects. A model's interpretation and a measured
 observation remain distinct; reports should explain their method and limitations.
 
 ## Results and decisions
+
+A Planner proposal may mark an investigation as required before building and
+explain the specific dependency. Its card shows that reason, and Build names and
+reveals the card. Optional investigations do not block Build. Failure, interruption
+and stopping execution retain the requirement so it can be retried. Removing an
+unstarted proposal withdraws the requirement. Completed required evidence remains
+blocking until the Planner incorporates its findings and creates any necessary
+human decision cards; it then clears the investigation's reason. These reviews run
+under the existing Planner owner, without starting local work. If a review fails or
+is interrupted, select **Apply findings** on the completed card to start a fresh
+Planner request.
 
 Results contain restricted document MDX, typed datasets, native view specifications
 and small text evidence. Supported views are tables, metric comparisons, bars and

@@ -16,6 +16,7 @@ export {
 } from "./github";
 export type { IconProps, IconSize } from "./icon";
 export { iconSizes } from "./icon";
+export { InvestigationIcon } from "./investigation";
 export {
 	ActualSizeIcon,
 	ArrowLeftIcon,
@@ -56,6 +57,7 @@ export {
 	SignInIcon,
 	SirenIcon,
 	SparkleIcon,
+	StarIcon,
 	TableIcon,
 	TabsIcon,
 	WrenchIcon,
@@ -72,5 +74,13 @@ export {
 } from "./system";
 export { TextStyleIcon } from "./text-style";
 export { MonitorIcon, MoonIcon, SunIcon } from "./theme";
+export {
+	BrainSparkleIcon,
+	CodePullRequestIcon,
+	GlobeSearchIcon,
+	PageIcon,
+	ScribbleIcon,
+	TerminalIcon,
+} from "./trace-tools";
 export { RedoIcon, UndoIcon } from "./undo";
 export { WarningIcon } from "./warning";

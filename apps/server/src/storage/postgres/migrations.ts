@@ -83,6 +83,15 @@ const MIGRATIONS = [{
 	id: "020_machines",
 	path: join(import.meta.dir, "migrations/020_machines.sql"),
 }, {
+	id: "021_document_titles",
+	path: join(import.meta.dir, "migrations/021_document_titles.sql"),
+}, {
+	id: "022_machine_choices",
+	path: join(import.meta.dir, "migrations/022_machine_choices.sql"),
+}, {
+	id: "023_machine_favorites",
+	path: join(import.meta.dir, "migrations/023_machine_favorites.sql"),
+}, {
 	id: "mantl_user_preferences",
 	path: join(import.meta.dir, "migrations/mantl_user_preferences.sql"),
 }, {

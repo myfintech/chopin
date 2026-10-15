@@ -5,6 +5,7 @@ import {
 	CONNECTOR_AGENT_HEADER,
 	CONNECTOR_AGENT_VERSION_HEADER,
 	CONNECTOR_HOST_HEADER,
+	CONNECTOR_PLANNER_COMMAND_HEADER,
 	CONNECTOR_PLANNER_HEADER,
 	CONNECTOR_PLATFORM_HEADER,
 	CONNECTOR_SERVICE_HEADER,
@@ -289,6 +290,8 @@ async function pairOnce(options: Parameters<typeof pair>[0]) {
 export type About = {
 	service?: boolean;
 	planner?: boolean;
+	/** It has a Planner command, so Chopin may ask it to run the Planner of a document. */
+	plannerCommand?: boolean;
 	agent?: { name: string; version?: string };
 };
 
@@ -299,6 +302,7 @@ function aboutHeaders(about: About): Record<string, string> {
 		[CONNECTOR_PLATFORM_HEADER]: `${process.platform} ${process.arch}`,
 		...(about.service ? { [CONNECTOR_SERVICE_HEADER]: "1" } : {}),
 		...(about.planner ? { [CONNECTOR_PLANNER_HEADER]: "1" } : {}),
+		...(about.plannerCommand ? { [CONNECTOR_PLANNER_COMMAND_HEADER]: "1" } : {}),
 		[CONNECTOR_AGENT_HEADER]: about.agent?.name,
 		[CONNECTOR_AGENT_VERSION_HEADER]: about.agent?.version,
 	};
@@ -333,7 +337,10 @@ export async function reportAgent(url: string, token: string, agent: About["agen
 	await post(url + "/api/connector/agent", agent, token).catch(() => {});
 }
 
-/** A short-lived credential for this machine's Planner backend to attach one document. */
+/**
+ * A short-lived credential for this machine's Planner backend to attach one document, and the
+ * document's id in Chopin when Chopin names it.
+ */
 export async function plannerCredential(
 	url: string,
 	token: string,
@@ -343,6 +350,29 @@ export async function plannerCredential(
 	let value = await post(url + "/api/connector/planner", { document }, token, signal);
 	if (typeof value.token !== "string" || typeof value.expiresAt !== "number") {
 		throw new Error("Missing Planner credential.");
+	}
+	let id = (value.document as { id?: unknown } | undefined)?.id;
+	return {
+		token: value.token,
+		expiresAt: value.expiresAt,
+		...(typeof id === "string" && id ? { document: id } : {}),
+	};
+}
+
+/**
+ * The machine's GitHub token for its processes to push to `repository` (`owner/name`) and open
+ * draft pull requests as its owner, and when it expires (ms). Chopin refuses when it holds no such
+ * token, the owner can't push there, or its GitHub App can't write there.
+ */
+export async function machineGitHubToken(
+	url: string,
+	token: string,
+	repository: string,
+	signal?: AbortSignal,
+) {
+	let value = await post(url + "/api/connector/github-token", { repository }, token, signal);
+	if (typeof value.token !== "string" || typeof value.expiresAt !== "number") {
+		throw new Error("Missing GitHub token.");
 	}
 	return { token: value.token, expiresAt: value.expiresAt };
 }

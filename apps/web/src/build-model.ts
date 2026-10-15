@@ -72,7 +72,7 @@ export function syncHint(
 	if (status?.kind === "needs-attention") return attentionHint(snapshot);
 	if (status?.kind !== "out-of-sync") return;
 	let retry = status.outstanding
-		? ` · will also retry ${plural(status.outstanding, "blocked task", "blocked tasks")}`
+		? `. ${plural(status.outstanding, "blocked task", "blocked tasks")} will retry too`
 		: "";
 	if (status.reason === "pending") return `Changes will build shortly${retry}`;
 	if (status.reason === "failed") return `The last rebuild failed${retry}`;
@@ -361,6 +361,9 @@ export function buildRefusalCopy(message: string): string {
 	let draft = draftRefusalCopy(message);
 	if (draft) return draft.replace(/\.$/, "");
 	if (/^no-workspace$/.test(message)) return "Start your local agent, then retry";
+	let offline = /^(.+ is offline)\. /.exec(message);
+	if (offline) return offline[1]!;
+	if (message.startsWith("Can't read your machine choice")) return message.replace(/\.$/, "");
 	if (/offline or busy/.test(message)) return "Your local agent is offline or busy with other work";
 	if (/nothing to build/.test(message)) return "There are no changes to build";
 	if (/busy/i.test(message)) return "Your local agent is busy with another document";
@@ -564,10 +567,16 @@ function progressCount(snapshot: Snapshot): { done: number; total: number } {
 
 /** The open decisions or accepted comments that hold any build, or nothing. */
 function blockerReason(snapshot: Snapshot, unanswered: number): string | undefined {
-	if (snapshot.blockers.includes("unanswered questionnaires")) {
-		return unanswered > 0
-			? `Answer ${plural(unanswered, "open decision", "open decisions")} first`
-			: "Answer the open decisions first";
+	let investigations = snapshot.buildInvestigations?.length ?? 0;
+	let decisions = snapshot.blockers.includes("unanswered questionnaires")
+		? Math.max(1, unanswered)
+		: 0;
+	if (decisions || investigations) {
+		let waiting = [
+			decisions && plural(decisions, "decision", "decisions"),
+			investigations && plural(investigations, "investigation", "investigations"),
+		].filter(Boolean);
+		return `Waiting on ${waiting.join(" and ")}`;
 	}
 	if (snapshot.blockers.includes("accepted comments awaiting plan changes")) {
 		return "Update the document for accepted comments first";
@@ -579,14 +588,8 @@ function planBlocker(snapshot: Snapshot | undefined, context: BuildContext): str
 	if (!context.hasContent) return "Write the document first";
 	if (!context.connected || !snapshot) return "Chopin isn’t connected";
 	let phase = buildPhase(snapshot);
-	if (phase.kind === "blocked" && phase.decisions) {
-		return context.unanswered > 0
-			? `Answer ${plural(context.unanswered, "open decision", "open decisions")} first`
-			: "Answer the open decisions first";
-	}
-	if (phase.kind === "blocked" && phase.comments) {
-		return "Update the document for accepted comments first";
-	}
+	let reason = blockerReason(snapshot, context.unanswered);
+	if (reason) return reason;
 	if (phase.kind === "blocked") return "This document can’t be built yet";
 	if (phase.kind === "drafting" && !context.planner) {
 		return "Chopin isn’t running for this document";
@@ -594,7 +597,6 @@ function planBlocker(snapshot: Snapshot | undefined, context: BuildContext): str
 	if (phase.kind === "drafting" && context.plannerDetached) {
 		return "Connect a Planner to this document to build";
 	}
-	if (!snapshot.buildReady) return "Add more detail before building";
 }
 
 /** Who else built a living document: their login, `""` when it is unknown, or nothing for you. */
@@ -621,7 +623,7 @@ export function buildLook(snapshot: Snapshot | undefined, context: BuildContext)
 			return {
 				kind: "built",
 				pullRequests: snapshot.live!.pullRequests.length,
-				tip: `Every pull request matches the document${who ? ` · built by ${who}` : ""}`,
+				tip: `${who ? `Built by ${who}. ` : ""}Every pull request matches the document`,
 			};
 		}
 		if (sync.kind === "needs-attention") {
@@ -658,7 +660,7 @@ export function buildLook(snapshot: Snapshot | undefined, context: BuildContext)
 			: who === ""
 			? "Edits since someone else’s build"
 			: "Edits since the last build";
-		return { kind: "stale", changes, live: context.live, tip, build, blocked };
+		return { kind: "stale", changes, live: context.live, tip: blocked ?? tip, build, blocked };
 	}
 	if (!snapshot) {
 		return step.view === "idle" ? { kind: "plan", blocked: "Chopin isn’t connected" } : {
@@ -698,7 +700,7 @@ export function buildLook(snapshot: Snapshot | undefined, context: BuildContext)
 	}
 	if (step.view === "working") return { kind: "tasks", tip: "Breaking the document into tasks" };
 	if (step.view === "waiting") {
-		return { kind: "tasks", tip: "Continues once the open decisions are answered" };
+		return { kind: "plan", blocked: blockerReason(snapshot, context.unanswered) };
 	}
 	let retry = context.canEdit && context.connected;
 	if (context.state.stage === "failed" && context.state.agent) {
@@ -731,17 +733,19 @@ export function buildLabel(look: BuildLook): string {
 		case "plan":
 			return "Build plan";
 		case "tasks":
-			return "Breaking into tasks…";
+			return "Preparing tasks";
 		case "building":
-			return `Building · ${look.done} of ${look.total}`;
+			return `Building ${look.done} of ${look.total}`;
 		case "stopped":
 			return "Build stopped";
 		case "agent":
-			return "Start your local agent";
+			return "Agent offline";
 		case "built":
 			return "Built";
 		case "stale":
-			return `${plural(look.changes, "change", "changes")} to build`;
+			return look.blocked
+				? look.blocked.includes("accepted comments") ? "Comments pending" : "Waiting to build"
+				: `${plural(look.changes, "change", "changes")} ready`;
 		case "rebuilding":
 			return "Building changes…";
 		case "failed":

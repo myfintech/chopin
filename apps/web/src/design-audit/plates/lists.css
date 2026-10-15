@@ -1,0 +1,4 @@
+/* The palette is anchored below the viewport top inside its modal; on a plate it sits in place. */
+.design-audit-plate .navigation-modal-content.navigation-palette {
+	margin-block-start: 0;
+}

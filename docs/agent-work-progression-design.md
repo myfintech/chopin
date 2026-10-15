@@ -20,7 +20,7 @@ Use the existing events. Add a protocol turn identity only if a later workflow n
 
 ## Progression and copy
 
-The active work row keeps one stable position beneath Chopin's author line. A small 3×3 dot lattice indicates activity. Its headline changes only when the real event-derived phase changes:
+The active work row keeps one stable position beneath Chopin's author line. A small pen scribble, writing itself and wiping away, indicates activity. Its headline changes only when the real event-derived phase changes:
 
 1. A turn without tool or response events: **Getting oriented**.
 2. A read/list/search tool is running: **Gathering context**.
@@ -30,7 +30,7 @@ The active work row keeps one stable position beneath Chopin's author line. A sm
 6. A response is streaming: **Writing a response**.
 7. Tools have finished but the turn has not: **Reviewing the next step**.
 
-Do not auto-advance through phases, show a percentage, or show generated reasoning paragraphs. A small secondary count may state how many actions finished. When the tool-bearing message is complete, the active headline contracts to a one-line disclosure such as **Work details · 4 actions**. Label the sum of reported tool durations as **tool time**, not as the duration of the entire thought or turn. If there are no tool calls, do not leave an empty work disclosure.
+Do not auto-advance through phases, show a percentage, or show generated reasoning paragraphs. A small secondary count may state how many actions finished. When the tool-bearing message is complete, the active headline contracts to a one-line disclosure such as **4 actions**. Label the sum of reported tool durations as **tool time**, not as the duration of the entire thought or turn. If there are no tool calls, do not leave an empty work disclosure.
 
 ## Tool inspection
 
@@ -38,7 +38,7 @@ The tool list is collapsed initially both during and after work. The summary is 
 
 ## Motion and layout
 
-- The lattice uses a low-contrast, diagonally staggered 1.6 s pulse while active. It stops immediately when the turn ends.
+- The scribble draws and wipes over 2.4 s while active, and a running tool line shows it in place of its glyph. It stops immediately when the turn ends; reduced motion shows the finished stroke.
 - A new phase label enters with opacity and a small vertical shift over about 180 ms. No shimmer runs across text continuously.
 - The disclosure uses the existing motion contract; its detail region is at most 192 px tall and scrolls inside the chat pane.
 - `prefers-reduced-motion: reduce` removes pulses and stage transitions. There is no motion-only status signal.

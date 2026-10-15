@@ -8,11 +8,13 @@ import {
 	EllipsisIcon,
 	PencilIcon,
 	RestartIcon,
+	StarIcon,
 } from "@chopin/icons";
 import { InlineNotice } from "@chopin/visuals/inline-notice";
 import { documentMenuKeyAction } from "../document-actions-menu";
 import { IconButton } from "../icon-button";
-import { listMachines } from "../machine-summary";
+import { setFavorite } from "../machine-choice";
+import { machines as liveMachines, useLiveMachines } from "../machine-summary";
 import { useMenuDismissal } from "../menu-dismissal";
 import { MenuItem, MenuSeparator } from "../menu-item";
 import { motionImmediately } from "../motion-input";
@@ -26,50 +28,36 @@ import type { KeyboardEvent } from "react";
 import type { Machine } from "../machine-summary";
 import type { NavigationDialogMotion } from "../navigation-dialog";
 
-/** How often /connect asks again, so a machine that pairs shows up without a reload. */
-const POLL_MS = 3000;
-
 /**
  * The signed-in person's machines, asked for again every few seconds while the page is in view.
  * `machines` is undefined until the first answer; `error` is the server's code for the last
- * failed answer, which the page turns into words.
+ * failed answer, which the page turns into words. The sidebar's count shares the same list.
  */
 export function useMachines() {
-	let [machines, setMachines] = useState<Machine[]>();
-	let [error, setError] = useState("");
+	let { machines, error } = useLiveMachines(true);
 	let [recommended, setRecommended] = useState<string | null>(null);
-	let reload = useRef<() => void>(() => {});
 	useEffect(() => {
 		let abort = new AbortController();
-		let timer: number | undefined;
-		let load = async () => {
-			window.clearTimeout(timer);
-			if (document.visibilityState !== "hidden") {
-				try {
-					setMachines(await listMachines(abort.signal));
-					setError("");
-				} catch (error) {
-					if (abort.signal.aborted) return;
-					setError(error instanceof Error ? error.message : "unavailable");
-				}
-			}
-			if (!abort.signal.aborted) timer = window.setTimeout(load, POLL_MS);
-		};
-		reload.current = () => void load();
-		void load();
-		document.addEventListener("visibilitychange", load);
 		fetch("/api/connector/version", { signal: abort.signal })
 			.then(response => response.ok ? response.json() : undefined)
 			.then(value => setRecommended(value?.version ?? null), () => {});
-		return () => {
-			abort.abort();
-			window.clearTimeout(timer);
-			document.removeEventListener("visibilitychange", load);
-		};
+		return () => abort.abort();
 	}, []);
-	let forget = (id: string) => setMachines(current => current?.filter(value => value.id !== id));
-	let retry = useCallback(() => reload.current(), []);
-	return { machines, error, recommended, forget, retry };
+	let forget = (id: string) => liveMachines.update(list => list.filter(value => value.id !== id));
+	let retry = useCallback(() => void liveMachines.load(), []);
+	/** Set or clear the favorite: starred at once, then as the server says. */
+	let favor = async (id: string, favorite: boolean) => {
+		let mark = (chosen: string | null) =>
+			liveMachines.update(list => list.map(value => ({ ...value, favorite: value.id === chosen })));
+		let before = machines?.find(value => value.favorite)?.id ?? null;
+		mark(favorite ? id : before === id ? null : before);
+		try {
+			mark(await setFavorite(id, favorite));
+		} catch {
+			void liveMachines.load();
+		}
+	};
+	return { machines, error, recommended, forget, retry, favor };
 }
 
 /**
@@ -95,7 +83,7 @@ export function MachinesProblem({ code, onRetry }: { code: string; onRetry: () =
 	return (
 		<InlineNotice
 			actions={problem.retry && (
-				<button className="btn btn-compact btn-outline" onClick={onRetry} type="button">
+				<button className="btn btn-xs btn-outline" onClick={onRetry} type="button">
 					<RestartIcon aria-hidden="true" />
 					Retry
 				</button>
@@ -119,7 +107,7 @@ export function useLogin() {
 	return login;
 }
 
-/** Move within /connect as the navigation shell does for a link, so it renders the new view. */
+/** Move within /machines as the navigation shell does for a link, so it renders the new view. */
 export function goTo(path: string) {
 	history.pushState(null, "", path);
 	window.dispatchEvent(new PopStateEvent("popstate"));
@@ -226,10 +214,12 @@ export type CopyItem = { label: string; command: string };
  * opens it, arrows, Home and End move within it, and Escape closes it.
  */
 export function MachineActions(
-	{ copies, machine, onDisconnect, onRename }: {
+	{ copies, machine, onDisconnect, onFavorite, onRename }: {
 		copies: CopyItem[];
 		machine: Machine;
 		onDisconnect: () => void;
+		/** Set or clear the machine as the favorite. */
+		onFavorite?: () => void;
 		onRename: () => void;
 	},
 ) {
@@ -339,9 +329,20 @@ export function MachineActions(
 							onRename();
 						}}
 					>
-						<PencilIcon aria-hidden="true" size={14} />
+						<PencilIcon aria-hidden="true" size={16} />
 						Edit machine name…
 					</MenuItem>
+					{onFavorite && (
+						<MenuItem
+							onClick={() => {
+								close(true);
+								onFavorite();
+							}}
+						>
+							<StarIcon aria-hidden="true" filled={machine.favorite} size={16} />
+							{machine.favorite ? "Remove favorite" : "Set as favorite"}
+						</MenuItem>
+					)}
 					{copies.map(item => {
 						let state = copied?.command === item.command ? copied : undefined;
 						return (
@@ -354,7 +355,7 @@ export function MachineActions(
 									)}
 							>
 								{state?.ok
-									? <CheckIcon aria-hidden="true" className="machines-copyable-done" size={14} />
+									? <CheckIcon aria-hidden="true" className="machines-copyable-done" size={16} />
 									: <CopyIcon />}
 								<span className="machines-menu-copy">
 									{state?.ok ? "Copied" : item.label}
@@ -373,7 +374,7 @@ export function MachineActions(
 						}}
 						tone="destructive"
 					>
-						<CloseIcon aria-hidden="true" size={14} />
+						<CloseIcon aria-hidden="true" size={16} />
 						Disconnect machine…
 					</MenuItem>
 				</div>,
