@@ -6,6 +6,7 @@ import { forgetWorkspaces } from "./atomic/workspace";
 import { createCopilotSdk } from "./copilot-sdk/adapter";
 import { shutdownPlannerExtensions } from "../planner-extensions";
 import { atomicProviders } from "../atomic-providers";
+import { announceAtomicPlanner } from "../isolated-planner";
 import { createRemoteAdapter } from "./remote/adapter";
 
 import type { HarnessV1 } from "@ai-sdk/harness";
@@ -21,6 +22,7 @@ function createAtomicHarness(
 ): HarnessV1 & { shutdown(): Promise<void> } {
 	// Atomic takes neither a GitHub credential nor a credit limit; only `auth` (validated by
 	// `harnessFor` below) and the extensions reach the real adapter.
+	announceAtomicPlanner();
 	return createAtomicAdapter({
 		auth: settings.auth as AtomicAuthMode,
 		extensions: settings.extensions,

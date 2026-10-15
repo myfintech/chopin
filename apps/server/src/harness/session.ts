@@ -8,6 +8,7 @@ import {
 	visualPlannerAgent,
 } from "./agents";
 import { extensionTools } from "../planner-extensions";
+import { fullAtomicPlanner } from "../isolated-planner";
 import { githubTools, type GitHubToolsError, lazyGithubTools, type Result } from "./github-tools";
 import { registerCredential } from "./harnesses";
 import {
@@ -159,7 +160,7 @@ export async function openPlannerSession(
 		let sessionId = crypto.randomUUID();
 		unregister = (deps.registerCredential ?? registerCredential)(sessionId, owner.currentToken);
 		// Background jobs keep the isolated boundary; only a Planner turn may run as a full session.
-		let workspace = channel.harness === "atomic" && !job
+		let workspace = channel.harness === "atomic" && !job && fullAtomicPlanner()
 			? await plannerWorkspace(channel.room.id, channel.repository)
 			: undefined;
 		let planner: FullPlanner | undefined;
