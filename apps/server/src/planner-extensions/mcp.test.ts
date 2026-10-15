@@ -112,7 +112,7 @@ describe("serverTools", () => {
 		expect(tools).toEqual({});
 	});
 
-	it("skips protocol discovery only for stdio servers, which may still be starting", async () => {
+	it("skips protocol discovery for every server", async () => {
 		let calls: Array<{ protocolVersionDiscovery?: boolean }> = [];
 		let stdio = server("local", {
 			transport: { type: "stdio", command: "npx", args: ["-y", "some-server"] },
@@ -122,7 +122,7 @@ describe("serverTools", () => {
 			"o/r",
 			fakeClient({ search: remoteSearch }, calls),
 		);
-		expect(calls.map(call => call.protocolVersionDiscovery).sort()).toEqual([false, true]);
+		expect(calls.map(call => call.protocolVersionDiscovery)).toEqual([false, false]);
 	});
 
 	it("keeps a connection whose opening reported a stray protocol error", async () => {
