@@ -1,24 +1,46 @@
 // Planner extensions for the deployed Chopin (myfintech/ai infra/chopin sets
 // PLANNER_EXTENSIONS to this file). See docs/planner-extensions.md.
 // Credentials are substituted from the environment at startup; a missing
-// variable refuses startup. On GCP, UNBLOCKED_TOKEN and NOTION_TOKEN come from
-// Secret Manager. Tool allowlists verified against the pinned server versions
-// by MCP probe.
+// variable refuses startup. On GCP, ATLASSIAN_MCP_AUTHORIZATION and NOTION_TOKEN
+// come from Secret Manager. Tool allowlists verified against the pinned server
+// versions by MCP probe.
 {
-	"instructions": "Always start by using unblocked__context_research to answer questions. Always use unblocked__context_get_urls to retrieve repository files. Fall back to searching the reading the repository directly ONLY when unblocked cannot provide you with the necessary information. Project briefs live in Notion (notion__API-post-search, then notion__API-retrieve-page-markdown).",
+	"instructions": "When a participant mentions a Jira key such as ABC-123, read the ticket with jira__getJiraIssue before planning around it; use jira__searchJiraIssuesUsingJql to find related tickets, always with a restriction such as project = KEY or updated >= -30d, since Jira rejects unbounded JQL. Pass cloudId 8dde2495-8d09-4aca-a9c3-75909a73a1aa (mantlteam.atlassian.net). Project briefs live in Notion (notion__API-post-search, then notion__API-retrieve-page-markdown).",
 
 	"mcpServers": {
-		"unblocked": {
+		// Unblocked is temporarily disabled. To re-enable, uncomment this server and
+		// restore the instructions that prefer unblocked__context_research.
+		// "unblocked": {
+		// 	"transport": {
+		// 		"type": "http",
+		// 		"url": "https://getunblocked.com/api/mcpsse",
+		// 		"headers": { "Authorization": "Bearer ${UNBLOCKED_TOKEN}" },
+		// 	},
+		// 	// Current tool surface (April 2026): the earlier five-tool surface
+		// 	// was replaced by these two. Startup logs name any mismatch.
+		// 	"tools": ["context_research", "context_get_urls"],
+		// 	"repositories": ["myfintech/*"],
+		// 	"instructions": "Organizational context across code, PRs, docs, issues, and messaging, with citations.",
+		// },
+		"jira": {
+			// Atlassian's hosted Rovo MCP server (v2). ATLASSIAN_MCP_AUTHORIZATION is
+			// the whole header value: "Basic <base64(email:api-token)>" for a personal
+			// API token, or "Bearer <api-key>" for a service account. The token needs
+			// read:jira:agent-interface and search:jira:agent-interface, plus read:me
+			// and read:account, without which every call fails resolving the site.
 			"transport": {
 				"type": "http",
-				"url": "https://getunblocked.com/api/mcpsse",
-				"headers": { "Authorization": "Bearer ${UNBLOCKED_TOKEN}" },
+				"url": "https://mcp.atlassian.com/v2/mcp",
+				"headers": { "Authorization": "${ATLASSIAN_MCP_AUTHORIZATION}" },
 			},
-			// Current tool surface (April 2026): the earlier five-tool surface
-			// was replaced by these two. Startup logs name any mismatch.
-			"tools": ["context_research", "context_get_urls"],
+			// Read tools only, verified by MCP probe. The server offers its write tools
+			// whatever the token's scopes, so this allowlist is what keeps them out.
+			// discover and executeRead are excluded because they reach any read
+			// operation the token's scopes allow, beyond Jira.
+			"tools": ["getJiraIssue", "searchJiraIssuesUsingJql"],
+			"instructions": "Read Jira tickets and search them with JQL.",
 			"repositories": ["myfintech/*"],
-			"instructions": "Organizational context across code, PRs, docs, issues, and messaging, with citations.",
+			"timeoutMs": 30000,
 		},
 		"notion": {
 			"transport": {

@@ -92,10 +92,12 @@ export async function connect(
 				createClient({
 					transport,
 					name: "chopin-planner",
-					// A stdio server that is still starting (an `npx` or `uvx` download) can
-					// miss the client's 1 s `server/discover` probe and answer it after the
-					// fallback `initialize`; that stray reply is an uncaught protocol error.
-					protocolVersionDiscovery: server.transport.type !== "stdio",
+					// Always negotiate with `initialize`. A stdio server that is still starting
+					// (an `npx` or `uvx` download) can miss the client's 1 s `server/discover`
+					// probe and answer it after the fallback `initialize`, an uncaught protocol
+					// error. Atlassian's Rovo MCP server rejects the probe with a modern
+					// protocol error, which the client rethrows instead of falling back.
+					protocolVersionDiscovery: false,
 					// `connect` handles failures while opening; only an established
 					// connection is dropped and reopened.
 					onUncaughtError: cause => {
