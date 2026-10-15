@@ -1,5 +1,6 @@
 /** Pure transitions for the durable Planner job queue. */
 
+import { ULID } from "@chopin/dialect";
 import type { ConversationPlan } from "@chopin/protocol";
 import type { JobIntent } from "./effects";
 
@@ -52,9 +53,21 @@ export function enqueue(jobs: Job[], intent: JobIntent, at: string): Job[] {
 		|| !bounded(intent.trigger, MAX_TRIGGER)
 		|| (intent.kind === "heading") !== (intent.target === "document")
 		|| !isoTime(at)
+		|| intent.threadId !== undefined && (intent.kind !== "refine"
+				|| !bounded(intent.threadId, 200) || !ULID.test(intent.target))
 	) invalid();
 	let id = jobId(intent);
 	if (jobs.some(job => job.id === id)) return jobs;
+	if (intent.kind === "heading") {
+		let pending = jobs.findIndex(job => job.kind === "heading" && job.status === "pending");
+		if (pending >= 0) {
+			return jobs.map((job, index) =>
+				index === pending
+					? { id, ...intent, status: "pending", attempts: 0, at }
+					: job
+			);
+		}
+	}
 	if (intent.kind === "refine" || intent.kind === "suggest") {
 		let pending = jobs.findIndex(job =>
 			(job.kind === "refine" || job.kind === "suggest")
@@ -76,13 +89,18 @@ export function enqueue(jobs: Job[], intent: JobIntent, at: string): Job[] {
 	return [...available, { id, ...intent, status: "pending", attempts: 0, at }];
 }
 
-export function next(jobs: Job[]): Job | undefined {
+export function next(jobs: Job[], eligible: (job: Job) => boolean = () => true): Job | undefined {
 	if (jobs.some(job => job.status === "running")) return;
-	return jobs.find(job => job.status === "pending");
+	return jobs.find(job => job.status === "pending" && eligible(job));
 }
 
-export function start(jobs: Job[], id: string, at: string): Job[] {
-	if (next(jobs)?.id !== id) return jobs;
+export function start(
+	jobs: Job[],
+	id: string,
+	at: string,
+	eligible?: (job: Job) => boolean,
+): Job[] {
+	if (next(jobs, eligible)?.id !== id) return jobs;
 	if (!isoTime(at)) invalid();
 	return jobs.map(job => job.id === id ? { ...job, status: "running", at } : job);
 }
@@ -109,6 +127,10 @@ export function settle(jobs: Job[], id: string, outcome: JobOutcome, at: string)
 export function retry(jobs: Job[], id: string, at: string): Job[] {
 	let failed = jobs.find(job => job.id === id && job.status === "failed");
 	if (!failed) return jobs;
+	if (
+		failed.kind === "heading"
+		&& jobs.some(job => job.kind === "heading" && job.status === "pending")
+	) return jobs;
 	if (
 		(failed.kind === "refine" || failed.kind === "suggest")
 		&& jobs.some(job =>
@@ -141,13 +163,14 @@ export function restore(value: unknown): Job[] {
 	let ids = new Set<string>();
 	let pendingCards = new Set<string>();
 	let running = 0;
+	let pendingHeading = false;
 	for (let raw of value) {
 		if (!raw || typeof raw !== "object" || Array.isArray(raw)) invalid();
 		let job = raw as Record<string, unknown>;
 		let required = ["id", "kind", "target", "trigger", "status", "attempts", "at"];
 		if (
 			required.some(key => !Object.hasOwn(job, key))
-			|| Object.keys(job).some(key => ![...required, "reason", "output"].includes(key))
+			|| Object.keys(job).some(key => ![...required, "reason", "output", "threadId"].includes(key))
 			|| !KINDS.has(job.kind as string)
 			|| !STATUSES.has(job.status as string)
 			|| !bounded(job.target, MAX_TARGET)
@@ -155,6 +178,8 @@ export function restore(value: unknown): Job[] {
 			|| !bounded(job.trigger, MAX_TRIGGER)
 			|| !bounded(job.id, 420)
 			|| job.id !== `${job.kind}:${job.target}:${job.trigger}`
+			|| Object.hasOwn(job, "threadId") && (job.kind !== "refine"
+					|| !bounded(job.threadId, 200) || !ULID.test(job.target as string))
 			|| ids.has(job.id)
 			|| !Number.isSafeInteger(job.attempts) || (job.attempts as number) < 0
 			|| !isoTime(job.at)
@@ -166,6 +191,10 @@ export function restore(value: unknown): Job[] {
 		if (job.status === "pending" || job.status === "running") {
 			if (hasReason || hasOutput) invalid();
 			if (job.status === "running" && ++running > 1) invalid();
+			if (job.status === "pending" && job.kind === "heading") {
+				if (pendingHeading) invalid();
+				pendingHeading = true;
+			}
 			if (
 				job.status === "pending" && (job.kind === "refine" || job.kind === "suggest")
 			) {

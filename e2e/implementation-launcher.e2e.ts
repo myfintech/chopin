@@ -1,6 +1,6 @@
 import { content, expect, roomPath, test } from "./room";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { failedBuild } from "./build-seed";
@@ -147,7 +147,7 @@ test("Build shares the document pane beside Chat and a task link reopens it afte
 		.toBeInViewport();
 });
 
-async function connector(baseURL: string, command: string[]) {
+async function connector(baseURL: string, command: string[], env: Record<string, string> = {}) {
 	let root = await mkdtemp(join(tmpdir(), "chopin-implementation-checkout-"));
 	let state = await mkdtemp(join(tmpdir(), "chopin-implementation-state-"));
 	let git = (...args: string[]) => execFileSync("git", ["-C", root, ...args], { stdio: "pipe" });
@@ -167,7 +167,7 @@ async function connector(baseURL: string, command: string[]) {
 		...command,
 	], {
 		cwd: ROOT,
-		env: { ...process.env, CHOPIN_URL: baseURL, CHOPIN_CONNECTOR_STATE_DIR: state },
+		env: { ...process.env, CHOPIN_URL: baseURL, CHOPIN_CONNECTOR_STATE_DIR: state, ...env },
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	let output = "";
@@ -175,7 +175,7 @@ async function connector(baseURL: string, command: string[]) {
 		let timer = setTimeout(() => reject(new Error(`Pairing timed out: ${output}`)), 15_000);
 		let read = (chunk: Buffer) => {
 			output += String(chunk);
-			let match = output.match(/http:\/\/[^\s]+\/connect\?pairing=[\w-]+/);
+			let match = output.match(/http:\/\/[^\s]+\/machines\?pairing=[\w-]+/);
 			if (match) {
 				clearTimeout(timer);
 				resolve(match[0]);
@@ -349,9 +349,16 @@ for (let mode of ["block", "complete", "startup-failure", "live"] as const) {
 			let blocked = view.getByRole("button", { name: /^Connect the local agent/ });
 			let dependent = view.getByRole("button", { name: /^Review the connection/ });
 			if (mode === "complete") {
-				await expect(view).toContainText("Built · 2 pull requests");
+				await expect(view).toContainText("Built 2 pull requests");
 				await expect(view.getByRole("link", { name: /^Pull request #\d+/ })).toHaveCount(2);
 				await expect(blocked).toHaveAttribute("aria-expanded", "false");
+				// The tasks the connector started, completed and opened pull requests for show under
+				// Build, as the Planner says; Chat has no card for a Build or its tasks.
+				await expect(view.getByRole("list", { name: "Tasks" }).locator(":scope > li"))
+					.toHaveCount(2);
+				let chat = page.getByRole("complementary", { name: "Chat", exact: true });
+				await expect(chat).toBeVisible();
+				await expect(chat.getByRole("region", { name: "Workflow runs" })).toHaveCount(0);
 			} else {
 				await expect(view).toContainText("Build stopped");
 				await expect(blocked).toHaveAttribute("aria-expanded", "true");
@@ -372,7 +379,7 @@ for (let mode of ["block", "complete", "startup-failure", "live"] as const) {
 			);
 			await openBuild();
 			await expect(view).toContainText(
-				mode === "complete" ? "Built · 2 pull requests" : "Blocked: Choose the next tracer",
+				mode === "complete" ? "Built 2 pull requests" : "Blocked: Choose the next tracer",
 			);
 			if (
 				process.env.CHOPIN_LAUNCHER_SCREENSHOT
@@ -396,6 +403,56 @@ for (let mode of ["block", "complete", "startup-failure", "live"] as const) {
 		}
 	});
 }
+
+test("a build's agent opens draft pull requests with the machine's own GitHub token", async ({ seed, join: enter, room, baseURL }) => {
+	test.setTimeout(60_000);
+	await seed("# Draft pull requests\n\nOpen them as the machine's owner.\n", {
+		graph: preparedGraph(),
+	});
+	let scratch = await mkdtemp(join(tmpdir(), "chopin-implementation-github-"));
+	let bin = join(scratch, "bin");
+	await mkdir(bin);
+	// gh, as the agent finds it: it records the token it was given and its arguments.
+	await writeFile(
+		join(bin, "gh"),
+		`#!/bin/sh\nprintf '%s\\n' "$GH_TOKEN" "$@" > "${join(scratch, "gh")}"\n`,
+	);
+	await chmod(join(bin, "gh"), 0o755);
+	let handle = person();
+	let local = await connector(baseURL!, [
+		"bun",
+		join(ROOT, "apps/connector/src/testing/fake-implementer.ts"),
+		"--github",
+	], {
+		PATH: `${bin}:${process.env.PATH}`,
+		CHOPIN_TEST_GITHUB: join(scratch, "github.json"),
+	});
+	try {
+		let page = await enter(handle);
+		await page.goto(await local.pairing);
+		await page.getByRole("button", { name: "Connect", exact: true }).click();
+		await expect(page.getByRole("status").filter({ hasText: "Connected" })).toHaveText(
+			"Connected",
+		);
+		await page.goto(testChannelPath(room));
+		await page.getByRole("button", { name: "Build plan", exact: true }).click();
+		await expect.poll(
+			() => readFile(join(scratch, "gh"), "utf8").catch(() => ""),
+			{ timeout: 30_000 },
+		).not.toBe("");
+		let [token, ...args] = (await readFile(join(scratch, "gh"), "utf8")).split("\n");
+		// The machine's own GitHub authorization, which its owner approved when it paired.
+		expect(token).toMatch(new RegExp(`^ghu_e2e_${handle}_\\d+$`));
+		expect(args).toEqual(["pr", "create", "--draft", "--title", "Task one", ""]);
+		let seen = JSON.parse(await readFile(join(scratch, "github.json"), "utf8"));
+		expect(seen).toMatchObject({ GH_TOKEN: token, GITHUB_TOKEN: token });
+		expect(seen.credential).toContain(`password=${token}\n`);
+		expect(local.output()).not.toContain(token);
+	} finally {
+		await local.close();
+		await rm(scratch, { recursive: true, force: true });
+	}
+});
 
 function buildView(page: import("@playwright/test").Page) {
 	return page.getByRole("region", { name: "Build", exact: true });
@@ -501,84 +558,143 @@ test("a #task link opens Build on that task, and rows toggle from the keyboard",
 		.toBe(0);
 });
 
-test("Build without a running local agent says how to start one", async ({ seed, join: enter }) => {
-	await seed("# Offline build\n\nNo local agent is connected.\n", { graph: preparedGraph() });
-	let page = await enter(person());
+test(
+	"Build without a running local agent says how to start one",
+	async ({ seed, join: enter }) => {
+		await seed("# Offline build\n\nNo local agent is connected.\n", { graph: preparedGraph() });
+		let page = await enter(person());
+		await page.getByRole("button", { name: "Build plan", exact: true }).click();
+		let capsule = page.getByRole("button", { name: "Agent offline", exact: true });
+		await expect(capsule).toHaveAccessibleDescription(
+			"Your local agent isn’t connected. Open Build for the command that starts it.",
+		);
+		await expect(page.getByRole("button", { name: /^Build stopped/ })).toHaveCount(0);
+		await expect(page.getByRole("button", { name: "Connect agent", exact: true })).toBeVisible();
+		await page.getByRole("button", { name: "Connect agent", exact: true }).click();
+		let popup = page.getByRole("dialog", { name: "Connect agent", exact: true });
+		await expect(popup.getByRole("button", { name: "Copy command", exact: true })).toBeEnabled();
+		let screenshot = test.info().outputPath("agent-connection-header.png");
+		await page.screenshot({ path: screenshot });
+		await test.info().attach("agent-connection-header", {
+			path: screenshot,
+			contentType: "image/png",
+		});
+		await page.keyboard.press("Escape");
+		await capsule.click();
+		let view = buildView(page);
+		let note = view.getByText(
+			"Your local agent isn’t connected. Run this in your project folder, then press Retry again.",
+			{ exact: true },
+		);
+		await expect(note).toBeVisible();
+		await expect(view.locator("code")).toContainText(
+			"/connector.js -o ~/.chopin/connector.js && CHOPIN_URL=",
+		);
+		await view.getByRole("button", { name: "Copy", exact: true }).click();
+		await expect(view.getByRole("button", { name: /^(Copied|Select to copy)$/ })).toBeVisible();
+		await expect(view.getByRole("link", { name: "Trouble connecting?", exact: true }))
+			.toHaveAttribute("href", /docs\/local-experiments\.md#trouble-connecting$/);
+		await expect(view.getByRole("alert")).toHaveCount(0);
+	},
+);
+
+test("the agent-offline notice folds to its glyph before the document's title gives way", async ({ seed, join: enter }) => {
+	await seed(
+		"# A rather long document title for the header row\n\nNo local agent is connected.\n",
+		{
+			graph: preparedGraph(),
+		},
+	);
+	let page = await enter(person(), { viewport: { width: 1100, height: 800 } });
 	await page.getByRole("button", { name: "Build plan", exact: true }).click();
-	let capsule = page.getByRole("button", { name: /^Start your local agent/ });
-	await expect(capsule).toHaveAccessibleDescription(
-		"Your local agent isn’t connected. Open Build for the command that starts it.",
-	);
-	await expect(page.getByRole("button", { name: /^Build stopped/ })).toHaveCount(0);
-	await expect(page.getByRole("button", { name: "Retry", exact: true })).toBeVisible();
-	await capsule.click();
-	let view = buildView(page);
-	let note = view.getByText(
-		"Your local agent isn’t connected. Run this in your project folder, then press Retry again.",
-		{ exact: true },
-	);
-	await expect(note).toBeVisible();
-	await expect(view.locator("code")).toContainText(
-		"/connector.js -o ~/.chopin/connector.js && CHOPIN_URL=",
-	);
-	await view.getByRole("button", { name: "Copy", exact: true }).click();
-	await expect(view.getByRole("button", { name: /^(Copied|Select to copy)$/ })).toBeVisible();
-	await expect(view.getByRole("link", { name: "Trouble connecting?", exact: true }))
-		.toHaveAttribute("href", /docs\/local-experiments\.md#trouble-connecting$/);
-	await expect(view.getByRole("alert")).toHaveCount(0);
+	let notice = page.getByRole("button", { name: "Agent offline", exact: true });
+	await expect(notice).toBeVisible();
+	let shots = process.env.CHOPIN_SHOTS;
+	// A title bar about 600px wide beside Chat, a narrower one, then a narrow window's header.
+	for (let width of [1100, 900, 600, 320]) {
+		await page.setViewportSize({ width, height: 800 });
+		let bar = page.locator(width >= 700 ? ".document-title-bar" : ".room-header");
+		let title = bar.locator(".title-control").first();
+		await expect(notice).toBeVisible();
+		await expect(notice).toBeInViewport({ ratio: 1 });
+		// The title keeps room for ten or so characters; the notice gave way first.
+		await expect.poll(() => title.evaluate(item => item.getBoundingClientRect().width))
+			.toBeGreaterThanOrEqual(80);
+		let [barBox, noticeBox] = [(await bar.boundingBox())!, (await notice.boundingBox())!];
+		expect(noticeBox.x + noticeBox.width).toBeLessThanOrEqual(barBox.x + barBox.width);
+		if (shots) await bar.screenshot({ path: `${shots}/agent-offline-header-${width}.png` });
+	}
+	// Folded, the glyph still opens Build, which says how to connect the agent.
+	await notice.click();
+	await expect(buildView(page).getByText(/Your local agent isn’t connected/)).toBeVisible();
 });
 
-test("Build plan waits for unanswered decisions and says so", async ({ seed, join: enter }) => {
-	let widget = "01K0N4TR8K7JGM4R1J7PW4R8YJ";
-	let question = "01K0N4V4E7Y6P4MJ5WD8XZF3B2";
-	let option = "01K0N4W3B7P27CBAEC7A8C8WEA";
-	let definition = {
-		questions: [{
-			id: question,
-			header: "Rollout",
-			question: "How should we deploy?",
-			multiple: false,
-			options: [{ id: option, label: "Canary", description: "" }],
-		}],
-	};
-	await seed(
-		`# Blocked build\n\nA decision is open.\n\n<Questionnaire id="${widget}" by="ana">
+test(
+	"Build plan waits for unanswered decisions and says so",
+	async ({ seed, join: enter }) => {
+		let widget = "01K0N4TR8K7JGM4R1J7PW4R8YJ";
+		let question = "01K0N4V4E7Y6P4MJ5WD8XZF3B2";
+		let option = "01K0N4W3B7P27CBAEC7A8C8WEA";
+		let definition = {
+			questions: [{
+				id: question,
+				header: "Rollout",
+				question: "How should we deploy?",
+				multiple: false,
+				options: [{ id: option, label: "Canary", description: "" }],
+			}],
+		};
+		await seed(
+			`# Blocked build\n\nA decision is open.\n\n<Questionnaire id="${widget}" by="ana">
 <Question id="${question}" header="Rollout" prompt="How should we deploy?" multiple="false">
 <Option id="${option}" label="Canary" />
 </Question>
 </Questionnaire>\n`,
-		{
-			revision: 1,
-			graph: preparedGraph(),
-			questions: [{
-				id: widget,
-				definition,
-				status: "open",
-				origin: "planner",
-				history: [],
-				optionOrigins: {},
-				editors: [],
-			}],
-			openQuestions: [{
-				definition,
-				id: widget,
-				model: storedQuestion(definition),
-				revision: 0,
-				widget,
-			}],
-		},
-	);
-	let page = await enter("ana");
-	let plan = page.getByRole("button", { name: "Build plan", exact: true });
-	await expect(plan).toHaveAttribute("aria-disabled", "true");
-	await expect(plan).toHaveAccessibleDescription("Answer 1 open decision first");
-	await plan.click({ force: true });
-	await expect(page.getByRole("button", { name: /^Breaking into tasks/ })).toHaveCount(0);
-	await expect(
-		page.getByRole("group", { name: "Document view" })
-			.getByRole("button", { name: "Build", exact: true }),
-	).toBeDisabled();
-});
+			{
+				revision: 1,
+				graph: preparedGraph(),
+				questions: [{
+					id: widget,
+					definition,
+					status: "open",
+					origin: "planner",
+					history: [],
+					optionOrigins: {},
+					editors: [],
+				}],
+				openQuestions: [{
+					definition,
+					id: widget,
+					model: storedQuestion(definition),
+					revision: 0,
+					widget,
+				}],
+			},
+		);
+		let page = await enter("ana");
+		let plan = page.getByRole("button", { name: "1 decision left. Show blockers", exact: true });
+		await expect(plan).toBeVisible();
+		await expect(page.getByRole("button", { name: "Build plan", exact: true })).toHaveCount(0);
+		await plan.click();
+		let popup = page.getByRole("dialog", { name: "Build blockers", exact: true });
+		let item = popup.getByRole("button", { name: "Review: How should we deploy?", exact: true });
+		await expect(item).toBeVisible();
+		let screenshot = test.info().outputPath("decision-blocker-header.png");
+		await page.screenshot({ path: screenshot });
+		await test.info().attach("decision-blocker-header", {
+			path: screenshot,
+			contentType: "image/png",
+		});
+		await item.click();
+		await expect(page.locator(`article[data-plan-sidecar-questionnaire="${widget}"]`).first())
+			.toBeFocused();
+		await expect(page.getByRole("button", { name: "Preparing tasks", exact: true })).toHaveCount(0);
+		await expect(
+			page.getByRole("group", { name: "Document view" })
+				.getByRole("button", { name: "Build", exact: true }),
+		).toBeDisabled();
+	},
+);
 
 test("a child document has no Build view", async ({ seed, join: enter, room, baseURL }) => {
 	await seed("# Parent\n\nThe parent can be built.\n", { graph: preparedGraph() });
@@ -615,7 +731,7 @@ test("a build in progress shows who started it and offers no action", async ({ s
 		await expect(page.getByRole("status").filter({ hasText: "Connected" })).toHaveText("Connected");
 		await page.goto(testChannelPath(room));
 		await page.getByRole("button", { name: "Build plan", exact: true }).click();
-		let capsule = page.getByRole("button", { name: /^Building · 0 of 2/ });
+		let capsule = page.getByRole("button", { name: /^Building 0 of 2/ });
 		await expect(capsule).toBeVisible();
 		await expectClearOfPeople(capsule);
 		// The capsule and the Build tab light each other, and the capsule opens Build.
@@ -630,7 +746,7 @@ test("a build in progress shows who started it and offers no action", async ({ s
 		await expect(view).toBeVisible();
 		// The capsule stays while its own view is open.
 		await expect(capsule).toBeVisible();
-		await expect(view.getByText(/^Building · 0 of 2 · started by you/)).toBeVisible();
+		await expect(view.getByText(/^Building 0 of 2 started by you/)).toBeVisible();
 		await expect(view.getByRole("button", { name: /Retry|Return to planning/ })).toHaveCount(0);
 		await expect(view.getByRole("list", { name: "Tasks" }).locator(":scope > li")).toHaveCount(2);
 		let snapshot = await (await page.request.get(`/api/channels/${room}/implementation`)).json();
@@ -695,7 +811,7 @@ test("edits after a build read as changes to build, and Build sends them to the 
 		await content(page).getByText("Validate the local agent connection.").click();
 		await page.keyboard.press("End");
 		await page.keyboard.type(" Then report back.");
-		let stale = page.getByRole("button", { name: "1 change to build", exact: true });
+		let stale = page.getByRole("button", { name: "1 change ready", exact: true });
 		await expect(stale).toBeVisible();
 		await expect(stale).toHaveAccessibleDescription("Edits since the last build");
 		await expectClearOfPeople(capsuleBuild(page));

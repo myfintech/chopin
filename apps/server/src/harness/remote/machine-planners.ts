@@ -2,7 +2,7 @@
  * Planner credentials for paired machines.
  *
  * A paired machine asks for a short-lived credential naming one document, and
- * hands it to a Planner backend command, which attaches over `/planner-link`
+ * hands it to a Planner backend command, which attaches over `/api/v1/agent`
  * with it instead of a GitHub bearer. The machine's owner then holds the
  * document's Planner through a delegated login whose GitHub token is the
  * machine's own, so no browser sign-in is needed and signing out of one does
@@ -69,6 +69,18 @@ export class MachinePlanners {
 		let expiresAt = now + PLANNER_CREDENTIAL_MS;
 		this.#issued.set(digest(token), { machineId: machine.id, channelId, expiresAt });
 		return { token, expiresAt };
+	}
+
+	/**
+	 * Forgets every credential `machineId` holds for `channelId`, so a backend Chopin stopped there
+	 * cannot attach again with one; the machine's next credential request is answered as usual.
+	 */
+	withdraw(machineId: string, channelId: string): void {
+		for (let [key, issued] of this.#issued) {
+			if (issued.machineId === machineId && issued.channelId === channelId) {
+				this.#issued.delete(key);
+			}
+		}
 	}
 
 	/** Whether a bearer is shaped as a Planner credential rather than a GitHub token. */
@@ -167,7 +179,7 @@ export class MachinePlanners {
 		try {
 			await this.#auth.sessions.end(id);
 		} catch (error) {
-			console.error("[planner-link] ending a machine's Planner login failed:", error);
+			console.error("[agent] ending a machine's Planner login failed:", error);
 		}
 	}
 }

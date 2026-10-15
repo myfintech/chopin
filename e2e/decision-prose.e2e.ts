@@ -1,5 +1,7 @@
 /** Browser coverage for chat decisions that become anchored document prose. */
 
+import { openDecisionDocument } from "./decision-deck-fixtures";
+
 import { content, expect, ready, test } from "./room";
 import { openJevWire, sendChat, wireFrames, wireState } from "./jev-wire";
 import { releasePlannerJob, resetPlannerJobs, scriptJob } from "./planner-jobs";
@@ -63,7 +65,7 @@ async function decide(page: Page, room: string, option = OPTION) {
 	await openJevWire(page, room);
 	let source = await sendChat(page, QUESTION);
 	await sendChat(page, OPTION);
-	await page.getByRole("button", { name: "Document", exact: true }).click();
+	await openDecisionDocument(page);
 	let decision = card(page);
 	await expect(decision).toBeVisible();
 	await decision.getByText(option, { exact: true }).click();
@@ -82,7 +84,7 @@ async function openPopover(page: Page): Promise<Locator> {
 }
 
 test.beforeEach(async () => {
-	await resetPlannerJobs();
+	await resetPlannerJobs({ heading: true, suggest: true });
 });
 
 test.afterEach(async () => {
@@ -174,7 +176,10 @@ test("ordinary prose edits retain the marker; deletion orphans it for both reade
 	await expect(marker(ana)).toHaveCount(0);
 	await expect(marker(ben)).toHaveCount(0);
 	await ana.getByRole("button", { name: /^Decisions/ }).click();
-	await ana.getByRole("button", { name: "1 resolved", exact: true }).click();
+	await expect(ana.getByRole("button", { name: "1 resolved", exact: true })).toHaveAttribute(
+		"aria-expanded",
+		"true",
+	);
 	await expect.poll(() => proseOrphaned(ana)).toBe(true);
 	await expect(ana.locator('[data-document-view="decisions"]')).toContainText(OPTION);
 
@@ -182,7 +187,10 @@ test("ordinary prose edits retain the marker; deletion orphans it for both reade
 	await ready(ben);
 	await openJevWire(ben, room);
 	await ben.getByRole("button", { name: /^Decisions/ }).click();
-	await ben.getByRole("button", { name: "1 resolved", exact: true }).click();
+	await expect(ben.getByRole("button", { name: "1 resolved", exact: true })).toHaveAttribute(
+		"aria-expanded",
+		"true",
+	);
 	await expect.poll(() => proseOrphaned(ben)).toBe(true);
 	await expect(ben.locator('[data-document-view="decisions"]')).toContainText(OPTION);
 });
@@ -198,13 +206,25 @@ test("Backspace after a hidden decided card moves into its prose without deletin
 	await expect(following).toHaveText("Following detail.");
 	await page.keyboard.press(process.platform === "darwin" ? "Meta+ArrowLeft" : "Home");
 	await page.keyboard.press("Backspace");
+	await expect.poll(() =>
+		content(page).evaluate(() => {
+			let selection = getSelection();
+			return {
+				text: selection?.anchorNode?.textContent,
+				offset: selection?.anchorOffset,
+			};
+		})
+	).toEqual({ text: `We decided: ${OPTION}`, offset: `We decided: ${OPTION}`.length });
 	await page.keyboard.type(" Updated.");
 
 	await expect(proseBlock(page)).toContainText(`We decided: ${OPTION} Updated.`);
 	await expect(content(page)).toContainText("Following detail.");
 	await expect(marker(page)).toBeVisible();
 	await page.getByRole("button", { name: /^Decisions/ }).click();
-	await page.getByRole("button", { name: "1 resolved", exact: true }).click();
+	await expect(page.getByRole("button", { name: "1 resolved", exact: true })).toHaveAttribute(
+		"aria-expanded",
+		"true",
+	);
 	await expect.poll(() => proseOrphaned(page)).toBe(false);
 	await page.reload();
 	await page.getByRole("button", { name: "Document", exact: true }).click();
@@ -224,7 +244,10 @@ test("Backspace from an empty paragraph after resolved prose keeps the decision"
 	await expect(content(page)).toContainText(`We decided: ${OPTION}`);
 	await expect(marker(page)).toBeVisible();
 	await page.getByRole("button", { name: /^Decisions/ }).click();
-	await page.getByRole("button", { name: "1 resolved", exact: true }).click();
+	await expect(page.getByRole("button", { name: "1 resolved", exact: true })).toHaveAttribute(
+		"aria-expanded",
+		"true",
+	);
 	await expect.poll(() => proseOrphaned(page)).toBe(false);
 });
 
@@ -236,7 +259,7 @@ test("Reopen leaves prose, restores the card beneath it, and a re-decision repla
 	let popover = await openPopover(page);
 	await popover.getByRole("button", { name: "Reopen", exact: true }).click();
 	let reopened = card(page);
-	await expect(reopened).toContainText("Previously: Start with a small pilot. · @ana");
+	await expect(reopened).toContainText("Previously chosen by @ana: Start with a small pilot.");
 	let [paragraph, reopenedCard] = await Promise.all([
 		prose(page).boundingBox(),
 		reopened.boundingBox(),
@@ -324,7 +347,7 @@ test("a failed prose job is visible on the opening message and Retry uses the co
 	let opening = page.locator(`[data-chat-message-id="${source}"]`);
 	await opening.getByRole("button", { name: /Analysis for message/ }).click();
 	let jobs = page.getByRole("group", { name: "Planner jobs" });
-	await expect(jobs).toContainText("prose · failed");
+	await expect(jobs).toContainText("prose failed");
 	await scriptProse(OPTION);
 	await jobs.getByRole("button", { name: "Retry prose job", exact: true }).click();
 	await waitForProseJob(page, "done");

@@ -1,6 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { useTransitionPresence } from "@chopin/editor/transition-presence";
-import { usePhone } from "@chopin/editor/pointer";
+import { usePhoneWidth } from "@chopin/editor/pointer";
 import {
 	ArrowUpIcon,
 	ChevronIcon,
@@ -11,6 +11,7 @@ import {
 	PlayIcon,
 	SearchIcon,
 	ServerIcon,
+	StarIcon,
 } from "@chopin/icons";
 import {
 	Badge,
@@ -22,6 +23,7 @@ import {
 	TableRow,
 } from "@chopin/visuals";
 import { ago } from "../build-model";
+import { FavoriteStar } from "../favorite-star";
 import { IconButton } from "../icon-button";
 import { updateAvailable } from "../machine-summary";
 import { motionImmediately } from "../motion-input";
@@ -303,6 +305,11 @@ function MachineTable(
 							<TableCell>
 								<span className="machines-stack">
 									<span className="machines-name-line">
+										<FavoriteStar
+											favorite={machine.favorite}
+											label={machine.label}
+											onToggle={() => void machines.favor(machine.id, !machine.favorite)}
+										/>
 										<span className="machines-name">{machine.label}</span>
 										{machine.service && (
 											<Badge
@@ -323,9 +330,12 @@ function MachineTable(
 											/>
 										)}
 									</span>
-									<span className="machines-secondary machines-truncate">
-										{[owner, machine.repositories.join(", ")].filter(Boolean).join(" · ")}
-									</span>
+									{owner && <span className="machines-secondary machines-truncate">{owner}</span>}
+									{machine.repositories.length > 0 && (
+										<span className="machines-secondary machines-truncate">
+											{machine.repositories.join(", ")}
+										</span>
+									)}
 								</span>
 							</TableCell>
 							<TableCell>
@@ -372,6 +382,7 @@ function MachineTable(
 									copies={copiesFor(machine, machines.recommended)}
 									machine={machine}
 									onDisconnect={() => onDisconnect(machine)}
+									onFavorite={() => void machines.favor(machine.id, !machine.favorite)}
 									onRename={() => onRename(machine)}
 								/>
 							</TableCell>
@@ -395,9 +406,10 @@ function page() {
  * a quiet second line, and a chevron to its own view.
  */
 function MachineRows(
-	{ list, login }: {
+	{ list, login, machines }: {
 		list: Machine[];
 		login: string | undefined;
+		machines: ReturnType<typeof useMachines>;
 	},
 ) {
 	let headingId = useId();
@@ -419,21 +431,34 @@ function MachineRows(
 			<ul>
 				{list.map(machine => {
 					let state = machineState(machine);
-					let detail = state === "connected"
-						? [
-							machine.hostname,
-							machine.version && `chopin ${machine.version}`,
-							OS[machine.platform?.os ?? ""],
-						]
-							.filter(Boolean).join(" · ") || machine.repositories[0] || "Connected"
-						: statusWords(machine, now);
+					let parts = [
+						machine.hostname,
+						machine.version && `chopin ${machine.version}`,
+						OS[machine.platform?.os ?? ""],
+					].filter(Boolean);
+					let detail = state !== "connected"
+						? statusWords(machine, now)
+						: parts.length
+						? parts.map((part, index) => (
+							<span className="machines-detail-part" key={index}>
+								{index > 0 && " "}
+								{part}
+							</span>
+						))
+						: machine.repositories[0] || "Connected";
 					return (
-						<li key={machine.id}>
+						<li className="machines-row-item" key={machine.id}>
+							<FavoriteStar
+								favorite={machine.favorite}
+								label={machine.label}
+								onToggle={() => void machines.favor(machine.id, !machine.favorite)}
+								touch
+							/>
 							<button
 								className="machines-row"
 								onClick={() => {
 									sessionStorage.setItem(SCROLL_KEY, String(page()?.scrollTop ?? 0));
-									goTo(`/connect?machine=${encodeURIComponent(machine.id)}`);
+									goTo(`/machines?machine=${encodeURIComponent(machine.id)}`);
 								}}
 								type="button"
 							>
@@ -441,7 +466,7 @@ function MachineRows(
 									<span className="machines-row-name">
 										<StatusDot label={statusWords(machine, now)} state={state} />
 										<span className="machines-name">{machine.label}</span>
-										<MachineIcon aria-hidden="true" className="machines-row-icon" size={14} />
+										<MachineIcon aria-hidden="true" className="machines-row-icon" size={16} />
 									</span>
 									<span className="machines-secondary machines-truncate">{detail}</span>
 								</span>
@@ -457,7 +482,7 @@ function MachineRows(
 
 /**
  * The person's machines: a search, how many there are, then the table on a desktop or the list on
- * a phone, and a quiet way to add another. With none yet, nothing: the page's banner offers the
+ * a phone or a window as narrow as one, and a quiet way to add another. With none yet, nothing: the page's banner offers the
  * first. The table asks again every few seconds, so a machine appears as it connects.
  */
 export function YourMachines(
@@ -468,7 +493,7 @@ export function YourMachines(
 	},
 ) {
 	let headingId = useId();
-	let phone = usePhone();
+	let phone = usePhoneWidth();
 	let [query, setQuery] = useState("");
 	let { dialogs, rename, disconnect } = useMachineDialogs(machines);
 	let all = machines.machines;
@@ -488,7 +513,7 @@ export function YourMachines(
 			<h2 className="sr-only" id={headingId}>Your machines</h2>
 			{machines.error && <MachinesProblem code={machines.error} onRetry={machines.retry} />}
 			<label className="machines-search">
-				<SearchIcon aria-hidden="true" className="machines-search-icon" size={14} />
+				<SearchIcon aria-hidden="true" className="machines-search-icon" size={16} />
 				<span className="sr-only">Search machines</span>
 				<input
 					className="field"
@@ -505,7 +530,7 @@ export function YourMachines(
 				</span>
 			)}
 			{phone
-				? <MachineRows list={list} login={login} />
+				? <MachineRows list={list} login={login} machines={machines} />
 				: (
 					<MachineTable
 						labelledBy={headingId}
@@ -525,7 +550,7 @@ export function YourMachines(
 }
 
 /**
- * One machine on a phone, at /connect?machine=<id>: its name and state, what it is, and its
+ * One machine on a phone, at /machines?machine=<id>: its name and state, what it is, and its
  * actions as full-width rows. Back returns to the list where it was.
  */
 export function MachineDetail(
@@ -536,7 +561,7 @@ export function MachineDetail(
 	},
 ) {
 	let machine = machines.machines?.find(value => value.id === id);
-	let { dialogs, rename, disconnect } = useMachineDialogs(machines, () => goTo("/connect"));
+	let { dialogs, rename, disconnect } = useMachineDialogs(machines, () => goTo("/machines"));
 	let [copied, setCopied] = useState<string>();
 	useEffect(() => {
 		if (!copied) return;
@@ -592,8 +617,19 @@ export function MachineDetail(
 			<ul aria-label={`Actions for ${machine.label}`} className="machines-detail-actions">
 				<li>
 					<button className="machines-row" onClick={() => rename(machine)} type="button">
-						<PencilIcon aria-hidden="true" size={14} />
+						<PencilIcon aria-hidden="true" size={16} />
 						Edit machine name…
+					</button>
+				</li>
+				<li>
+					<button
+						aria-pressed={machine.favorite}
+						className="machines-row"
+						onClick={() => void machines.favor(machine.id, !machine.favorite)}
+						type="button"
+					>
+						<StarIcon aria-hidden="true" filled={machine.favorite} size={16} />
+						{machine.favorite ? "Remove favorite" : "Set as favorite"}
 					</button>
 				</li>
 				{copiesFor(machine, machines.recommended).map(item => (
@@ -622,7 +658,7 @@ export function MachineDetail(
 						onClick={() => disconnect(machine)}
 						type="button"
 					>
-						<CloseIcon aria-hidden="true" size={14} />
+						<CloseIcon aria-hidden="true" size={16} />
 						Disconnect machine…
 					</button>
 				</li>

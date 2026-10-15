@@ -39,13 +39,17 @@ if (supplied.some(Boolean) && !supplied.every(Boolean)) {
 let managed = !supplied[0];
 try {
 	if (process.env.E2E_SKIP_BUILD !== "1") {
-		await run(["bun", "run", "build"], { VITE_CHILD_MOTION_TOGGLE: "on" });
+		await run(["bun", "run", "build"], {
+			VITE_CHILD_MOTION_TOGGLE: "on",
+			VITE_MESSAGE_ANALYSIS: "on",
+		});
 	}
 	if (managed) {
 		await run([...COMPOSE, "up", "-d", "--wait", ...SERVICES]);
 	}
 	for (let [index, url] of databases.entries()) {
 		await run(["bun", "apps/server/src/storage/migrate.ts"], {
+			AGENT: "off",
 			DATABASE_URL: supplied[index] || url,
 			STORAGE_DRIVER: "postgres",
 			APP_ORIGIN: `http://127.0.0.1:${appOrigins[index]}`,

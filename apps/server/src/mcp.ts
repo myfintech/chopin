@@ -125,7 +125,7 @@ export type RenameDocument<Caller> = {
 		input: RenameDocumentInput,
 	): Promise<
 		| { kind: "renamed" | "unchanged"; document: DocumentSummary }
-		| { kind: "archived" | "conflict" | "forbidden" | "unavailable" }
+		| { kind: "archived" | "conflict" | "forbidden" | "unavailable" | "locked" }
 	>;
 };
 
@@ -346,7 +346,7 @@ export const TOOLS: Tool[] = [
 				repository: { type: "string", pattern: REPOSITORY_PATH_PATTERN },
 				baseBranch: { type: "string", minLength: 1, maxLength: 255 },
 				baseCommit: { type: "string", minLength: 1, maxLength: 64 },
-				title: { type: "string", minLength: 1, maxLength: MAX_TITLE_LENGTH },
+				title: { type: "string", maxLength: MAX_TITLE_LENGTH },
 				brief: BRIEF,
 				plan: { type: "string", minLength: 1 },
 			},
@@ -438,7 +438,8 @@ export const TOOLS: Tool[] = [
 	},
 	{
 		name: "rename_document",
-		description: "Rename a Chopin document without changing its canonical plan or revision.",
+		description:
+			"Rename a document's leading H1, display title and URL together. Authored changes advance its revision.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -448,7 +449,7 @@ export const TOOLS: Tool[] = [
 					maxLength: MAX_DOCUMENT_ID_LENGTH,
 					pattern: "\\S",
 				},
-				title: { type: "string", minLength: 1, maxLength: MAX_TITLE_LENGTH },
+				title: { type: "string", maxLength: MAX_TITLE_LENGTH },
 			},
 			required: ["id", "title"],
 			additionalProperties: false,
@@ -460,6 +461,7 @@ export const TOOLS: Tool[] = [
 				outcome([
 					"document-archived",
 					"title-conflict",
+					"document-locked",
 					"repository-forbidden",
 					"document-unavailable",
 				]),
@@ -785,7 +787,7 @@ function renameArguments(value: Record<string, unknown>): RenameDocumentInput | 
 		|| !isId(value.id)
 	) return undefined;
 	let title = normalizedTitle(value.title);
-	return title ? { id: value.id, title } : undefined;
+	return title !== undefined ? { id: value.id, title } : undefined;
 }
 
 function isJsonRpcId(value: unknown): value is string | number | null {
@@ -1054,6 +1056,8 @@ export function handler<Caller>(
 					}
 					let code = outcome.kind === "archived"
 						? "document-archived"
+						: outcome.kind === "locked"
+						? "document-locked"
 						: outcome.kind === "conflict"
 						? "title-conflict"
 						: outcome.kind === "forbidden"

@@ -8,8 +8,10 @@ import {
 	$getSelection,
 	$isElementNode,
 	$isNodeSelection,
+	$isParagraphNode,
 	$isRangeSelection,
 	$isRootNode,
+	COMMAND_PRIORITY_CRITICAL,
 	COMMAND_PRIORITY_HIGH,
 	DELETE_CHARACTER_COMMAND,
 	DELETE_LINE_COMMAND,
@@ -72,12 +74,34 @@ function browserBoundary(editor: LexicalEditor): LexicalNode | null {
 	return topLevel(node).getPreviousSibling();
 }
 
+/** Only an adjacent paragraph linked by a stored decision target may take the generic merge. */
+export function $isAdjacentDecisionProse(
+	card: LexicalNode,
+	questions: QuestionnaireStore | undefined,
+): boolean {
+	if (!$isQuestionnaireNode(card) || !questions) return false;
+	let previous = card.getPreviousSibling();
+	if (!$isParagraphNode(previous)) return false;
+	let key = previous.getKey();
+	return questions.proseKey(card.getId()) === key
+		|| card.getQuestionnaire().questions.some(question =>
+			questions.blocks(card.getId(), question.id).includes(key)
+		);
+}
+
 function moveIntoProse(card: LexicalNode, questions: QuestionnaireStore | undefined): void {
 	if (!$isQuestionnaireNode(card)) return;
+	let key = questions?.proseKey(card.getId());
+	if (!key) return;
 	let previous = card.getPreviousSibling();
-	if (previous && previous.getKey() === questions?.proseKey(card.getId())) {
-		previous.selectEnd();
+	// Shared empty caret paragraphs are absent from canonical MDX and may separate the prose.
+	while (
+		$isParagraphNode(previous) && previous.getChildrenSize() === 0
+		&& previous.getKey() !== key
+	) {
+		previous = previous.getPreviousSibling();
 	}
+	if ($isParagraphNode(previous) && previous.getKey() === key) previous.selectEnd();
 }
 
 function protect(
@@ -107,11 +131,13 @@ export function registerDecisionDeletion(
 			event => {
 				let card = browserBoundary(editor);
 				if (!decided(card, meta)) return false;
+				if ($isAdjacentDecisionProse(card!, questions)) return false;
 				moveIntoProse(card!, questions);
 				event.preventDefault();
 				return true;
 			},
-			COMMAND_PRIORITY_HIGH,
+			// Intercept separated or unlinked targets before generic hidden-decorator deletion.
+			COMMAND_PRIORITY_CRITICAL,
 		),
 		editor.registerCommand(
 			DELETE_CHARACTER_COMMAND,

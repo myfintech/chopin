@@ -80,7 +80,7 @@ test("the current prompt generation stays live across a same-second reopen", () 
 	let reopened = { ...saved, status: "reopened" as const };
 
 	expect(promptView({ entry: promptEntry(0), latest: true, meta: saved, value: savedValue }))
-		.toEqual({ state: "collapsed", text: "Decided: GitHub Apps · @mina" });
+		.toEqual({ state: "collapsed", text: "Decided by @mina: GitHub Apps" });
 	expect(promptView({ entry: promptEntry(0), latest: true, meta: reopened, value: savedValue }))
 		.toEqual({ state: "collapsed", text: "Reopened" });
 	expect(promptView({ entry: promptEntry(0), latest: false, meta: reopened, value: savedValue }))
@@ -113,10 +113,10 @@ test("a decision without labels uses its saved-answer fallback and owner", () =>
 	};
 	let meta = openMeta({ status: "decided", owner: "jules" });
 	expect(promptView({ entry: promptEntry(0), latest: true, meta, value: custom }))
-		.toEqual({ state: "collapsed", text: "Decided: Use the hosted provider · @jules" });
+		.toEqual({ state: "collapsed", text: "Decided by @jules: Use the hosted provider" });
 	let unanswered = { ...custom, questions: [{ ...custom.questions[0]!, answer: undefined }] };
 	expect(promptView({ entry: promptEntry(0), latest: true, meta, value: unanswered }))
-		.toEqual({ state: "collapsed", text: "Decided: Saved decision · @jules" });
+		.toEqual({ state: "collapsed", text: "Decided by @jules: Saved decision" });
 });
 
 test("prompt selection shares the card projection and exact suggestion snapshot", () => {
@@ -279,4 +279,22 @@ test("activity text stays exact when its label is interior or absent", () => {
 	}));
 	expect(absent).toContain("Chopin drafted the title and goal");
 	expect(absent).not.toContain("the document");
+});
+
+test("compact Chat decision prompts omit full-card context", () => {
+	let description = "Our session data must survive restarts.";
+	let value = { ...VALUE, questions: [{ ...VALUE.questions[0]!, description }] };
+	for (let latest of [true, false]) {
+		let markup = renderToStaticMarkup(createElement(DecisionPrompt, {
+			entry: promptEntry(0),
+			latest,
+			value,
+			meta: openMeta(),
+			connected: false,
+			canEdit: false,
+			onOpenCard() {},
+		}));
+		expect(markup).not.toContain(description);
+		if (latest) expect(markup).toContain(VALUE.questions[0]!.prompt);
+	}
 });

@@ -46,19 +46,6 @@
 		]
 	},
 	{
-		"file": "apps/web/src/design-audit/surfaces.css",
-		"reason": "Continuous loading indicator has an established local repeat period; no equal semantic duration token exists.",
-		"cases": [
-			[
-				"motion",
-				"animation",
-				"design-audit-spin 900ms linear infinite",
-				"CSS > .design-audit-navigation-loading svg",
-				1
-			]
-		]
-	},
-	{
 		"file": "apps/web/src/design-audit/foundations.tsx",
 		"reason": "Specimen iterates a finite list of canonical token names; rendering the token being demonstrated requires a dynamic var() name.",
 		"cases": [
@@ -91,11 +78,11 @@
 				1
 			]
 		],
-		"sourceHash": "7736dc2ddcd49b36b90b85f387b3e497810b7a2b9efd78ca5d91ec282760b6b2",
+		"sourceHash": "668907a52cf8e3bc0827158a8d22542652b627b9f848dd12d0f4dc148a93a6e0",
 		"producers": [
 			{
 				"file": "apps/web/src/design-audit/foundations.tsx",
-				"sourceHash": "7736dc2ddcd49b36b90b85f387b3e497810b7a2b9efd78ca5d91ec282760b6b2"
+				"sourceHash": "668907a52cf8e3bc0827158a8d22542652b627b9f848dd12d0f4dc148a93a6e0"
 			}
 		]
 	},

@@ -1,34 +1,19 @@
 import { describe, expect, it } from "bun:test";
-import { SelectItem } from "@chopin/visuals";
-import { Children, createElement, isValidElement } from "react";
+import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { Controls } from "./controls";
 import { AuthoredContent, callouts } from "./authored-content";
 import { Foundations } from "./foundations";
 import { InteractiveSpecimens } from "./interactive";
+import { BuildBlockerAudit } from "./build-blockers";
 import { AUDIT_INVENTORY } from "./inventory";
 import { Surfaces } from "./surfaces";
-
-import type { ReactElement, ReactNode } from "react";
 
 function plate(markup: string, item: string): string {
 	let start = markup.indexOf(`<section class="design-audit-plate" data-audit-item="${item}">`);
 	let end = markup.indexOf("</section>", start);
 	return start === -1 || end === -1 ? "" : markup.slice(start, end + "</section>".length);
-}
-
-function elementsOfType(
-	node: ReactNode,
-	type: ReactElement["type"],
-	found: ReactElement<{ children?: ReactNode; value?: unknown }>[] = [],
-) {
-	Children.forEach(node, child => {
-		if (!isValidElement<{ children?: ReactNode; value?: unknown }>(child)) return;
-		if (child.type === type) found.push(child);
-		elementsOfType(child.props.children, type, found);
-	});
-	return found;
 }
 
 describe("design audit specimens", () => {
@@ -191,7 +176,7 @@ describe("design audit specimens", () => {
 		let specimen = plate(markup, "presentation-table");
 		expect(specimen).toContain('data-audit-item="presentation-table"');
 		expect(specimen).toContain('data-table-example="plain"');
-		expect(specimen).toContain('data-table-example="contained-overflow"');
+		expect(specimen).toContain('data-table-example="contained-narrow"');
 		expect(specimen).toContain('data-variant="plain"');
 		expect(specimen).toContain('data-variant="contained"');
 		expect(specimen.match(/data-slot="table"/g)).toHaveLength(2);
@@ -219,35 +204,50 @@ describe("design audit specimens", () => {
 		}
 		expect(markup).toContain('aria-label="Add document"');
 		expect(markup).toContain("disabled");
-		expect(markup).toContain('aria-selected="true"');
+		expect(plate(markup, "selections")).toContain(
+			'aria-disabled="true" aria-label="githubnext/design-notes, added"',
+		);
+		expect(plate(markup, "selections")).toContain('class="navigation-palette-option"');
+		expect(markup).not.toContain("design-audit-selection-list");
 		expect(markup).toContain('role="menu"');
-		expect(markup).toContain('data-slot="select-trigger"');
-		expect(markup).toContain('data-slot="select-value"');
-		expect(markup).not.toContain('<select class="field"');
+		expect(plate(markup, "dropdowns")).toContain(
+			'class="navigation-account-menu motion-dropdown is-open"',
+		);
+		expect(plate(markup, "dropdowns")).toContain("Manage repository access");
+		expect(markup).not.toContain("design-audit-dropdown-trigger");
+		expect(markup).not.toContain('data-slot="select-trigger"');
+		for (let id of ["buttons", "icon-buttons", "links", "fields"]) {
+			expect(plate(markup, id)).not.toContain("data-audit-state");
+		}
 		expect(markup).toMatch(/aria-busy="true"[^>]*disabled[^>]*>[\s\S]*data-button-loader/);
-		expect(
-			elementsOfType(Controls(), SelectItem).map(item => [item.props.value, item.props.children]),
-		).toEqual([
-			["active", "Active documents"],
-			["archived", "Archived documents"],
-		]);
+		expect(markup).toContain('class="field h-8 w-full px-2 text-sm"');
+		expect(markup).toContain('class="app-icon-button btn');
+		expect(markup).toContain('class="link text-sm"');
+		for (let state of ["hover", "active", "focus"]) {
+			expect(markup).toContain(`data-force-state="${state}"`);
+		}
 	});
 
-	it("gives focused audit links breathing room", async () => {
-		let css = await Bun.file(new URL("./controls.css", import.meta.url)).text();
+	it("shows control states through the production rules", async () => {
+		let audit = await Bun.file(new URL("./controls.css", import.meta.url)).text();
+		let theme = await Bun.file(new URL("../theme.css", import.meta.url)).text();
 
-		expect(css).toMatch(
-			new RegExp(
-				String.raw`\.design-audit-link:is\(\[data-audit-state="focus"\], :focus-visible\)`
-					+ String.raw`[\s\S]*margin-inline:\s*-0\.25rem;`
-					+ String.raw`[\s\S]*padding-inline:\s*0\.25rem;`,
-			),
-		);
+		expect(audit).not.toContain(".btn-");
+		expect(audit).not.toContain("design-audit-link");
+		expect(theme).toContain('&:is(:hover, [data-force-state="hover"]):not(:disabled)');
+		expect(theme).toContain('&:is(:active, [data-force-state="active"]):not(:disabled)');
+		expect(theme).toContain("@utility link");
 	});
 
 	it("renders every application surface and its meaningful states", () => {
 		let markup = renderToStaticMarkup(
-			createElement("div", null, createElement(Surfaces), createElement(InteractiveSpecimens)),
+			createElement(
+				"div",
+				null,
+				createElement(Surfaces),
+				createElement(InteractiveSpecimens),
+				createElement(BuildBlockerAudit),
+			),
 		);
 
 		for (let item of AUDIT_INVENTORY.find(group => group.id === "surfaces")!.items) {
@@ -256,10 +256,43 @@ describe("design audit specimens", () => {
 		expect(plate(markup, "dialogs")).toContain('role="group"');
 		expect(plate(markup, "dialogs")).not.toContain('aria-modal="true"');
 		expect(markup).toContain('aria-current="page"');
-		expect(markup).toContain('aria-label="Compact workspace view"');
+		expect(markup).toContain('aria-label="Workspace view"');
+		let navigation = plate(markup, "navigation");
+		expect(navigation).toContain("project-sidebar-document-current");
+		expect(navigation).toContain("project-sidebar-document-ancestor");
+		expect(navigation).toContain("project-sidebar-child-current");
+		expect(navigation).toContain('data-sidebar-decision-count=""');
+		expect(navigation).toContain("Loading documents…");
+		expect(navigation).not.toContain("Archived draft");
+		expect(plate(markup, "lists")).toContain('class="navigation-palette-option"');
+		expect(plate(markup, "lists")).toContain('class="document-status-badge">Archived<');
+		let empty = plate(markup, "empty");
+		expect(empty).toContain('<p class="project-sidebar-empty">No documents</p>');
+		expect(empty).toContain('<p class="project-sidebar-empty">No archived documents</p>');
+		expect(empty).toContain("No matching documents");
 		expect(markup).toContain('data-chat-entry="true"');
-		expect(markup).toContain("Avatar image loading");
-		expect(markup).toContain("Editing this question");
+		let chat = plate(markup, "chat");
+		expect(chat).toContain('class="workspace-root');
+		expect(chat).toContain('class="composer-surface field"');
+		expect(chat).toContain('class="composer-notice motion-feedback"');
+		expect(chat).toContain("Reconnect");
+		expect(chat).toContain('aria-label="Stop Chopin"');
+		expect(chat).toContain("Read-only access");
+		expect(chat).toContain("Document archived");
+		expect(chat).not.toContain("<textarea");
+		expect(chat).not.toContain("design-audit-chat-error");
+		expect(plate(markup, "errors")).toContain('class="btn btn-sm btn-outline-danger"');
+		expect(plate(markup, "identity")).toContain('class="presence-faces"');
+		expect(plate(markup, "identity")).toContain("Editing this question: ");
+		expect(plate(markup, "identity")).toContain('class="presence-more"');
+		expect(plate(markup, "identity")).toContain("People here: ");
+		expect(plate(markup, "decisions")).toContain('class="plan-decisions"');
+		expect(markup).toContain("Questions from Chopin will appear here");
+		expect(markup).toContain('data-relation="orphaned"');
+		expect(markup).toContain('data-relation="empty"');
+		expect(plate(markup, "resolved-comments")).toContain('class="plan-resolved-comment"');
+		expect(plate(markup, "resolved-comments")).toContain("Resolved by Olivia");
+		expect(plate(markup, "resolved-comments")).toContain(">Reopen</button>");
 		expect(markup).toContain('role="alert"');
 		expect(markup).toMatch(
 			/<button aria-busy="true" class="btn btn-md btn-primary" disabled=""[^>]*>/,

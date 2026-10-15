@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { SparkleIcon } from "@chopin/icons";
+import { InvestigationIcon, SparkleIcon } from "@chopin/icons";
 import { UnfoldPanel, UnfoldToggle, useUnfold } from "@chopin/visuals/unfold";
 
 import { investigationProvenance } from "./experiments/api";
@@ -79,7 +79,9 @@ export function ChildProvenance({ channelId, parent }: { channelId: string; pare
 		<div className="child-provenance" data-child-provenance="">
 			<p className="child-provenance-line">
 				<span aria-hidden="true" className="plan-research-badge" data-tone="brand">
-					<SparkleIcon size={14} />
+					{origin.kind === "Investigation"
+						? <InvestigationIcon size={16} />
+						: <SparkleIcon size={16} />}
 				</span>
 				<span className="min-w-0">
 					{origin.kind} from{" "}
@@ -95,9 +97,9 @@ export function ChildProvenance({ channelId, parent }: { channelId: string; pare
 						{origin.startedBy && (
 							<>
 								{" "}
-								<span className="child-provenance-segment">· by {origin.startedBy}</span>
+								<span className="child-provenance-segment">by {origin.startedBy}</span>
 							</>
-						)} <span className="child-provenance-segment">· {origin.detail}</span>
+						)} <span className="child-provenance-segment ms-2">{origin.detail}</span>
 					</span>
 				</span>
 				<UnfoldToggle className="child-provenance-toggle btn btn-sm btn-ghost" unfold={brief}>

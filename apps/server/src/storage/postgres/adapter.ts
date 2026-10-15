@@ -1,7 +1,7 @@
+import { finalizeTitleReceipt } from "../title";
 import { SQL } from "bun";
 
 import { documentSlug, documentSlugCandidate } from "../../channels/slug";
-import { availableChannelTitle } from "../../channels/title";
 import { sidecarUnansweredDecisions } from "../../questions/unanswered";
 import { childSidecarWithoutConversation } from "../child-conversation";
 import { conflict, corrupt, missing, StorageError, unavailable } from "../errors";
@@ -527,7 +527,7 @@ export class PostgresStorage implements StorageAdapter {
 		this.experiments = new PostgresExperimentStore(
 			this.#sql,
 			(sql, lease) => this.#assertLease(sql, lease),
-			(transaction, input) => this.#createAvailableChannelInTransaction(transaction, input),
+			(transaction, input) => this.#createChannelInTransaction(transaction, input),
 		);
 		this.navigation = new PostgresNavigationStore(
 			this.#sql,
@@ -560,7 +560,7 @@ export class PostgresStorage implements StorageAdapter {
 				await transaction`SELECT pg_advisory_xact_lock(2043237432)`;
 				await this.#assertLease(transaction, lease);
 			},
-			(transaction, input) => this.#createAvailableChannelInTransaction(transaction, input),
+			(transaction, input) => this.#createChannelInTransaction(transaction, input),
 		);
 		this.preferences = new PostgresPreferenceStore(
 			this.#sql,
@@ -872,20 +872,6 @@ export class PostgresStorage implements StorageAdapter {
 			}
 		}
 		return channel({ ...saved, slug });
-	}
-
-	async #createAvailableChannelInTransaction(
-		transaction: TransactionSQL,
-		input: CreateChannel,
-	): Promise<ChannelRecord> {
-		await this.#lockChannelTitles(transaction, input.repositoryId);
-		let rows = await transaction<{ title: string }[]>`
-			SELECT title FROM channels WHERE repository_id = ${input.repositoryId}
-		`;
-		return this.#createChannelInTransaction(transaction, {
-			...input,
-			title: availableChannelTitle(input.title, rows.map(row => row.title)),
-		});
 	}
 
 	async #lockChannelTitles(transaction: TransactionSQL, repositoryId: string): Promise<void> {
@@ -1435,6 +1421,31 @@ export class PostgresStorage implements StorageAdapter {
 		);
 	}
 
+	async #commitTitle(
+		transaction: TransactionSQL,
+		input: CommitChannel | ReplaceChannel,
+	): Promise<ChannelRecord | undefined> {
+		let [current] = await transaction<ChannelRow[]>`
+			SELECT ${transaction.unsafe(CHANNEL_COLUMNS)} FROM channels WHERE id = ${input.channelId}
+		`;
+		if (!current) throw missing(`channel ${input.channelId} does not exist`);
+		let existing = channel(current);
+		if (input.title === undefined || existing.title === input.title) return existing;
+		let slug = await this.#reserveSlug(
+			transaction,
+			existing.repositoryId,
+			existing.id,
+			input.title,
+			input.now,
+		);
+		let [saved] = await transaction<ChannelRow[]>`
+			UPDATE channels SET title = ${input.title} WHERE id = ${input.channelId}
+			RETURNING ${transaction.unsafe(CHANNEL_RETURNING)}
+		`;
+		if (!saved) throw corrupt("committing a title returned no record");
+		return channel({ ...saved, slug });
+	}
+
 	#commit(input: CommitChannel): Promise<CommitResult> {
 		return this.#run("commit channel", () =>
 			this.#sql.begin(async transaction => {
@@ -1456,6 +1467,9 @@ export class PostgresStorage implements StorageAdapter {
 						revision: integer(previous.revision, "operation revision"),
 						sequence: integer(previous.sequence, "operation sequence"),
 						repeated: true,
+						...(input.title !== undefined
+							? { channel: await this.#commitTitle(transaction, { ...input, title: undefined }) }
+							: {}),
 					};
 				}
 				if (locked.archivedAt !== null && !input.allowArchived) {
@@ -1587,10 +1601,28 @@ export class PostgresStorage implements StorageAdapter {
 					updated_at = GREATEST(updated_at, ${input.now})
 				WHERE id = ${input.channelId}
 			`;
+				let saved = input.title !== undefined
+					? await this.#commitTitle(transaction, input)
+					: undefined;
+				let sidecar = input.finalizeTitleReceipt && input.sidecar !== undefined && saved
+					? finalizeTitleReceipt(input.sidecar, saved)
+					: undefined;
+				if (sidecar !== undefined) {
+					await transaction`
+					UPDATE channel_state SET sidecar = ${JSON.stringify(sidecar)}::jsonb
+					WHERE channel_id = ${input.channelId}
+				`;
+				}
 				if (input.provenance) {
 					await this.provenance.record(transaction, input.channelId, input.provenance, input.now);
 				}
-				return { revision, sequence, repeated: false };
+				return {
+					revision,
+					sequence,
+					repeated: false,
+					...(saved ? { channel: saved } : {}),
+					...(sidecar !== undefined ? { sidecar } : {}),
+				};
 			}));
 	}
 
@@ -1724,6 +1756,9 @@ export class PostgresStorage implements StorageAdapter {
 						revision: integer(previous.revision, "operation revision"),
 						sequence: integer(previous.sequence, "operation sequence"),
 						repeated: true,
+						...(input.title !== undefined
+							? { channel: await this.#commitTitle(transaction, { ...input, title: undefined }) }
+							: {}),
 					};
 				}
 				if (locked.archivedAt !== null) {
@@ -1777,7 +1812,10 @@ export class PostgresStorage implements StorageAdapter {
 						updated_at = GREATEST(updated_at, ${input.now})
 					WHERE id = ${input.channelId}
 				`;
-				return { revision, sequence, repeated: false };
+				let saved = input.title !== undefined
+					? await this.#commitTitle(transaction, input)
+					: undefined;
+				return { revision, sequence, repeated: false, ...(saved ? { channel: saved } : {}) };
 			}));
 	}
 

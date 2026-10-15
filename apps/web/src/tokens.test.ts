@@ -120,7 +120,7 @@ function sizes(name: string): { height: number; width?: number } {
 		if (!found) continue;
 		let value = found[1]!.replace(/var\((--[\w-]+)\)/g, (_, token) => resolved(token));
 		let length = /^([\d.]+)rem$/.exec(value);
-		let scaled = /^calc\(var\(--spacing\) \* ([\d.]+)\)$/.exec(value);
+		let scaled = /^calc\((?:var\(--spacing\)|0\.25rem) \* ([\d.]+)\)$/.exec(value);
 		if (length) result[property] = Number(length[1]) * 16;
 		else if (scaled) {
 			result[property] = Number.parseFloat(resolved("--spacing")) * 16 * Number(scaled[1]);
@@ -303,13 +303,16 @@ describe("edges and depth", () => {
 
 describe("controls", () => {
 	it("exposes the settled button sizes and destructive states", () => {
+		// shadcn Nova's scale.
+		expect(sizes("btn-xs")).toEqual({ height: 24 });
+		expect(sizes("btn-sm")).toEqual({ height: 28 });
 		expect(sizes("btn-md")).toEqual({ height: 32 });
-		expect(sizes("btn-sm")).toEqual({ height: 24 });
-		expect(sizes("btn-compact")).toEqual({ height: 24 });
+		expect(sizes("btn-lg")).toEqual({ height: 36 });
+		expect(sizes("btn-icon-xs")).toEqual({ height: 24, width: 24 });
 		expect(sizes("btn-icon")).toEqual({ height: 28, width: 28 });
-		expect(inlinePadding("btn-md")).toBe("calc(var(--spacing) * 3)");
-		expect(inlinePadding("btn-sm")).toBe("var(--control-padding-inline)");
-		expect(resolved("--control-padding-inline")).toBe("calc(var(--spacing) * 2)");
+		expect(inlinePadding("btn-xs")).toBe("calc(var(--spacing) * 2)");
+		expect(inlinePadding("btn-sm")).toBe("calc(var(--spacing) * 2.5)");
+		expect(inlinePadding("btn-md")).toBe("calc(var(--spacing) * 2.5)");
 		expect(utility("btn-icon")).toContain("padding: var(--icon-button-padding);");
 		expect(declared("--icon-button-padding")).toBe(
 			"calc((var(--icon-button-size) - var(--icon-size-default)) / 2)",
@@ -321,8 +324,8 @@ describe("controls", () => {
 	it("gives every button tier guarded states without a rest border", () => {
 		for (let tier of ["primary", "secondary", "ghost", "destructive"]) {
 			let rule = utility(`btn-${tier}`);
-			expect(rule).toMatch(/&:hover:not\(:disabled\)/);
-			expect(rule).toMatch(/&:active:not\(:disabled\)/);
+			expect(rule).toContain('&:is(:hover, [data-force-state="hover"]):not(:disabled)');
+			expect(rule).toContain('&:is(:active, [data-force-state="active"]):not(:disabled)');
 			expect(rule.slice(0, rule.indexOf("&:"))).not.toMatch(/\bborder(?:-\w+)?:/);
 		}
 	});
@@ -346,7 +349,7 @@ describe("controls", () => {
 
 	it("spaces button icons and gives busy actions a readable disabled state", () => {
 		let button = utility("btn");
-		expect(button).toContain("gap: calc(var(--spacing) * 2)");
+		expect(button).toContain("gap: calc(var(--spacing) * 1.5)");
 		expect(button).toMatch(/&\[aria-busy="true"\]:disabled\s*\{[\s\S]*opacity:\s*0\.65/);
 		expect(button).toMatch(
 			/&\[aria-busy="true"\] \[data-button-loader\]\s*\{[\s\S]*animation:\s*button-loader-spin/,
@@ -386,7 +389,7 @@ describe("controls", () => {
 			let lines = readFileSync(file, "utf8").split("\n");
 			for (let [index, line] of lines.entries()) {
 				if (!line.includes("className=") || !/(?<![\w-])btn(?![\w-])/.test(line)) continue;
-				if (/\bbtn-(?:md|sm|compact|icon)\b/.test(line)) continue;
+				if (/\bbtn-(?:xs|sm|md|lg|icon|icon-xs)\b/.test(line)) continue;
 				if (
 					relative(ROOT, file) === "apps/web/src/icon-button.tsx"
 					&& line.includes("app-icon-button btn")
@@ -624,7 +627,7 @@ describe("migration", () => {
 	it("puts each listed standard control on its shared utility", () => {
 		let controls: StandardControl[] = [
 			{
-				file: "apps/web/src/chat/chat.tsx",
+				file: "apps/web/src/chat/composer.tsx",
 				marker: 'className="composer-surface field"',
 				name: "chat composer",
 				tag: "div",
@@ -757,15 +760,15 @@ describe("migration", () => {
 				size: "btn-icon",
 				tiers: ["btn-ghost"],
 			}],
-			["apps/web/src/chat/chat.tsx", {
+			["apps/web/src/chat/composer.tsx", {
 				action: "Stop Chopin",
-				marker: 'control("chat:abort")',
+				marker: 'aria-label="Stop Chopin"',
 				size: "btn-icon",
 				tiers: ["btn-secondary"],
 			}],
-			["apps/web/src/chat/chat.tsx", {
+			["apps/web/src/chat/composer.tsx", {
 				action: "Resume Planner",
-				marker: 'control("chat:resume")',
+				marker: 'aria-label="Resume Chopin"',
 				size: "btn-icon",
 				tiers: ["btn-secondary"],
 			}],
@@ -791,12 +794,6 @@ describe("migration", () => {
 				action: "resolve comment",
 				marker: 'aria-label="Resolve"',
 				size: "btn-icon",
-				tiers: ["btn-ghost"],
-			}],
-			["packages/editor/src/decisions.tsx", {
-				action: "resolved disclosure",
-				marker: "aria-expanded={history}",
-				size: "btn-sm",
 				tiers: ["btn-ghost"],
 			}],
 			["packages/question/src/react/question-view.tsx", {

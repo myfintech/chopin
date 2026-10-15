@@ -201,7 +201,7 @@ export function ResearchComposer(
 					onClick={onCancel}
 					type="button"
 				>
-					<CloseIcon aria-hidden="true" size={14} />
+					<CloseIcon aria-hidden="true" size={16} />
 				</button>
 			)}
 			<div className="plan-research-composer-footer">
@@ -249,14 +249,14 @@ function Indicator({ stage }: { stage: Research.RequestStage }) {
 	if (stage === "failed") {
 		return (
 			<span aria-hidden="true" className="plan-research-badge">
-				<WarningIcon size={14} />
+				<WarningIcon size={16} />
 			</span>
 		);
 	}
 	if (stage === "ready") {
 		return (
 			<span aria-hidden="true" className="plan-research-badge" data-tone="brand">
-				<SparkleIcon size={14} />
+				<SparkleIcon size={16} />
 			</span>
 		);
 	}
@@ -421,7 +421,12 @@ export function ResearchCard(
 					<Swap id={stage}>
 						<span>
 							{WORDS[stage]}
-							{sourceCount && <span className="plan-research-meta">{"\u00a0· "}{sourceCount}</span>}
+							{sourceCount && (
+								<>
+									{" "}
+									<span className="plan-research-meta ms-1">{sourceCount}</span>
+								</>
+							)}
 						</span>
 					</Swap>
 					<div className="plan-research-remove">
@@ -435,7 +440,7 @@ export function ResearchCard(
 									onClick={event => settle(event, onRemove)}
 									type="button"
 								>
-									<CloseIcon aria-hidden="true" size={14} />
+									<CloseIcon aria-hidden="true" size={16} />
 								</button>
 							)}
 						</Swap>

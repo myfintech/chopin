@@ -56,10 +56,10 @@ import {
 	FormulaIcon,
 	ImageIcon,
 	InfoIcon,
+	InvestigationIcon,
 	MagnifierIcon,
 	TableIcon,
 	TabsIcon,
-	WrenchIcon,
 } from "@chopin/icons";
 
 import { $insertBlock, $leaveForBlock, $openBlock, insertList } from "./block-target";
@@ -330,7 +330,7 @@ const COMMANDS: SlashCommand[] = [
 		id: "investigate",
 		label: "Investigate",
 		hint: "Ask your local agent to try it in code",
-		icon: WrenchIcon,
+		icon: InvestigationIcon,
 		group: "Research",
 		keywords: ["investigate", "investigation", "experiment", "spike"],
 		kind: "action",
@@ -682,7 +682,7 @@ export function SlashMenu({ actions = NO_ACTIONS, disabled }: SlashMenuProps) {
 										: "text-text-secondary"
 								}`}
 							>
-								<command.icon size={14} className="shrink-0" />
+								<command.icon size={16} className="shrink-0" />
 								<span className="ml-2 w-24 shrink-0">{command.label}</span>
 								<span
 									aria-hidden="true"

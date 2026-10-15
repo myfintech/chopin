@@ -51,6 +51,10 @@ import {
 } from "@chopin/editor";
 
 import { BuildGlyph, BuildPlanButton, useBuildPlan } from "./build-plan-button";
+import { buildBlockers } from "./build-blockers";
+import type { BuildBlocker } from "./build-blockers";
+import { offlineChoice, useMachineChoice } from "./machine-choice";
+import type { MachineChoice } from "./machine-choice";
 import { useLiveBuild } from "./live-build";
 import { BuildView } from "./build-view";
 import { Chat } from "./chat/chat";
@@ -83,6 +87,7 @@ import {
 import { newestDocumentMetadata } from "./document-actions";
 import { DocumentActionsMenu } from "./document-actions-menu";
 import { DocumentRename } from "./document-rename";
+import { LostEditsNotice, UNDO_REFUSALS, UndoRefusedNotice } from "./document-status-notices";
 import { browserStorage, rememberOpened } from "./documents-sheet-model";
 import { PhoneHeader, PhoneHeaderContent } from "./phone-header";
 import { DocumentSkeleton } from "./phone-skeleton";
@@ -108,7 +113,6 @@ import type {
 	ExperimentResources,
 	InvestigationResources,
 	PlanState,
-	Refusal,
 	ResearchLaunchResult,
 } from "@chopin/editor";
 import type { DocumentMetadata } from "./document-actions";
@@ -189,6 +193,8 @@ type TitleProps = {
 	canManage: boolean;
 	editing?: TitleEdit;
 	label: string;
+	/** The person's machine choice for this document, offered as Machine in the title's menu. */
+	machine?: MachineChoice;
 	onAction: (action: DocumentAction) => void;
 	onEditingChange: (editing?: TitleEdit) => void;
 	onRenamed: (channel: DocumentMetadata) => void;
@@ -219,6 +225,7 @@ export function DocumentTitle(
 		editing,
 		icon,
 		label,
+		machine,
 		onAction,
 		onEditingChange,
 		onRenamed,
@@ -278,7 +285,7 @@ export function DocumentTitle(
 			{path && (
 				<button
 					aria-label={`Back to ${label}`}
-					className="document-title-crumb btn btn-compact btn-ghost min-w-0"
+					className="document-title-crumb btn btn-xs btn-ghost min-w-0"
 					onClick={path.onReturn}
 					type="button"
 				>
@@ -335,6 +342,7 @@ export function DocumentTitle(
 						align="start"
 						channel={{ archivedAt, title: label }}
 						className="title-control-action"
+						machine={machine}
 						onAction={action => action === "rename" ? onEditingChange("rename") : onAction(action)}
 						trigger={
 							<ChevronIcon
@@ -351,7 +359,7 @@ export function DocumentTitle(
 					<Badge icon={ArchiveIcon} label="Archived" size="sm" textSize="2xs" tone="warning" />
 					{canManage && (
 						<button
-							className="btn btn-compact btn-outline"
+							className="btn btn-xs btn-outline"
 							onClick={() => onAction("restore")}
 							type="button"
 						>
@@ -371,7 +379,7 @@ export function DocumentTitle(
 			{path.onShowChild && (
 				<button
 					aria-current="page"
-					className="document-title-crumb document-title-child-crumb btn btn-compact btn-ghost min-w-0"
+					className="document-title-crumb document-title-child-crumb btn btn-xs btn-ghost min-w-0"
 					onClick={path.onShowChild}
 					type="button"
 				>
@@ -418,14 +426,6 @@ export function Header(
 		</header>
 	);
 }
-
-const LOST_EDITS =
-	"Your last edits couldn't be saved because the document changed while you were offline.";
-
-const UNDO_REFUSALS: Record<Refusal, string> = {
-	others: "Others have edited this since.",
-	change: "This change can't be reversed here.",
-};
 
 /** Reconnect attempts a person can make in one outage before Reload is offered. */
 const RECONNECTS_BEFORE_RELOAD = 3;
@@ -637,6 +637,11 @@ export function RoomWorkspace(
 	let typing = useDocumentEditing(room);
 	let plannerDetached = plannerAttachment.wire === wire && !!plannerAttachment.planner
 		&& plannerAttachment.planner.state !== "attached";
+	// Which of the person's machines works here, so Build plan can say when it is offline.
+	let machineChoice = useMachineChoice(
+		room,
+		profile.implementation && !!effectiveCanEdit && !(archivedAt ?? metadata.archivedAt),
+	);
 	let build = useBuildPlan({
 		canEdit: effectiveCanEdit && !(archivedAt ?? metadata.archivedAt) && status === "connected",
 		connected: status === "connected",
@@ -650,6 +655,11 @@ export function RoomWorkspace(
 		userId,
 		wire,
 	});
+	let namedBuildBlockers = useMemo(() => buildBlockers(build.snapshot, entries, cardMetadata), [
+		build.snapshot,
+		entries,
+		cardMetadata,
+	]);
 	// Touch has no tooltips, so a phone tap on Build, or on the build slot, says why it can't open.
 	let buildUnavailable = build.look.kind === "plan" && build.look.blocked
 		? build.look.blocked
@@ -986,6 +996,37 @@ export function RoomWorkspace(
 		});
 	};
 
+	let showInvestigation = (id: string) => {
+		selectDestination("plan");
+		requestAnimationFrame(() => {
+			let card = document.querySelector<HTMLElement>(
+				`[data-workspace-room="${CSS.escape(room)}"] [data-investigation="${CSS.escape(id)}"]`,
+			);
+			if (!card) return;
+			card.scrollIntoView({ block: "center" });
+			card.focus({ preventScroll: true });
+		});
+	};
+	let showNamedBuildBlocker = (item: BuildBlocker) => {
+		if (item.kind === "decision") showPlan(item.id, item.question);
+		else showInvestigation(item.id);
+	};
+	let showBuildBlocker = (reason: string) => {
+		let entry = firstOpenDecision(entries, cardMetadata);
+		let question = entry?.value.questions.find(value => value.answer === undefined)?.id
+			?? entry?.value.questions[0]?.id;
+		if (build.snapshot?.blockers.includes("unanswered questionnaires") && entry && question) {
+			showPlan(entry.id, question);
+			return;
+		}
+		let investigation = build.snapshot?.buildInvestigations?.[0];
+		if (investigation) {
+			showInvestigation(investigation.id);
+			return;
+		}
+		if (phone) explainBuild(reason);
+	};
+
 	let startResearch = async (brief: string): Promise<ResearchLaunchResult> => {
 		let checked = researchLauncher.check(brief);
 		if (!checked.ok) return checked;
@@ -1152,6 +1193,20 @@ export function RoomWorkspace(
 	useEffect(() => {
 		if (childOpen) setEditing(false);
 	}, [childOpen]);
+	// Compact Chat covers the document; split views keep the reader's chosen destination.
+	let requestedChild =
+		presentation.type === "parent-with-child" && presentation.childState === "open"
+			? presentation.childRequestKey
+			: undefined;
+	let previousChild = useRef<string | undefined>(undefined);
+	useEffect(() => {
+		let previous = previousChild.current;
+		previousChild.current = requestedChild;
+		if (mode !== "compact" || requestedChild === undefined) return;
+		if (previous !== requestedChild) {
+			latestSelectDestination.current("plan");
+		}
+	}, [mode, requestedChild]);
 	let [childEdit, setChildEdit] = useState<{ docked: boolean; editing: boolean }>();
 	let childToggle = useRef<() => void>(undefined);
 	let reportChildEdit = useCallback(
@@ -1209,11 +1264,21 @@ export function RoomWorkspace(
 				canEdit={investigationsEditable}
 				locked={implementation.locked}
 				onRemove={remove}
+				onApply={async () => {
+					if (!wire?.connected) throw new Error("Chopin isn’t connected. Reconnect, then retry.");
+					await wire.ask("chat:send", {
+						requestId: crypto.randomUUID(),
+						to: "planner",
+						text:
+							`Apply the completed findings from investigation ${id} to this document. Surface any necessary human decisions, then clear its Build requirement once the findings are handled.`,
+					});
+				}}
 				onOpen={(child, opener) => onResearchChildOpen(room, child, { current: opener })}
 			/>
 		),
 	}), [
 		experiments,
+		wire,
 		userId,
 		investigationsEditable,
 		implementation.locked,
@@ -1311,47 +1376,10 @@ export function RoomWorkspace(
 	let statusNotices = (
 		<>
 			{!!planState.lost && planState.lost !== lostSeen && (
-				<div className="plan-status" data-level="alert" role="alert">
-					<span className="plan-status-text">
-						<span
-							aria-hidden="true"
-							className="plan-status-label"
-							data-tooltip={LOST_EDITS}
-							data-tooltip-verbatim=""
-						>
-							Edits not saved
-						</span>
-						<span aria-hidden="true" className="plan-status-detail">{LOST_EDITS}</span>
-						<span className="sr-only">{LOST_EDITS}</span>
-					</span>
-					<button
-						className="btn btn-sm btn-ghost"
-						onClick={() =>
-							setLostSeen(planState.lost ?? 0)}
-						type="button"
-					>
-						Dismiss
-					</button>
-				</div>
+				<LostEditsNotice onDismiss={() => setLostSeen(planState.lost ?? 0)} />
 			)}
 			{/* Apart from PlanStatus, which would announce its end as "Reconnected". */}
-			{planState.refused && (
-				<div className="plan-status" data-level="notice">
-					<span aria-hidden="true" className="plan-status-dot" />
-					<span aria-hidden="true" className="plan-status-text">
-						<span
-							className="plan-status-label"
-							data-tooltip={UNDO_REFUSALS[planState.refused.reason]}
-							data-tooltip-verbatim=""
-						>
-							Can't undo
-						</span>
-						<span className="plan-status-detail">
-							{UNDO_REFUSALS[planState.refused.reason]}
-						</span>
-					</span>
-				</div>
-			)}
+			{planState.refused && <UndoRefusedNotice reason={planState.refused.reason} />}
 			<span aria-atomic="true" aria-live="polite" className="sr-only" role="status">
 				{planState.refused && `Can't undo. ${UNDO_REFUSALS[planState.refused.reason]}`}
 			</span>
@@ -1421,6 +1449,9 @@ export function RoomWorkspace(
 		canManage: effectiveCanManage,
 		editing: titleEdit,
 		label: metadata.title,
+		machine: machineChoice.state && workspaceCanEdit && status === "connected"
+			? machineChoice
+			: undefined,
 		onAction: action => onDocumentAction(room, action),
 		onEditingChange: setTitleEdit,
 		onRenamed: updateMetadata,
@@ -1469,7 +1500,7 @@ export function RoomWorkspace(
 						data-child-title-bar
 					>
 						<span className="child-title-icon">
-							<MagnifierIcon aria-hidden="true" size={14} />
+							<MagnifierIcon aria-hidden="true" size={16} />
 						</span>
 						<div className="document-title-slot">{childTitleControl}</div>
 						<button
@@ -1479,7 +1510,7 @@ export function RoomWorkspace(
 							onClick={presentation.onClose}
 							type="button"
 						>
-							<CloseIcon aria-hidden="true" size={14} />
+							<CloseIcon aria-hidden="true" size={16} />
 						</button>
 					</div>
 				)}
@@ -1526,11 +1557,16 @@ export function RoomWorkspace(
 	let buildSlot = profile.implementation && (presentation.type !== "parent-with-child" || phone)
 		&& (
 			<BuildPlanButton
+				blockers={namedBuildBlockers}
+				onBlockerSelect={showNamedBuildBlocker}
 				build={build}
+				documentURL={new URL(documentPath(repository.owner, repository.name, slug), location.origin)
+					.href}
+				machineOffline={offlineChoice(machineChoice.state)}
 				canEdit={!!workspaceCanEdit && status === "connected"}
 				compact={mode !== "split"}
 				hot={buildHover === "tab"}
-				onExplain={phone ? explainBuild : undefined}
+				onExplain={showBuildBlocker}
 				phone={phone}
 				onHover={on => setBuildHover(on ? "capsule" : undefined)}
 				onOpen={() => selectDestination("build")}
@@ -1552,7 +1588,7 @@ export function RoomWorkspace(
 				<Workspace
 					available={available}
 					buildEnabled={build.tabReady}
-					buildGlyph={<BuildGlyph look={build.look} />}
+					buildGlyph={<BuildGlyph blockers={namedBuildBlockers} look={build.look} />}
 					buildHot={buildHover === "capsule"}
 					buildUnavailable={buildUnavailable}
 					onBuildHover={on => setBuildHover(on ? "tab" : undefined)}
@@ -1645,6 +1681,7 @@ export function RoomWorkspace(
 									editing={titleEdit}
 									editingDocument={!childOpen && !!barEdit?.editing}
 									label={metadata.title}
+									machine={titleProps.machine}
 									members={members}
 									onAction={action => onDocumentAction(room, action)}
 									onComments={() => {
@@ -1679,7 +1716,7 @@ export function RoomWorkspace(
 							<DecisionViewControl
 								attention={attention}
 								buildEnabled={profile.implementation ? build.tabReady : undefined}
-								buildGlyph={<BuildGlyph look={build.look} />}
+								buildGlyph={<BuildGlyph blockers={namedBuildBlockers} look={build.look} />}
 								buildHot={buildHover === "capsule"}
 								onBuildHover={on => setBuildHover(on ? "tab" : undefined)}
 								documentActivity={documentActivity(documentWatch, chatActivity.busy)}

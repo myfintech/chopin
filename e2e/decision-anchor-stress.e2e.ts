@@ -1,5 +1,7 @@
 /** Stress the durable prose link while nearby document text changes. */
 
+import { openDecisionDocument } from "./decision-deck-fixtures";
+
 import { content, expect, test, written } from "./room";
 import { openJevWire, sendChat, wireFrames } from "./jev-wire";
 import { resetPlannerJobs, scriptJob } from "./planner-jobs";
@@ -34,6 +36,14 @@ function commentDecision(page: Page) {
 	return page.locator("[data-plan-comment-card]").filter({ hasText: "Keep this choice recorded." });
 }
 
+async function expectAcceptedQuote(page: Page) {
+	let accepted = commentDecision(page);
+	let disclosure = accepted.getByRole("button", { name: /^Accepted:/ });
+	if (await disclosure.getAttribute("aria-expanded") !== "true") await disclosure.click();
+	await expect(disclosure).toHaveAttribute("aria-expanded", "true");
+	await expect(accepted).toContainText(MARKED_PROSE);
+}
+
 function port(page: Page): number {
 	return Number(new URL(page.url()).port);
 }
@@ -48,6 +58,7 @@ async function decide(page: Page, room: string) {
 	await sendChat(page, OPTION);
 	let card = page.locator('[data-document-view="plan"] article[data-plan-sidecar-questionnaire]')
 		.filter({ has: page.getByRole("heading", { name: QUESTION, exact: true }) });
+	await openDecisionDocument(page);
 	await expect(card).toBeVisible();
 	await card.getByText(OPTION, { exact: true }).click();
 	await card.getByRole("button", { name: "Save", exact: true }).click();
@@ -74,8 +85,12 @@ function expectLinked(snapshot: Plan.Open.Reply, widget?: string): string {
 	return linked!.widget;
 }
 
-async function placeCaretAtParagraphEnd(page: Page, textContent: string) {
-	return content(page).evaluate((root, expectedText) => {
+async function placeCaretAtParagraph(
+	page: Page,
+	textContent: string,
+	position: "start" | "end",
+) {
+	return content(page).evaluate((root, { expectedText, position }) => {
 		let paragraph = [...root.querySelectorAll(":scope > p")].find(
 			item => item.textContent === expectedText,
 		);
@@ -85,7 +100,7 @@ async function placeCaretAtParagraphEnd(page: Page, textContent: string) {
 		if (!selection) throw new Error("selection unavailable");
 		(root as HTMLElement).focus();
 		let range = document.createRange();
-		range.setStart(text, text.data.length);
+		range.setStart(text, position === "start" ? 0 : text.data.length);
 		range.collapse(true);
 		selection.removeAllRanges();
 		selection.addRange(range);
@@ -93,10 +108,11 @@ async function placeCaretAtParagraphEnd(page: Page, textContent: string) {
 			active: document.activeElement === root,
 			anchor: selection.anchorNode === text,
 			atEnd: selection.anchorOffset === text.data.length,
+			atStart: selection.anchorOffset === 0,
 			paragraph: paragraph?.textContent ?? null,
 			contentEditable: (root as HTMLElement).contentEditable,
 		};
-	}, textContent);
+	}, { expectedText: textContent, position });
 }
 
 async function expectResolvedDecision(page: Page, room: string) {
@@ -117,7 +133,7 @@ async function expectResolvedDecision(page: Page, room: string) {
 }
 
 test.beforeEach(async () => {
-	await resetPlannerJobs();
+	await resetPlannerJobs({ suggest: true });
 });
 
 test.afterEach(async () => {
@@ -164,8 +180,8 @@ test("a custom browser update cannot remove an accepted Decision projection", as
 	let other = await join("ben");
 	await expect(content(editor)).toContainText(MARKED_PROSE);
 	await expect(content(other)).toContainText(MARKED_PROSE);
-	await expect(commentDecision(editor)).toContainText(MARKED_PROSE);
-	await expect(commentDecision(other)).toContainText(MARKED_PROSE);
+	await expectAcceptedQuote(editor);
+	await expectAcceptedQuote(other);
 	await written(editor, room, "<Decision");
 
 	let openReply = waitForPlanOpen();
@@ -211,8 +227,8 @@ test("a custom browser update cannot remove an accepted Decision projection", as
 	expect(appFrames.some(frame => frame.kind === "plan:reset")).toBe(true);
 	await expect(content(editor)).toContainText(MARKED_PROSE);
 	await expect(content(other)).toContainText(MARKED_PROSE);
-	await expect(commentDecision(editor)).toContainText(MARKED_PROSE);
-	await expect(commentDecision(other)).toContainText(MARKED_PROSE);
+	await expectAcceptedQuote(editor);
+	await expectAcceptedQuote(other);
 	await expect.poll(() => readSource(port(editor), room)).toMatch(
 		new RegExp(`<Decision[^>]*id="${decisionId}"`),
 	);
@@ -221,7 +237,7 @@ test("a custom browser update cannot remove an accepted Decision projection", as
 	await editor.reload();
 	await expect(content(editor)).toHaveAttribute("contenteditable", "true", { timeout: 20_000 });
 	await expect(content(editor)).toContainText(MARKED_PROSE);
-	await expect(commentDecision(editor)).toContainText(MARKED_PROSE);
+	await expectAcceptedQuote(editor);
 	await openJevWire(editor, room);
 	let synced = (await wireFrames(editor)).findLast(frame => frame.kind === "comment:sync") as {
 		threads?: Array<{ id: string; status: string; quote?: string }>;
@@ -232,14 +248,16 @@ test("a custom browser update cannot remove an accepted Decision projection", as
 		quote: MARKED_PROSE,
 	}));
 	await expect(content(other)).toContainText(MARKED_PROSE);
-	await expect(commentDecision(other)).toContainText(MARKED_PROSE);
+	await expectAcceptedQuote(other);
 });
 
 test(
 	"adjacent edits and a reconnect preserve a resolved decision's prose anchor",
 	async ({ join, page, room }, testInfo) => {
 		let sockets: WebSocketRoute[] = [];
+		let offline = false;
 		await page.routeWebSocket("**/ws?**", route => {
+			if (offline) return route.close();
 			route.connectToServer();
 			sockets.push(route);
 		});
@@ -264,10 +282,10 @@ test(
 		widget = expectLinked(await latestDocumentSnapshot(editor, room), widget);
 
 		// Shift the associated paragraph down by inserting context above it.
-		let leading = content(editor).locator(":scope > p").first();
-		await expect(leading).toBeEmpty();
-		await leading.click();
+		expect(await placeCaretAtParagraph(editor, await prose(editor).innerText(), "start"))
+			.toMatchObject({ active: true, anchor: true, atStart: true, contentEditable: "true" });
 		await editor.keyboard.type("Earlier context.");
+		await editor.keyboard.press("Enter");
 		let context = content(editor).locator("p").filter({ hasText: "Earlier context." });
 		await expect(context).toHaveText("Earlier context.");
 		let order = await content(editor).locator("p").allTextContents();
@@ -279,7 +297,7 @@ test(
 		widget = expectLinked(await latestDocumentSnapshot(editor, room), widget);
 
 		// An edited anchored paragraph should retain the same live relation.
-		expect(await placeCaretAtParagraphEnd(editor, await prose(editor).innerText()))
+		expect(await placeCaretAtParagraph(editor, await prose(editor).innerText(), "end"))
 			.toMatchObject({ active: true, anchor: true, atEnd: true, contentEditable: "true" });
 		await editor.keyboard.type(" Still the same decision.");
 		await expect(prose(editor)).toContainText("Still the same decision.");
@@ -288,10 +306,13 @@ test(
 		await expectResolvedDecision(editor, room);
 
 		// Drop the UI connection and let the provider reopen the document itself.
+		offline = true;
 		await sockets[0]!.close();
 		await expect(content(editor)).toHaveAttribute("contenteditable", "false");
+		offline = false;
+		await editor.evaluate(() => window.dispatchEvent(new Event("online")));
 		await expect(content(editor)).toHaveAttribute("contenteditable", "true", { timeout: 20_000 });
-		expect(await placeCaretAtParagraphEnd(editor, await prose(editor).innerText()))
+		expect(await placeCaretAtParagraph(editor, await prose(editor).innerText(), "end"))
 			.toMatchObject({ active: true, anchor: true, atEnd: true, contentEditable: "true" });
 		await editor.keyboard.type(" After reconnect.");
 		await expect(prose(editor)).toContainText("After reconnect.");
@@ -335,11 +356,12 @@ test(
 			hasText: /^Move destination\.$/,
 		});
 		await expect(destination).toHaveCount(1);
-		let caret = await placeCaretAtParagraphEnd(page, "Move destination.");
+		let caret = await placeCaretAtParagraph(page, "Move destination.", "end");
 		expect(caret).toEqual({
 			active: true,
 			anchor: true,
 			atEnd: true,
+			atStart: false,
 			paragraph: "Move destination.",
 			contentEditable: "true",
 		});

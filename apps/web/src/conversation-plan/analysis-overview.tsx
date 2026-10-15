@@ -1,4 +1,5 @@
 import { CheckIcon } from "@chopin/icons";
+import { UnfoldSection } from "@chopin/visuals/unfold";
 
 import { ExcerptCorrection } from "./excerpt-correction";
 import { answerText, questionName, SIGNALS } from "./analysis-labels";
@@ -156,7 +157,7 @@ export function AnalysisOverview({
 									outcome.status === "accepted" ? "text-success-ink" : "text-text-tertiary"
 								}`}
 							>
-								{outcome.status === "accepted" ? <CheckIcon aria-hidden="true" size={14} /> : "·"}
+								{outcome.status === "accepted" && <CheckIcon aria-hidden="true" size={16} />}
 							</span>
 							<div className="min-w-0 flex-1">
 								<div className="flex items-baseline justify-between gap-2">
@@ -195,25 +196,28 @@ export function AnalysisOverview({
 			)}
 			{outcomes.length > 0 && (review > 0 || ignored > 0) && (
 				<p className="m-0 mt-1 text-sm text-text-tertiary">
-					{review} held for review · {ignored} not applied
+					{review} held for review, {ignored} not applied
 				</p>
 			)}
 			{analysis && (
-				<details className="mt-3 hairline-t pt-2">
-					<summary className="cursor-pointer text-sm font-medium text-brand-ink">
-						Model answers and run details
-					</summary>
-					<div className="mt-2 text-sm leading-4 text-text-tertiary">
-						<p className="m-0">
-							Model {analysis.modelVersion || "not recorded"} · Questions{" "}
-							{analysis.questionSetVersion || "not recorded"}
-							{analysis.latencyMs === undefined ? "" : ` · ${analysis.latencyMs} ms`}
+				<UnfoldSection className="mt-3 hairline-t pt-2" label="Model answers and run details">
+					<div className="text-sm leading-4 text-text-tertiary">
+						<p className="m-0 flex flex-wrap gap-x-3">
+							<span>Model {analysis.modelVersion || "not recorded"}</span>{" "}
+							<span>Questions {analysis.questionSetVersion || "not recorded"}</span>
+							{analysis.latencyMs !== undefined && (
+								<>
+									{" "}
+									<span>{analysis.latencyMs} ms</span>
+								</>
+							)}
 						</p>
 						{analysis.policyGate && <p className="m-0 mt-1">Policy: {analysis.policyGate}</p>}
 						{analysis.quoteValidation && (
 							<p className="m-0 mt-1">
-								Source quotes:{" "}
-								{analysis.quoteValidation.filter(range => range.valid).length}/{analysis
+								Source quotes: {analysis.quoteValidation.filter(range =>
+									range.valid
+								).length}/{analysis
 									.quoteValidation.length} valid
 							</p>
 						)}
@@ -233,7 +237,7 @@ export function AnalysisOverview({
 							</section>
 						))}
 					</div>
-				</details>
+				</UnfoldSection>
 			)}
 		</>
 	);

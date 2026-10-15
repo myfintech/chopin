@@ -24,7 +24,7 @@ let DocumentRouteSwap = lazy(() => {
 	void import("./room-workspace").catch(() => {});
 	return import("./document-route-view");
 });
-// /connect, the person's machines and the pairing confirmation, loads only when visited.
+// /machines, the person's machines and the pairing confirmation, loads only when visited.
 let MachinesPage = lazy(() => import("./experiments/pairing"));
 // Only a failed load shows it, so it stays out of the first JavaScript a reader downloads.
 let Failure = lazy(() => import("./hosted-failure"));
@@ -76,7 +76,9 @@ function decoded(value: string): string | undefined {
 
 export function hostedRoute(pathname: string): HostedRoute {
 	if (pathname === "/" || pathname === "") return { page: "repositories" };
-	if (/^\/connect\/?$/.test(pathname)) return { page: "machines" };
+	// The server redirects /connect, the page's former address; a history entry made before still
+	// opens the page.
+	if (/^\/(?:machines|connect)\/?$/.test(pathname)) return { page: "machines" };
 	let child = parseChildDocumentPath(pathname);
 	if (child) return { page: "child", ...child };
 	let document = parseDocumentPath(pathname);
@@ -135,8 +137,6 @@ export function HostedApp(
 ) {
 	let [route, setRoute] = useState(() => hostedRoute(location.pathname));
 	let [navigationRevision, setNavigationRevision] = useState(0);
-	let hostedRouteRef = useRef(route);
-	hostedRouteRef.current = route;
 	let childOpener = useRef<ResearchOpener | undefined>(undefined);
 	// The root document can replace a research card's opener while the child's first commit lays
 	// out, so the clicked element and its rect are kept from the click itself.
@@ -175,7 +175,9 @@ export function HostedApp(
 		let nextRoute = hostedRoute(target.pathname);
 		if (options.replace) history.replaceState(history.state, "", next);
 		else {
-			let currentRoute = hostedRouteRef.current;
+			// The URL, not route state: a rename can rewrite the parent's slug in place without
+			// updating the route, and a stale slug would push the child as an unrelated page.
+			let currentRoute = hostedRoute(location.pathname);
 			let siblingChild = nextRoute.page === "child" && currentRoute.page === "child"
 				&& nextRoute.owner.toLocaleLowerCase() === currentRoute.owner.toLocaleLowerCase()
 				&& nextRoute.repository.toLocaleLowerCase()

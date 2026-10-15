@@ -16,6 +16,62 @@ import type { GitHub } from "../github/client";
 import type { HostedAuth } from "../auth/routes";
 
 let checkout = { repository: "owner/repository", branch: "main", commit: "a".repeat(40) };
+
+test("opening an archived document cannot start a new readiness review", async () => {
+	let assessments = 0;
+	let context = await setup({ assess: () => assessments++ });
+	try {
+		await context.call(context.path);
+		expect(assessments).toBe(1);
+		await context.storage.channels.archive({ id: context.plan.id, now: context.now });
+		await context.call(context.path);
+		expect(assessments).toBe(1);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("Build names required investigations and refuses to queue until they are resolved", async () => {
+	let context = await setup();
+	try {
+		await paired(context);
+		let optional = await context.experiments.service.create(
+			context.plan.id,
+			"U_test",
+			"Explore UI",
+		);
+		let value = await context.experiments.service.create(
+			context.plan.id,
+			"U_test",
+			"Measure startup",
+			crypto.randomUUID(),
+			undefined,
+			"Choose a startup approach from measured evidence",
+		);
+		let snapshot = await (await context.call(context.path)).json();
+		expect(snapshot.buildReady).toBe(false);
+		expect(snapshot.buildInvestigations).toEqual([{
+			id: value.id,
+			brief: "Measure startup",
+			reason: "Choose a startup approach from measured evidence",
+		}]);
+		expect(snapshot.buildInvestigations.some((item: { id: string }) => item.id === optional.id))
+			.toBe(false);
+		let response = await context.call(context.path, {
+			planRevision: 0,
+			graphVersion: 1,
+			graphRevision: 1,
+		});
+		expect(response.status).toBe(409);
+		expect((await response.json()).error).toContain("required investigations");
+		expect(context.plan.builds).toHaveLength(0);
+		await context.experiments.service.stop(value.id, "failed", "Disconnected");
+		expect((await (await context.call(context.path)).json()).buildReady).toBe(false);
+		await context.experiments.service.stop(optional.id, "cancelled");
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
 async function prepare(plan: Plan.Plan) {
 	await implementationGraphs().revise(plan, {
 		planRevision: 0,
@@ -35,9 +91,23 @@ async function prepare(plan: Plan.Plan) {
 }
 
 async function setup(
-	options: { liveBuild?: boolean } = {},
+	options: {
+		liveBuild?: boolean;
+		assess?: (id: string, revision: number) => void;
+		/** While set, reading the stored machine choices fails, as a locked table does. */
+		unreadable?: { locked: boolean };
+	} = {},
 ) {
 	let context = await openPlan("# Launcher plan\n");
+	let unreadable = options.unreadable;
+	if (unreadable) {
+		let machines = context.storage.machines;
+		let read = machines.choices.bind(machines);
+		machines.choices = async () => {
+			if (unreadable.locked) throw new Error("canceling statement due to statement timeout");
+			return read();
+		};
+	}
 	let github = {
 		async user(token: string) {
 			return { id: token === "other" ? "U_other" : "U_test", login: "test", avatarUrl: "" };
@@ -106,8 +176,11 @@ async function setup(
 		implementations: () => implementations,
 	});
 	implementations = registerImplementationRoutes(router, auth, {
+		assess: options.assess,
 		liveBuild: options.liveBuild ?? false,
 		connections: experiments.connections,
+		refuseOffline: experiments.refuseOffline,
+		machineChoices: experiments.machineChoices,
 		busy: async connectionId =>
 			(await experiments.service.store.active()).some(item =>
 				item.connectionId === connectionId && ["running", "publishing"].includes(item.state)
@@ -1631,6 +1704,91 @@ test("a connector that disconnects fails its running rebuild at once, without go
 			error: "Your local agent disconnected.",
 		});
 		expect(context.plan.live?.baseRevision).toBe(live?.baseRevision);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("Build uses the machine the person chose for the document, never another", async () => {
+	let context = await setup();
+	try {
+		let first = await paired(context);
+		let chosen = await paired(context);
+		await context.call(`/api/connector/machines/${chosen.machine}/label`, { label: "build-box" });
+		let choose = (machine: string | null) =>
+			context.call(`/api/documents/${context.plan.id}/machine`, { machine });
+		expect((await choose(chosen.machine)).status).toBe(200);
+		let review = { planRevision: 0, graphVersion: 1, graphRevision: 1 };
+		// The first machine was paired first and is idle, but the person chose build-box.
+		await tool(context, chosen.token, "disconnect_workspace");
+		let offline = await context.call(context.path, review);
+		expect(offline.status).toBe(409);
+		expect(await offline.json()).toEqual({
+			error: "machine-offline",
+			message: "build-box is offline. Start chopin connect on it, or choose another machine.",
+		});
+		expect(context.plan.builds).toEqual([]);
+		// Back to automatic, the first machine takes it.
+		expect((await choose(null)).status).toBe(200);
+		let built = await (await context.call(context.path, review)).json();
+		expect(built.connectionId).toBe(first.connection.id);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("an automatic rebuild follows the builder's machine choice", async () => {
+	let { context, rebuild } = await rebuilding(true);
+	try {
+		await tool(context, rebuild.runToken, "report_rebuild", {
+			summary: "No change needed.",
+			commits: [],
+			tasks: [],
+		});
+		expect((await edit(context.plan, "A later edit.")).ok).toBe(true);
+		let connections = context.experiments.connections;
+		let own = connections.get(context.plan.builds.at(-1)!.connectionId)!;
+		connections.choose(context.plan.id, "U_test", "another-machine");
+		expect((await queueRebuild(context.plan, connections, { automatic: true })).kind).toBe(
+			"unavailable",
+		);
+		connections.choose(context.plan.id, "U_test", own.machineId);
+		expect((await queueRebuild(context.plan, connections, { automatic: true })).kind).toBe(
+			"queued",
+		);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("Build is refused while the person's machine choice cannot be read, then uses it", async () => {
+	let unreadable = { locked: false };
+	let context = await setup({ unreadable });
+	try {
+		let first = await paired(context);
+		let chosen = await paired(context);
+		await context.call(`/api/connector/machines/${chosen.machine}/label`, { label: "build-box" });
+		let path = `/api/documents/${context.plan.id}/machine`;
+		expect((await context.call(path, { machine: chosen.machine })).status).toBe(200);
+		await tool(context, chosen.token, "disconnect_workspace");
+		// The server restarts and machine_choices cannot be read; only the other machine is online.
+		unreadable.locked = true;
+		context.experiments.connections.unread();
+		let review = { planRevision: 0, graphVersion: 1, graphRevision: 1 };
+		let refused = await context.call(context.path, review);
+		expect(refused.status).toBe(503);
+		expect(await refused.json()).toEqual({
+			error: "machine-choice-unavailable",
+			message: "Can't read your machine choice right now. Try again.",
+		});
+		expect(context.plan.builds).toEqual([]);
+		expect(context.experiments.connections.allows(context.plan.id, first.connection)).toBe(false);
+		// Readable again, the choice applies: build-box is offline, so the first machine gets nothing.
+		unreadable.locked = false;
+		let offline = await context.call(context.path, review);
+		expect(offline.status).toBe(409);
+		expect((await offline.json()).error).toBe("machine-offline");
+		expect(context.plan.builds).toEqual([]);
 	} finally {
 		await Plan.close(context.plan);
 	}

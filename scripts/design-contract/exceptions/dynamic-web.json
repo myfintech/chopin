@@ -42,7 +42,7 @@
 	},
 	{
 		"file": "apps/web/src/document-workspace-host.tsx",
-		"reason": "Workspace assembly supplies document/session callbacks and data, not design values; scanner does not execute the workspaceProps function. Its returned keys contain no className or style; the parent presentation carries the child layer node, a finite \"open\" | \"closing\" state, a finite \"lift\" | \"zoom\" motion that Workspace renders only as a data attribute, path labels, a close callback, the open child's channel id that Chat sends as its focus, and a child-open callback; a document presentation carries only that child-open callback.",
+		"reason": "Workspace assembly supplies document/session callbacks and data, not design values; scanner does not execute the workspaceProps function. Its returned keys contain no className or style; the parent presentation carries the child layer node, a finite \"open\" | \"closing\" state, a finite \"lift\" | \"zoom\" motion that Workspace renders only as a data attribute, path labels, a close callback, the open child's channel id that Chat sends as its focus, a child-open callback, and the child request key retained across canonical changes and used only to reveal a newly requested Document view; a document presentation carries only that child-open callback.",
 		"cases": [
 			[
 				"dynamic",
@@ -59,7 +59,7 @@
 				1
 			]
 		],
-		"sourceHash": "686d11761299b904809f0bed307b80f1affdd076eec1da60a2b7a63e33f5e4e6"
+		"sourceHash": "201e83e15db914171abbbeac5030abb0c2bb5b8671466bcb7126b060702d506e"
 	},
 	{
 		"file": "apps/web/src/document-rename.tsx",
@@ -73,7 +73,7 @@
 				1
 			]
 		],
-		"sourceHash": "834ae3a6082aff6f1456bacfb943f9f419c1ffd120de974ef2800a595f647be5"
+		"sourceHash": "7116df5ad4fc3d55f905cdc426c4eb8de3a7c9fb9903f75a1bf4657b351704ac"
 	},
 	{
 		"file": "apps/web/src/chat/markdown.tsx",
@@ -101,21 +101,21 @@
 				1
 			]
 		],
-		"sourceHash": "a243b136337faa8ec8b1878605d907c8830a6fd8bc75116045debcf8cfbcf9ee"
+		"sourceHash": "6fbb39dc0afed34f11e3bc4977df42a7fc611dada902fee0806e11ec6287a588"
 	},
 	{
-		"file": "apps/web/src/project-sidebar.tsx",
-		"reason": "Account menu receives the finite transition-presence class from NavigationShell; the sidebar adds only fixed menu classes.",
+		"file": "apps/web/src/account-menu.tsx",
+		"reason": "Account menu receives the finite transition-presence class from NavigationShell through ProjectSidebar; the menu adds only fixed menu classes.",
 		"cases": [
 			[
 				"dynamic",
 				"class",
-				"accountMenu.className",
-				"class > ProjectSidebar > <div>",
+				"menu.className",
+				"class > AccountMenu > <div>",
 				1
 			]
 		],
-		"sourceHash": "a243b136337faa8ec8b1878605d907c8830a6fd8bc75116045debcf8cfbcf9ee"
+		"sourceHash": "6ec411bac9f554b6eb13f280217a66ad83f4f1e8f8e0e2d50666d1fb603ea9e0"
 	},
 	{
 		"file": "apps/web/src/design-audit/icons.tsx",
@@ -129,7 +129,7 @@
 				1
 			]
 		],
-		"sourceHash": "0021b21e89257d9a961015150862c9587d106933dd7f611363565cbd896e15eb"
+		"sourceHash": "5b6fe38e2be10948e6f4de85f9ce2f4789add62fb5ec49a13071d1e9777f892e"
 	},
 	{
 		"file": "apps/web/src/design-audit/controls.tsx",
@@ -143,7 +143,7 @@
 				1
 			]
 		],
-		"sourceHash": "7d08e5ceaaa8079c2e2824c24cc21bb2637931e2af97c00e470e9a1ffc00a602"
+		"sourceHash": "f14be4530ef2ef97cad54e8e7a343f90e8e8a8a0462d5c45571d798fcf7092f4"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -157,7 +157,7 @@
 				1
 			]
 		],
-		"sourceHash": "71a9eb8593fe0f13b39f6f2b949feb8d7471e77131763247eb54795039c7da4e"
+		"sourceHash": "c1ecadf88088db5d0e53b75fb8ccb0e92abbd16e6c6904ed7a9e70387f07e892"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -171,7 +171,7 @@
 				1
 			]
 		],
-		"sourceHash": "71a9eb8593fe0f13b39f6f2b949feb8d7471e77131763247eb54795039c7da4e"
+		"sourceHash": "c1ecadf88088db5d0e53b75fb8ccb0e92abbd16e6c6904ed7a9e70387f07e892"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -192,7 +192,7 @@
 				1
 			]
 		],
-		"sourceHash": "71a9eb8593fe0f13b39f6f2b949feb8d7471e77131763247eb54795039c7da4e"
+		"sourceHash": "c1ecadf88088db5d0e53b75fb8ccb0e92abbd16e6c6904ed7a9e70387f07e892"
 	},
 	{
 		"file": "apps/web/src/terminal-alert.tsx",
@@ -227,7 +227,7 @@
 				1
 			]
 		],
-		"sourceHash": "d95f0437fe4e56c405797c747ecd6d61f0f62c7bcb436af7be75efd5045b9d8c"
+		"sourceHash": "6dbd2777812a028a5e6294c0b67923b364e1daf008ace8654ada6ea07cc85e71"
 	},
 	{
 		"file": "apps/web/src/navigation-drawer.tsx",
@@ -276,7 +276,7 @@
 				1
 			]
 		],
-		"sourceHash": "39847923947ec187c3f3cb1973ab1df745dea4bcaff882fc5dbbf9bd2108d42f"
+		"sourceHash": "f84a3f2c9ca08fe38e3608e472837e902fe156733756d5bfd3db0b788d6b036f"
 	},
 	{
 		"file": "apps/web/src/navigation-dialog.tsx",
@@ -300,62 +300,6 @@
 		"sourceHash": "f7c06d489223022873b10f1c3ae463e43d02f60212a344b15ae52ebe88eac359"
 	},
 	{
-		"file": "apps/web/src/repository-picker.tsx",
-		"reason": "Anchored picker position comes from measured viewport placement; presentation roles are supplied by separately checked CSS.",
-		"cases": [
-			[
-				"dynamic",
-				"*",
-				"position",
-				"unresolved style > RepositoryPicker > popup > <div>",
-				1
-			]
-		],
-		"sourceHash": "abc9d2a5e3e05c195a599f1ef58f58f0dd1090b9507a0e1c20277fd4d7171a07"
-	},
-	{
-		"file": "apps/web/src/repository-picker.tsx",
-		"reason": "Motion/presence contract returns finite semantic state classes; imported function evaluation is outside this static scanner. Review the producer when changing this boundary.",
-		"cases": [
-			[
-				"dynamic",
-				"class",
-				"popupPresence.className",
-				"class > RepositoryPicker > popup > <div>",
-				1
-			]
-		],
-		"sourceHash": "abc9d2a5e3e05c195a599f1ef58f58f0dd1090b9507a0e1c20277fd4d7171a07"
-	},
-	{
-		"file": "apps/web/src/document-picker.tsx",
-		"reason": "Anchored picker position comes from measured viewport placement; presentation roles are supplied by separately checked CSS.",
-		"cases": [
-			[
-				"dynamic",
-				"*",
-				"position",
-				"unresolved style > DocumentPicker > popup > <div>",
-				1
-			]
-		],
-		"sourceHash": "a09e6f8b44c76129cae233c1d57ddf54b7109b22e990febb4dddb9de11d6ca8c"
-	},
-	{
-		"file": "apps/web/src/document-picker.tsx",
-		"reason": "Motion/presence contract returns finite semantic state classes; imported function evaluation is outside this static scanner. Review the producer when changing this boundary.",
-		"cases": [
-			[
-				"dynamic",
-				"class",
-				"popupPresence.className",
-				"class > DocumentPicker > popup > <div>",
-				1
-			]
-		],
-		"sourceHash": "a09e6f8b44c76129cae233c1d57ddf54b7109b22e990febb4dddb9de11d6ca8c"
-	},
-	{
 		"file": "apps/web/src/conversation-plan/markers.tsx",
 		"reason": "Message analysis portal uses measured message, transcript and composer bounds for placement and clipping; this exact browser geometry boundary supplies position, size, visibility and motion origin without semantic color or typography values.",
 		"cases": [
@@ -367,7 +311,21 @@
 				1
 			]
 		],
-		"sourceHash": "f6b56e35f4a84411532e598ef53c893966b496b001d3020a3f470d87bd3efd8e"
+		"sourceHash": "25d5641ba4757668917be319cb5452999354e3f730264d3b1ec8cde48f3c3f44"
+	},
+	{
+		"file": "apps/web/src/machine-button.tsx",
+		"reason": "Motion/presence contract returns finite semantic state classes; imported function evaluation is outside this static scanner. Review the producer when changing this boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"class",
+				"presence.className",
+				"class > MachineButton > <div>",
+				1
+			]
+		],
+		"sourceHash": "2aff63785d3f7c08cb3a0a28a855ad68e9984646a795b5ab5724685b17fb5532"
 	},
 	{
 		"file": "apps/web/src/experiments/machine-setup.tsx",
@@ -381,7 +339,7 @@
 				1
 			]
 		],
-		"sourceHash": "7a7af038fd564985e6ee7630da5943cd39999400368d20f3d112b89385f3fd48"
+		"sourceHash": "8224c37fda1a747fb9c560b5c22b4e83dac334d7ba46cb7c4aa4d8c07c233aff"
 	},
 	{
 		"file": "apps/web/src/experiments/machines.tsx",
@@ -395,6 +353,6 @@
 				1
 			]
 		],
-		"sourceHash": "3e9b58052c0f17b9d5e8446b55e37157aa230f2e276dc4182db18dc9e72aa46e"
+		"sourceHash": "f45c5ff596aa59bdd003351d8d08c84ce98718df46ab4d430db7d102df663af1"
 	}
 ]

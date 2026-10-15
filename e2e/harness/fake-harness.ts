@@ -10,6 +10,8 @@ import type {
 	HarnessV1Session,
 	HarnessV1StartOptions,
 } from "../../apps/server/src/harness/harness-v1";
+import { HEADING_TOOL_NAMES } from "../../apps/server/src/harness/tool-names";
+import { nameDocument } from "./fake-heading";
 
 type FakeHarnessSettings = {
 	credentials: (id: string) => string | undefined;
@@ -92,7 +94,16 @@ export function createFakeHarness(
 
 				async doPromptTurn(turn: HarnessV1PromptTurnOptions): Promise<HarnessV1PromptControl> {
 					let available = new Set(turn.tools.map(spec => spec.name));
-					for (let toolName of SCRIPTED_TOOLS) {
+					let prompt = promptText(turn.prompt);
+					// Automatic turns carry the latest human message in the session bootstrap.
+					let requested = prompt.includes("Respond to the current source message")
+						? turn.instructions?.split("\n").findLast(line => line.startsWith("@")) ?? prompt
+						: prompt;
+					let heading = prompt.startsWith("[Background job: heading]\n");
+					if (heading && available.size !== HEADING_TOOL_NAMES.length) {
+						throw new Error("e2e-fake heading job received tools outside its scope");
+					}
+					for (let toolName of heading ? HEADING_TOOL_NAMES : SCRIPTED_TOOLS) {
 						if (!available.has(toolName)) {
 							throw new Error(`e2e-fake harness expected host tool ${toolName}`);
 						}
@@ -118,7 +129,7 @@ export function createFakeHarness(
 
 					let callTool = (
 						toolName: string,
-						toolCallId = crypto.randomUUID(),
+						toolCallId: string = crypto.randomUUID(),
 						input: Record<string, unknown> = {},
 					): Promise<{ output: unknown; isError?: boolean }> => {
 						let outcome = Promise.withResolvers<{ output: unknown; isError?: boolean }>();
@@ -133,7 +144,6 @@ export function createFakeHarness(
 					};
 					let pause = () => new Promise<void>(resolve => setTimeout(resolve, STEP_MS));
 
-					let prompt = promptText(turn.prompt);
 					let thread = COMMENT_THREAD.exec(prompt)?.[1];
 					let focused = CHILD_FOCUS.exec(prompt)?.[1];
 					let finish = () => {
@@ -159,7 +169,7 @@ export function createFakeHarness(
 							revision: current,
 							operations: [{
 								op: "insert",
-								index: 0,
+								index: 1,
 								source: ASKED.map(item => `${item.header}: we chose the first option.`)
 									.join("\n\n"),
 							}],
@@ -183,7 +193,20 @@ export function createFakeHarness(
 						}
 					};
 
-					if (thread && !prompt.includes(SLOW_PROMPT)) {
+					if (heading) {
+						void (async () => {
+							try {
+								await nameDocument(prompt, callTool);
+								finish();
+								settled.resolve();
+							} catch (err) {
+								turn.emit({ type: "error", error: err });
+								settled.reject(err);
+							} finally {
+								turn.abortSignal?.removeEventListener("abort", onAbort);
+							}
+						})();
+					} else if (thread && !prompt.includes(SLOW_PROMPT)) {
 						// A comment sent to Chopin: answer in the thread, unless the comment
 						// asks to be answered only in Chat so the server's backstop is exercised.
 						void (async () => {
@@ -258,7 +281,7 @@ export function createFakeHarness(
 								turn.abortSignal?.removeEventListener("abort", onAbort);
 							}
 						})();
-					} else if (prompt.includes(CHILD_PROMPT)) {
+					} else if (requested.includes(CHILD_PROMPT)) {
 						void (async () => {
 							try {
 								for (let toolName of CHILD_TOOLS) {
@@ -305,6 +328,31 @@ export function createFakeHarness(
 								turn.abortSignal?.removeEventListener("abort", onAbort);
 							}
 						})();
+					} else if (prompt.includes("REQUIRE-REMOVED-INVESTIGATION")) {
+						void (async () => {
+							try {
+								let listed = await callTool("list_investigations");
+								let { investigations } = JSON.parse(String(listed.output)) as {
+									investigations: { id: string; revision: number; state: string }[];
+								};
+								let value = investigations.find(item => item.state === "cancelled");
+								if (!value) throw new Error("No withdrawn investigation");
+								let result = await callTool("set_investigation_build_blocker", undefined, {
+									id: value.id,
+									revision: value.revision,
+									reason: "Choose a cache",
+								});
+								let id = crypto.randomUUID();
+								turn.emit({ type: "text-start", id });
+								turn.emit({ type: "text-delta", id, delta: String(result.output) });
+								turn.emit({ type: "text-end", id });
+								finish();
+								settled.resolve();
+							} catch (err) {
+								turn.emit({ type: "error", error: err });
+								settled.reject(err);
+							}
+						})();
 					} else if (prompt.includes(INVESTIGATE_PROMPT)) {
 						void (async () => {
 							try {
@@ -317,6 +365,11 @@ export function createFakeHarness(
 								if (!block) throw new Error("read_plan has no block to investigate");
 								let proposed = await callTool("propose_investigation", undefined, {
 									brief: "Measure cold start time on a local checkout.",
+									...(prompt.includes("REQUIRED")
+										? {
+											buildBlocker: "Choose the cache approach from measured cold start times.",
+										}
+										: {}),
 									key: "anchor",
 									after: { index: block.index, digest: block.digest },
 								});

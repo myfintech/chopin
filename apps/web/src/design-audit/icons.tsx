@@ -8,6 +8,7 @@ import {
 	DocumentIcon,
 	ImageIcon,
 	InfoIcon,
+	InvestigationIcon,
 	KeyboardIcon,
 	LightbulbIcon,
 	LinkPlusIcon,
@@ -73,6 +74,7 @@ const NUCLEO_ICONS: readonly IconCatalogueItem[] = [
 	{ icon: SignInIcon, name: "Sign in" },
 	{ icon: SirenIcon, name: "Siren" },
 	{ icon: SparkleIcon, name: "Important sparkle" },
+	{ icon: InvestigationIcon, name: "Investigation" },
 	{ icon: WarningIcon, name: "Warning" },
 	{ icon: ArchiveIcon, name: "Archive" },
 	{ icon: DocumentIcon, name: "Document" },
@@ -85,13 +87,15 @@ const NUCLEO_ICONS: readonly IconCatalogueItem[] = [
 export function IconCatalogue() {
 	return (
 		<div className="design-audit-icon-catalogue">
-			<div className="design-audit-icon-states" aria-label="Icon colour states">
-				{(["Default", "Active", "Disabled"] as const).map(state => (
-					<div data-icon-state={state.toLowerCase()} key={state}>
-						<CheckIcon aria-hidden="true" size={14} />
-						<span>{state}</span>
-					</div>
-				))}
+			<div className="design-audit-icon-states" aria-label="Icon colour roles">
+				<div data-icon-state="default">
+					<CheckIcon aria-hidden="true" size={16} />
+					<span>Default</span>
+				</div>
+				<div data-icon-state="danger">
+					<WarningIcon aria-hidden="true" className="icon-danger" size={16} />
+					<span>Danger</span>
+				</div>
 			</div>
 			<h4>Nucleo icons</h4>
 			<div className="design-audit-icon-grid">
@@ -99,7 +103,7 @@ export function IconCatalogue() {
 					<figure key={`${source ? "asset" : "component"}-${name}`}>
 						<span className="design-audit-icon-frame">
 							{source ? <img alt="" src={source} /> : null}
-							{Glyph ? <Glyph aria-hidden="true" className={className} size={14} /> : null}
+							{Glyph ? <Glyph aria-hidden="true" className={className} size={16} /> : null}
 						</span>
 						<figcaption>
 							<strong>{name}</strong>
@@ -114,7 +118,7 @@ export function IconCatalogue() {
 				] as const).map(({ label, size }) => (
 					<div key={label}>
 						<MessageIcon aria-hidden="true" size={size} />
-						<span>{label} · {size}px</span>
+						<span>{label} at {size}px</span>
 					</div>
 				))}
 			</div>

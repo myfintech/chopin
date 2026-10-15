@@ -23,6 +23,9 @@ import { WorkProgress } from "./work-progress";
 import { clearSourceHighlight, highlightSource } from "../conversation-plan/source";
 import type { ChatDestination } from "../conversation-plan/source";
 
+/** Message analysis is a development diagnostic; the browser suite builds it in too. */
+const ANALYSIS = import.meta.env.DEV || import.meta.env.VITE_MESSAGE_ANALYSIS === "on";
+
 import type { Chat, ConversationPlan } from "@chopin/protocol";
 import type { CompletedWork, Group, Message } from "./model";
 import type { CardMetaStore, QuestionnaireStore } from "@chopin/editor";
@@ -88,7 +91,7 @@ function SystemEntry(
 			data-chat-system
 		>
 			<div className="shrink-0">
-				<Icon aria-hidden="true" size={14} />
+				<Icon aria-hidden="true" size={16} />
 			</div>
 			{linked
 				? (
@@ -133,7 +136,7 @@ function CommentSystemEntry(
 			type="button"
 		>
 			<span className="chat-comment-notice-head">
-				<MessageForwardIcon aria-hidden="true" className="icon-first-line" size={14} />
+				<MessageForwardIcon aria-hidden="true" className="icon-first-line" size={16} />
 				<span>
 					Comment on <span className="chat-comment-notice-title">“{comment.excerpt}”</span>{" "}
 					sent to Chopin
@@ -270,12 +273,12 @@ function MessageBody(
 								title="Withdraw"
 								type="button"
 							>
-								<CloseIcon aria-hidden="true" size={14} />
+								<CloseIcon aria-hidden="true" size={16} />
 							</button>
 						)}
 				</div>
 			)}
-			{!message.queued && markers.onCardLink && markers.onRetryAnalysis && (
+			{ANALYSIS && !message.queued && markers.onCardLink && markers.onRetryAnalysis && (
 				<MessageMarkers
 					canEdit={!!markers.canEdit}
 					messageId={message.id}
@@ -408,7 +411,7 @@ export function Transcript(
 		onRetryJob?: (jobId: string) => Promise<void>;
 		decisions?: TranscriptDecisions;
 		empty?: string;
-		emptyHint?: { planner: boolean; references: boolean };
+		emptyHint?: { planner: boolean; references: boolean; automatic?: boolean };
 		researchOffers?: ResearchOfferControls;
 		entries: Chat.Entry[];
 		handle: string;
@@ -731,8 +734,10 @@ export function Transcript(
 							measure="short"
 							description={
 								<>
-									Talk it through with your collaborators.
-									{emptyHint.planner && (
+									{emptyHint.automatic
+										? "Talk it through with your collaborators and Chopin."
+										: "Talk it through with your collaborators."}
+									{emptyHint.planner && !emptyHint.automatic && (
 										<>
 											{" "}Mention{" "}
 											<strong className="font-medium text-text-secondary">@chopin</strong>{" "}
@@ -742,7 +747,7 @@ export function Transcript(
 									)}
 									{emptyHint.references && (
 										<>
-											{emptyHint.planner ? "" : " Use "}
+											{emptyHint.planner && !emptyHint.automatic ? "" : " Use "}
 											<strong className="font-medium text-text-secondary">#</strong>{" "}
 											to point at a document.
 										</>

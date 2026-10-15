@@ -11,7 +11,33 @@ import { parse } from "@chopin/dialect/parse";
 import { ulid } from "@chopin/dialect/ulid";
 import { validate } from "@chopin/dialect/validate";
 
+import { COACHING } from "./coaching";
 import { DIAGRAM_AUTHORING, plannerInstructions, PROMPT, WIREFRAME_AUTHORING } from "./planner";
+
+test("all Planner surfaces compose coaching once and preserve their question boundary", () => {
+	let workspaces: Parameters<typeof plannerInstructions>[2][] = [
+		undefined,
+		{ cwd: "/tmp/chopin-checkout", checkout: true },
+		{ cwd: "/tmp/chopin-scratch", checkout: false },
+		{ remote: true },
+	];
+	for (let workspace of workspaces) {
+		for (let routed of [false, true]) {
+			let prompt = plannerInstructions("octo-org/score", "Earlier context.", workspace, routed);
+			expect(prompt.split(COACHING)).toHaveLength(2);
+			expect(prompt.endsWith("Earlier context.")).toBe(true);
+			if (workspace) {
+				expect(prompt).toContain("Expiry is not an answer or approval");
+				expect(prompt).toContain(
+					"continue only independent work with explicitly provisional assumptions",
+				);
+				expect(prompt).not.toContain("proceed on your best judgement");
+			} else {
+				expect(prompt).toContain("You have no shell, checkout, host filesystem");
+			}
+		}
+	}
+});
 
 test("offers grounded optional diagrams with valid diagram and chart authoring examples", () => {
 	expect(PROMPT).toContain(DIAGRAM_AUTHORING);
@@ -60,6 +86,21 @@ test("a remote Planner learns where it runs and that its questions become Decisi
 	expect(prompt).not.toContain("You have no shell");
 	expect(prompt).not.toContain("Your working directory");
 	expect(prompt.endsWith("Earlier context.")).toBe(true);
+});
+
+test("a Planner with workflows says a Build's tasks show under Build, not as cards in Chat", () => {
+	for (
+		let workspace of [{ remote: true } as const, { cwd: "/tmp/chopin-test", checkout: false }]
+	) {
+		let prompt = plannerInstructions("octo-org/score", undefined, workspace).replace(/\s+/g, " ");
+		// Chat's cards are for the workflow runs the Planner starts; a Build has none.
+		expect(prompt).toContain("Chat shows a card for each workflow run you start");
+		expect(prompt).not.toContain("Chat shows a card for each run");
+		expect(prompt).toContain(
+			"A Build is not a workflow run, and Chat shows no card for a Build or its tasks",
+		);
+		expect(prompt).toContain("under **Build**, beside Decisions");
+	}
 });
 
 test("ordinary guidance supplies an executable numerical chart example", () => {
@@ -142,19 +183,19 @@ test("offers native composition recipes with valid table and Callout examples", 
 	]);
 });
 
-test("settles blocking opening choices before writing a first plan", () => {
-	expect(PROMPT).toContain(
-		"When a new room has no plan prose, settle genuinely blocking choices before writing the first draft",
-	);
-	expect(PROMPT.indexOf("settle genuinely blocking choices"))
-		.toBeLessThan(PROMPT.indexOf("The plan is yours to write"));
-	expect(PROMPT).toContain("Do not invent a question when repository evidence already settles it");
+test("permits grounded provisional prose while human choices remain open", () => {
+	expect(PROMPT).toContain("Usually place the question beside the relevant provisional prose");
+	expect(PROMPT).toContain("question never hides or replaces existing prose");
+	expect(PROMPT).not.toContain("settle genuinely blocking choices before writing the first draft");
+	expect(PROMPT).toContain("do not ask for permission to do ordinary document work");
 });
 
-test("gives genuinely blocking new-room questions an explicit empty placement", () => {
+test("keeps empty placement only for choices that prevent any grounded opening passage", () => {
 	expect(PROMPT).toContain(
-		"For genuinely blocking choices in a new empty room, call `read_plan` and pass its returned revision plus `blocks: []` for every question to `ask`.",
+		"If a grounded human choice must be asked before any passage can be written,",
 	);
+	expect(PROMPT).toContain("only when its block list is empty");
+	expect(PROMPT).toContain("`blocks: []` for that `ask` question");
 });
 
 test("asks existing and drafted non-blocking decisions beside their related prose", () => {

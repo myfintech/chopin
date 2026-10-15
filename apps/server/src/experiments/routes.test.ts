@@ -257,6 +257,10 @@ test("work runs on the clicker's own connection; scoped claims publish", async (
 		commit: "a".repeat(40),
 		label: "Laptop",
 	})).json();
+	// The link the connector prints opens the Machines page, at its canonical address.
+	expect(new URL(pair.url).pathname + new URL(pair.url).search).toBe(
+		`/machines?pairing=${pair.id}`,
+	);
 	expect(
 		(await request(`/api/connector/pairings/${pair.id}/claim`, { secret: "x".repeat(32) })).status,
 	).toBe(403);
@@ -267,7 +271,7 @@ test("work runs on the clicker's own connection; scoped claims publish", async (
 		await (await request(`/api/connector/pairings/${pair.id}/claim`, { secret: pair.secret }))
 			.json(),
 	).toEqual({ waiting: true });
-	expect(await authorized(pair.id, "alice")).toBe(`/connect?pairing=${pair.id}`);
+	expect(await authorized(pair.id, "alice")).toBe(`/machines?pairing=${pair.id}`);
 	let shown = await (await request(`/api/connector/pairings/${pair.id}`, undefined, alice.cookie))
 		.json();
 	expect(shown.connected).toBe("/documents/org/repo");
@@ -736,7 +740,7 @@ test(
 			expect(claimed?.connectionId).not.toBe(paired.connection.id);
 			expect(paths).toContain("/api/connector/connections");
 			expect(paths.filter(path => path.startsWith("/api/connector/pairings"))).toEqual([]);
-			expect(output).not.toContain("/connect?pairing=");
+			expect(output).not.toContain("?pairing=");
 		} finally {
 			connector.kill("SIGKILL");
 			await connector.exited;
@@ -1544,4 +1548,259 @@ test("the connector versions this server wants are public", async () => {
 	let response = await request("/api/connector/version");
 	expect(response.status).toBe(200);
 	expect(await response.json()).toEqual({ protocol: CONNECTOR_PROTOCOLS, version: "0.1.3" });
+});
+
+test("a person chooses which of their machines runs a document's work, and back to automatic", async () => {
+	let { alice, bob, documentId, request, pair, tool, storage } = await setup();
+	let laptop = await pair(alice.cookie);
+	let buildBox = await pair(alice.cookie);
+	// The background service runs it, as its connection says.
+	let service = await (await request(
+		"/api/connector/connections",
+		{ repository: "org/repo", commit: "a".repeat(40), label: "Laptop" },
+		undefined,
+		buildBox.machineToken,
+		{ ...CURRENT, [CONNECTOR_SERVICE_HEADER]: "1" },
+	)).json();
+	await tool(buildBox.token, "disconnect_workspace", {});
+	await request(
+		`/api/connector/machines/${buildBox.machine}/label`,
+		{ label: "build-box" },
+		alice.cookie,
+	);
+	let path = `/api/documents/${documentId}/machine`;
+	let shown = await (await request(path, undefined, alice.cookie)).json();
+	expect(shown.choice).toBeNull();
+	expect(shown.automatic).toMatchObject({ id: expect.any(String) });
+	expect(shown.machines.map((item: { label: string }) => item.label).sort()).toEqual([
+		"Laptop",
+		"build-box",
+	]);
+	expect(shown.machines.every((item: { connected: boolean }) => item.connected)).toBe(true);
+	// Only the caller's own machine, and only one serving the document's repository.
+	let bobs = await pair(bob.cookie);
+	expect((await request(path, { machine: bobs.machine }, alice.cookie)).status).toBe(404);
+	let elsewhere = await pair(alice.cookie, "org/other");
+	let unserved = await request(path, { machine: elsewhere.machine }, alice.cookie);
+	expect(unserved.status).toBe(409);
+	expect((await unserved.json()).error).toBe("repository-unserved");
+	expect((await request(path, { machine: buildBox.machine }, alice.cookie)).status).toBe(200);
+	let chosen = await (await request(path, undefined, alice.cookie)).json();
+	expect(chosen.choice).toBe(buildBox.machine);
+	// Automatic still says what it would use, for the menu's Automatic row.
+	expect(chosen.automatic).toMatchObject({ id: expect.any(String), label: expect.any(String) });
+	// Stored, so a restarted server keeps it; bob's own choice is untouched.
+	expect(await storage.machines.choices()).toContainEqual({
+		channelId: documentId,
+		userId: "alice",
+		machineId: buildBox.machine,
+	});
+	expect((await (await request(path, undefined, bob.cookie)).json()).choice).toBeNull();
+
+	// Run goes to the chosen machine even though the laptop was used last.
+	let run = async () => {
+		let id = crypto.randomUUID();
+		await request(
+			`/api/documents/${documentId}/experiments`,
+			{ id, brief: "Measure" },
+			alice.cookie,
+		);
+		return {
+			id,
+			response: await request(
+				`/api/documents/${documentId}/experiments/${id}/run`,
+				{},
+				alice.cookie,
+			),
+		};
+	};
+	expect((await run()).response.status).toBe(200);
+	let offered = text(await tool(service.token, "wait_for_experiment", {}));
+	expect(offered.id).toBeString();
+	expect(error(await tool(laptop.token, "claim_experiment", { id: offered.id })))
+		.toStartWith("connection-forbidden");
+
+	// An offline chosen machine is never silently replaced by another.
+	await tool(service.token, "disconnect_workspace", {});
+	let offline = (await run()).response;
+	expect(offline.status).toBe(409);
+	expect(await offline.json()).toEqual({
+		error: "machine-offline",
+		message: "build-box is offline. Start chopin connect on it, or choose another machine.",
+	});
+	let listed = await (await request(path, undefined, alice.cookie)).json();
+	expect(listed.machines.find((item: { id: string }) => item.id === buildBox.machine))
+		.toMatchObject({ connected: false, service: true });
+
+	expect((await request(path, { machine: null }, alice.cookie)).status).toBe(200);
+	expect((await run()).response.status).toBe(200);
+	expect((await (await request(path, undefined, alice.cookie)).json()).automatic.id).toBe(
+		laptop.machine,
+	);
+});
+
+test("a machine choice that cannot be read refuses the document's work, never another machine", async () => {
+	let first = await setup();
+	let a = await first.pair(first.alice.cookie);
+	let b = await first.pair(first.alice.cookie);
+	let documentId = first.documentId;
+	let path = `/api/documents/${documentId}/machine`;
+	expect((await first.request(path, { machine: a.machine }, first.alice.cookie)).status).toBe(200);
+	// The server restarts while machine_choices is locked: every read times out (PostgreSQL 57014).
+	let machines = first.storage.machines;
+	let read = machines.choices.bind(machines);
+	let fault = { locked: true, reads: 0 };
+	machines.choices = async () => {
+		fault.reads++;
+		if (fault.locked) throw new Error("canceling statement due to statement timeout");
+		return read();
+	};
+	let restarted = await setup({ storage: first.storage, lease: first.lease });
+	let { alice, request, runtime } = restarted;
+	// Only machine B is connected; machine A, the one chosen, is offline.
+	let onB = await (await restarted.open(b.machineToken)).json();
+	let unreadable = {
+		error: "machine-choice-unavailable",
+		message: "Can't read your machine choice right now. Try again.",
+	};
+	let shown = await request(path, undefined, alice.cookie);
+	expect(shown.status).toBe(503);
+	expect(await shown.json()).toEqual(unreadable);
+	// Choosing needs the stored choices too.
+	expect((await request(path, { machine: b.machine }, alice.cookie)).status).toBe(503);
+	let id = crypto.randomUUID();
+	await request(`/api/documents/${documentId}/experiments`, { id, brief: "Measure" }, alice.cookie);
+	let runPath = `/api/documents/${documentId}/experiments/${id}/run`;
+	let before = fault.reads;
+	let refused = await request(runPath, {}, alice.cookie);
+	expect(refused.status).toBe(503);
+	expect(await refused.json()).toEqual(unreadable);
+	// A short, bounded retry for the request, not a stall.
+	expect(fault.reads - before).toBeGreaterThan(1);
+	expect(fault.reads - before).toBeLessThanOrEqual(3);
+	// Nothing reached machine B, and automatic work (rebuilds, prototypes) does not pick it.
+	expect((await runtime.service.store.get(id))?.connectionId).toBeUndefined();
+	let connection = runtime.connections.get(onB.connection.id)!;
+	expect(runtime.connections.allows(documentId, connection)).toBe(false);
+	expect(runtime.connections.candidates("repo", "alice", documentId)).toEqual([]);
+
+	// Once the choices can be read again, machine A applies: offline, so B still gets nothing.
+	fault.locked = false;
+	let recovered = await (await request(path, undefined, alice.cookie)).json();
+	expect(recovered.choice).toBe(a.machine);
+	let offline = await request(runPath, {}, alice.cookie);
+	expect(offline.status).toBe(409);
+	expect((await offline.json()).error).toBe("machine-offline");
+	expect(runtime.connections.allows(documentId, connection)).toBe(false);
+	let onA = await (await restarted.open(a.machineToken)).json();
+	expect((await request(runPath, {}, alice.cookie)).status).toBe(200);
+	expect((await runtime.service.store.get(id))?.connectionId).toBe(onA.connection.id);
+});
+
+test("Automatic prefers the person's favorite machine where it serves the document, never over a choice", async () => {
+	let { alice, bob, documentId, request, pair, open, tool, runtime } = await setup();
+	let laptop = await pair(alice.cookie);
+	let desk = await pair(alice.cookie);
+	let path = `/api/documents/${documentId}/machine`;
+	let favor = (machine: string, favorite: boolean, cookie = alice.cookie) =>
+		request(`/api/connector/machines/${machine}/favorite`, { favorite }, cookie);
+	let run = async () => {
+		let id = crypto.randomUUID();
+		await request(
+			`/api/documents/${documentId}/experiments`,
+			{ id, brief: "Measure" },
+			alice.cookie,
+		);
+		let response = await request(
+			`/api/documents/${documentId}/experiments/${id}/run`,
+			{},
+			alice.cookie,
+		);
+		return { status: response.status, body: await response.json(), id };
+	};
+	let ranOn = async (value: { id: string }) =>
+		(await runtime.service.store.get(value.id))?.connectionId;
+	// The laptop last worked on the document, which Automatic would use without a favorite.
+	expect((await request(path, { machine: laptop.machine }, alice.cookie)).status).toBe(200);
+	expect(await ranOn(await run())).toBe(laptop.connection.id);
+	expect((await request(path, { machine: null }, alice.cookie)).status).toBe(200);
+	expect((await (await request(path, undefined, alice.cookie)).json()).automatic)
+		.toMatchObject({ id: laptop.machine, favorite: false });
+
+	// Only the owner favors their own machine.
+	expect((await favor(desk.machine, true, bob.cookie)).status).toBe(404);
+	let favored = await favor(desk.machine, true);
+	expect(favored.status).toBe(200);
+	expect(await favored.json()).toEqual({ favorite: desk.machine });
+	let shown = await (await request(path, undefined, alice.cookie)).json();
+	expect(shown.favorite).toBe(desk.machine);
+	expect(shown.automatic).toMatchObject({ id: desk.machine, favorite: true });
+	let listed = await (await request("/api/connector/machines", undefined, alice.cookie)).json();
+	expect(
+		listed.machines.map((item: { id: string; favorite: boolean }) => [item.id, item.favorite]),
+	).toEqual(expect.arrayContaining([[desk.machine, true], [laptop.machine, false]]));
+	// The favorite beats the machine last used for the document.
+	expect(await ranOn(await run())).toBe(desk.connection.id);
+
+	// An offline favorite: Automatic falls back to today's rule.
+	await tool(desk.token, "disconnect_workspace", {});
+	expect(await ranOn(await run())).toBe(laptop.connection.id);
+	expect((await (await request(path, undefined, alice.cookie)).json()).automatic)
+		.toMatchObject({ id: laptop.machine, favorite: false });
+
+	// A favorite that serves another repository is ignored here.
+	let elsewhere = await pair(alice.cookie, "org/other");
+	expect((await favor(elsewhere.machine, true)).status).toBe(200);
+	expect(await ranOn(await run())).toBe(laptop.connection.id);
+
+	// A choice for the document beats the favorite, and an offline choice never falls back to it.
+	let back = await (await open(desk.machineToken)).json();
+	expect((await favor(desk.machine, true)).status).toBe(200);
+	expect(await ranOn(await run())).toBe(back.connection.id);
+	expect((await request(path, { machine: laptop.machine }, alice.cookie)).status).toBe(200);
+	expect(await ranOn(await run())).toBe(laptop.connection.id);
+	await tool(laptop.token, "disconnect_workspace", {});
+	let refused = await run();
+	expect(refused.status).toBe(409);
+	expect(refused.body.error).toBe("machine-offline");
+
+	// Clearing it, or revoking the machine, leaves no favorite.
+	expect(await (await favor(desk.machine, false)).json()).toEqual({ favorite: null });
+	expect((await favor(desk.machine, true)).status).toBe(200);
+	await request(`/api/connector/machines/${desk.machine}/revoke`, {}, alice.cookie);
+	expect((await (await request(path, undefined, alice.cookie)).json()).favorite).toBeNull();
+	expect((await favor(desk.machine, true)).status).toBe(404);
+});
+
+test("a favorite that cannot be read refuses the work rather than guess", async () => {
+	let first = await setup();
+	let desk = await first.pair(first.alice.cookie);
+	await first.request(
+		`/api/connector/machines/${desk.machine}/favorite`,
+		{ favorite: true },
+		first.alice.cookie,
+	);
+	let machines = first.storage.machines;
+	let read = machines.favorites.bind(machines);
+	let fault = { locked: true };
+	machines.favorites = async () => {
+		if (fault.locked) throw new Error("canceling statement due to statement timeout");
+		return read();
+	};
+	let restarted = await setup({ storage: first.storage, lease: first.lease });
+	let laptop = await restarted.pair(restarted.alice.cookie);
+	let path = `/api/documents/${first.documentId}/machine`;
+	let shown = await restarted.request(path, undefined, restarted.alice.cookie);
+	expect(shown.status).toBe(503);
+	expect((await shown.json()).error).toBe("machine-choice-unavailable");
+	expect(
+		(await restarted.request(
+			`/api/connector/machines/${laptop.machine}/favorite`,
+			{ favorite: true },
+			restarted.alice.cookie,
+		)).status,
+	).toBe(503);
+	fault.locked = false;
+	expect((await (await restarted.request(path, undefined, restarted.alice.cookie)).json()).favorite)
+		.toBe(desk.machine);
 });

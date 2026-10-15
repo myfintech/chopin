@@ -2,7 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { findAgent } from "../packages/protocol/agents";
+import { AGENTS, findAgent } from "../packages/protocol/agents";
 import {
 	CONNECTOR_AGENT_HEADER,
 	CONNECTOR_AGENT_VERSION_HEADER,
@@ -17,11 +17,21 @@ import { compiledChopin } from "../apps/connector/src/testing/binary";
 import { assets, fakeRelease } from "../apps/connector/src/testing/release";
 import { agentCommand, setupCommand } from "../apps/web/src/experiments/setup-commands";
 import { expect, test } from "./room";
+import { RELEASE } from "./release";
 import { ROOT } from "./servers";
 
 import type { Page } from "@playwright/test";
 
 const PHONE = { hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } };
+/** Set to a directory to keep the screenshots a pull request shows. */
+const SHOTS = process.env.CHOPIN_SHOTS;
+
+async function shot(page: Page, name: string) {
+	if (!SHOTS) return;
+	await mkdir(SHOTS, { recursive: true });
+	await new Promise(resolve => setTimeout(resolve, 400));
+	await page.screenshot({ path: `${SHOTS}/${name}.png` });
+}
 const RELEASES = "https://github.com/githubnext/chopin/releases/latest/download";
 const KEY = /chopin_k_[A-Za-z0-9_-]{43}/;
 
@@ -141,7 +151,7 @@ function keyRequests(page: Page) {
 	return made;
 }
 
-const PAIRING_LINK = /http:\/\/[^\s]+\/connect\?pairing=[\w-]+/;
+const PAIRING_LINK = /http:\/\/[^\s]+\/machines\?pairing=[\w-]+/;
 
 test("your computer: one copied command installs chopin, prints a link, and pairs once approved here", async ({ baseURL, join: enter }) => {
 	test.setTimeout(240_000);
@@ -150,7 +160,7 @@ test("your computer: one copied command installs chopin, prints a link, and pair
 	let minted = keyRequests(page);
 	let entry = machinesEntry(page, "Machines, none connected");
 	await entry.click();
-	await expect(page).toHaveURL(/\/connect$/);
+	await expect(page).toHaveURL(/\/machines$/);
 	await expect(entry).toHaveAttribute("aria-current", "page");
 	await expect(page.getByRole("link", { name: "Learn more", exact: true }))
 		.toHaveAttribute("href", /docs\/chopin-cli\.md$/);
@@ -170,12 +180,13 @@ test("your computer: one copied command installs chopin, prints a link, and pair
 	await dialog.getByRole("button", { name: "Linux", exact: true }).click();
 	let picker = dialog.getByRole("combobox", { name: "Coding agent", exact: true });
 	await expect(picker).toHaveValue("copilot");
+	// The built-in agents, Copilot CLI first.
+	await expect(picker.locator("option")).toHaveText(["GitHub Copilot CLI", "Atomic"]);
 	await expect.poll(command).toBe(setupCommand(origin, "sh", findAgent("copilot")));
 	await dialog.getByRole("button", { name: "Windows", exact: true }).click();
 	await expect.poll(command).toBe(setupCommand(origin, "powershell", findAgent("copilot")));
-	await picker.selectOption({ label: "Claude Code" });
-	await expect(dialog.getByText(/Keep the terminal open\./)).toBeVisible();
-	await expect.poll(command).toBe(setupCommand(origin, "powershell", findAgent("claude-code")));
+	await picker.selectOption({ label: "Atomic" });
+	await expect.poll(command).toBe(setupCommand(origin, "powershell", findAgent("atomic")));
 	await picker.selectOption({ label: "GitHub Copilot CLI" });
 	await dialog.getByRole("button", { name: "macOS", exact: true }).click();
 	await expect.poll(command).toBe(setupCommand(origin, "sh", findAgent("copilot")));
@@ -234,9 +245,9 @@ test("server or VM: a generated script pairs with its single-use key, automatic 
 	test.setTimeout(240_000);
 	let page = await enter(person());
 	let minted = keyRequests(page);
-	await page.goto("/connect");
+	await page.goto("/machines");
 	await addMachine(page, "Server or VM");
-	await expect(page).toHaveURL(/\/connect\?server$/);
+	await expect(page).toHaveURL(/\/machines\?server$/);
 	await expect(page.getByRole("heading", { level: 1 })).toHaveText("Add a server");
 	await expect(page.getByText("Choose settings, then generate an install script.")).toBeVisible();
 	// Opening the page makes no key; Generate does.
@@ -248,25 +259,22 @@ test("server or VM: a generated script pairs with its single-use key, automatic 
 	});
 	await expect(background).toHaveAttribute("aria-checked", "true");
 	await expect(automatic).toHaveAttribute("aria-checked", "false");
-	// An agent that asks permission in the terminal runs there.
-	let picker = page.getByRole("combobox", { name: "Coding agent", exact: true });
-	await picker.selectOption({ label: "Claude Code" });
-	await expect(background).toBeDisabled();
-	await expect(background).toHaveAttribute("aria-checked", "false");
-	await expect(page.getByText(/^Claude Code asks for permission in the terminal/)).toBeVisible();
-	await picker.selectOption({ label: "GitHub Copilot CLI" });
-	await expect(background).toHaveAttribute("aria-checked", "true");
 	await automatic.click();
 	await expect(automatic).toHaveAttribute("aria-checked", "true");
+	// The machine's name is optional; the field says the hostname stands in without one.
+	let name = page.getByRole("textbox", { name: "Machine name", exact: true });
+	await expect(name).toHaveValue("");
+	await expect(name).toHaveAttribute("placeholder", "hostname");
+	await name.fill("ci-runner");
 	await page.getByRole("button", { name: "Linux", exact: true }).click();
 
 	// GitHub authorizes the next machine and comes straight back, and the page makes the key.
 	await page.getByRole("button", { name: "Generate install script", exact: true }).click();
 	let copy = page.getByRole("button", { name: "Copy install script", exact: true });
 	await expect(copy).toBeVisible({ timeout: 30_000 });
-	await expect(page).toHaveURL(/\/connect\?server$/);
+	await expect(page).toHaveURL(/\/machines\?server$/);
 	await expect(automatic).toHaveAttribute("aria-checked", "true");
-	await expect(page.getByText(/^Single use · expires in 10 min$/)).toBeVisible();
+	await expect(page.getByText(/^Works once and expires in 10 min$/)).toBeVisible();
 	let shown = async () => {
 		let text = await page.locator(".machines-run pre code").innerText();
 		return { text, key: text.match(KEY)?.[0] };
@@ -277,10 +285,15 @@ test("server or VM: a generated script pairs with its single-use key, automatic 
 	await expect.poll(async () => (await shown()).key).not.toBe(first);
 	let { text: command, key } = await shown();
 	let origin = new URL(baseURL!).origin;
-	expect(command).toBe(setupCommand(origin, "sh", findAgent("copilot"), { key: key! }));
+	expect(command).toBe(
+		setupCommand(origin, "sh", findAgent("copilot"), { key: key!, name: "ci-runner" }),
+	);
+	expect(command).toContain(" connect --name ci-runner --install-service ");
 	await page.getByRole("button", { name: "Windows", exact: true }).click();
 	await expect.poll(async () => (await shown()).text)
-		.toBe(setupCommand(origin, "powershell", findAgent("copilot"), { key: key! }));
+		.toBe(
+			setupCommand(origin, "powershell", findAgent("copilot"), { key: key!, name: "ci-runner" }),
+		);
 	await page.getByRole("button", { name: "Linux", exact: true }).click();
 	// The key stays out of the address and the browser's storage.
 	expect(page.url()).not.toContain(key!);
@@ -294,20 +307,20 @@ test("server or VM: a generated script pairs with its single-use key, automatic 
 		// Pasted on the machine as it is: it pairs at once, with nothing opened in a browser.
 		expect(await server.run(command), server.output()).toBe(0);
 		expect(server.output()).not.toContain(key!);
-		expect(server.output()).not.toContain("/connect?pairing=");
+		expect(server.output()).not.toContain("?pairing=");
 		expect(server.output()).toContain("Installed the chopin service");
 
 		await expect(page.getByText(hostname())).toHaveCount(0);
 		await expect.poll(
 			() =>
 				page.evaluate(async () => (await (await fetch("/api/connector/machines")).json()).machines),
-		).toMatchObject([{ label: hostname(), autoRun: true }]);
+		).toMatchObject([{ label: "ci-runner", hostname: hostname(), autoRun: true }]);
 
 		// Back on Machines, the machine is in the table.
 		await page.getByRole("link", { name: "Back to Machines", exact: true }).click();
-		await expect(page).toHaveURL(/\/connect$/);
+		await expect(page).toHaveURL(/\/machines$/);
 		let row = page.getByRole("table", { name: "Your machines" })
-			.getByRole("row", { name: new RegExp(hostname()) });
+			.getByRole("row", { name: /ci-runner/ });
 		await expect(row).toContainText("Connected", { timeout: 30_000 });
 		await expect(row).not.toContainText("New");
 
@@ -322,7 +335,7 @@ test("server or VM: a generated script pairs with its single-use key, automatic 
 
 test("a phone wraps every command in view", async ({ join: enter }) => {
 	let page = await enter(person(), PHONE);
-	await page.goto("/connect");
+	await page.goto("/machines");
 	await addMachine(page, "Your computer", true);
 	let dialog = page.getByRole("dialog", { name: "Add your computer", exact: true });
 	await expect(dialog.getByRole("button", { name: "Copy setup command", exact: true }))
@@ -332,7 +345,7 @@ test("a phone wraps every command in view", async ({ join: enter }) => {
 	await dialog.getByRole("button", { name: "Show install command", exact: true }).click();
 	for (let system of ["Linux", "Windows"]) {
 		await dialog.getByRole("button", { name: system, exact: true }).click();
-		for (let id of ["copilot", "atomic", "claude-code", "codex", "gemini"]) {
+		for (let { id } of AGENTS) {
 			await dialog.getByRole("combobox", { name: "Coding agent", exact: true }).selectOption(id);
 			for (let well of await dialog.locator(".machines-command pre").all()) {
 				expect(await well.evaluate(pre => pre.scrollWidth - pre.clientWidth)).toBe(0);
@@ -345,7 +358,7 @@ test("a phone wraps every command in view", async ({ join: enter }) => {
 
 const CONNECTOR = {
 	[CONNECTOR_PROTOCOL_HEADER]: String(CONNECTOR_PROTOCOL),
-	[CONNECTOR_VERSION_HEADER]: "0.0.5",
+	[CONNECTOR_VERSION_HEADER]: RELEASE,
 };
 
 /**
@@ -355,7 +368,7 @@ const CONNECTOR = {
 async function pairedMachine(page: Page, label: string, about?: Record<string, string>) {
 	let origin = new URL(page.url()).origin;
 	await page.goto("/auth/github/connector?key");
-	await expect(page).toHaveURL(/\/connect\?server$/);
+	await expect(page).toHaveURL(/\/machines\?server$/);
 	let minted = await (await page.request.post("/api/connector/pairing-keys", {
 		data: {},
 		headers: { origin },
@@ -391,11 +404,11 @@ async function threeMachines(page: Page) {
 	await pairedMachine(page, "studio", {
 		[CONNECTOR_HOST_HEADER]: "studio.local",
 		[CONNECTOR_PLATFORM_HEADER]: "darwin arm64",
-		[CONNECTOR_AGENT_HEADER]: "Claude Code",
+		[CONNECTOR_AGENT_HEADER]: "Atomic",
 		[CONNECTOR_AGENT_VERSION_HEADER]: "0.12.3",
 	});
 	await pairedMachine(page, "old-laptop");
-	await page.goto("/connect");
+	await page.goto("/machines");
 }
 
 test("the machines table: search, Tailscale's columns, a row's menu and renaming", async ({ join: enter }) => {
@@ -406,10 +419,12 @@ test("the machines table: search, Tailscale's columns, a row's menu and renaming
 	for (let heading of ["Machine", "Host", "Version", "Agent", "Last seen"]) {
 		await expect(table.getByRole("columnheader", { name: heading, exact: true })).toBeVisible();
 	}
-	let row = (name: string) => table.getByRole("row", { name: new RegExp(`^${name}`) });
+	// A row's name starts with its favorite star's.
+	let row = (name: string) =>
+		table.getByRole("row", { name: new RegExp(`^(Favorite |Remove )?${name}`) });
 	await expect(row("build-box")).toContainText("Service");
 	await expect(row("build-box")).toContainText("build-box.internal");
-	await expect(row("build-box")).toContainText("chopin 0.0.5");
+	await expect(row("build-box")).toContainText(`chopin ${RELEASE}`);
 	await expect(row("build-box")).toContainText("Linux arm64");
 	await expect(row("build-box")).toContainText("GitHub Copilot CLI 1.0.97");
 	await expect(row("build-box")).toContainText("Connected");
@@ -420,7 +435,7 @@ test("the machines table: search, Tailscale's columns, a row's menu and renaming
 
 	// Search narrows the table, by name, repository, system or agent alike.
 	let search = page.getByRole("searchbox", { name: "Search machines" });
-	await search.fill("claude");
+	await search.fill("atomic");
 	await expect(page.getByText("1 of 3 machines", { exact: true })).toBeVisible();
 	await expect(table.getByRole("row")).toHaveCount(2);
 	await search.fill("");
@@ -430,6 +445,7 @@ test("the machines table: search, Tailscale's columns, a row's menu and renaming
 	let menu = page.getByRole("menu", { name: "Actions for build-box" });
 	await expect(menu.getByRole("menuitem")).toHaveText([
 		"Edit machine name…",
+		"Set as favorite",
 		"Disconnect machine…",
 	]);
 	await menu.getByRole("menuitem", { name: "Edit machine name…" }).click();
@@ -450,23 +466,23 @@ test("the machines table: search, Tailscale's columns, a row's menu and renaming
 
 test("on a phone, machines are rows that open their own view, where they rename", async ({ join: enter }) => {
 	let page = await enter(person(), PHONE);
-	await page.goto("/connect");
+	await page.goto("/machines");
 	await expect(page.getByRole("region", { name: "Add your first machine", exact: true }))
 		.toBeVisible();
 	await expect(page.getByRole("searchbox", { name: "Search machines" })).toHaveCount(0);
 	await threeMachines(page);
 	let rows = page.getByRole("region", { name: /^@mia-/ });
-	await expect(rows.getByRole("button")).toHaveCount(3);
+	await expect(rows.locator(".machines-row")).toHaveCount(3);
 	await expect(rows.getByRole("img", { name: "Connected" })).toHaveCount(2);
 	await expect(rows.getByRole("img", { name: /^Last seen/ })).toHaveCount(1);
-	await expect(rows.getByRole("button", { name: /build-box/ }))
-		.toContainText("build-box.internal · chopin 0.0.5 · Linux");
+	await expect(rows.locator(".machines-row").filter({ hasText: "build-box" }))
+		.toContainText(`build-box.internal chopin ${RELEASE} Linux`);
 	await page.getByRole("searchbox", { name: "Search machines" }).fill("studio");
-	await expect(rows.getByRole("button")).toHaveCount(1);
+	await expect(rows.locator(".machines-row")).toHaveCount(1);
 	await page.getByRole("searchbox", { name: "Search machines" }).fill("");
 
-	await rows.getByRole("button", { name: /build-box/ }).click();
-	await expect(page).toHaveURL(/\/connect\?machine=/);
+	await rows.locator(".machines-row").filter({ hasText: "build-box" }).click();
+	await expect(page).toHaveURL(/\/machines\?machine=/);
 	await expect(page.getByRole("heading", { level: 1 })).toHaveText("build-box");
 	// The state shows once, in the Status row, not again under the name.
 	await expect(page.locator(".machines-description")).toHaveCount(0);
@@ -481,6 +497,142 @@ test("on a phone, machines are rows that open their own view, where they rename"
 	await expect(page.getByRole("heading", { level: 1 })).toHaveText("Build box");
 
 	await page.getByRole("button", { name: "Machines", exact: true }).click();
-	await expect(page).toHaveURL(/\/connect$/);
-	await expect(rows.getByRole("button", { name: /Build box/ })).toBeVisible();
+	await expect(page).toHaveURL(/\/machines$/);
+	await expect(rows.locator(".machines-row").filter({ hasText: "Build box" })).toBeVisible();
+});
+
+test("a favorite machine: its star in the table and the row menu, one at a time", async ({ join: enter }) => {
+	let page = await enter(person());
+	await threeMachines(page);
+	let table = page.getByRole("table", { name: "Your machines" });
+	let row = (name: string) =>
+		table.getByRole("row", { name: new RegExp(`^(Favorite |Remove )?${name}`) });
+	let star = row("studio").getByRole("button", { name: "Favorite studio" });
+	await expect(star).toHaveAttribute("aria-pressed", "false");
+	// The outline waits for the row's hover or focus.
+	expect(await star.evaluate(item => getComputedStyle(item).opacity)).toBe("0");
+	await row("studio").hover();
+	expect(await star.evaluate(item => getComputedStyle(item).opacity)).toBe("1");
+	await star.click();
+	await expect(row("studio").getByRole("button", { name: "Remove studio as favorite" }))
+		.toHaveAttribute("aria-pressed", "true");
+	// The row menu sets another, and only one is ever the favorite.
+	await row("build-box").getByRole("button", { name: "Actions for build-box" }).click();
+	await page.getByRole("menu", { name: "Actions for build-box" })
+		.getByRole("menuitem", { name: "Set as favorite" }).click();
+	await expect(row("build-box").getByRole("button", { name: "Remove build-box as favorite" }))
+		.toHaveAttribute("aria-pressed", "true");
+	await expect(row("studio").getByRole("button", { name: "Favorite studio" }))
+		.toHaveAttribute("aria-pressed", "false");
+	await expect(table.locator(".favorite-star[aria-pressed=true]")).toHaveCount(1);
+	await page.reload();
+	await expect(row("build-box").getByRole("button", { name: "Remove build-box as favorite" }))
+		.toBeAttached();
+	await row("build-box").getByRole("button", { name: "Actions for build-box" }).click();
+	await expect(
+		page.getByRole("menu", { name: "Actions for build-box" })
+			.getByRole("menuitem", { name: "Remove favorite" }),
+	).toBeVisible();
+	await page.keyboard.press("Escape");
+	await row("studio").hover();
+	await shot(page, "machines-table-favorite");
+});
+
+test("the sidebar's Machines menu sets the default machine and leads to the page", async ({ join: enter }) => {
+	let page = await enter(person());
+	await threeMachines(page);
+	let sidebar = page.getByRole("complementary", { name: "Projects" });
+	let entry = sidebar.getByRole("button", { name: /^Machines/ });
+	await entry.click();
+	let menu = page.getByRole("menu");
+	let option = (name: string) => menu.getByRole("menuitemradio", { name: new RegExp(`^${name}`) });
+	// Nothing is the default yet: any available machine runs the work.
+	await expect(option("Any available")).toHaveAttribute("aria-checked", "true");
+	await expect(option("studio")).toHaveAttribute("aria-checked", "false");
+	await option("studio").click();
+	await expect(menu).toBeHidden();
+	// The page's star agrees: the menu set the favorite, which Automatic prefers.
+	let table = page.getByRole("table", { name: "Your machines" });
+	await expect(table.getByRole("button", { name: "Remove studio as favorite" }))
+		.toHaveAttribute("aria-pressed", "true");
+	await entry.click();
+	await expect(option("studio")).toHaveAttribute("aria-checked", "true");
+	await option("Any available").click();
+	await expect(table.locator(".favorite-star[aria-pressed=true]")).toHaveCount(0);
+	// Manage machines is the way to the full page.
+	await page.goto("/");
+	await entry.click();
+	await menu.getByRole("menuitem", { name: "Manage machines" }).click();
+	await expect(page).toHaveURL(/\/machines$/);
+});
+
+test("on a phone, a machine's row has its star, and its view sets the favorite", async ({ join: enter }) => {
+	let page = await enter(person(), PHONE);
+	await threeMachines(page);
+	let rows = page.getByRole("region", { name: /^@mia-/ });
+	let star = rows.getByRole("button", { name: "Favorite studio" });
+	await expect(star).toBeVisible();
+	// A 44px target.
+	let box = (await star.boundingBox())!;
+	let reach = await page.evaluate(
+		([x, y]) => !!document.elementFromPoint(x!, y!)?.closest(".favorite-star"),
+		[
+			box.x + box.width / 2,
+			box.y + box.height / 2 + 21,
+		],
+	);
+	expect(reach).toBe(true);
+	await star.tap();
+	await expect(rows.getByRole("button", { name: "Remove studio as favorite" }))
+		.toHaveAttribute("aria-pressed", "true");
+	await expect(page).toHaveURL(/\/machines$/);
+	await shot(page, "phone-machines-favorite");
+	await rows.locator(".machines-row").filter({ hasText: "build-box" }).click();
+	await expect(page).toHaveURL(/\/machines\?machine=/);
+	let set = page.getByRole("button", { name: "Set as favorite" });
+	await expect(set).toHaveAttribute("aria-pressed", "false");
+	await set.click();
+	await expect(page.getByRole("button", { name: "Remove favorite" })).toHaveAttribute(
+		"aria-pressed",
+		"true",
+	);
+	await shot(page, "phone-machine-detail-favorite");
+	await page.getByRole("button", { name: "Machines", exact: true }).click();
+	await expect(rows.getByRole("button", { name: "Remove build-box as favorite" })).toBeVisible();
+	await expect(rows.getByRole("button", { name: "Favorite studio" })).toBeVisible();
+});
+
+test("a narrow window without touch lists machines as a phone does, not as a table", async ({ join: enter }) => {
+	let page = await enter(person(), { viewport: { width: 390, height: 844 } });
+	await page.goto("/machines");
+	await threeMachines(page);
+	let rows = page.getByRole("region", { name: /^@mia-/ });
+	let table = page.getByRole("table", { name: "Your machines" });
+	await expect(rows.locator(".machines-row")).toHaveCount(3);
+	await expect(table).toHaveCount(0);
+	await expect(page.getByRole("searchbox", { name: "Search machines" }))
+		.toHaveAttribute("placeholder", "Search");
+	// Nothing on the page scrolls sideways.
+	let sideways = () =>
+		page.evaluate(() =>
+			[...document.querySelectorAll<HTMLElement>("main, main *")].filter(item =>
+				item.scrollWidth > item.clientWidth + 1
+				&& ["auto", "scroll"].includes(getComputedStyle(item).overflowX)
+			).length
+		);
+	expect(await sideways()).toBe(0);
+	await shot(page, "narrow-machines-list");
+	// A row opens the machine's own view there too.
+	await rows.locator(".machines-row").filter({ hasText: "build-box" }).click();
+	await expect(page).toHaveURL(/\/machines\?machine=/);
+	await expect(page.getByRole("heading", { level: 1 })).toHaveText("build-box");
+	await page.getByRole("button", { name: "Machines", exact: true }).click();
+	await expect(page).toHaveURL(/\/machines$/);
+
+	// Wider than a phone, the table returns.
+	await page.setViewportSize({ width: 1024, height: 844 });
+	await expect(table).toBeVisible();
+	await expect(rows.locator(".machines-row")).toHaveCount(0);
+	await page.setViewportSize({ width: 390, height: 844 });
+	await expect(rows.locator(".machines-row")).toHaveCount(3);
 });

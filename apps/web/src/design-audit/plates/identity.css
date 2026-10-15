@@ -1,0 +1,21 @@
+.design-audit-identity-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+	gap: 1rem;
+}
+
+.design-audit-identity-sample {
+	display: grid;
+	align-content: start;
+	gap: 0.5rem;
+}
+
+.design-audit-identity-row {
+	display: flex;
+	min-height: 2.5rem;
+	align-items: center;
+	border-radius: var(--radius-lg);
+	background: var(--color-page);
+	box-shadow: var(--shadow-resting);
+	padding: 0.5rem 0.75rem;
+}

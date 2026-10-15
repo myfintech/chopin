@@ -1,5 +1,8 @@
 import { registerImplementationRoutes } from "./tasks/routes";
 import { draftInstruction, draftRefusal } from "./tasks/draft";
+import { planningReadiness } from "./tasks/plan-graphs";
+import { READINESS_INSTRUCTION } from "./tasks/readiness-instruction";
+import { ReadinessReviews } from "./tasks/readiness-review";
 /**
  * The server.
  *
@@ -10,13 +13,14 @@ import { draftInstruction, draftRefusal } from "./tasks/draft";
  */
 
 import { join } from "node:path";
-import { ulid } from "@chopin/dialect";
+import { parse, ulid } from "@chopin/dialect";
 
 import { harnessFor, shutdownHarnesses } from "./harness/harnesses";
 import {
-	admitPlannerLink,
-	isPlannerLinkSocket,
-	openPlannerLinkSocket,
+	admitAgent,
+	AGENT_UPGRADE_HEADERS,
+	isAgentSocket,
+	openAgentSocket,
 } from "./harness/remote/endpoint";
 import { notAttachedMessage, PlannerAttachments } from "./harness/remote/attachments";
 import { MachinePlanners } from "./harness/remote/machine-planners";
@@ -29,12 +33,14 @@ import type { ExperimentRuntime } from "./experiments/routes";
 import type { Instruction, ServerInstructionDeps } from "./chat/server-instruction";
 import { fingerprint } from "./experiments/service";
 import * as Chat from "./chat/service";
+import * as Initiative from "./chat/initiative";
 import { createChildDocuments } from "./chat/children";
 import { createRootChat } from "./chat/root";
 import { serverInstruction as runServerInstruction } from "./chat/server-instruction";
 import { CHAT_CAPABILITIES, incomingFrame, sidebarFrame } from "./chat/incoming";
 import { ReferenceService } from "./chat/references";
 import { createConversationRuntime } from "./conversation-plan/runtime";
+import { createEditingUnlocked } from "./plan/editing-unlocked";
 import { researchBriefDefinition } from "./jobs/research-brief";
 import {
 	greetJoinedPlan,
@@ -52,6 +58,7 @@ import { describe, load } from "./config";
 import { GitHubClient, GitHubError } from "./github/client";
 import { GitHubReferences } from "./github/references";
 import { registerConnectorScript } from "./http/connector-script";
+import { registerMachinesPath } from "./http/machines-path";
 import { Router } from "./http/router";
 import { JobExecutionError, JobRegistry } from "./jobs/registry";
 import * as JobBrowser from "./jobs/browser";
@@ -103,10 +110,10 @@ import { createStorage } from "./storage/registry";
 import { WriterLease } from "./storage/writer-lease";
 import { broadcast, fail, relay, reply, repositoryTopic, tell, topic } from "./wire";
 
-import { LINK_CLOSE, PLANNER_LINK_PATH } from "@chopin/planner-link";
+import { AGENT_PATH, LINK_CLOSE } from "@chopin/agent-link";
 
 import type { Server, ServerWebSocket } from "bun";
-import type { PlannerLinkSocketData } from "./harness/remote/endpoint";
+import type { AgentSocketData } from "./harness/remote/endpoint";
 import type { RepositoryAuthorizer, WatchTopics } from "./socket/decision-watch";
 import type { DocumentSummaryInput } from "./jobs/document-summary";
 import type { JobDefinition } from "./jobs/registry";
@@ -167,6 +174,27 @@ let referenceService: ReferenceService | undefined;
 let summaryCoordinator: DocumentSummaryCoordinator | undefined;
 let liveSync: LiveSyncCoordinator | undefined;
 let buildReadiness: BuildReadiness | undefined;
+let readinessReviews = new ReadinessReviews({
+	list: id => experiments!.service.store.list(id),
+	start: (channelId, about) =>
+		startSettle(
+			{
+				instruction: serverInstructionDeps(),
+				channel: id => storage.channels.get(id),
+				attached: plannerAttachments ? id => plannerAttachments!.confirmed(id) : undefined,
+			},
+			channelId,
+			current => {
+				if (Service.implementationActive(current) || current.chat?.busy) return;
+				return {
+					handle: "Chopin",
+					said: "Checking decisions and investigations needed before building",
+					text: READINESS_INSTRUCTION,
+					about,
+				};
+			},
+		),
+});
 let spikeScout: SpikeScout | undefined;
 let descriptionProjector: DocumentDescriptionProjector | undefined;
 let researchBriefJobs: JobService | undefined;
@@ -239,6 +267,8 @@ function presence(server: Server<SocketData>, room: Rooms.Room): void {
 
 function documentBackend(): Service.Backend {
 	return {
+		documentTitles: true,
+		onChannelRenamed: announceChannel,
 		storage,
 		lease: () => {
 			if (!writerLease.held) throw new Error("storage writer lease is unavailable");
@@ -256,13 +286,14 @@ function documentBackend(): Service.Backend {
 		},
 		liveBuild: !!config.liveBuild,
 		onBuildStopped: id => liveSync?.stopped(id),
-		onEditingUnlocked: id => {
-			void relinkDecisions(id).catch(err =>
-				console.error("chopin: could not re-link decisions after a build -", err)
-			);
-			// Spike callouts the lock deferred land now.
-			void spikeScout?.refresh(id);
-		},
+		onEditingUnlocked: createEditingUnlocked({
+			withDocumentLock,
+			opened: id => Rooms.get(id)?.plan,
+			wake: opened => conversationRuntime.wake(opened),
+			relink: config.liveBuild ? relinkDecisions : undefined,
+			refreshSpikes: id => spikeScout?.refresh(id),
+			onError: (message, err) => console.error(message, err),
+		}),
 	};
 }
 
@@ -323,7 +354,13 @@ function settlePendingSpikes(channelId: string): void {
 
 /** Wake owner-bound work: background jobs and spike settlements that waited for an owner. */
 function ownerAvailable(channelId: string): Promise<void> {
+	let opened = Rooms.get(channelId)?.plan;
+	if (opened) conversationRuntime.wake(opened);
 	settlePendingSpikes(channelId);
+	void reviewCompletedInvestigations(channelId);
+	void currentDocumentTarget(channelId).then(target => {
+		if (target) buildReadiness?.schedule(target);
+	});
 	return jobRunner?.ownerAvailable(channelId) ?? Promise.resolve();
 }
 
@@ -335,7 +372,11 @@ function serverInstructionDeps(): ServerInstructionDeps {
 		transition: withDocumentTransition,
 		open: room => plan(room, server),
 		conversation,
-		instruct: (context, { handle, text, said }) => Chat.instruct(context, handle, text, said),
+		instruct: async (context, { handle, text, said, about }) => {
+			// This runs inside the document transition, after any archive has committed.
+			if (about?.readiness && (await storage.channels.get(context.room))?.archivedAt) return;
+			return Chat.instruct(context, handle, text, said, about);
+		},
 		evict,
 	};
 }
@@ -454,6 +495,7 @@ async function plan(room: Rooms.Room, server: Server<SocketData>): Promise<Servi
 	});
 	try {
 		let opened = await opening;
+		opened.chat.initiativeEnabled = config.agent && !opened.parentChannelId;
 		conversationRuntime.wake(opened);
 		return opened;
 	} finally {
@@ -486,6 +528,25 @@ function conversation(
 		auth: hostedAuth,
 		claimantSessionId,
 		repository,
+		initiativePresent: (sessionId, actor) => {
+			return Rooms.get(room.id) === room && room.plan === opened && !room.closing
+				&& !archivingChannels.has(room.id) && !deletingChannels.has(room.id)
+				&& [...room.members.values()].some(member =>
+					!member.data.closed && member.data.canEdit && member.data.sessionId === sessionId
+					&& Initiative.actor(member) === actor
+				);
+		},
+		initiativeAuthorize: async (sessionId, actor) => {
+			let member = [...room.members.values()].find(member =>
+				!member.data.closed && member.data.sessionId === sessionId
+				&& Initiative.actor(member) === actor
+			);
+			if (!member || await refreshAccess(member, true) !== "allowed") return false;
+			return !member.data.closed && member.data.canEdit
+				&& room.members.get(member.data.client) === member
+				&& Rooms.get(room.id) === room && room.plan === opened && !room.closing
+				&& !archivingChannels.has(room.id) && !deletingChannels.has(room.id);
+		},
 		plannerNotAttached: plannerAttachments
 			? async () => {
 				if (await plannerAttachments!.confirmed(room.id)) return undefined;
@@ -522,9 +583,18 @@ function conversation(
 			? {
 				async list() {
 					return {
-						investigations: (await experiments!.service.store.list(room.id)).slice(0, 20).map(
-							value => ({ id: value.id, brief: value.brief.slice(0, 400), state: value.state }),
-						),
+						investigations: (await experiments!.service.store.list(room.id))
+							.filter(value => !value.spike)
+							.sort((a, b) => Number(!!b.buildBlocker) - Number(!!a.buildBlocker))
+							.map(
+								value => ({
+									id: value.id,
+									brief: value.brief.slice(0, 400),
+									state: value.state,
+									revision: value.revision,
+									buildBlocker: value.buildBlocker,
+								}),
+							),
 					};
 				},
 				async read(id, dataset, offset = 0) {
@@ -554,6 +624,8 @@ function conversation(
 					}
 					return {
 						id: value.id,
+						revision: value.revision,
+						buildBlocker: value.buildBlocker,
 						state: value.state,
 						source: value.input?.source,
 						report: value.result?.report.slice(0, 16_000),
@@ -585,7 +657,14 @@ function conversation(
 					let id = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-a${
 						hash.slice(17, 20)
 					}-${hash.slice(20, 32)}`;
-					let value = await experiments!.service.create(room.id, request.userId, request.brief, id);
+					let value = await experiments!.service.create(
+						room.id,
+						request.userId,
+						request.brief,
+						id,
+						undefined,
+						request.buildBlocker,
+					);
 					let placed: InvestigationPlacement | "closing" | "unopened" | "locked";
 					try {
 						placed = await placeInvestigationReference(room.id, value.id, request.after);
@@ -623,6 +702,43 @@ function conversation(
 							? "The document is closing, so its card was not placed and the proposal was withdrawn. Propose it again once the document is open."
 							: "The document was not open to place its card, so the proposal was withdrawn. Propose it again while the document is open.",
 					};
+				},
+				async setBuildBlocker(request) {
+					await experiments!.access(
+						await hostedAuth.sessions.forUser(request.userId),
+						room.id,
+						true,
+					);
+					if (
+						deletingChannels.has(room.id) || archivingChannels.has(room.id)
+						|| Rooms.get(room.id)?.closing
+					) throw new Error("The document is closing");
+					return withDocumentLock(room.id, async () => {
+						await experiments!.mutationAllowed(room.id);
+						let plan = Rooms.get(room.id)?.plan;
+						if (!plan) throw new Error("The document is not open");
+						return Service.exclusive(plan, async () => {
+							if (
+								request.reason
+								&& !parse(Service.source(plan)).children.some(node =>
+									node.type === "mdxJsxFlowElement" && node.name === "Investigation"
+									&& node.attributes.some(attribute =>
+										"name" in attribute && attribute.name === "id" && attribute.value === request.id
+									)
+								)
+							) {
+								throw new Error(
+									"Place its investigation card in the document before requiring it for Build",
+								);
+							}
+							return experiments!.service.setBuildBlocker(
+								room.id,
+								request.id,
+								request.revision,
+								request.reason,
+							);
+						});
+					});
 				},
 			}
 			: undefined,
@@ -833,6 +949,8 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 		case "plan:open": {
 			try {
 				let opened = await plan(room, server);
+				let currentChannel = await storage.channels.get(room.id);
+				if (currentChannel) applyChannelAccess(ws, currentChannel, ws.data.canManage);
 				implementations?.track(room.id);
 				let parent = room.parentChannelId;
 				await greetJoinedPlan(
@@ -868,6 +986,22 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 			if (room.plan) Service.departed(room.plan, ws);
 			return;
 
+		case "chat:typing": {
+			if (!room.plan || room.plan.parentChannelId || typeof frame.active !== "boolean") return;
+			if (archivingChannels.has(room.id) || room.closing || ws.data.closed) return;
+			Initiative.initiative(chat(room, ws))?.typing(
+				ws.data.client,
+				Initiative.actor(ws),
+				frame.active,
+			);
+			return;
+		}
+
+		case "chat:participation":
+			if (!await plannerWritable(room, ws, frame.rid)) return;
+			await Initiative.setParticipation(chat(room, ws), ws, frame);
+			return;
+
 		case "chat:send":
 			try {
 				if (!await plannerWritable(room, ws, frame.rid)) return;
@@ -897,6 +1031,11 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 				let refusal = draftRefusal(opened);
 				if (refusal) {
 					fail(ws, frame.rid, refusal);
+					return;
+				}
+				let readiness = await planningReadiness(opened, opened.revision);
+				if (!readiness.ok) {
+					fail(ws, frame.rid, `Resolve ${readiness.blockers.join(" and ")} first`);
 					return;
 				}
 				let { text, said } = draftInstruction(opened, ws.data.handle, frame.build);
@@ -1118,7 +1257,7 @@ const VIEWER_ALLOWED = new Set([
 	"provenance:authorship",
 ]);
 
-type AnySocket = ServerWebSocket<SocketData | SidebarSocketData | PlannerLinkSocketData>;
+type AnySocket = ServerWebSocket<SocketData | SidebarSocketData | AgentSocketData>;
 
 function isSidebarSocket(ws: AnySocket): ws is SidebarSocket {
 	return ws.data.sidebar === true;
@@ -1420,6 +1559,8 @@ function closeRoomSocket(ws: Socket): void {
 	ws.unsubscribe(topic(ws.data.room));
 	if (!room) return;
 	if (room.plan) {
+		room.plan.chat.initiative?.depart(ws.data.client);
+		if (!room.members.size) room.plan.chat.initiative?.cancel();
 		Service.departed(room.plan, ws);
 		Questions.away(room.plan, ws);
 		conversationRuntime.processor(room.plan)?.leaveResearch(ws.data.client);
@@ -1437,19 +1578,20 @@ function closeSidebarSocket(ws: SidebarSocket): void {
 
 function upgraded(
 	req: Request,
-	self: Server<SocketData | SidebarSocketData | PlannerLinkSocketData>,
-	data: SocketData | SidebarSocketData | PlannerLinkSocketData,
+	self: Server<SocketData | SidebarSocketData | AgentSocketData>,
+	data: SocketData | SidebarSocketData | AgentSocketData,
+	headers?: HeadersInit,
 ): Response | undefined {
 	if (
 		req.headers.get("x-chopin-socket-probe") === "1"
 		&& req.headers.get("upgrade")?.toLowerCase() !== "websocket"
 	) return new Response(null, { status: 204 });
-	if (self.upgrade(req, { data })) return undefined;
+	if (self.upgrade(req, { data, headers })) return undefined;
 	return new Response("upgrade failed", { status: 400 });
 }
 
 function listen(): Server<SocketData> {
-	return Bun.serve<SocketData | SidebarSocketData | PlannerLinkSocketData>({
+	return Bun.serve<SocketData | SidebarSocketData | AgentSocketData>({
 		hostname: config.host,
 		port: config.port,
 
@@ -1466,15 +1608,15 @@ function listen(): Server<SocketData> {
 				}
 				return upgraded(req, self, outcome.data);
 			}
-			if (url.pathname === PLANNER_LINK_PATH) {
-				let outcome = await admitPlannerLink(
+			if (url.pathname === AGENT_PATH) {
+				let outcome = await admitAgent(
 					req,
 					hostedAuth,
 					!!plannerAttachments,
 					machinePlanners,
 				);
 				if (outcome instanceof Response) return outcome;
-				return upgraded(req, self, outcome);
+				return upgraded(req, self, outcome, AGENT_UPGRADE_HEADERS);
 			}
 			if (url.pathname === "/ws/sidebar") {
 				let outcome = await admitSidebar(req, hostedAuth);
@@ -1485,20 +1627,24 @@ function listen(): Server<SocketData> {
 			}
 			let routed = await router.handle(req, url);
 			if (routed) return routed;
+			// No other path takes a WebSocket; the web client's fallback page is no answer to one.
+			if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+				return new Response("not found", { status: 404 });
+			}
 
 			return config.devClient ? proxy(req, url, config.devClient) : serve(url, CLIENT);
 		},
 
 		websocket: {
 			open(ws: AnySocket) {
-				if (isPlannerLinkSocket(ws)) {
+				if (isAgentSocket(ws)) {
 					if (!plannerAttachments) return ws.close(LINK_CLOSE.failed, "unavailable");
-					openPlannerLinkSocket(ws, hostedAuth, {
+					openAgentSocket(ws, hostedAuth, {
 						attachments: plannerAttachments,
 						unavailable: channelId => deletingChannels.has(channelId),
-						pingEveryMs: config.plannerLinkPingMs,
-						pongTimeoutMs: config.plannerLinkTimeoutMs,
-						maxSilenceMs: config.plannerLinkMaxSilenceMs,
+						pingEveryMs: config.agentConnectionPingMs,
+						pongTimeoutMs: config.agentConnectionTimeoutMs,
+						maxSilenceMs: config.agentConnectionMaxSilenceMs,
 					});
 					return;
 				}
@@ -1509,7 +1655,7 @@ function listen(): Server<SocketData> {
 			},
 
 			message(ws: AnySocket, raw) {
-				if (isPlannerLinkSocket(ws)) {
+				if (isAgentSocket(ws)) {
 					ws.data.alive?.heard();
 					return ws.data.link?.receive(raw);
 				}
@@ -1522,13 +1668,13 @@ function listen(): Server<SocketData> {
 				});
 			},
 
-			// Only Planner links are pinged by the server itself; see openPlannerLinkSocket.
+			// Only agent connections are pinged by the server itself; see openAgentSocket.
 			pong(ws: AnySocket) {
-				if (isPlannerLinkSocket(ws)) ws.data.alive?.heard();
+				if (isAgentSocket(ws)) ws.data.alive?.heard();
 			},
 
 			close(ws: AnySocket) {
-				if (isPlannerLinkSocket(ws)) {
+				if (isAgentSocket(ws)) {
 					ws.data.alive?.stop();
 					return ws.data.link?.disconnected();
 				}
@@ -1731,6 +1877,12 @@ async function restoreChannelLocked(channelId: string, now: Date) {
 	summaryCoordinator?.resume(channelId);
 	let current = Rooms.get(channelId);
 	if (current?.plan) {
+		let opened = current.plan;
+		await withDocumentLock(
+			channelId,
+			() => Service.exclusive(opened, () => Service.activateTitles(opened)),
+		);
+		result.channel = await storage.channels.get(channelId) ?? result.channel;
 		await conversationRuntime.attach(current, current.plan, false, !result.channel.parentChannelId);
 	}
 	announceChannel(result.channel);
@@ -1960,6 +2112,7 @@ async function credentialsWillRotate(sessionId: string, revision: number): Promi
 }
 
 async function channelOwnerReset(channelId: string): Promise<void> {
+	Rooms.get(channelId)?.plan?.chat.initiative?.cancel();
 	let jobs = jobRunner?.channelOwnerReset(channelId);
 	ownerBindings?.revokeChannel(channelId);
 	plannerAttachments?.ownerReset(channelId);
@@ -1971,6 +2124,7 @@ let hostedAuth = registerAuthRoutes(router, {
 	storage,
 	agent: config.agent,
 	liveBuild: !!config.liveBuild,
+	setupAgents: config.setupAgents,
 	onSessionRevoked: sessionRevoked,
 	onCredentialsWillRotate: credentialsWillRotate,
 });
@@ -1980,6 +2134,7 @@ let machinePlanners = config.agent && config.harness === "remote"
 	: undefined;
 experiments = registerExperimentRoutes(router, hostedAuth, {
 	planners: machinePlanners,
+	attachments: () => plannerAttachments,
 	implementations: () => implementations,
 	connectorVersion: config.connectorVersion,
 	lease() {
@@ -2013,6 +2168,9 @@ experiments = registerExperimentRoutes(router, hostedAuth, {
 			broadcast(server, documentId, { kind: "experiment:changed", ts: 0, documentId });
 		}
 		void spikeScout?.refresh(documentId);
+		void reviewCompletedInvestigations(documentId);
+		void liveSync?.blockersChanged(documentId)
+			.catch(err => console.error("chopin: investigation build scheduling failed -", err));
 	},
 	async canMutate(id) {
 		let active = Rooms.get(id)?.plan;
@@ -2028,12 +2186,16 @@ ownerBindings = new ActiveOwnerBindings(hostedAuth);
 if (config.agent && config.harness === "remote") {
 	plannerAttachments = new PlannerAttachments(hostedAuth, config.plannerAttachGraceMs);
 	plannerAttachments.onChange((channelId, planner) => {
+		// A machine chosen for the document may start its Planner, or stop waiting to.
+		experiments?.plannerChanged(channelId);
 		if (server && !draining) {
 			broadcast(server, channelId, { kind: "session:planner", ts: 0, planner });
 		}
 		// Settlements that waited for a Planner can run now.
 		if (planner.state === "attached") {
-			settlePendingSpikes(channelId);
+			void ownerAvailable(channelId).catch(err =>
+				console.error("chopin: could not wake work after a Planner attached -", err)
+			);
 			void relinkDecisions(channelId).catch(err =>
 				console.error("chopin: could not re-link decisions after a Planner attached -", err)
 			);
@@ -2105,25 +2267,30 @@ referenceService = new ReferenceService({
 	research: researchService,
 	id: ulid,
 });
-// A living document or one with build history is past the question of readiness.
+// Existing visible decisions and active work do not need another readiness turn.
 function pastReadiness(channelId: string): boolean {
 	let held = Rooms.get(channelId)?.plan;
-	return !!held && (!!held.live || held.builds.length > 0 || held.lifecycle.history.length > 0);
+	return !!held && (Service.implementationActive(held) || !!held.chat?.busy
+		|| [...held.records.values()].some(record => record.status === "open"));
 }
+
+async function reviewCompletedInvestigations(channelId: string): Promise<void> {
+	if (!config.agent || !experiments || draining) return;
+	try {
+		await readinessReviews.evidence(channelId);
+	} catch (err) {
+		console.error("chopin: investigation evidence review failed -", err);
+	}
+}
+
 if (config.liveBuild) {
 	buildReadiness = new BuildReadiness({
 		current: currentDocumentTarget,
 		skip: pastReadiness,
+		review: id => readinessReviews.review(id),
 		ask: process.env.JEV_API_KEY || process.env.TYPESAFE_API_KEY
 			? request => askJev(request)
 			: undefined,
-		changed: (channelId, planRevision, ready) =>
-			broadcast(server, channelId, {
-				kind: "implementation:readiness",
-				ts: 0,
-				planRevision,
-				ready,
-			}),
 		error: err => console.error("chopin: build readiness failed -", err),
 	});
 }
@@ -2222,9 +2389,13 @@ registerMcpRoutes(router, hostedAuth, {
 		withDocumentTransition(channelId, () => withDocumentLock(channelId, action)),
 });
 implementations = registerImplementationRoutes(router, hostedAuth, {
-	buildable: buildReadiness && buildReadiness.ready.bind(buildReadiness),
+	assess: buildReadiness && ((id, revision) => {
+		buildReadiness!.ready(id, revision);
+	}),
 	liveBuild: !!config.liveBuild,
 	connections: experiments.connections,
+	refuseOffline: experiments.refuseOffline,
+	machineChoices: experiments.machineChoices,
 	busy: async connectionId =>
 		(await experiments!.service.store.active()).some(item =>
 			item.connectionId === connectionId && ["running", "publishing"].includes(item.state)
@@ -2274,7 +2445,11 @@ registerChannelRoutes(router, hostedAuth, {
 	onAgentReset: channelOwnerReset,
 	onChannelArchived: archiveChannel,
 	onChannelDeleted: deleteChannel,
-	onChannelRenamed: announceChannel,
+	renameChannel: (id, title) =>
+		withImplementationPlan(
+			id,
+			opened => Service.exclusive(opened, () => Service.rename(opened, title)),
+		),
 	onChannelRestored: restoreChannel,
 	references: hostedAuth.github instanceof GitHubClient
 		? new GitHubReferences(hostedAuth.github)
@@ -2304,6 +2479,7 @@ registerConnectorScript(router, {
 	bundle: join(import.meta.dir, "../../connector/dist/connector.js"),
 	source: join(import.meta.dir, "../../connector/src/main.ts"),
 });
+registerMachinesPath(router);
 
 try {
 	await storage.health();

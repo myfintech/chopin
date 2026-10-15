@@ -132,6 +132,8 @@ applied migration. The application schema contains:
 | `research_messages`        | Compatibility transcript rows retained for historical workspace references; not a current product thread.                                                  |
 | `plan_images`              | Images uploaded to a document through MCP `upload_image`: SHA-256, type, bytes, size, uploader, and time, keyed by channel and hash.                       |
 | `machines`                 | Paired local agents: owner, label, repositories, auto-run choice, token hash, encrypted GitHub credentials, contact and revocation times.                  |
+| `machine_choices`          | Each person's chosen machine for one document; no row is automatic. Revoking the machine or deleting the document removes it.                              |
+| `machine_favorites`        | Each person's one favorite machine, which Automatic prefers; no row is none. Revoking the machine removes it.                                              |
 
 `channel_state.unanswered_decisions` is maintained in JavaScript rather than a
 generated column. Sidecar text may contain an escaped NUL or an unpaired UTF-16
@@ -150,11 +152,12 @@ hash, generator version, source job ID, and projection timestamp. A newer job
 does not clear the current projection when it is enqueued or fails, so the last
 completed description remains visible and searchable.
 
-Channel titles have a case-insensitive unique constraint within each repository.
-Slug values are also unique per repository, with one canonical slug per channel.
+Display titles may repeat. Slug values remain unique per repository, with one
+canonical slug per channel. Authored title changes commit the document state,
+display title and slug in the same fenced collaboration transaction.
 A rename promotes a new collision-suffixed slug but retains all former slugs as
 aliases that cannot be assigned to another channel while it exists. Archived
-channels continue to reserve their titles and aliases.
+channels continue to reserve their aliases.
 
 ## Archival and deletion
 

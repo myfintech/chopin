@@ -4,7 +4,14 @@ import * as Jobs from "./jobs";
 import { type JobIntent, MAX_EFFECTS } from "./effects";
 import type { Job, JobOutcome } from "./jobs";
 import type { PlannerJobDeps } from "./planner-job-types";
-import { canonicalIntent, currentProse, line, outcome, reason } from "./planner-job-support";
+import {
+	canonicalIntent,
+	currentProse,
+	initialThread,
+	line,
+	outcome,
+	reason,
+} from "./planner-job-support";
 
 export { interruptPlannerJobs } from "./planner-job-interruption";
 export { line } from "./planner-job-support";
@@ -54,18 +61,19 @@ export function createPlannerJobs(deps: PlannerJobDeps) {
 			if (stopped) throw new Error("Planner job service is stopped");
 			let pending = plan.conversationPlanPendingEffects;
 			let effect = pending.find(item => item.key === key);
+			let initial = effect?.kind === "insert-card" && intent.kind === "refine"
+				&& intent.threadId === effect.threadId && intent.trigger === effect.trigger;
 			if (
-				effect?.kind !== "job" || effect.intent.kind !== intent.kind
-				|| effect.intent.target !== intent.target
-				|| effect.intent.trigger !== intent.trigger
+				!initial && (
+					effect?.kind !== "job" || effect.intent.kind !== intent.kind
+					|| effect.intent.target !== intent.target || effect.intent.trigger !== intent.trigger
+					|| intent.threadId !== undefined
+				)
 			) throw new Error("Planner job receipt has no matching pending job effect");
 
 			let previous = plan.conversationPlanJobs;
 			let canonical = canonicalIntent(plan, intent);
-			let updated = intent.kind === "heading"
-					&& (previous.some(job => job.kind === "heading") || deps.headingAllowed?.() === false)
-				? previous
-				: Jobs.enqueue(previous, canonical, now());
+			let updated = Jobs.enqueue(previous, canonical, now());
 			plan.conversationPlanJobs = updated;
 			plan.conversationPlanPendingEffects = pending.filter(item => item.key !== key);
 			plan.conversationPlanEffects = [...receipts, key].slice(-MAX_EFFECTS);
@@ -90,7 +98,7 @@ export function createPlannerJobs(deps: PlannerJobDeps) {
 		} catch (error) {
 			report(error);
 		}
-		if (job && job.target !== "document") {
+		if (job && job.target !== "document" && plan.records.has(job.target)) {
 			try {
 				deps.publishMeta(job.target);
 			} catch (error) {
@@ -100,10 +108,19 @@ export function createPlannerJobs(deps: PlannerJobDeps) {
 	}
 
 	async function run(job: Job): Promise<JobOutcome> {
-		if (job.kind === "heading" && deps.headingAllowed?.() === false) {
-			return { status: "skipped", reason: "The document already has prose." };
-		}
-		if (job.kind === "refine" || job.kind === "suggest") {
+		if (job.threadId) {
+			let thread = initialThread(plan, job);
+			if (!thread) {
+				return { status: "skipped", reason: "The conversation decision is no longer open." };
+			}
+			let record = plan.records.get(job.target);
+			if (record && thread.questionnaireId === job.target && record.threadId === thread.id) {
+				return {
+					status: "done",
+					output: JSON.stringify({ title: record.definition.questions[0]!.question, added: 0 }),
+				};
+			}
+		} else if (job.kind === "refine" || job.kind === "suggest") {
 			let status = plan.records.get(job.target)?.status;
 			if (status !== "open" && status !== "reopened") {
 				return { status: "skipped", reason: "The decision card is no longer open." };
@@ -120,10 +137,25 @@ export function createPlannerJobs(deps: PlannerJobDeps) {
 				return { status: "failed", reason: `no prompt for ${job.kind} jobs` };
 			}
 			let result = outcome(await deps.runner(job, prompt, controller.signal));
+			if (job.threadId && !initialThread(plan, job)) {
+				return { status: "skipped", reason: "The conversation decision is no longer open." };
+			}
+			if (job.threadId && result.status === "skipped") {
+				return { status: "failed", reason: result.reason };
+			}
+			if (job.threadId && result.status === "done" && !plan.records.has(job.target)) {
+				return {
+					status: "failed",
+					reason: "The Planner did not create the decision card. Retry to prepare it.",
+				};
+			}
 			return job.kind === "prose" && !currentProse(plan, job)
 				? { status: "skipped", reason: "The saved decision has changed." }
 				: result;
 		} catch (error) {
+			if (job.threadId && !initialThread(plan, job)) {
+				return { status: "skipped", reason: "The conversation decision is no longer open." };
+			}
 			return { status: "failed", reason: reason(error, "The Planner could not be reached.") };
 		}
 	}
@@ -131,9 +163,10 @@ export function createPlannerJobs(deps: PlannerJobDeps) {
 	async function drain(): Promise<void> {
 		for (;;) {
 			if (stopped) return;
-			let pending = Jobs.next(plan.conversationPlanJobs);
+			let pending = Jobs.next(plan.conversationPlanJobs, deps.eligible);
 			if (!pending) return;
-			let started = await change(jobs => Jobs.start(jobs, pending.id, now()));
+			if (deps.ready && !await deps.ready(pending)) return;
+			let started = await change(jobs => Jobs.start(jobs, pending.id, now(), deps.eligible));
 			if (stopped) return;
 			if (!started) continue;
 			let running = started.find(job => job.id === pending.id);
@@ -182,7 +215,9 @@ export function createPlannerJobs(deps: PlannerJobDeps) {
 			draining = undefined;
 			let requested = wakeRequested;
 			wakeRequested = false;
-			if (!failed && requested && !stopped && Jobs.next(plan.conversationPlanJobs)) wake();
+			if (!failed && requested && !stopped && Jobs.next(plan.conversationPlanJobs, deps.eligible)) {
+				wake();
+			}
 		});
 	}
 
@@ -195,13 +230,7 @@ export function createPlannerJobs(deps: PlannerJobDeps) {
 				return;
 			}
 			if (stopped) throw new Error("Planner job service is stopped");
-			let changed = await change(jobs => {
-				if (
-					intent.kind === "heading"
-					&& (jobs.some(job => job.kind === "heading") || deps.headingAllowed?.() === false)
-				) return jobs;
-				return Jobs.enqueue(jobs, intent, now());
-			});
+			let changed = await change(jobs => Jobs.enqueue(jobs, intent, now()));
 			if (stopped && !changed) throw new Error("Planner job service is stopped");
 			if (changed) announce(changed.find(job => job.id === Jobs.jobId(intent)));
 			wake();

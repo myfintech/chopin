@@ -1,9 +1,10 @@
 // Bar chart: single series (data) or grouped series (categories + series).
 // Accent goes to the focal bar/series only; everything else is muted.
 import { el, text } from "../../svg.mjs";
-import { textWidth, wrap } from "../../text.mjs";
+import { textWidth } from "../../text.mjs";
 import { fmt, niceDomain, ticks } from "./scale.mjs";
-import { axisLabels, bands, clampCentre, FITTED_TEXT } from "./fit.mjs";
+import { axisLabels, clampCentre } from "./fit.mjs";
+import { fittedBarLayout, nativeBarLayout } from "./fitted-bar-layout.mjs";
 import { legend } from "../shared/legend.mjs";
 
 export const family = "chart";
@@ -105,7 +106,7 @@ function renderMarimekko(spec) {
 				y: y + 1,
 				width: Math.max(0, w - 2),
 				height: Math.max(0, h - 2),
-				"data-sc-tip": `${c.label} · ${s.name}: ${fmt(s.value, spec.unit || "")} (${
+				"data-sc-tip": `${s.name} in ${c.label}: ${fmt(s.value, spec.unit || "")} (${
 					Math.round((s.value / c.total) * 100)
 				}%)`,
 			}));
@@ -147,23 +148,14 @@ function renderMarimekko(spec) {
 // band (or there are too many bands to stack), otherwise one bar per row with
 // its label above it.
 function renderFitted({ spec, cats, series, dom, multi, unit, barCls, tip, step }, width) {
-	const S = FITTED_TEXT;
-	const mono = { size: S, mono: true, tracking: 0.04 };
+	const layout = fittedBarLayout({ spec, cats, series, dom, unit, width });
+	const { S, mono, axisLines, top, catW, tickValues, left, slot, group, upright } = layout;
 	const out = [];
-	let top = 0;
-	if (spec.axis) {
-		const lines = wrap(spec.axis, width, { ...mono, tracking: 0.08, upper: true });
-		lines.forEach((line, i) =>
+	if (axisLines.length) {
+		axisLines.forEach((line, i) =>
 			out.push(text({ class: "ax-label", x: 0, y: S + i * (S + 4) }, line))
 		);
-		top = lines.length * (S + 4) + 8;
 	}
-	const catW = cats.map((c) => textWidth(c, { size: S }));
-	const tickValues = ticks(dom);
-	const left = Math.max(...tickValues.map((t) => textWidth(fmt(t, unit), mono))) + 8;
-	const { slot, group } = bands(cats.length, width - left);
-	const upright = spec.orientation !== "horizontal"
-		&& (catW.every((w) => w <= slot - 4) || cats.length > 12);
 	const swatches = () =>
 		series.map((s, i) => ({
 			type: "swatch",
@@ -171,7 +163,7 @@ function renderFitted({ spec, cats, series, dom, multi, unit, barCls, tip, step 
 			label: s.name,
 		}));
 	const valueW = (v) => textWidth(fmt(v, unit), mono);
-	let h;
+	let h = layout.height;
 
 	if (upright) {
 		const plotTop = top + S + 8, plotH = 220;
@@ -228,22 +220,14 @@ function renderFitted({ spec, cats, series, dom, multi, unit, barCls, tip, step 
 				),
 			);
 		}
-		h = plotTop + plotH + S + 12;
 	} else {
 		const valueRoom = multi ? 0 : Math.max(...series[0].values.map(valueW)) + 6;
 		// Negative bars carry their value on the negative side, so they need room there too.
 		const negativeRoom = dom.lo < 0 ? valueRoom : 0;
 		const plotW = width - valueRoom - negativeRoom - 2;
 		const x = (v) => negativeRoom + ((v - dom.lo) / (dom.hi - dom.lo)) * plotW;
-		const barH = multi ? 8 : 12;
-		let cy = top;
-		const rows = cats.map((c, i) => {
-			const lines = wrap(c, width, { size: S });
-			const row = { i, lines, label: cy, bars: cy + lines.length * (S + 4) + 2 };
-			cy = row.bars + series.length * (barH + 2) + 12;
-			return row;
-		});
-		const end = cy - 12;
+		const { rows, barH } = layout;
+		const end = layout.height - (multi ? S + 12 : 4);
 		if (multi) {
 			const kept = axisLabels(tickValues.map(x), tickValues.map((t) => valueW(t)), 0, width);
 			for (const t of tickValues) {
@@ -300,7 +284,6 @@ function renderFitted({ spec, cats, series, dom, multi, unit, barCls, tip, step 
 				}
 			});
 		}
-		h = end + (multi ? S + 12 : 4);
 	}
 	if (multi) {
 		const lg = legend({ x: 0, y: h + 4, w: width, extra: swatches(), size: S });
@@ -384,7 +367,7 @@ export function render(spec, { settings = {} } = {}) {
 		if (multi && !focal) return `c-bar s-${(si % 5) + 1}`;
 		return `c-bar${focal ? " is-focal" : ""}`;
 	};
-	const tip = (s, i) => `${cats[i]}${multi ? ` · ${s.name}` : ""}: ${fmt(s.values[i], unit)}`;
+	const tip = (s, i) => `${multi ? `${s.name} in ` : ""}${cats[i]}: ${fmt(s.values[i], unit)}`;
 	if (settings.width) {
 		const fitted = renderFitted(
 			{ spec, cats, series, dom, multi, unit, barCls, tip, step },
@@ -394,16 +377,9 @@ export function render(spec, { settings = {} } = {}) {
 	}
 
 	if (!horiz) {
-		const plotH = 260;
-		const slot = Math.max(44, Math.min(150, 640 / cats.length));
-		const groupW = slot * 0.62;
+		const native = nativeBarLayout({ cats, dom, unit });
+		const { plotH, slot, groupW, rotate, left, W } = native;
 		const bw = groupW / series.length;
-		const labelW = Math.max(...cats.map((c) => textWidth(c, { size: 10 })));
-		const rotate = labelW > slot - 6;
-		const left = Math.max(
-			...ticks(dom).map((t) => textWidth(fmt(t, unit), { size: 8, mono: true })),
-		) + 16;
-		const W = left + slot * cats.length;
 		const y = (v) => plotH - ((v - dom.lo) / (dom.hi - dom.lo)) * plotH;
 		for (const t of ticks(dom)) {
 			out.push(
@@ -462,7 +438,7 @@ export function render(spec, { settings = {} } = {}) {
 					: text({ class: "c-cat", x: cx, y: plotH + 18, "text-anchor": "middle" }, c),
 			);
 		});
-		let h = plotH + (rotate ? labelW * 0.6 + 24 : 34);
+		let h = native.height - 44;
 		if (multi) {
 			const lg = legend({
 				x: left,

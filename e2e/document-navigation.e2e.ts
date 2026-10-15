@@ -285,7 +285,7 @@ test("the room header renames the current document and the sidebar creates one i
 	await expect(header.getByRole("button", { name: /^Rename / })).toBeFocused();
 
 	await projects.getByRole("button", { name: "New document", exact: true }).click();
-	await expect(page).toHaveURL(/\/documents\/octo-org\/score\/[a-z]+-[a-z]+$/);
+	await expect(page).toHaveURL(/\/documents\/octo-org\/score\/[a-z]+-[a-z]+(?:-\d+)?$/);
 	await expect(headerDocument(page)).toHaveAccessibleName(/^Document: [a-z]+-[a-z]+$/);
 	// A new document opens with its generated name selected, ready to be replaced.
 	await expect(title).toBeFocused();
@@ -358,7 +358,9 @@ test("typing straight after New document names it without losing a character", a
 			await page.keyboard.type(name, { delay });
 			await page.keyboard.press("Enter");
 			await expect(headerDocument(page)).toHaveAccessibleName(`Document: ${name}`);
-			await expect(content(page)).not.toContainText(name.slice(0, 5));
+			await expect(content(page).getByRole("heading", { level: 1, name, exact: true }))
+				.toHaveCount(1);
+			await expect(content(page).locator(":scope > :not(h1)")).toHaveText([""]);
 		}
 	} finally {
 		await cdp.send("Emulation.setCPUThrottlingRate", { rate: 1 });
@@ -603,7 +605,7 @@ test("a stale catalogue response cannot remove a newly created document", async 
 	await captured.promise;
 	let projects = sidebar(page);
 	await projects.getByRole("button", { name: "New document", exact: true }).click();
-	await expect(page).toHaveURL(/\/documents\/octo-org\/score\/[a-z]+-[a-z]+$/);
+	await expect(page).toHaveURL(/\/documents\/octo-org\/score\/[a-z]+-[a-z]+(?:-\d+)?$/);
 	let created = projects.locator('a[aria-current="page"]');
 	await expect(created).toBeVisible();
 	let createdTitle = (await created.textContent())!.trim();
@@ -643,7 +645,7 @@ test("document switches preserve navigation state and avoid catalogue reloads", 
 	expect(originalPath).toBeTruthy();
 
 	await projects.getByRole("button", { name: "New document", exact: true }).click();
-	await expect(page).toHaveURL(/\/documents\/octo-org\/score\/[a-z]+-[a-z]+$/);
+	await expect(page).toHaveURL(/\/documents\/octo-org\/score\/[a-z]+-[a-z]+(?:-\d+)?$/);
 	let created = projects.locator('a[aria-current="page"]');
 	let createdTitle = (await created.textContent())!.trim();
 	let createdPath = await created.getAttribute("href");
@@ -1147,10 +1149,12 @@ test(
 			"# A calmer document\n\nRetrying navigation keeps the document and draft available.\n",
 		);
 		await page.setViewportSize({ width: 1452, height: 895 });
-		let failed = false;
+		let navigationOnline = false;
+		let attempts = 0;
 		await page.route("**/api/navigation", async route => {
-			if (route.request().method() === "GET" && !failed) {
-				failed = true;
+			if (route.request().method() === "GET") attempts++;
+			// Startup revalidation may queue a GET while the first is still in flight.
+			if (route.request().method() === "GET" && !navigationOnline) {
 				await route.abort("failed");
 				return;
 			}
@@ -1167,7 +1171,10 @@ test(
 		let draft = chatInput(page);
 		await fillChat(draft, "Keep this draft while retrying navigation.");
 		await page.screenshot({ path: testInfo.outputPath("navigation-warning.png") });
+		let attemptsBeforeRetry = attempts;
+		navigationOnline = true;
 		await notice.getByRole("button", { name: "Try again", exact: true }).click();
+		await expect.poll(() => attempts).toBeGreaterThan(attemptsBeforeRetry);
 		await expect(notice).toHaveCount(0);
 		await expectChatValue(draft, "Keep this draft while retrying navigation.");
 		await expect(sidebar(page).getByRole("link").and(page.locator('[aria-current="page"]')))
@@ -1192,7 +1199,7 @@ test("sidebar creation failures remain retryable", async ({ join, page }) => {
 	await expect(page.getByRole("alert")).toBeVisible();
 	await expect(create).toBeEnabled();
 	await create.click();
-	await expect(page).toHaveURL(/\/documents\/octo-org\/score\/[a-z]+-[a-z]+$/);
+	await expect(page).toHaveURL(/\/documents\/octo-org\/score\/[a-z]+-[a-z]+(?:-\d+)?$/);
 });
 
 test("archiving a sidebar row by keyboard moves focus to a neighbouring row", async ({ baseURL, join }) => {

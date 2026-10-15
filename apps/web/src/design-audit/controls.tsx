@@ -1,11 +1,16 @@
-import { CheckIcon, ChevronIcon, LoaderIcon, PlusIcon, WarningIcon } from "@chopin/icons";
+import { LoaderIcon, PlusIcon } from "@chopin/icons";
+import { useRef } from "react";
 import { StaticPlanEditor } from "@chopin/editor/static";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@chopin/visuals";
 
+import { SidebarAccount } from "../account-menu";
+import { RepositoryOptions } from "../add-project-dialog";
+import { BuildGlyph } from "../build-plan-button";
 import { DecisionViewControl } from "../decision-view-control";
+import { IconButton } from "../icon-button";
 import { AuditPlate, StateLabel } from "./frame";
 
-import type { ReactNode } from "react";
+import type * as Api from "../api";
+import type { ComponentProps, ReactNode } from "react";
 
 const TABS = [
 	'<Tabs id="01K0N4W3B7P27CBAEC7A8C8WF0">',
@@ -27,7 +32,72 @@ const TABS = [
 	"</Tabs>",
 ].join("\n") + "\n";
 
-const STATES = ["Default", "Hover", "Active", "Focus", "Disabled"] as const;
+/** Each state is the production rule itself, reached through `data-force-state`. */
+const STATES = [
+	{ label: "Default" },
+	{ force: "hover", label: "Hover" },
+	{ force: "active", label: "Active" },
+	{ force: "focus", label: "Focus" },
+	{ disabled: true, label: "Disabled" },
+] as const satisfies readonly { disabled?: true; force?: string; label: string }[];
+
+const BUILDING = <BuildGlyph look={{ done: 2, kind: "building", total: 5 }} />;
+
+// The document view switcher in the states the live title bar gives it.
+const VIEW_SPECIMENS: {
+	label: string;
+	props: Partial<ComponentProps<typeof DecisionViewControl>>;
+}[] = [
+	{ label: "Document selected, 3 unanswered", props: { unanswered: 3 } },
+	{ label: "Decisions selected", props: { unanswered: 3, view: "decisions" } },
+	{ label: "No unanswered decisions", props: {} },
+	{
+		label: "Planner writing the document",
+		props: { documentActivity: "writing", view: "decisions" },
+	},
+	{ label: "New document changes", props: { documentActivity: "unseen", view: "decisions" } },
+	{ label: "Build not ready", props: { buildEnabled: false } },
+	{ label: "Build ready, building", props: { buildEnabled: true, buildGlyph: BUILDING } },
+	{
+		label: "Build selected",
+		props: { buildEnabled: true, buildGlyph: BUILDING, view: "build" },
+	},
+	{
+		label: "Build linked to the hovered capsule",
+		props: { buildEnabled: true, buildGlyph: BUILDING, buildHot: true },
+	},
+];
+
+const AUDIT_USER = { avatarUrl: "", id: "audit-user", login: "MaggieAppleton" };
+
+const AUDIT_REPOSITORIES: Api.Repository[] = ["chopin", "design-notes", "editor-lab"].map(name => ({
+	defaultBranch: "main",
+	fullName: `githubnext/${name}`,
+	id: `R_${name}`,
+	name,
+	owner: "githubnext",
+	permissions: { admin: false, pull: true, push: true },
+	private: false,
+	url: `https://github.com/githubnext/${name}`,
+}));
+
+/** The live palette listbox as Add project shows it: one repository already added and not offered. */
+function SelectionList() {
+	let input = useRef<HTMLInputElement>(null);
+	return (
+		<div className="navigation-modal-content navigation-palette">
+			<div className="navigation-palette-list">
+				<RepositoryOptions
+					addedIds={new Set(["R_design-notes"])}
+					input={input}
+					onChoose={() => {}}
+					query="githubnext"
+					repositories={AUDIT_REPOSITORIES}
+				/>
+			</div>
+		</div>
+	);
+}
 
 function StateSample({ children, state }: { children: ReactNode; state: string }) {
 	return (
@@ -44,11 +114,11 @@ function ButtonRow(
 	return (
 		<div className="design-audit-control-grid">
 			{STATES.map(state => (
-				<StateSample key={state} state={state}>
+				<StateSample key={state.label} state={state.label}>
 					<button
 						className={`btn btn-md ${className}`}
-						data-audit-state={state.toLowerCase()}
-						disabled={state === "Disabled"}
+						data-force-state={"force" in state ? state.force : undefined}
+						disabled={"disabled" in state}
 						type="button"
 					>
 						{label}
@@ -58,6 +128,27 @@ function ButtonRow(
 		</div>
 	);
 }
+
+const ICON_BUTTONS = [
+	{ label: "Ghost" },
+	{ label: "Nested in a hovered row", tone: "nested" },
+	{ glyph: "compact", label: "Compact", size: "compact" },
+] as const satisfies readonly {
+	glyph?: "compact";
+	label: string;
+	size?: "compact";
+	tone?: "nested";
+}[];
+
+function forceState(state: string) {
+	return (element: HTMLElement | null) => element?.setAttribute("data-force-state", state);
+}
+
+/** Icon buttons have no pressed fill; hover and focus share one. */
+const ICON_STATES = STATES.filter(state => state.label !== "Active");
+
+/** Links have no pressed or disabled treatment in the app. */
+const LINK_STATES = STATES.filter(state => !("disabled" in state) && state.label !== "Active");
 
 export function Controls() {
 	return (
@@ -93,10 +184,10 @@ export function Controls() {
 						<ButtonRow className="btn-destructive" label="Delete document" />
 					</div>
 					<div className="design-audit-button-sizes" data-audit-sample="sizes">
-						<StateSample state="Medium · 32px high · 12px sides">
+						<StateSample state="Medium: 32px high, 12px sides">
 							<button className="btn btn-md btn-primary" type="button">Medium</button>
 						</StateSample>
-						<StateSample state="Small · 24px high · 8px sides">
+						<StateSample state="Small: 24px high, 8px sides">
 							<button className="btn btn-sm btn-secondary" type="button">Small</button>
 						</StateSample>
 						<StateSample state="Busy">
@@ -109,64 +200,76 @@ export function Controls() {
 			</AuditPlate>
 
 			<AuditPlate
-				description="The shared 28px square control with a 14px glyph and 7px inset."
+				description="The shared IconButton in its tones and sizes."
 				item="icon-buttons"
 				title="Icon buttons"
 			>
-				<div className="design-audit-control-grid">
-					{STATES.map(state => (
-						<StateSample key={state} state={state}>
-							<button
-								aria-label="Add document"
-								className="btn btn-icon btn-ghost"
-								data-audit-state={state.toLowerCase()}
-								disabled={state === "Disabled"}
-								type="button"
-							>
-								<PlusIcon aria-hidden="true" size={14} />
-							</button>
-						</StateSample>
+				<div className="design-audit-button-families">
+					{ICON_BUTTONS.map(recipe => (
+						<div key={recipe.label}>
+							<h4>{recipe.label}</h4>
+							<div className="design-audit-control-grid">
+								{ICON_STATES.map(state => (
+									<StateSample key={state.label} state={state.label}>
+										<IconButton
+											aria-label="Add document"
+											disabled={"disabled" in state}
+											// IconButton's props stay closed; the audit sets its seam after mount.
+											ref={"force" in state ? forceState(state.force) : undefined}
+											glyph={"glyph" in recipe ? recipe.glyph : undefined}
+											size={"size" in recipe ? recipe.size : undefined}
+											tone={"tone" in recipe ? recipe.tone : undefined}
+										>
+											<PlusIcon aria-hidden="true" />
+										</IconButton>
+									</StateSample>
+								))}
+							</div>
+						</div>
 					))}
 				</div>
 			</AuditPlate>
 
-			<AuditPlate description="Inline navigation and action links." item="links" title="Links">
+			<AuditPlate
+				description="Inline actions and links in running text."
+				item="links"
+				title="Links"
+			>
 				<div className="design-audit-control-grid">
-					{STATES.map(state => (
-						<StateSample key={state} state={state}>
+					{LINK_STATES.map(state => (
+						<StateSample key={state.label} state={state.label}>
 							<a
-								aria-disabled={state === "Disabled" ? true : undefined}
-								className="design-audit-link"
-								data-audit-state={state.toLowerCase()}
-								href={state === "Disabled" ? undefined : "#links"}
+								className="link text-sm"
+								data-force-state={"force" in state ? state.force : undefined}
+								href="#links"
 							>
-								Read the document
+								Configure
 							</a>
 						</StateSample>
 					))}
 				</div>
 			</AuditPlate>
 
-			<AuditPlate description="Text, selection, and multiline inputs." item="fields" title="Fields">
+			<AuditPlate description="Text and multiline inputs." item="fields" title="Fields">
 				<div className="design-audit-field-grid">
 					<label htmlFor="audit-field-default">
 						Default<input
-							className="field"
+							className="field h-8 w-full px-2 text-sm"
 							defaultValue="Document title"
 							id="audit-field-default"
 						/>
 					</label>
 					<label htmlFor="audit-field-focus">
 						Focus<input
-							className="field"
-							data-audit-state="focus"
+							className="field h-8 w-full px-2 text-sm"
+							data-force-state="focus"
 							defaultValue="Focused title"
 							id="audit-field-focus"
 						/>
 					</label>
 					<label htmlFor="audit-field-disabled">
 						Disabled<input
-							className="field"
+							className="field h-8 w-full px-2 text-sm"
 							defaultValue="Unavailable"
 							disabled
 							id="audit-field-disabled"
@@ -175,40 +278,22 @@ export function Controls() {
 					<label htmlFor="audit-field-invalid">
 						Error<input
 							aria-invalid="true"
-							className="field"
+							className="field h-8 w-full px-2 text-sm"
 							defaultValue=""
 							id="audit-field-invalid"
 						/>
 					</label>
 					<label htmlFor="audit-field-readonly">
 						Read only<input
-							className="field"
+							className="field h-8 w-full px-2 text-sm"
 							defaultValue="Stored title"
 							id="audit-field-readonly"
 							readOnly
 						/>
 					</label>
-					<div className="design-audit-field-control">
-						<span id="audit-field-select-label">Select</span>
-						<Select
-							defaultValue="active"
-							items={[
-								{ value: "active", label: "Active documents" },
-								{ value: "archived", label: "Archived documents" },
-							]}
-						>
-							<SelectTrigger aria-labelledby="audit-field-select-label" id="audit-field-select">
-								<SelectValue />
-							</SelectTrigger>
-							<SelectContent>
-								<SelectItem value="active">Active documents</SelectItem>
-								<SelectItem value="archived">Archived documents</SelectItem>
-							</SelectContent>
-						</Select>
-					</div>
 					<label className="design-audit-field-wide" htmlFor="audit-field-textarea">
 						Textarea<textarea
-							className="field"
+							className="min-h-16 min-w-0 resize-y field px-2 py-1 text-sm font-normal"
 							defaultValue="Write a message to the room"
 							id="audit-field-textarea"
 							rows={3}
@@ -224,33 +309,35 @@ export function Controls() {
 			>
 				<div className="design-audit-choice-row">
 					<label>
-						<input className="choice-control" type="checkbox" />Unchecked
-					</label>
-					<label>
-						<input className="choice-control" defaultChecked type="checkbox" />Checked
-					</label>
-					<label>
-						<input className="choice-control" disabled type="checkbox" />Disabled
+						<input className="choice-control size-4 shrink-0" type="checkbox" />Unchecked
 					</label>
 					<label>
 						<input
-							className="choice-control"
+							className="choice-control size-4 shrink-0"
+							defaultChecked
+							type="checkbox"
+						/>Checked
+					</label>
+					<label>
+						<input className="choice-control size-4 shrink-0" disabled type="checkbox" />Disabled
+					</label>
+					<label>
+						<input
+							className="choice-control size-4 shrink-0"
 							defaultChecked
 							name="audit-radio"
 							type="radio"
 						/>Selected
 					</label>
 					<label>
-						<input className="choice-control" name="audit-radio" type="radio" />Unselected
+						<input
+							className="choice-control size-4 shrink-0"
+							name="audit-radio"
+							type="radio"
+						/>Unselected
 					</label>
 				</div>
-				<div aria-label="Documents" className="design-audit-selection-list" role="listbox">
-					<div role="option">Architecture notes</div>
-					<div aria-selected="true" role="option">
-						<CheckIcon aria-hidden="true" size={14} />Design system audit
-					</div>
-					<div aria-disabled="true" role="option">Archived proposal</div>
-				</div>
+				<SelectionList />
 			</AuditPlate>
 
 			<AuditPlate
@@ -260,21 +347,23 @@ export function Controls() {
 			>
 				<div className="flex flex-col gap-4">
 					<div className="design-audit-tab-specimens">
-						<div>
-							<StateLabel>Document view switcher · Document selected</StateLabel>
-							<DecisionViewControl onView={() => {}} unanswered={3} view="plan" />
-						</div>
-						<div>
-							<StateLabel>Document view switcher · Decisions selected</StateLabel>
-							<DecisionViewControl onView={() => {}} unanswered={3} view="decisions" />
-						</div>
-						<div>
-							<StateLabel>Document view switcher · no unanswered decisions</StateLabel>
-							<DecisionViewControl onView={() => {}} unanswered={0} view="plan" />
-						</div>
+						{VIEW_SPECIMENS.map(({ label, props }) => (
+							<div key={label}>
+								<StateLabel>{label}</StateLabel>
+								<DecisionViewControl
+									buildEnabled={props.buildEnabled}
+									buildGlyph={props.buildGlyph}
+									buildHot={props.buildHot}
+									documentActivity={props.documentActivity}
+									onView={() => {}}
+									unanswered={props.unanswered ?? 0}
+									view={props.view ?? "plan"}
+								/>
+							</div>
+						))}
 					</div>
 					<div>
-						<StateLabel>Authored tabs · first tab selected</StateLabel>
+						<StateLabel>Authored tabs with the first tab selected</StateLabel>
 						<StaticPlanEditor source={TABS} />
 					</div>
 				</div>
@@ -293,7 +382,7 @@ export function Controls() {
 						</button>
 					</div>
 					<div>
-						<StateLabel>Open · focus · disabled</StateLabel>
+						<StateLabel>Open, focused and disabled</StateLabel>
 						<div aria-label="Document actions" className="design-audit-menu" role="menu">
 							<button role="menuitem" type="button">Rename document</button>
 							<button data-audit-state="focus" role="menuitem" type="button">
@@ -309,60 +398,35 @@ export function Controls() {
 			</AuditPlate>
 
 			<AuditPlate
-				description="Closed trigger and open list selection."
+				description="The sidebar account menu, closed and open."
 				item="dropdowns"
 				title="Dropdowns"
 			>
 				<div className="design-audit-dropdown-row">
-					<button
-						aria-expanded="false"
-						className="field design-audit-dropdown-trigger"
-						type="button"
-					>
-						Active documents<ChevronIcon aria-hidden="true" className="rotate-90" size={14} />
-					</button>
-					<div className="design-audit-dropdown-open">
-						<button
-							aria-expanded="true"
-							className="field design-audit-dropdown-trigger"
-							type="button"
-						>
-							Active documents<ChevronIcon aria-hidden="true" className="rotate-90" size={14} />
-						</button>
-						<div
-							aria-label="Document collection"
-							className="design-audit-dropdown-list"
-							role="listbox"
-						>
-							<div aria-selected="true" role="option">
-								<CheckIcon aria-hidden="true" size={14} />Active documents
-							</div>
-							<div role="option">Archived documents</div>
+					<div>
+						<StateLabel>Closed</StateLabel>
+						<div className="project-sidebar">
+							<SidebarAccount onAccount={() => {}} user={AUDIT_USER} />
 						</div>
 					</div>
-					<div className="design-audit-dropdown-open">
-						<StateLabel>Loading</StateLabel>
-						<button
-							aria-busy="true"
-							className="field design-audit-dropdown-trigger"
-							disabled
-							type="button"
-						>
-							Loading documents<LoaderIcon aria-hidden="true" />
-						</button>
-					</div>
-					<div className="design-audit-dropdown-open">
-						<StateLabel>Error</StateLabel>
-						<button
-							aria-invalid="true"
-							className="field design-audit-dropdown-trigger"
-							type="button"
-						>
-							Documents unavailable<WarningIcon aria-hidden="true" />
-						</button>
-						<span className="design-audit-dropdown-error" role="alert">
-							Could not load documents.
-						</span>
+					<div>
+						<StateLabel>Open</StateLabel>
+						<div className="design-audit-account-open">
+							<div className="project-sidebar">
+								<SidebarAccount
+									menu={{
+										className: "is-open",
+										closing: false,
+										onDismiss() {},
+										onShortcuts() {},
+										onSignOut() {},
+									}}
+									menuId="design-audit-account-menu"
+									onAccount={() => {}}
+									user={AUDIT_USER}
+								/>
+							</div>
+						</div>
 					</div>
 				</div>
 			</AuditPlate>
