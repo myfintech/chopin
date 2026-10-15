@@ -11,6 +11,7 @@ import { delimiter, join } from "node:path";
 
 import { loadAuth } from "./auth/config";
 import { setupAgents } from "./setup-agents";
+import { decisionsConfigured } from "./openai-decisions";
 
 import type { SetupAgent } from "@chopin/protocol/agents";
 import type { AuthConfig } from "./auth/config";
@@ -207,13 +208,13 @@ export function load(): Config {
 	) {
 		throw new Error("JEV_TIMEOUT_MS must be an integer between 100 and 60000 milliseconds");
 	}
-	if (conversationPlan && !process.env.JEV_API_KEY) {
+	if (conversationPlan && !process.env.JEV_API_KEY && !decisionsConfigured()) {
 		throw new Error("JEV_API_KEY is required when CONVERSATION_PLAN=on");
 	}
-	if (plannerVisuals && !process.env.JEV_API_KEY) {
+	if (plannerVisuals && !process.env.JEV_API_KEY && !decisionsConfigured()) {
 		throw new Error("JEV_API_KEY is required when PLANNER_VISUALS=on");
 	}
-	if (agent && !process.env.JEV_API_KEY) {
+	if (agent && !process.env.JEV_API_KEY && !decisionsConfigured()) {
 		throw new Error("JEV_API_KEY is required when AGENT is enabled");
 	}
 	if (
