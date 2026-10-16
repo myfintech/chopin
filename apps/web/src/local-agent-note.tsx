@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useLocalAgentCommand } from "./local-agent-command";
 
 /** Where pairing problems are explained; the docs ship with the repository. */
 const TROUBLESHOOTING =
@@ -26,7 +27,7 @@ export function localAgentNoteText(action?: string): string {
  * It stays until the person presses again, so a refused press never silently resets.
  */
 export function LocalAgentNote({ action }: { action?: string }) {
-	let command = connectorCommand(location.origin);
+	let { command } = useLocalAgentCommand(location.origin, connectorCommand(location.origin));
 	let [copied, setCopied] = useState<"copied" | "failed">();
 	useEffect(() => {
 		if (!copied) return;
