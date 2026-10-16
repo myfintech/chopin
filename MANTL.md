@@ -175,21 +175,24 @@ GitHub Copilot, which the MANTL LLM gateway cannot serve, so `atomic` is the onl
   Planners by default with machine Planners per document. Build a sandboxed runner of our own
   only if workflows prove worth it.
 - **Automatic participation.** Upstream made Chopin reply to ordinary Chat messages whenever
-  the Planner is on (`d22dd222`), and refuses to start without `JEV_API_KEY`. Jev is TypeSafe's
-  hosted judge: in group chats it receives recent messages, a document excerpt, and open
-  decisions. MANTL keeps the feature but sends those judgments to the OpenAI Decisions API under
-  MANTL's OpenAI Enterprise agreement instead, a near one-to-one fit for Jev's questions. It
-  goes direct to OpenAI because the MANTL gateway serves no OpenAI models or `/v1/decisions`;
-  the base URL is configurable if that changes. See
-  [OpenAI Decisions in place of Jev](docs/openai-decisions.md).
+  the Planner is on (`d22dd222`), and refuses to start without a decisions model. MANTL sends
+  those judgments to the OpenAI Decisions API under MANTL's OpenAI Enterprise agreement, not to
+  TypeSafe's Jev. MANTL used to do that with its own transport; upstream's `fdc7a817` now routes
+  every decision through Atomic's classifiers and picks `openai-decisions/gpt-6-luna` when only
+  `OPENAI_API_KEY` is set, so MANTL carries no code for it. Do not set `JEV_API_KEY` or
+  `TYPESAFE_API_KEY`: either one makes upstream prefer Jev. The MANTL gateway serves no OpenAI
+  models or `/v1/decisions`, so the key is OpenAI's own. See
+  [Decisions](docs/self-hosting.md#decisions).
 - **Deployment.** `myfintech/ai` `infra/chopin` must, in the same deploy as the upstream merge
   that removed Pi:
   - set `HARNESS=atomic` instead of `pi` (upstream refuses `pi` with `Unknown harness: pi`);
   - add `ATOMIC_PLANNER=isolated`;
   - rename `PI_PROVIDERS` to `ATOMIC_PROVIDERS`, pointing at
     `/app/apps/server/config/atomic-providers.mantl.jsonc`;
-  - load `OPENAI_DECISIONS_API_KEY` from Secret Manager (a dedicated OpenAI project with zero
-    data retention and a budget limit); without it or `JEV_API_KEY`, startup is refused.
+  - load `OPENAI_API_KEY` from Secret Manager (a dedicated OpenAI project with zero data
+    retention and a budget limit); without a decisions model, startup is refused. Deployments
+    that still set `OPENAI_DECISIONS_API_KEY` must rename it to `OPENAI_API_KEY`, or startup
+    fails after the merge at upstream `e6d74014`.
 
 ## Pinned design exceptions
 
@@ -248,10 +251,6 @@ Two other upstream checks catch MANTL UI work:
 | `docs/atomic-providers.md`                                                  | MANTL-owned file    | Atomic providers configuration and value research method                                                                                                                                                                                                                                                              |
 | `apps/server/src/isolated-planner/`                                         | MANTL-owned files   | [Isolated Atomic Planner](docs/isolated-planner.md): `ATOMIC_PLANNER=isolated` mode and startup check                                                                                                                                                                                                                 |
 | `docs/isolated-planner.md`                                                  | MANTL-owned file    | Isolated Planner, what it gives up, and how workflows could run securely later                                                                                                                                                                                                                                        |
-| `apps/server/src/openai-decisions/`                                         | MANTL-owned files   | [OpenAI Decisions](docs/openai-decisions.md) in place of TypeSafe's Jev for upstream's judgment calls                                                                                                                                                                                                                 |
-| `docs/openai-decisions.md`                                                  | MANTL-owned file    | OpenAI Decisions configuration, mapping, data, and gateway notes                                                                                                                                                                                                                                                      |
-| `apps/server/src/conversation-plan/jev.ts`                                  | Upstream file, seam | `askJev` returns `askDecisions(...)` when `decisionsConfigured()`, after its bounds check                                                                                                                                                                                                                             |
-| `apps/server/src/config.ts`                                                 | Upstream file, seam | Import plus `!decisionsConfigured()` on each `JEV_API_KEY` startup requirement                                                                                                                                                                                                                                        |
 | `apps/server/src/harness/tool-names.ts`                                     | Upstream file, seam | Import plus one `push` appending configured tool names                                                                                                                                                                                                                                                                |
 | `apps/server/src/harness/agents.ts`                                         | Upstream file, seam | Extension placeholders in the tool set; `extensionTools` call option merged in `prepareCall`; provenance: `agentTools` wraps upstream's `reporting(scopedJobTools(...))` in `prepareCall`                                                                                                                             |
 | `apps/server/src/harness/session.ts`                                        | Upstream file, seam | Binds `extensionTools` for the repository when a Planner session opens; isolated Planner: `fullAtomicPlanner()` gates the full Atomic session                                                                                                                                                                         |
