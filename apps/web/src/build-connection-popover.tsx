@@ -3,6 +3,7 @@ import { UnfoldSection } from "@chopin/visuals/unfold";
 import { useId, useState } from "react";
 
 import { plannerConnectCommand } from "./build-connection";
+import { useLocalAgentCommand } from "./local-agent-command";
 import { connectorCommand } from "./local-agent-note";
 import "./build-connection-popover.css";
 
@@ -16,10 +17,12 @@ export function BuildConnectionPopover({ documentURL, kind, outline, phone }: {
 	let [backend, setBackend] = useState("");
 	let [copied, setCopied] = useState("");
 	let planner = kind === "planner";
+	let origin = new URL(documentURL).origin;
+	let local = useLocalAgentCommand(origin, connectorCommand(origin));
 	let label = planner ? "Connect Chopin" : "Connect agent";
 	let command = planner
 		? plannerConnectCommand(documentURL, backend)
-		: connectorCommand(new URL(documentURL).origin);
+		: local.command;
 	let copy = (text: string, notice: string) => {
 		void navigator.clipboard.writeText(text).then(
 			() => setCopied(notice),
@@ -56,7 +59,7 @@ export function BuildConnectionPopover({ documentURL, kind, outline, phone }: {
 					Copy command
 				</button>
 				<span className="text-xs text-text-tertiary">
-					{planner ? "Chopin CLI required" : "Bun and Copilot CLI required"}
+					{planner ? "Chopin CLI required" : `Bun and ${local.agent ?? "Copilot CLI"} required`}
 				</span>
 			</div>
 			{planner && (
