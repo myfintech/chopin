@@ -1,6 +1,7 @@
 import { Menu } from "@base-ui/react/menu";
 import { Count } from "@chopin/editor/count";
 import { MachineIcon, PlusIcon, ServerIcon, WarningIcon } from "@chopin/icons";
+import { useLayoutEffect, useRef } from "react";
 
 import { ago } from "./build-model";
 import { setFavorite } from "./machine-choice";
@@ -11,9 +12,11 @@ import {
 	useLiveMachines,
 } from "./machine-summary";
 
+import { useNavigationDocument, useNavigationMenu } from "./navigation-shell";
 import "./machines-entry.css";
 
 import type { Machine } from "./machine-summary";
+import type { ReactNode } from "react";
 
 /** Where the Machines page's Add machine flow starts: Add your computer, opened at once. */
 const ADD_MACHINE_PATH = "/machines?add";
@@ -30,6 +33,8 @@ const ANY = "any";
 export function MachinesEntry(
 	{ current = false, placement }: { current?: boolean; placement: "sidebar" | "sheet" },
 ) {
+	let [open, setOpen] = useNavigationMenu();
+	let { navigationRevision } = useNavigationDocument();
 	let { machines: list, error } = useLiveMachines();
 	let summary = list && !error ? summarizeMachines(list) : undefined;
 	let favorite = list?.find(machine => machine.favorite);
@@ -78,7 +83,14 @@ export function MachinesEntry(
 	};
 	let uses = list?.find(machine => machine.connected)?.label;
 	return (
-		<Menu.Root onOpenChange={open => open && void liveMachines.load()}>
+		<Menu.Root
+			key={navigationRevision}
+			open={open}
+			onOpenChange={next => {
+				setOpen(next);
+				if (next) void liveMachines.load();
+			}}
+		>
 			<Menu.Trigger
 				aria-current={current ? "page" : undefined}
 				aria-label={warn ? `${label}, your default is offline` : label}
@@ -95,7 +107,7 @@ export function MachinesEntry(
 					side="top"
 					sideOffset={4}
 				>
-					<Menu.Popup className="machines-menu">
+					<MachinesMenuPopup>
 						<Menu.RadioGroup
 							onValueChange={value => void choose(value as string)}
 							value={favorite?.id ?? ANY}
@@ -106,7 +118,7 @@ export function MachinesEntry(
 									<ServerIcon />
 								</span>
 								<span className="truncate">Any available</span>
-								<span className="app-menu-item-meta">
+								<span className="app-menu-item-meta" title={uses ? `Uses ${uses}` : undefined}>
 									{uses ? `Uses ${uses}` : "None connected"}
 								</span>
 							</Menu.RadioItem>
@@ -118,7 +130,7 @@ export function MachinesEntry(
 									value={machine.id}
 								>
 									<MachineMark machine={machine} />
-									<span className="truncate">{machine.label}</span>
+									<span className="truncate" title={machine.label}>{machine.label}</span>
 									<span className="app-menu-item-meta">{state(machine)}</span>
 								</Menu.RadioItem>
 							))}
@@ -136,10 +148,37 @@ export function MachinesEntry(
 							</span>
 							Manage machines
 						</Menu.LinkItem>
-					</Menu.Popup>
+					</MachinesMenuPopup>
 				</Menu.Positioner>
 			</Menu.Portal>
 		</Menu.Root>
+	);
+}
+
+function MachinesMenuPopup({ children }: { children: ReactNode }) {
+	let popup = useRef<HTMLDivElement>(null);
+	let openedOn = useRef(location.href);
+	useLayoutEffect(() => {
+		let panel = popup.current;
+		if (!panel) return;
+		// Placement remeasures on resize, but a smaller scrollport can hide the focused row.
+		let observer = new ResizeObserver(() => {
+			let focused = document.activeElement;
+			if (focused instanceof HTMLElement && panel.contains(focused)) {
+				focused.scrollIntoView({ block: "nearest" });
+			}
+		});
+		observer.observe(panel);
+		return () => observer.disconnect();
+	}, []);
+	return (
+		<Menu.Popup
+			className="machines-menu"
+			finalFocus={() => openedOn.current === location.href}
+			ref={popup}
+		>
+			{children}
+		</Menu.Popup>
 	);
 }
 

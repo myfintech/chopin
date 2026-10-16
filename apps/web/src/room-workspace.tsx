@@ -53,7 +53,14 @@ import {
 import { BuildGlyph, BuildPlanButton, useBuildPlan } from "./build-plan-button";
 import { buildBlockers } from "./build-blockers";
 import type { BuildBlocker } from "./build-blockers";
-import { offlineChoice, useMachineChoice } from "./machine-choice";
+import { MachineButton } from "./machine-button";
+import {
+	offlineChoice,
+	plannerStartingOn,
+	showsMachineChoice,
+	useMachineChoice,
+} from "./machine-choice";
+import { useLiveMachines } from "./machine-summary";
 import type { MachineChoice } from "./machine-choice";
 import { useLiveBuild } from "./live-build";
 import { BuildView } from "./build-view";
@@ -637,11 +644,20 @@ export function RoomWorkspace(
 	let typing = useDocumentEditing(room);
 	let plannerDetached = plannerAttachment.wire === wire && !!plannerAttachment.planner
 		&& plannerAttachment.planner.state !== "attached";
-	// Which of the person's machines works here, so Build plan can say when it is offline.
+	// Which of the person's machines works here: the machine buttons beside Build plan and in Chat,
+	// and Machine in the title's menu, share it, and Build plan says when it is offline.
 	let machineChoice = useMachineChoice(
 		room,
 		profile.implementation && !!effectiveCanEdit && !(archivedAt ?? metadata.archivedAt),
 	);
+	// The choice shows only while the person has a paired machine, live: it appears with their
+	// first and goes with their last.
+	let ownsMachine = showsMachineChoice(useLiveMachines().machines);
+	// Who runs the Planner changed: Chat's machine button says so at once.
+	let refreshMachine = machineChoice.refresh;
+	useEffect(() => {
+		refreshMachine();
+	}, [plannerAttachment.planner, refreshMachine]);
 	let build = useBuildPlan({
 		canEdit: effectiveCanEdit && !(archivedAt ?? metadata.archivedAt) && status === "connected",
 		connected: status === "connected",
@@ -1449,7 +1465,7 @@ export function RoomWorkspace(
 		canManage: effectiveCanManage,
 		editing: titleEdit,
 		label: metadata.title,
-		machine: machineChoice.state && workspaceCanEdit && status === "connected"
+		machine: ownsMachine && machineChoice.state && workspaceCanEdit && status === "connected"
 			? machineChoice
 			: undefined,
 		onAction: action => onDocumentAction(room, action),
@@ -1552,6 +1568,16 @@ export function RoomWorkspace(
 		: presentation.type === "parent-with-child" && mode === "split"
 		? { motion: presentation.motion, slot: zoomChild ? childTitleSlot : null }
 		: undefined;
+	// A phone's top bar has no room for it; there it is Chat's alone.
+	let machineButton = (place: "build" | "chat") =>
+		ownsMachine && machineChoice.state && !!workspaceCanEdit && status === "connected" && (
+			<MachineButton
+				choice={machineChoice}
+				compact={phone && place === "chat"}
+				phone={phone}
+				planner={place === "chat"}
+			/>
+		);
 	// Build plan or the build capsule sits beside the people here; a child open beside its parent
 	// has no build of its own. A phone shows this room's bar only off Document, so it keeps it.
 	let buildSlot = profile.implementation && (presentation.type !== "parent-with-child" || phone)
@@ -1562,6 +1588,7 @@ export function RoomWorkspace(
 				build={build}
 				documentURL={new URL(documentPath(repository.owner, repository.name, slug), location.origin)
 					.href}
+				machine={phone ? undefined : machineButton("build")}
 				machineOffline={offlineChoice(machineChoice.state)}
 				canEdit={!!workspaceCanEdit && status === "connected"}
 				compact={mode !== "split"}
@@ -1658,7 +1685,9 @@ export function RoomWorkspace(
 							room={room}
 							sendAcknowledgements={chatSendAcks.wire === wire && chatSendAcks.enabled}
 							planner={plannerAttachment.wire === wire ? plannerAttachment.planner : undefined}
+							plannerMachine={plannerStartingOn(machineChoice.state)}
 							wire={wire}
+							machine={profile.implementation ? machineButton("chat") : undefined}
 						/>
 					}
 					chatActivity={chatActivity}

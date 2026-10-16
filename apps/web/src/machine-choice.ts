@@ -69,17 +69,26 @@ const STATE_WORDS: Record<MachineState, string> = {
 
 /** The machine button's accessible name: which machine, and whether it can take work now. */
 export function machineButtonLabel(state: MachineChoiceState | undefined): string {
-	if (!state) return "Machine: Automatic";
+	if (!state) return "Machine: Default machine";
 	let chosen = chosenMachine(state);
 	if (chosen) return `Machine: ${chosen.label}, ${STATE_WORDS[machineState(chosen)]}`;
 	let using = automaticLabel(state);
-	return `Machine: Automatic, ${using ? `uses ${using}` : "no machine connected"}`;
+	return `Machine: Default machine, ${using ? `uses ${using}` : "no machine connected"}`;
 }
 
 function automaticLabel(state: MachineChoiceState) {
 	let automatic = state.automatic;
 	return automatic
 		&& (automatic.label ?? state.machines.find(machine => machine.id === automatic.id)?.label);
+}
+
+/**
+ * Whether a document offers the machine choice: its buttons beside Build plan and in Chat, and
+ * Machine in its title's menu. Only once the person has paired a machine, connected or not, and
+ * whatever repositories its checkouts are of; before that the Machines page is the way to add one.
+ */
+export function showsMachineChoice(machines: readonly Pick<Machine, "id">[] | undefined): boolean {
+	return !!machines?.length;
 }
 
 /** Why Build can't start: the chosen machine is offline, named. Automatic never is. */
@@ -124,6 +133,13 @@ export function plannerButton(
 		};
 	}
 	return undefined;
+}
+
+/** The person's own machine that is starting the document's Planner, by name, when one is. */
+export function plannerStartingOn(state: MachineChoiceState | undefined): string | undefined {
+	let planner = state?.planner;
+	if (planner?.state !== "starting" || !planner.machine) return undefined;
+	return state?.machines.find(machine => machine.id === planner.machine)?.label;
 }
 
 const OS: Record<string, string> = { linux: "Linux", darwin: "macOS", win32: "Windows" };
@@ -186,7 +202,7 @@ export function machineRows(
 	return [
 		{
 			id: null,
-			label: "Automatic",
+			label: "Default machine",
 			detail,
 			checked: !chosen,
 			disabled: false,

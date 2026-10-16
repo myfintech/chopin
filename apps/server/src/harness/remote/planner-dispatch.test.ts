@@ -7,7 +7,7 @@ import {
 } from "@chopin/protocol/connector";
 
 import { Machines } from "../../auth/machines";
-import { registerExperimentRoutes } from "../../experiments/routes";
+import { PLANNER_IDLE_MS, registerExperimentRoutes } from "../../experiments/routes";
 import { Router } from "../../http/router";
 import {
 	linkAuth,
@@ -47,22 +47,31 @@ async function dispatchServer() {
 	cleanups.push(server.stop);
 	let router = new Router();
 	let lease = (await storage.leases.acquire("writer", "test", 60_000))!;
-	let runtime = registerExperimentRoutes(router, { ...auth, machines, pairings: {} } as never, {
-		lease: () => lease,
-		changed: () => {},
-		context: async () => ({ source: "# Context", revision: 0 }),
-		planners,
-		attachments: () => server.attachments,
-		// No builds wait anywhere; only the Planner poll is exercised.
-		implementations: () =>
-			({
-				waiting: async () => undefined,
-				busy: async () => false,
-				disconnected: async () => {},
-				sweep: async () => {},
-				call: async () => ({}),
-			}) as never,
-	});
+	/** Documents open in Chopin now, as `main.ts` says from its rooms; and how far the clock moved. */
+	let open = new Set<string>();
+	let skew = { ms: 0 };
+	let clock = () => new Date(Date.now() + skew.ms);
+	let runtime = registerExperimentRoutes(
+		router,
+		{ ...auth, clock, machines, pairings: {} } as never,
+		{
+			lease: () => lease,
+			changed: () => {},
+			context: async () => ({ source: "# Context", revision: 0 }),
+			planners,
+			attachments: () => server.attachments,
+			documentOpen: id => open.has(id),
+			// No builds wait anywhere; only the Planner poll is exercised.
+			implementations: () =>
+				({
+					waiting: async () => undefined,
+					busy: async () => false,
+					disconnected: async () => {},
+					sweep: async () => {},
+					call: async () => ({}),
+				}) as never,
+		},
+	);
 	server.attachments.onChange(channelId => runtime.plannerChanged(channelId));
 
 	async function send(
@@ -109,17 +118,21 @@ async function dispatchServer() {
 			},
 		});
 		let protocol = connector.protocol ?? 4;
-		let opened = await send("/api/connector/connections", {
-			bearer: token,
-			body: { repository: "octo-org/score", commit: "a".repeat(40), label: "score" },
-			headers: {
-				[CONNECTOR_VERSION_HEADER]: "dev",
-				[CONNECTOR_PROTOCOL_HEADER]: String(protocol),
-				...(connector.plannerCommand ?? true ? { [CONNECTOR_PLANNER_COMMAND_HEADER]: "1" } : {}),
-			},
-		});
-		expect(opened.status).toBe(200);
-		let connection = (await opened.json()).token as string;
+		/** `chopin connect` on the machine: a connection of its own, as after a restart. */
+		async function connect() {
+			let opened = await send("/api/connector/connections", {
+				bearer: token,
+				body: { repository: "octo-org/score", commit: "a".repeat(40), label: "score" },
+				headers: {
+					[CONNECTOR_VERSION_HEADER]: "dev",
+					[CONNECTOR_PROTOCOL_HEADER]: String(protocol),
+					...(connector.plannerCommand ?? true ? { [CONNECTOR_PLANNER_COMMAND_HEADER]: "1" } : {}),
+				},
+			});
+			expect(opened.status).toBe(200);
+			return (await opened.json()).token as string;
+		}
+		let connection = await connect();
 		/**
 		 * One `wait_for_work` long poll on the connection: with `planners`, the Planner poll a
 		 * protocol 4 connector makes naming the documents whose Planners it runs. A poll with no
@@ -179,7 +192,20 @@ async function dispatchServer() {
 					params: { name: "disconnect_workspace", arguments: {} },
 				},
 			});
-		return { id: machine.id, token, poll, credential, backend, disconnect };
+		let connectionId = runtime.connections.lookup(connection).connection.id;
+		let reconnect = async () => {
+			connection = await connect();
+		};
+		return {
+			id: machine.id,
+			token,
+			connectionId,
+			poll,
+			credential,
+			backend,
+			disconnect,
+			reconnect,
+		};
 	}
 	let path = `/api/documents/${channel.id}/machine`;
 	let choose = async (login: string, machine: string | null) => {
@@ -188,8 +214,36 @@ async function dispatchServer() {
 		return response.json();
 	};
 	let choice = async (login: string) => (await send(path, { login })).json();
+	/** Star a machine as its owner's favorite, which Default machine prefers, or clear it. */
+	let favor = async (login: string, machine: string, favorite = true) => {
+		let response = await send(`/api/connector/machines/${machine}/favorite`, {
+			login,
+			body: { favorite },
+		});
+		expect(response.status).toBe(200);
+	};
+	/** Someone opens the document in Chopin; closing it starts its idle time. */
+	let visit = async (id = channel.id) => {
+		open.add(id);
+		await runtime.plannerUsed(id);
+	};
 	let url = expect.stringContaining(`https://chopin.test/`);
-	return { ...linked, machines, planners, server, send, machine, choose, choice, url };
+	return {
+		...linked,
+		machines,
+		planners,
+		server,
+		runtime,
+		open,
+		skew,
+		send,
+		machine,
+		choose,
+		choice,
+		favor,
+		visit,
+		url,
+	};
 }
 
 /** The status an agent connection's upgrade gets with `credential`: 101 when it opens. */
@@ -227,7 +281,11 @@ describe("choosing a machine for a document", () => {
 		await choose("member", desk.id);
 		expect(await first.next("refused")).toMatchObject({ code: "access-revoked" });
 		expect((await first.closed).code).toBe(LINK_CLOSE.forbidden);
-		expect(await laptop.poll([channel.id])).toEqual({ kind: "planners", planners: [] });
+		expect(await laptop.poll([channel.id])).toEqual({
+			kind: "planners",
+			planners: [],
+			stopped: { [channel.id]: expect.stringContaining("stopped running its Planner") },
+		});
 		expect(await desk.poll([])).toEqual({ kind: "planners", planners: [{ id: channel.id, url }] });
 		let second = await desk.backend();
 		await second.next("attached");
@@ -240,7 +298,7 @@ describe("choosing a machine for a document", () => {
 			machine: null,
 		});
 		expect(await second.next("refused")).toMatchObject({ code: "access-revoked" });
-		expect(await desk.poll([channel.id])).toEqual({ kind: "planners", planners: [] });
+		expect(await desk.poll([channel.id])).toMatchObject({ kind: "planners", planners: [] });
 		expect(server.attachments.attached(channel.id)).toBe(false);
 	});
 
@@ -285,7 +343,7 @@ describe("choosing a machine for a document", () => {
 		let held = await rivals.backend();
 		await held.next("attached");
 		// So the laptop is no longer asked to run it; then its owner chooses Automatic.
-		expect(await laptop.poll([channel.id])).toEqual({ kind: "planners", planners: [] });
+		expect(await laptop.poll([channel.id])).toMatchObject({ kind: "planners", planners: [] });
 		await choose("member", null);
 		held.send({ type: "detach" });
 		for (let deadline = Date.now() + 4_000; server.attachments.holder(channel.id);) {
@@ -305,6 +363,56 @@ describe("choosing a machine for a document", () => {
 		let credential = await laptop.credential();
 		await choose("member", null);
 		expect(await upgrade(server.url, credential)).toBe(401);
+	});
+
+	it("asks one machine for the Planners of documents in several repositories", async () => {
+		let { machine, choose, channel, send, storage, url } = await dispatchServer();
+		let notes = await storage.channels.create({
+			id: crypto.randomUUID(),
+			repositoryId: "R_notes",
+			repositoryOwner: "octo-org",
+			repositoryName: "notes",
+			title: "Notes document",
+			createdBy: "U_member",
+			now: new Date(),
+		});
+		// Both connected with a checkout of octo-org/score only.
+		let laptop = await machine("member", "U_member", "laptop", { protocol: 5 });
+		let older = await machine("member", "U_member", "older", { protocol: 4 });
+		let chooseNotes = async (machineId: string) => {
+			let response = await send(`/api/documents/${notes.id}/machine`, {
+				login: "member",
+				body: { machine: machineId },
+			});
+			expect(response.status).toBe(200);
+			return response.json();
+		};
+		await choose("member", laptop.id);
+		let chosen = await chooseNotes(laptop.id);
+		expect(chosen.planner).toEqual({ state: "starting", login: null, machine: laptop.id });
+		let asked = await laptop.poll([]);
+		expect(asked.kind).toBe("planners");
+		expect(asked.planners.map((item: { id: string }) => item.id).sort())
+			.toEqual([channel.id, notes.id].sort());
+		expect(asked.planners).toContainEqual({ id: notes.id, url });
+		// Its credential says which repository's checkout the Planner runs in.
+		let issued = await send("/api/connector/planner", {
+			bearer: laptop.token,
+			headers: {
+				[CONNECTOR_VERSION_HEADER]: "dev",
+				[CONNECTOR_PROTOCOL_HEADER]: "5",
+			},
+			body: { document: notes.id },
+		});
+		expect(issued.status).toBe(200);
+		expect((await issued.json()).document).toMatchObject({
+			id: notes.id,
+			repository: "octo-org/notes",
+		});
+		// An older connector connected for octo-org/score is never asked for octo-org/notes.
+		expect((await chooseNotes(older.id)).planner)
+			.toEqual({ state: "none", login: null, machine: null });
+		expect(await older.poll([])).toEqual({ waiting: true });
 	});
 
 	it("never asks a machine without a Planner command or an older connector", async () => {
@@ -364,6 +472,170 @@ describe("choosing a machine for a document", () => {
 		expect((await tower.poll([channel.id])).error).toStartWith("repository-forbidden");
 		expect(await link.next("refused")).toMatchObject({ code: "access-revoked" });
 		expect(server.attachments.attached(channel.id)).toBe(false);
+	});
+});
+
+describe("a document on Default machine", () => {
+	it("runs its Planner on its creator's favorite machine without anyone choosing it", async () => {
+		let { machine, favor, visit, choice, channel, runtime, url } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		let desk = await machine("member", "U_member", "desk");
+		await favor("member", desk.id);
+		// Nobody has opened it yet, so no machine runs its Planner.
+		expect(await desk.poll([])).toEqual({ waiting: true });
+		expect(await runtime.plannerStarting(channel.id)).toBeUndefined();
+
+		await visit();
+		expect(await desk.poll([])).toEqual({ kind: "planners", planners: [{ id: channel.id, url }] });
+		expect(await laptop.poll([])).toEqual({ waiting: true });
+		expect((await choice("member")).planner)
+			.toEqual({ state: "starting", login: null, machine: desk.id });
+		expect(await runtime.plannerStarting(channel.id)).toEqual({ login: "member" });
+
+		let link = await desk.backend();
+		await link.next("attached");
+		expect((await choice("member")).planner)
+			.toEqual({ state: "attached", login: "member", machine: desk.id });
+		expect(await runtime.plannerStarting(channel.id)).toBeUndefined();
+	});
+
+	it("falls back to the machine last used for the document, then any machine that can run Planners", async () => {
+		let { machine, favor, visit, channel, runtime, url } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		let desk = await machine("member", "U_member", "desk");
+		// The favorite can't run Planners, so it is passed over.
+		let plain = await machine("member", "U_member", "plain", { plannerCommand: false });
+		await favor("member", plain.id);
+		runtime.connections.use(channel.id, laptop.connectionId);
+		await visit();
+		expect(await laptop.poll([])).toEqual({
+			kind: "planners",
+			planners: [{ id: channel.id, url }],
+		});
+		expect(await desk.poll([])).toEqual({ waiting: true });
+		expect(await plain.poll([])).toEqual({ waiting: true });
+
+		// Another document nobody built anywhere goes to any machine that can run Planners.
+		let other = await dispatchServer();
+		let tower = await other.machine("member", "U_member", "tower");
+		let box = await other.machine("member", "U_member", "box", { plannerCommand: false });
+		await other.visit();
+		expect(await tower.poll([])).toEqual({
+			kind: "planners",
+			planners: [{ id: other.channel.id, url }],
+		});
+		expect(await box.poll([])).toEqual({ waiting: true });
+	});
+
+	it("runs nowhere when none of its creator's machines can run Planners, nor on anyone else's", async () => {
+		let { machine, visit, choice, channel, runtime } = await dispatchServer();
+		let plain = await machine("member", "U_member", "plain", { plannerCommand: false });
+		let rivals = await machine("rival", "U_rival", "rival-box");
+		await visit();
+		expect(await plain.poll([])).toEqual({ waiting: true });
+		expect(await rivals.poll([])).toEqual({ waiting: true });
+		expect((await choice("member")).planner).toEqual({ state: "none", login: null, machine: null });
+		expect(await runtime.plannerStarting(channel.id)).toBeUndefined();
+	});
+
+	it("keeps the Planner on its machine when another comes online, and moves it when that machine disconnects", async () => {
+		let { machine, favor, visit, choice, channel, server, url } = await dispatchServer();
+		// The creator's favorite is offline, so their other machine takes the Planner.
+		let desk = await machine("member", "U_member", "desk");
+		await favor("member", desk.id);
+		expect((await desk.disconnect()).status).toBe(200);
+		let laptop = await machine("member", "U_member", "laptop");
+		await visit();
+		expect(await laptop.poll([])).toEqual({
+			kind: "planners",
+			planners: [{ id: channel.id, url }],
+		});
+		let first = await laptop.backend();
+		await first.next("attached");
+
+		// The favorite comes back online, and another machine connects: the Planner stays where it is.
+		await desk.reconnect();
+		let tower = await machine("member", "U_member", "tower");
+		expect(await desk.poll([])).toEqual({ waiting: true });
+		expect(await tower.poll([])).toEqual({ waiting: true });
+		expect(await laptop.poll([channel.id])).toEqual({ waiting: true });
+		expect(server.attachments.holding(channel.id)?.machineId).toBe(laptop.id);
+
+		// Its machine disconnects: the creator's favorite is asked, and nothing else.
+		expect((await laptop.disconnect()).status).toBe(200);
+		expect(await first.next("refused")).toMatchObject({ code: "access-revoked" });
+		expect(await desk.poll([], 1_000)).toEqual({
+			kind: "planners",
+			planners: [{ id: channel.id, url }],
+		});
+		expect(await tower.poll([])).toEqual({ waiting: true });
+		let second = await desk.backend();
+		await second.next("attached");
+		expect((await choice("member")).planner)
+			.toEqual({ state: "attached", login: "member", machine: desk.id });
+	});
+
+	it("moves the Planner when its creator's favorite changes, and keeps it when they choose the machine it runs on", async () => {
+		let { machine, favor, visit, choose, choice, channel, url } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		let desk = await machine("member", "U_member", "desk");
+		await favor("member", laptop.id);
+		await visit();
+		expect(await laptop.poll([])).toEqual({
+			kind: "planners",
+			planners: [{ id: channel.id, url }],
+		});
+		let link = await laptop.backend();
+		await link.next("attached");
+
+		// Choosing the machine it already runs on, then Default machine again, never restarts it.
+		await choose("member", laptop.id);
+		await choose("member", null);
+		expect(await laptop.poll([channel.id])).toEqual({ waiting: true });
+		expect((await choice("member")).planner)
+			.toEqual({ state: "attached", login: "member", machine: laptop.id });
+
+		// A new favorite takes it over.
+		await favor("member", desk.id);
+		expect(await link.next("refused")).toMatchObject({ code: "access-revoked" });
+		expect(await laptop.poll([channel.id])).toEqual({
+			kind: "planners",
+			planners: [],
+			stopped: { [channel.id]: expect.stringContaining("changed their favorite machine") },
+		});
+		expect(await desk.poll([])).toEqual({ kind: "planners", planners: [{ id: channel.id, url }] });
+	});
+
+	it("stops the Planner once nobody has used the document for a while", async () => {
+		let { machine, visit, channel, runtime, open, skew, url } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		await visit();
+		expect(await laptop.poll([])).toEqual({
+			kind: "planners",
+			planners: [{ id: channel.id, url }],
+		});
+		let link = await laptop.backend();
+		await link.next("attached");
+
+		// Open, it keeps its Planner however long it stays open.
+		skew.ms = PLANNER_IDLE_MS * 2;
+		await runtime.sweep();
+		expect(await laptop.poll([channel.id])).toEqual({ waiting: true });
+
+		// Closed, it keeps it a while longer, then the Planner stops.
+		open.delete(channel.id);
+		await runtime.sweep();
+		skew.ms += PLANNER_IDLE_MS - 1_000;
+		await runtime.sweep();
+		expect(await laptop.poll([channel.id])).toEqual({ waiting: true });
+		skew.ms += 2_000;
+		await runtime.sweep();
+		expect(await link.next("refused")).toMatchObject({ code: "access-revoked" });
+		expect(await laptop.poll([channel.id])).toEqual({
+			kind: "planners",
+			planners: [],
+			stopped: { [channel.id]: expect.stringContaining("Nobody has used this document") },
+		});
 	});
 });
 

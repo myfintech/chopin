@@ -25,7 +25,6 @@ import type { PlannerSession } from "../harness/session";
 import { verifiedCheckout } from "../harness/atomic/checkout";
 import { rememberCheckout } from "../harness/atomic/workspace";
 import { plannerInstructions } from "../agent/planner";
-import { askJev } from "../conversation-plan/jev";
 import type { ActiveOwnerBinding } from "../agent/active-owner";
 import type { DocumentRoom, ResearchWorkspaceRequest } from "../agent/tools";
 import type { ChildDocuments } from "./children";
@@ -53,6 +52,8 @@ import type { Server } from "bun";
 import type { TextStreamPart, ToolSet } from "ai";
 import type { Chat as Wire, ConversationPlan, Request } from "@chopin/protocol";
 import type { Config } from "../config";
+import type { Decide } from "../conversation-plan/decisions";
+import type { JevRequest } from "../conversation-plan/jev";
 import type { HostedAuth } from "../auth/routes";
 import type { HostedRepository } from "../agent/repository";
 import type { JobService } from "../jobs/service";
@@ -600,6 +601,8 @@ export type Room = {
 	server: Server<SocketData>;
 	room: string;
 	config: Config;
+	/** The deployment's decisions boundary; absent when no decisions model is configured. */
+	decide?: Decide;
 	auth: HostedAuth;
 	/**
 	 * Login session that may claim Planner ownership for this room's turns.
@@ -614,6 +617,11 @@ export type Room = {
 	 * posted or queued, and only an attachment takes Planner ownership.
 	 */
 	plannerNotAttached?: () => Promise<string | undefined>;
+	/**
+	 * Under `HARNESS=remote`, waits a bounded time for a Planner a machine is starting for this
+	 * document, before an `@chopin` message or `invoke_planner` is checked for one.
+	 */
+	plannerStarting?: () => Promise<void>;
 	activeOwner?: () => Promise<ActiveOwnerBinding | undefined>;
 	persist: (chat?: () => Pick<Chat, "entries" | "runs" | "initiativePaused">) => Promise<void>;
 	initiativePresent?: (sessionId: string, actor: string) => boolean;
@@ -666,11 +674,17 @@ export function send(context: Room, ws: Socket, msg: Request<Wire.Send>): Promis
 		return Promise.resolve();
 	}
 	context.chat.pendingSends++;
-	let process = () => processSend(context, ws, msg);
-	let accepted = context.chat.sending.then(process, process);
-	let completed = accepted.finally(() => context.chat.pendingSends--);
-	context.chat.sending = completed.then(() => {}, () => {});
-	return completed;
+	let enqueue = () => {
+		let process = () => processSend(context, ws, msg);
+		let accepted = context.chat.sending.then(process, process);
+		let completed = accepted.finally(() => context.chat.pendingSends--);
+		context.chat.sending = completed.then(() => {}, () => {});
+		return completed;
+	};
+	// A message to the Planner waits for one that is starting before it joins the queue, so the
+	// room's messages never wait with it.
+	if (msg.to !== "planner" || !context.plannerStarting) return enqueue();
+	return context.plannerStarting().catch(() => {}).then(enqueue);
 }
 
 /**
@@ -767,10 +781,15 @@ export async function invoke(
 		context.memberMessagePersisted?.(entry, context.claimantSessionId);
 		return undefined;
 	};
-	let accepted = chat.sending.then(post, post);
-	let completed = accepted.finally(() => chat.pendingSends--);
-	chat.sending = completed.then(() => {}, () => {});
-	return completed;
+	let enqueue = () => {
+		let accepted = chat.sending.then(post, post);
+		let completed = accepted.finally(() => chat.pendingSends--);
+		chat.sending = completed.then(() => {}, () => {});
+		return completed;
+	};
+	// It waits for a Planner that is starting before it joins the queue, as `@chopin` does.
+	if (!context.plannerStarting) return enqueue();
+	return context.plannerStarting().catch(() => {}).then(enqueue);
 }
 
 async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): Promise<void> {
@@ -1602,7 +1621,7 @@ function currentMemberRequest(chat: Chat): ActiveMemberRequest | undefined {
 
 function visualRouting(context: Room): boolean {
 	if (
-		!context.config?.plannerVisuals || context.chat.job
+		!context.config?.plannerVisuals || !context.decide || context.chat.job
 		|| context.config.harness !== "copilot-sdk"
 	) return false;
 	let request = currentMemberRequest(context.chat);
@@ -1652,12 +1671,8 @@ export function documentRoom(context: Room): DocumentRoom {
 		},
 		...(visualRouting(context) && {
 			visual: {
-				ask: (request: Parameters<typeof askJev>[0]) =>
-					askJev(request, {
-						model: context.config.conversationPlanModel,
-						timeoutMs: context.config.conversationPlanTimeoutMs,
-						signal: chat.turnController?.signal,
-					}),
+				ask: (request: JevRequest) =>
+					context.decide!(request, { signal: chat.turnController?.signal }),
 			},
 		}),
 		readReference: async (id, repositoryId) => {

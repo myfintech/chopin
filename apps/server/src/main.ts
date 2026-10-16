@@ -22,7 +22,12 @@ import {
 	isAgentSocket,
 	openAgentSocket,
 } from "./harness/remote/endpoint";
-import { notAttachedMessage, PlannerAttachments } from "./harness/remote/attachments";
+import {
+	notAttachedMessage,
+	PlannerAttachments,
+	startingMessage,
+} from "./harness/remote/attachments";
+import type { PlannerAttachment } from "./harness/remote/attachments";
 import { MachinePlanners } from "./harness/remote/machine-planners";
 import { documentUrl } from "./channels/document-url";
 import { ActiveOwnerBindings } from "./agent/active-owner";
@@ -75,7 +80,7 @@ import { heuristicJudge, jevJudge, SpikeScout } from "./experiments/spike-scout"
 import { spikeHost } from "./experiments/spike-host";
 import { spikeSettler, startSettle } from "./experiments/spike-settle";
 import { resolveInstruction } from "./experiments/spikes";
-import { askJev } from "./conversation-plan/jev";
+import { openDecisions } from "./conversation-plan/decisions";
 import { locksEditing, requestBuild } from "./tasks/builds";
 import { pendingLinks, relinkInstruction } from "./tasks/relink";
 import { BuildReadiness } from "./tasks/readiness";
@@ -128,6 +133,8 @@ import type {
 } from "./wire";
 
 const config = load();
+/** The one decisions boundary, checked against Atomic's registry before anything starts. */
+const decide = await openDecisions(config);
 harnessFor(config);
 const storage = createStorage(config.storage);
 const router = new Router();
@@ -149,6 +156,8 @@ const LEASE_RETRY_MS = 1_000;
 const SESSION_CLEANUP_MS = 5 * 60_000;
 const ACCESS_RECHECK_MS = 60_000;
 const RESEARCH_RECOVERY_RETRY_MS = 10_000;
+/** How long `@chopin` and `invoke_planner` wait for a Planner a machine is starting. */
+const PLANNER_START_MS = 30_000;
 
 let server: Server<SocketData>;
 const writerLease = new WriterLease(storage.leases, {
@@ -204,6 +213,7 @@ let archivingChannels = new Set<string>();
 let deletingChannels = new Set<string>();
 let conversationRuntime = createConversationRuntime({
 	config,
+	decide,
 	server: () => server,
 	unavailable: id => archivingChannels.has(id) || deletingChannels.has(id),
 	researchJobs: () => researchBriefJobs,
@@ -525,6 +535,7 @@ function conversation(
 		server,
 		room: room.id,
 		config,
+		decide,
 		auth: hostedAuth,
 		claimantSessionId,
 		repository,
@@ -554,12 +565,14 @@ function conversation(
 				let path = channel
 					? await documentUrl(channel, storage.channels)
 					: `/channels/${room.id}`;
-				return notAttachedMessage(
+				return plannerNotAttached(
+					room.id,
 					new URL(path, hostedAuth.config.origin).href,
 					`${repository.owner}/${repository.name}`,
 				);
 			}
 			: undefined,
+		plannerStarting: plannerAttachments ? () => plannerStarting(room.id) : undefined,
 		persist: chat => Service.persist(opened, chat),
 		...(room.parentChannelId
 			? {
@@ -857,6 +870,56 @@ async function closeRoom(room: Rooms.Room, force = false): Promise<void> {
 	} finally {
 		if (room.closing === closing) room.closing = undefined;
 	}
+}
+
+/**
+ * What a Planner request is told while the document has no Planner attached: that a machine is
+ * still starting it, or how to get one.
+ */
+async function plannerNotAttached(channelId: string, url: string, repository: string) {
+	let starting = await experiments?.plannerStarting(channelId);
+	if (starting) return startingMessage(starting.login);
+	return notAttachedMessage(url, repository, !!experiments?.plannerMachines);
+}
+
+/**
+ * An `@chopin` message or `invoke_planner` call: the document is in use, so a machine starts its
+ * Planner if none runs it, and the request waits a bounded time for it to attach.
+ */
+async function plannerStarting(channelId: string): Promise<void> {
+	if (!plannerAttachments || plannerAttachments.attached(channelId) || !experiments) return;
+	await experiments.plannerUsed(channelId);
+	if (await experiments.plannerStarting(channelId)) {
+		await plannerAttachments.attachedWithin(channelId, PLANNER_START_MS);
+	}
+}
+
+/** Who holds the document's Planner, or whose machine is starting it when nobody does. */
+async function plannerStatus(channelId: string): Promise<PlannerAttachment> {
+	let status = plannerAttachments!.status(channelId);
+	if (status.state !== "none") return status;
+	let starting = await experiments?.plannerStarting(channelId);
+	return starting ? { state: "starting", login: starting.login } : status;
+}
+
+/** Each document's latest status announcement, so an earlier one that resolves later is dropped. */
+let plannerAnnouncements = new Map<string, number>();
+
+/** Tell everyone in the document who holds its Planner now, or whose machine is starting it. */
+function announcePlanner(channelId: string): void {
+	if (!plannerAttachments || !Rooms.get(channelId)) return;
+	let turn = (plannerAnnouncements.get(channelId) ?? 0) + 1;
+	plannerAnnouncements.set(channelId, turn);
+	void plannerStatus(channelId).then(planner => {
+		if (plannerAnnouncements.get(channelId) !== turn) return;
+		plannerAnnouncements.delete(channelId);
+		if (server && !draining) {
+			broadcast(server, channelId, { kind: "session:planner", ts: 0, planner });
+		}
+	}, err => {
+		if (plannerAnnouncements.get(channelId) === turn) plannerAnnouncements.delete(channelId);
+		console.error("chopin: could not announce a document's Planner -", err);
+	});
 }
 
 function evict(room: Rooms.Room): void {
@@ -1543,6 +1606,14 @@ function openRoomSocket(ws: Socket): void {
 	});
 	if (plannerAttachments) {
 		tell(ws, { kind: "session:planner", ts: 0, planner: plannerAttachments.status(room.id) });
+		// Opening a document on Default machine asks its creator's machine to start its Planner.
+		void (async () => {
+			await experiments?.plannerUsed(room.id);
+			let planner = await plannerStatus(room.id);
+			if (!ws.data.closed && planner.state === "starting") {
+				tell(ws, { kind: "session:planner", ts: 0, planner });
+			}
+		})().catch(err => console.error("chopin: could not start a document's Planner -", err));
 	}
 	relay(ws, { kind: "session:presence", ts: 0, members: Rooms.members(room) });
 	scheduleAuthorization(ws);
@@ -2135,6 +2206,8 @@ let machinePlanners = config.agent && config.harness === "remote"
 experiments = registerExperimentRoutes(router, hostedAuth, {
 	planners: machinePlanners,
 	attachments: () => plannerAttachments,
+	documentOpen: id => Rooms.all().some(room => room.id === id || room.parentChannelId === id),
+	plannerStatus: announcePlanner,
 	implementations: () => implementations,
 	connectorVersion: config.connectorVersion,
 	lease() {
@@ -2188,9 +2261,7 @@ if (config.agent && config.harness === "remote") {
 	plannerAttachments.onChange((channelId, planner) => {
 		// A machine chosen for the document may start its Planner, or stop waiting to.
 		experiments?.plannerChanged(channelId);
-		if (server && !draining) {
-			broadcast(server, channelId, { kind: "session:planner", ts: 0, planner });
-		}
+		announcePlanner(channelId);
 		// Settlements that waited for a Planner can run now.
 		if (planner.state === "attached") {
 			void ownerAvailable(channelId).catch(err =>
@@ -2288,9 +2359,7 @@ if (config.liveBuild) {
 		current: currentDocumentTarget,
 		skip: pastReadiness,
 		review: id => readinessReviews.review(id),
-		ask: process.env.JEV_API_KEY || process.env.TYPESAFE_API_KEY
-			? request => askJev(request)
-			: undefined,
+		ask: decide,
 		error: err => console.error("chopin: build readiness failed -", err),
 	});
 }
@@ -2376,6 +2445,7 @@ registerMcpRoutes(router, hostedAuth, {
 			transition: withDocumentTransition,
 			open: rootId => openRootChat(rootId, input.session?.session.id, input.repository),
 		}, input),
+	plannerNotAttached,
 	archiveChannel,
 	isChannelDeleting: channelId => deletingChannels.has(channelId),
 	onChannelRenamed: announceChannel,
@@ -2396,6 +2466,7 @@ implementations = registerImplementationRoutes(router, hostedAuth, {
 	connections: experiments.connections,
 	refuseOffline: experiments.refuseOffline,
 	machineChoices: experiments.machineChoices,
+	sourceFor: experiments.sourceFor,
 	busy: async connectionId =>
 		(await experiments!.service.store.active()).some(item =>
 			item.connectionId === connectionId && ["running", "publishing"].includes(item.state)
@@ -2407,10 +2478,7 @@ if (config.liveBuild) {
 	liveSync = new LiveSyncCoordinator({
 		withPlan: withImplementationPlan,
 		connections: runtime.connections,
-		classifier: liveClassifier({
-			model: config.conversationPlanModel ?? "jev-latest",
-			timeoutMs: config.conversationPlanTimeoutMs ?? 30_000,
-		}),
+		classifier: liveClassifier(decide),
 		queued: (id, build) => {
 			implementations?.track(id);
 			runtime.connections.wake(build.repositoryId);
@@ -2419,12 +2487,11 @@ if (config.liveBuild) {
 	});
 }
 if (config.liveSpikes) {
-	let jev = config.conversationPlanModel ?? "jev-latest";
-	let timeoutMs = config.conversationPlanTimeoutMs ?? 30_000;
 	spikeScout = new SpikeScout({
 		host: spikeHost({
 			service: experiments.service,
 			connections: experiments.connections,
+			sourceFor: experiments.sourceFor,
 			withPlan: withImplementationPlan,
 			landed: (channelId, value) => {
 				void spikeSettlement.settle(channelId, value.id).catch(err =>
@@ -2432,9 +2499,9 @@ if (config.liveSpikes) {
 				);
 			},
 		}),
-		// Without Jev nothing is spiked unless the operator opts into the regex judge.
-		judge: process.env.JEV_API_KEY || process.env.TYPESAFE_API_KEY
-			? jevJudge(request => askJev(request, { model: jev, timeoutMs }))
+		// Without a decisions model nothing is spiked unless the operator opts into the regex judge.
+		judge: decide
+			? jevJudge(request => decide(request))
 			: config.liveSpikesRegexJudge
 			? heuristicJudge
 			: undefined,

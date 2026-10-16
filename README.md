@@ -100,14 +100,15 @@ and tool vocabulary remain optimized for planning.
   transcripts, decisions, research request staging, background-job inputs and
   artifacts, and session records are stored in PostgreSQL.
 - Optional conversation-derived cards default to off. With `CONVERSATION_PLAN=on`,
-  current and recent Chat messages and selected decision context are sent to
-  TypeSafe's Jev service for interpretation. This uses the server's `JEV_API_KEY`,
-  separately from the Planner's harness credentials, and continues with `AGENT=off`.
+  current and recent Chat messages and selected decision context are sent to the
+  deployment's decisions classifier (OpenAI's Decisions API with `OPENAI_API_KEY`,
+  or TypeSafe's Jev with `JEV_API_KEY`), separately from the Planner's harness
+  credentials. It continues with `AGENT=off`.
   Independent research analysis can propose [research offers](docs/conversation-research.md)
   with shared editable briefs. Brief synthesis uses an isolated harness worker;
   a writer starts the research explicitly.
-- Experimental Planner visual routing is opt-in with `PLANNER_VISUALS=on` and
-  `JEV_API_KEY`. Jev makes small possibility, comprehension, and type decisions
+- Experimental Planner visual routing is opt-in with `PLANNER_VISUALS=on`. The
+  decisions classifier makes small possibility, comprehension, and type decisions
   for one explanatory paragraph at a time; Planner authors the selected visual.
   Routing applies to explicit member requests of at most 1,000 characters under
   `copilot-sdk`. Other turns keep their ordinary authoring behavior.
@@ -158,7 +159,8 @@ Install, configure, and start Chopin:
 bun install
 cp .env.example .env
 openssl rand -hex 32
-# Fill in the GitHub App values, generated session key, and JEV_API_KEY in .env.
+# Fill in the GitHub App values, generated session key, and OPENAI_API_KEY or
+# JEV_API_KEY in .env.
 bun run db:up
 bun run migrate
 bun run dev
@@ -218,14 +220,16 @@ a Chat reference.
 ## Use your own machine
 
 The `chopin` CLI connects a machine you control to your Chopin server, so
-builds, investigations and Planner work run in your own checkout with your own
-coding agent. Install it, then connect your checkout once with your server's
-origin in `CHOPIN_URL`. `chopin connect` pairs the machine the first time and
-saves the server for later commands.
+builds, investigations and Planner work run there with your own coding agent,
+for documents in any repository you can push to. Install it, then connect once
+with your server's origin in `CHOPIN_URL`, from any folder. `chopin connect`
+pairs the machine the first time and saves the server for later commands. It
+clones each repository the first time work needs it; `--checkout <path>` uses
+a checkout you already have instead.
 
 ```bash
 curl -fsSL https://github.com/githubnext/chopin/releases/latest/download/install.sh | sh
-CHOPIN_URL=https://your-chopin-instance.example chopin connect . --agent copilot
+CHOPIN_URL=https://your-chopin-instance.example chopin connect --agent copilot
 ```
 
 That runs in your terminal and stops when you close it. On a remote machine or
@@ -241,7 +245,7 @@ agents:
 | [Atomic](https://github.com/bastani-inc/atomic-acp)                                                 | `npm install -g @bastani/atomic @bastani/atomic-acp` | `--agent atomic`  | Yes                |
 
 Any other agent that speaks ACP works too: give its command after `--` instead,
-as in `chopin connect . -- my-agent --acp`.
+as in `chopin connect -- my-agent --acp`.
 
 The **Machines** page, at `/machines` on your server (its former address, `/connect`, redirects there), gives one command that
 installs `chopin` and connects the machine, with your server filled in: your

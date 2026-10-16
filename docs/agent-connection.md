@@ -243,13 +243,13 @@ rests on ends or the document's Planner is reset. The server then sends
 `refused` and closes an attached connection at once, and any eligible account,
 including the same one, can attach again immediately:
 
-| Cause                                                                                                                                     | Refusal code       | Close code |
-| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ---------- |
-| The owner's browser sign-in signs out or expires                                                                                          | `sign-in-required` | 4401       |
-| The machine whose credential attached it is disconnected, or GitHub refuses its authorization                                             | `access-revoked`   | 4403       |
-| Chopin started it on a machine chosen for the document, and its owner chose another machine or Automatic, or the machine lost push access | `access-revoked`   | 4403       |
-| A repository writer resets the document's Planner                                                                                         | `access-revoked`   | 4403       |
-| The stored ownership no longer names this attachment's sign-in                                                                            | `access-revoked`   | 4403       |
+| Cause                                                                                                                                                                        | Refusal code       | Close code |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ---------- |
+| The owner's browser sign-in signs out or expires                                                                                                                             | `sign-in-required` | 4401       |
+| The machine whose credential attached it is disconnected, or GitHub refuses its authorization                                                                                | `access-revoked`   | 4403       |
+| Chopin started it on a machine and moved it to another, or stopped it: a new machine choice or favorite, the document unused for 30 minutes, or the machine lost push access | `access-revoked`   | 4403       |
+| A repository writer resets the document's Planner                                                                                                                            | `access-revoked`   | 4403       |
+| The stored ownership no longer names this attachment's sign-in                                                                                                               | `access-revoked`   | 4403       |
 
 The same checks before every `start` and `turn`, and the periodic one, also
 find an expired sign-in or a released ownership that nothing reported; an
@@ -287,7 +287,23 @@ with the code `planner-not-attached`, and nothing is posted or queued. A
 document whose Planner is within its grace period counts as unattached, and so
 does one whose attached connection the request finds stale: its owner's browser
 sign-in has ended or the stored ownership no longer names it. The request closes
-that connection before it is refused. The refusal's message names the document URL:
+that connection before it is refused.
+
+When a paired machine is starting the document's Planner, the request first
+waits up to 30 seconds for it to attach, and is refused only if it has not:
+
+```text
+This document's Planner is still starting on @<login>'s machine. Try again in a moment.
+```
+
+If no machine is starting one, the message says how to get one. Where Chopin
+runs Planners on paired machines:
+
+```text
+No Planner is attached to this document. Connect a machine that can run Planners (start `chopin connect` with `--planner-command`), or choose one with the machine button in Chat.
+```
+
+Elsewhere it names the document URL:
 
 ```text
 No Planner is attached to this document. To attach one, connect a Planner client to <document URL> over the agent connection from a session in a checkout of <owner/name>; that session becomes this document's Planner.
@@ -571,10 +587,16 @@ paused, so a paused run stays stopped.
 `status` is one of `running`, `waiting`, `paused`, `finished`, `blocked`,
 `failed`, `stopped`; times are whole seconds since the epoch; `waiting` counts
 open questions. Up to 64 `stages` are
-`{ "id": "", "name": "", "kind?": "tool", "status": "", "started?": 0, "ended?": 0 }`
+`{ "id": "", "name": "", "parentIds?": [], "kind?": "tool", "status": "", "started?": 0, "ended?": 0 }`
 with `status` one of `pending`, `running`, `awaiting_input`, `paused`, `blocked`,
-`completed`, `failed`, `skipped`. `active` and `paused` list at most 64 root run
-ids. When the connection closes, the server shows the reported live runs as stopped.
+`completed`, `failed`, `skipped`, `stopped`. Optional `parentIds` names the parent
+stages by their IDs in this report (at most 64 IDs, each 1–128 characters). Send
+these links for nested work; older reports without them remain valid on version 1.
+Chat renders unfinished descendants of stopped, failed, blocked or skipped stages
+as stopped, while preserving finished outcomes. A stopped, failed or blocked run
+stops all unfinished stage displays even without parent links. `active` and
+`paused` list at most 64 root run IDs. When the connection closes, the server
+shows the reported live runs as stopped.
 
 ## Closing
 
@@ -611,7 +633,7 @@ A paired machine can run a document's Planner without a browser sign-in. The
 hands it a credential; the backend attaches over this connection like any client.
 
 ```sh
-chopin connect . --planner https://chopin.example/octo-org/score/plan \
+chopin connect --planner https://chopin.example/octo-org/score/plan \
   --planner-command "my-planner --flag" --agent copilot
 ```
 
@@ -619,8 +641,10 @@ chopin connect . --planner https://chopin.example/octo-org/score/plan \
 shell would, without expanding anything: single and double quotes, also inside
 a word as in `--label="two words"`, and backslash escapes outside single
 quotes; an unmatched quote is refused. `CHOPIN_PLANNER_COMMAND` may hold the
-command as a JSON array of words instead. The command runs in the checkout
-`connect` serves, in its own process group. Its standard output and error go
+command as a JSON array of words instead. The command runs in the checkout of
+the document's repository, in its own process group: the one `--checkout` named,
+else a clone in `<base dir>/repos/<owner>/<repo>` that the connector makes once
+and fetches again before each launch. Its standard output and error go
 to the connector's a line at a time, with its credential, your `--env` values
 and anything that looks like a token replaced with `[redacted]`; a line too
 long to mask is left out, with a note in its place.
@@ -634,7 +658,7 @@ Each launch gets the connector's environment, your `--env` values, and these:
 | `CHOPIN_URL`                     | The server's origin.                                                                     |
 | `CHOPIN_DOCUMENT`                | The document as given to `--planner`, or its URL when Chopin chose this machine.         |
 | `CHOPIN_PLANNER_TOKEN`           | This launch's [credential](#credential).                                                 |
-| `CHOPIN_CHECKOUT`                | The checkout's absolute root.                                                            |
+| `CHOPIN_CHECKOUT`                | The absolute root of the document's repository's checkout or clone.                      |
 | `CHOPIN_WORKTREE`                | The command's own worktree path, `<base dir>/planners/<owner>/<repo>/<document id>`.     |
 | `CHOPIN_GITHUB_TOKEN`            | The machine owner's token from Chopin's GitHub App, for pushing and draft pull requests. |
 | `CHOPIN_GITHUB_TOKEN_EXPIRES_AT` | When that token expires, in ISO 8601.                                                    |

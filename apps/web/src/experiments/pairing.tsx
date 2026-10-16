@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { useTransitionPresence } from "@chopin/editor/transition-presence";
 import { ArrowLeftIcon, CheckIcon, MachineIcon, RestartIcon } from "@chopin/icons";
 import { InlineNotice } from "@chopin/visuals/inline-notice";
@@ -7,7 +7,7 @@ import { AddServerPage } from "./add-server";
 import { experimentRequest } from "./api";
 import { AddComputerDialog, AddMachineMenu } from "./machine-setup";
 import { MachineDetail, YourMachines } from "./machine-list";
-import { goTo, useArrivedMachine, useLogin, useMachines } from "./machines";
+import { goTo, useArrivedMachine, useMachines, useOwner } from "./machines";
 import { pairingProblem } from "./pairing-problems";
 import { SETUP_GUIDE } from "./setup-commands";
 
@@ -40,6 +40,12 @@ function MachinesFrame(
 		title: string;
 	},
 ) {
+	let heading = useRef<HTMLHeadingElement>(null);
+	useLayoutEffect(() => {
+		if (!document.activeElement?.closest('[role="dialog"]')) {
+			heading.current?.focus({ preventScroll: true });
+		}
+	}, [title]);
 	return (
 		<div className="machines-page" data-hosted="">
 			<main className="machines-main">
@@ -47,7 +53,7 @@ function MachinesFrame(
 					{lead}
 					<div className="machines-title">
 						<div className="min-w-0">
-							<h1 className="text-xl font-semibold">{title}</h1>
+							<h1 className="text-xl font-semibold" ref={heading} tabIndex={-1}>{title}</h1>
 							{description && (
 								<p className="machines-description mt-1 text-sm text-text-secondary">
 									{description}
@@ -77,7 +83,7 @@ function MachinesHome({ onServer }: { onServer: () => void }) {
 	let list = machines.machines;
 	let arrived = useArrivedMachine(list);
 	let bannerId = useId();
-	let login = useLogin();
+	let owner = useOwner();
 	// /machines?add, as a document's machine button's Add machine opens it, starts with the dialog.
 	let [adding, setAdding] = useState(() => new URLSearchParams(location.search).has("add"));
 	useEffect(() => {
@@ -122,7 +128,7 @@ function MachinesHome({ onServer }: { onServer: () => void }) {
 					</div>
 				</section>
 			)}
-			<YourMachines login={login} machines={machines} onChoose={choose} />
+			<YourMachines machines={machines} onChoose={choose} owner={owner} />
 			{dialog.phase !== "closed" && (
 				<AddComputerDialog
 					motion={dialog}
@@ -172,7 +178,7 @@ function MachinesPage() {
  */
 function MachinePage({ id }: { id: string }) {
 	let machines = useMachines();
-	let login = useLogin();
+	let owner = useOwner();
 	let machine = machines.machines?.find(value => value.id === id);
 	return (
 		<MachinesFrame
@@ -191,7 +197,7 @@ function MachinePage({ id }: { id: string }) {
 			}
 			title={machine?.label ?? "Machine"}
 		>
-			<MachineDetail id={id} login={login} machines={machines} />
+			<MachineDetail id={id} machines={machines} owner={owner} />
 		</MachinesFrame>
 	);
 }
@@ -220,10 +226,10 @@ function ConnectedMachines({ label }: { label: string }) {
 		}, FOLLOW_MS);
 		return () => window.clearTimeout(timer);
 	}, [waiting, machines.machines, retry]);
-	let login = useLogin();
+	let owner = useOwner();
 	return (
 		<YourMachines
-			login={login}
+			owner={owner}
 			machines={machines}
 			onChoose={kind => goTo(kind === "server" ? SERVER_PATH : "/machines")}
 		/>
