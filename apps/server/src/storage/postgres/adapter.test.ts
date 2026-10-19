@@ -1010,6 +1010,8 @@ if (url) {
 				"021_document_titles",
 				"022_machine_choices",
 				"023_machine_favorites",
+				"024_document_versions",
+				"025_document_version_summaries",
 				"mantl_document_provenance",
 				"mantl_user_preferences",
 			]);

@@ -53,6 +53,8 @@ export type PlannerInvocation = {
 	instruction: string;
 	/** Unverified; only the atomic harness reads it. */
 	checkout?: string;
+	/** An automatic follow-up shown in Chat as a system notice rather than the caller's message. */
+	system?: boolean;
 };
 
 export type ImplementationPersistence = { lease(): Lease };
@@ -342,6 +344,7 @@ export function hosted(
 						session: await auth.sessions.forUser(caller.user.id),
 						instruction: input.instruction,
 						...(input.checkout === undefined ? {} : { checkout: input.checkout }),
+						...(input.as === "system" ? { system: true } : {}),
 					});
 					let url =
 						new URL(await documentUrl(channel, auth.storage.channels), auth.config.origin).href;
@@ -647,6 +650,13 @@ export function hosted(
 							}
 							if (channel.archivedAt) return { kind: "archived" as const };
 							if (Plan.implementationActive(plan)) return { kind: "locked" as const };
+							// History credits the rewrite to this person, so they need a user row.
+							await auth.storage.users.put({
+								id: caller.user.id,
+								login: caller.user.login,
+								avatarUrl: caller.user.avatarUrl,
+								now: auth.clock(),
+							});
 							if (input.revision !== plan.revision) {
 								return {
 									kind: "revision-conflict" as const,
@@ -670,7 +680,7 @@ export function hosted(
 										? { description: channel.description.value }
 										: {}),
 								},
-							}));
+							}), caller.user.id);
 							if (!outcome.ok) {
 								return outcome.reason === "stale"
 									? {

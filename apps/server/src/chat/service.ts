@@ -116,6 +116,8 @@ export type Waiting = Wire.Waiting & {
 	focus?: Focus;
 	/** The child holding `thread`, when the thread is not in this document. */
 	threadChannel?: string;
+	/** See `Instruction`. */
+	quiet?: boolean;
 };
 
 /** A request for implementation tasks, live while its turn is queued or running. */
@@ -170,6 +172,8 @@ export type Instruction = {
 	focus?: Focus;
 	/** The child holding `thread`, when the thread is not in this document. */
 	threadChannel?: string;
+	/** Kept out of the visible queue: its notice says why, and its text is for the Planner alone. */
+	quiet?: boolean;
 };
 
 /**
@@ -550,10 +554,13 @@ function responded(chat: Chat, server: Server<SocketData>, room: string, text: s
  * The queue as clients see it.
  *
  * Internal queue metadata decides how and under whose authority a turn runs.
- * None of it belongs in the wire projection.
+ * None of it belongs in the wire projection. Queued background jobs are not messages
+ * anyone sent, so they stay off the wire entirely.
  */
 function visible(chat: Chat): Wire.Waiting[] {
-	return chat.waiting.filter(item => !item.draft).map(({ handle, id, text, references }) => ({
+	return chat.waiting.filter(item => !item.draft && !item.job && !item.quiet).map((
+		{ handle, id, text, references },
+	) => ({
 		handle,
 		id,
 		text,
@@ -692,7 +699,9 @@ export function send(context: Room, ws: Socket, msg: Request<Wire.Send>): Promis
  *
  * The caller is attributed on the posted message, and the turn runs under the
  * channel's Planner owner. A checkout matters only to the atomic harness, which
- * verifies it before anything is posted and remembers it for the channel.
+ * verifies it before anything is posted and remembers it for the channel. With a
+ * `notice`, an automatic follow-up, Chat shows that notice instead of a message
+ * and the text goes to the Planner alone, as for any other instruction.
  */
 export async function invoke(
 	context: Room,
@@ -702,6 +711,7 @@ export async function invoke(
 	focus?: Focus,
 	/** Called once, when the invoked turn ends or is dropped; never when this refuses. */
 	settled?: () => void,
+	notice?: string,
 ): Promise<
 	| "planner-unavailable"
 	| "planner-not-attached"
@@ -730,6 +740,15 @@ export async function invoke(
 		}
 		if (chat.closed) return "planner-unavailable" as const;
 		if (chat.busy && chat.waiting.length >= MAX_QUEUE) return "planner-queue-full" as const;
+		if (notice !== undefined) {
+			if (verified) rememberCheckout(room, verified);
+			await instruct(context, user.login, text, notice, {
+				quiet: true,
+				...(focus ? { focus } : {}),
+				...(settled ? { ended: () => settled() } : {}),
+			});
+			return undefined;
+		}
 		let entry: Wire.Entry = {
 			id: ulid(),
 			author: { kind: "member", handle: user.login },

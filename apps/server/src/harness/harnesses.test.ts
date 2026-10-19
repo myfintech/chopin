@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, it } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { workflowJournal } from "./atomic/workspace";
 import { harnesses, harnessFor, registerCredential, shutdownHarnesses } from "./harnesses";
 
 // A developer's .env can select HARNESS=atomic; agents.ts then constructs and
@@ -54,6 +55,37 @@ it("refuses Atomic's host-login auto mode on a non-loopback bind but accepts ai-
 	}
 	expect(harnessFor({ harness: "atomic", harnessAuth: "ai-gateway", host: "0.0.0.0" }).harnessId)
 		.toBe("atomic");
+});
+
+it("journals Atomic workflow runs in Chopin's state directory unless the operator names a journal", async () => {
+	let previous = {
+		state: process.env.XDG_STATE_HOME,
+		journal: process.env.ATOMIC_WORKFLOW_JOURNAL_PATH,
+	};
+	let state = join(tmpdir(), `chopin-state-${crypto.randomUUID()}`);
+	let restore = (name: string, value: string | undefined) =>
+		value === undefined ? delete process.env[name] : process.env[name] = value;
+	try {
+		process.env.XDG_STATE_HOME = state;
+		delete process.env.ATOMIC_WORKFLOW_JOURNAL_PATH;
+		if (process.platform === "linux") {
+			expect(workflowJournal()).toBe(join(state, "chopin", "atomic", "workflows.sqlite"));
+		}
+		// Each Planner session is given its journal; the process environment is left alone.
+		harnessFor({ harness: "atomic", harnessAuth: "ai-gateway", host: "0.0.0.0" });
+		expect(process.env.ATOMIC_WORKFLOW_JOURNAL_PATH).toBeUndefined();
+		await shutdownHarnesses();
+
+		process.env.ATOMIC_WORKFLOW_JOURNAL_PATH = "/srv/atomic/runs.sqlite";
+		expect(workflowJournal()).toBe("/srv/atomic/runs.sqlite");
+		harnessFor({ harness: "atomic", harnessAuth: "ai-gateway", host: "0.0.0.0" });
+		await shutdownHarnesses();
+		expect(process.env.ATOMIC_WORKFLOW_JOURNAL_PATH).toBe("/srv/atomic/runs.sqlite");
+	} finally {
+		await shutdownHarnesses();
+		restore("XDG_STATE_HOME", previous.state);
+		restore("ATOMIC_WORKFLOW_JOURNAL_PATH", previous.journal);
+	}
 });
 
 it("accepts the remote harness on any bind without HARNESS_AUTH, and refuses one", () => {

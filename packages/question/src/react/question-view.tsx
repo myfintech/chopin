@@ -12,7 +12,7 @@
 import { useEffect, useId, useLayoutEffect, useReducer, useRef, useState } from "react";
 import { CheckIcon, ChevronIcon, DecisionIcon, PlusIcon, WarningIcon } from "@chopin/icons";
 
-import { INPUT_EXPIRY_MS, MAX_LABEL, MAX_SHARED_OPTIONS } from "../limits";
+import { MAX_NEW_LABEL, MAX_SHARED_OPTIONS } from "../limits";
 import { answered } from "../draft";
 import { InlineCode } from "./inline-code";
 import { plainInlineList, plainInlineText } from "./inline-segments";
@@ -473,7 +473,7 @@ function AddOption(
 					className="question-field"
 					disabled={disabled}
 					enterKeyHint="done"
-					maxLength={MAX_LABEL}
+					maxLength={MAX_NEW_LABEL}
 					onBlur={event => {
 						// Only an empty field collapses by itself. Typed text is kept, because
 						// adding an option is visible to everyone and should be deliberate.
@@ -565,9 +565,7 @@ function Related(
 			type="button"
 			data-ace-question-id={id}
 			data-press="wide"
-			aria-label={count > 1
-				? `${label} — show in document, ${count} places`
-				: `${label} — show in document`}
+			aria-label={`${label} — show in document`}
 			onClick={() => onSelect?.(id)}
 			onMouseEnter={() => onEnter?.(id)}
 			onMouseLeave={event => event.currentTarget !== document.activeElement && onLeave?.(id)}
@@ -576,11 +574,6 @@ function Related(
 			className={`${className} ${LINK}`}
 		>
 			<span className="min-w-0 flex-1">{children}</span>
-			{count > 1 && (
-				<span aria-hidden="true" className="shrink-0 text-sm text-text-tertiary tabular-nums">
-					{count}
-				</span>
-			)}
 		</button>
 	);
 }
@@ -753,13 +746,13 @@ function Callout(
 	);
 }
 
-const EXPIRED_NOTE = `Nobody answered within ${
-	INPUT_EXPIRY_MS / 60_000
-} minutes. The Planner will use its best judgement for this decision.`;
+const EXPIRED_NOTE =
+	"Nobody answered this question, so the Planner used its best judgement for this decision.";
 
 /**
- * Host input whose time ran out. Unlike a cancelled card it stays in the
- * document, so it keeps what was asked beside the note saying nobody answered.
+ * Host input an earlier Chopin closed unanswered; questions no longer expire.
+ * Unlike a cancelled card it stays in the document, so it keeps what was asked
+ * beside the note saying nobody answered.
  */
 function Expired({ definition }: { definition: Definition }) {
 	return (
@@ -983,7 +976,6 @@ export function QuestionView(props: QuestionViewProps) {
 			: undefined;
 		let relationNote = hostNote ?? (related && (
 			<RelationNote
-				count={places?.[related.question]}
 				onEnter={onQuestionEnter}
 				onLeave={onQuestionLeave}
 				onSelect={onQuestionSelect}

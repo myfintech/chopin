@@ -87,7 +87,11 @@ occurs.
 Title maintenance uses an isolated heading job after a member message is saved,
 including ordinary coworker messages. It works with `CONVERSATION_PLAN=off`
 without Jev and is disabled by `AGENT=off`. It preserves weak-context titles and
-existing body prose, and may refine a human-edited title when the topic changes.
+existing body prose. When the topic changes it may refine a blank title, the
+generated name of a document created without one, or the title a Planner last
+drafted (kept in the sidecar as `plannerTitle`). A title a person set, at
+creation, by renaming or by editing the heading, is never replaced; the job may
+still seed a goal beneath it.
 Missing credentials, an absent remote attachment and an implementation lock keep
 new work pending. Closing or detaching interrupts live work; reconnecting never
 replays an interrupted job. Under `remote`, title work uses only the attached owner
@@ -98,6 +102,11 @@ call follows the same rules. Its instruction is posted as the caller's own
 message; the turn runs under the channel's current owner, whoever that is. A
 channel without one is claimed for the caller's live browser login, hosted or
 local, and without such a login the call is refused and nothing is posted.
+With `as: "system"` the call is an
+[automatic follow-up](local-agent-mcp.md#automatic-follow-ups): Chat shows a
+system notice naming the caller instead of their message, and the instruction
+goes to the Planner alone. Only the document's creator or the account holding
+its Planner may send one, at most 10 an hour per document.
 Under `HARNESS=remote` only attaching claims ownership. An `@chopin` message or
 `invoke_planner` call for a document without an attached Planner is refused with
 `planner-not-attached`, and with one it runs as a turn on that Planner under its
@@ -253,7 +262,7 @@ them. Chopin's compaction, summary, and cache overrides still apply on top.
 Chopin appends its Planner
 instructions to Atomic's assembled prompt. Session, settings, and model
 credentials remain in memory; Atomic's own enabled tools, extensions, MCP
-servers, and workflow storage can perform writes as the server process's user.
+servers, and workflow journal can perform writes as the server process's user.
 Background summary and research workers still use the isolated sessions described
 above.
 
@@ -304,18 +313,24 @@ extension dialogs, and workflow-stage input become ordinary shared Decisions:
   appear verbatim in the prompt. Explicitly submitted empty text is an answer,
   not cancellation.
 - Workflow cards show their question exactly as asked, with no run or stage
-  ids; Chat's run card shows which run is waiting on Decisions. A request is
-  appended as one adjacent batch at the end of the document.
+  ids; Chat's run card shows which run is waiting on Decisions. A request that
+  names the block it concerns goes, as one adjacent batch, directly after that
+  block and is linked to it (see
+  [Agent connection questions](agent-connection.md#questions)). One that names
+  none, or a block that has changed since, is appended at the end of the
+  document, not linked yet.
 - An abort withdraws still-open cards, removes their document nodes, and records
   cancellation by `@chopin`. Member cancellations retain any answers already
   given in that batch. Late submissions cannot approve withdrawn input.
-- A request nobody answers within 30 minutes expires. Its still-open cards stay
-  in the document and in Decisions, among the resolved cards, marked
-  `status="expired"`; each reads "Nobody answered within 30 minutes. The
-  Planner will use its best judgement for this decision." Nobody can answer an
-  expired card. Atomic receives no answer: a questionnaire comes back cancelled
-  with no answers, confirm returns false, and select, input, and editor return
-  nothing. The limit is fixed in code, not configured.
+- A request has no time limit. It waits until members answer it or it is
+  withdrawn: the Planner stops, its run is cancelled, the document is archived
+  or deleted, or the asker's link closes. A document on **Default machine**
+  keeps its Planner running while that Planner waits on a question or a live or
+  paused workflow run, so nobody viewing the document does not withdraw it.
+- Cards an earlier Chopin closed unanswered after a fixed time stay in the
+  document and in Decisions, among the resolved cards, marked
+  `status="expired"`; each reads "Nobody answered this question, so the Planner
+  used its best judgement for this decision." Nobody can answer an expired card.
 
 Host input is not held to the Planner `ask` tool's per-field limits on question
 and option counts or header, question, label, description, and answer lengths.
@@ -593,8 +608,15 @@ stopped comes back stopped. Ended rows stay until the next workflow starts in th
 document. When a run ends, Chat also records a line saying how it ended and how
 long it took. The session is let go when its runs finish, when its owner
 binding ends, or when the document closes; run state is durable in Atomic's
-workflow store, so runs interrupted that way can be resumed from a later
-session. A Build is not a workflow run and has no card in Chat: its tasks, their
+workflow journal, so runs interrupted that way can be resumed from a later
+session. Chopin keeps that journal at
+`$XDG_STATE_HOME/chopin/atomic/workflows.sqlite` under the same per-user state
+directory as the documents' own directories, because a run resumes only with
+the journal and working directory it started in. Each Planner session is
+given that file through Atomic's `createAgentSession({ journal })`, so the
+server's process environment is left unchanged. An operator's non-empty
+`ATOMIC_WORKFLOW_JOURNAL_PATH` names another file instead; Atomic's
+`workflows.journal` setting is not used for Planner sessions. A Build is not a workflow run and has no card in Chat: its tasks, their
 state and pull requests show under **Build**, whichever machine runs it. The
 Planner's instructions say so, so it does not point people to Chat for a Build.
 

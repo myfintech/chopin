@@ -159,7 +159,8 @@ export const SPIKE_DEADLINE_MS = 20 * 60_000;
 export const MAX_INVESTIGATION_IMAGES = 3;
 /**
  * A document on Default machine has its Planner run on its creator's machine while someone uses
- * it: it is open in Chopin, or was within this long.
+ * it: it is open in Chopin, its Planner waits on a question or a live or paused workflow run, or
+ * either was so within this long.
  */
 export const PLANNER_IDLE_MS = 30 * 60_000;
 /**
@@ -393,6 +394,11 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 	/** Why each machine stopped running a document's Planner, told to its connector once. */
 	let stopReasons = new Map<string, Map<string, string>>();
 	/**
+	 * The address each connection was last told for each document whose Planner it runs, by
+	 * connection id, so a rename reaches the connector: its Planner poll names documents by id.
+	 */
+	let toldUrls = new Map<string, Map<string, string>>();
+	/**
 	 * Whether a connection can run its owner's Planners on request: it has a Planner command, speaks
 	 * protocol 4, and this server runs the remote Planner with machines' own GitHub authorization.
 	 */
@@ -407,9 +413,10 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		);
 	}
 	/**
-	 * Documents someone uses, by id, with when they last were seen in use: open in Chopin, or
-	 * their Planner asked for. On Default machine their creator's machine runs their Planner until
-	 * one goes PLANNER_IDLE_MS unused. Forgotten with a restart.
+	 * Documents someone uses, by id, with when they last were seen in use: open in Chopin, their
+	 * Planner asked for, or their Planner waiting on a question or workflow run. On Default machine
+	 * their creator's machine runs their Planner until one goes PLANNER_IDLE_MS unused. Forgotten
+	 * with a restart.
 	 */
 	let inUse = new Map<string, number>();
 	/**
@@ -535,13 +542,14 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		return undefined;
 	}
 	/**
-	 * A document stops being used once nobody has had it open for PLANNER_IDLE_MS: the machine
-	 * Default machine gave its Planner stops running it.
+	 * A document stops being used once nobody has had it open, and its Planner has waited on no
+	 * question or workflow run, for PLANNER_IDLE_MS: the machine Default machine gave its Planner
+	 * stops running it. A question never times out by this route while its Planner waits on it.
 	 */
 	async function plannersIdle() {
 		let now = auth.clock().getTime();
 		for (let [documentId, seen] of inUse) {
-			if (options.documentOpen?.(documentId)) {
+			if (options.documentOpen?.(documentId) || options.attachments?.()?.waiting(documentId)) {
 				inUse.set(documentId, now);
 				continue;
 			}
@@ -632,6 +640,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 	 * machine's other connections able to run Planners serves, and Default machine's move on.
 	 */
 	connections.onEnded = connection => {
+		toldUrls.delete(connection.id);
 		let others = connections.machine(connection.machineId).filter(runsPlanners);
 		void stopPlanners(
 			connection.machineId,
@@ -1635,9 +1644,20 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 				let running = new Set(args.planners as string[]);
 				let changed = async (): Promise<PlannerControl | undefined> => {
 					let planners = await plannerDocuments(connection);
-					if (planners.length === running.size && planners.every(value => running.has(value.id))) {
+					let told = toldUrls.get(connection.id) ?? new Map<string, string>();
+					toldUrls.set(connection.id, told);
+					// A document renamed since this connection was told about it is a change too.
+					let moved = planners.some(value =>
+						told.has(value.id) && told.get(value.id) !== value.url
+					);
+					for (let value of planners) if (!told.has(value.id)) told.set(value.id, value.url);
+					if (
+						!moved && planners.length === running.size
+						&& planners.every(value => running.has(value.id))
+					) {
 						return undefined;
 					}
+					toldUrls.set(connection.id, new Map(planners.map(value => [value.id, value.url])));
 					let listed = new Set(planners.map(value => value.id));
 					let reasons = stopReasons.get(connection.machineId);
 					let stopped: Record<string, string> = {};
