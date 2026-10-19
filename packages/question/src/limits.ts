@@ -14,12 +14,18 @@ export const MAX_DECISION_OPTIONS = 10;
 /** The most options a question may hold once members start appending their own. */
 export const MAX_SHARED_OPTIONS = 10;
 export const MAX_HEADER = 80;
-/** Legacy stored primary questions retain their original bound. */
+/**
+ * Stored and chat-derived fields retain their original bounds; the `MAX_NEW_*`
+ * bounds apply to text authored from now on.
+ */
 export const MAX_QUESTION = 1_000;
 export const MAX_NEW_QUESTION = 100;
 export const MAX_QUESTION_DESCRIPTION = 300;
+export const MAX_NEW_QUESTION_DESCRIPTION = 140;
 export const MAX_LABEL = 200;
+export const MAX_NEW_LABEL = 60;
 export const MAX_DESCRIPTION = 1_000;
+export const MAX_NEW_DESCRIPTION = 160;
 export const MAX_CUSTOM = 4_000;
 
 /** Longest idempotency key for appending an option. */
@@ -33,6 +39,3 @@ export const MAX_MODEL_BYTES = 256 * 1024;
 
 /** Longest a tool call id may be, since it identifies the request. */
 export const MAX_CALL_ID = 256;
-
-/** How long host input waits for an answer before its card expires unanswered. */
-export const INPUT_EXPIRY_MS = 30 * 60 * 1_000;

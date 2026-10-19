@@ -2,6 +2,7 @@ import {
 	useCallback,
 	useContext,
 	useEffect,
+	useId,
 	useLayoutEffect,
 	useMemo,
 	useRef,
@@ -14,6 +15,7 @@ import {
 	ArchiveIcon,
 	CheckIcon,
 	ChevronIcon,
+	ClockIcon,
 	CloseIcon,
 	DocumentIcon,
 	MagnifierIcon,
@@ -53,7 +55,6 @@ import {
 import { BuildGlyph, BuildPlanButton, useBuildPlan } from "./build-plan-button";
 import { buildBlockers } from "./build-blockers";
 import type { BuildBlocker } from "./build-blockers";
-import { MachineButton } from "./machine-button";
 import {
 	offlineChoice,
 	plannerStartingOn,
@@ -93,6 +94,12 @@ import {
 } from "./document-activity";
 import { newestDocumentMetadata } from "./document-actions";
 import { DocumentActionsMenu } from "./document-actions-menu";
+import { DocumentContents } from "./document-contents";
+import {
+	DocumentHistoryPanel,
+	DocumentVersionBar,
+	DocumentVersionView,
+} from "./document-history-panel";
 import { DocumentRename } from "./document-rename";
 import { LostEditsNotice, UNDO_REFUSALS, UndoRefusedNotice } from "./document-status-notices";
 import { browserStorage, rememberOpened } from "./documents-sheet-model";
@@ -124,6 +131,7 @@ import type {
 } from "@chopin/editor";
 import type { DocumentMetadata } from "./document-actions";
 import type { DocumentAction } from "./document-actions-menu";
+import type { DocumentVersionSummary } from "./document-history";
 import type { TitleEdit } from "./title-edit";
 import type { HostedWorkspaceProps } from "./hosted";
 import type { ReactNode } from "react";
@@ -484,6 +492,43 @@ export function RoomWorkspace(
 	}, [archivedAt, repository.id, room, userId]);
 	let [status, setStatus] = useState<Status>("connecting");
 	let [planState, setPlanState] = useState<PlanState>({ synced: false });
+	// Contents ticks sit in the document's margin. History slides over the views bar and document,
+	// and an earlier session it names replaces the live document in place.
+	let [activityOpen, setActivityOpen] = useState(false);
+	let [activityClosing, setActivityClosing] = useState(false);
+	let [historyReload, setHistoryReload] = useState(0);
+	// Kept with its document, so a version chosen on one never shows over the next.
+	let [viewed, setViewed] = useState<{ room: string; version: DocumentVersionSummary }>();
+	let viewedVersion = viewed?.room === room ? viewed.version : undefined;
+	let setViewedVersion = useCallback(
+		(version: DocumentVersionSummary | undefined) =>
+			setViewed(version ? { room, version } : undefined),
+		[room],
+	);
+	let documentArea = useRef<HTMLDivElement>(null);
+	let sidePanelId = useId();
+	let activityId = `${sidePanelId}-activity`;
+	let contentsRoot = useCallback(
+		() =>
+			documentArea.current?.querySelector(
+				viewedVersion ? ".history-version" : "[data-live-document]",
+			),
+		[viewedVersion],
+	);
+	useEffect(() => {
+		setActivityOpen(false);
+		setActivityClosing(false);
+		setViewed(undefined);
+	}, [room]);
+	let historyToggle = useRef<HTMLButtonElement>(null);
+	let closeActivity = () => {
+		setActivityClosing(true);
+		setViewedVersion(undefined);
+		// The panel covers its toggle and is about to unmount, so focus returns to the toggle.
+		if (document.getElementById(activityId)?.contains(document.activeElement)) {
+			historyToggle.current?.focus({ preventScroll: true });
+		}
+	};
 	// Claimed while rendering, so a new document's title takes focus as soon as it mounts.
 	let [titleEdit, setTitleEdit] = useState(() => claimTitleEdit(room));
 	// A phone reads until its writer asks to edit. Local to this client and this document: it
@@ -644,8 +689,7 @@ export function RoomWorkspace(
 	let typing = useDocumentEditing(room);
 	let plannerDetached = plannerAttachment.wire === wire && !!plannerAttachment.planner
 		&& plannerAttachment.planner.state !== "attached";
-	// Which of the person's machines works here: the machine buttons beside Build plan and in Chat,
-	// and Machine in the title's menu, share it, and Build plan says when it is offline.
+	// Machine in the title menu chooses where work runs; Build plan says when it is offline.
 	let machineChoice = useMachineChoice(
 		room,
 		profile.implementation && !!effectiveCanEdit && !(archivedAt ?? metadata.archivedAt),
@@ -653,7 +697,7 @@ export function RoomWorkspace(
 	// The choice shows only while the person has a paired machine, live: it appears with their
 	// first and goes with their last.
 	let ownsMachine = showsMachineChoice(useLiveMachines().machines);
-	// Who runs the Planner changed: Chat's machine button says so at once.
+	// Refresh the title menu's choice when the Planner moves to another machine.
 	let refreshMachine = machineChoice.refresh;
 	useEffect(() => {
 		refreshMachine();
@@ -1460,6 +1504,38 @@ export function RoomWorkspace(
 			/>
 		</GitHubReferencesProvider>
 	);
+	let planArea = (
+		<div className="history-layout">
+			<div className="history-layout-main" ref={documentArea}>
+				<div className="h-full" data-live-document hidden={!!viewedVersion}>{plan}</div>
+				{viewedVersion && (
+					<DocumentVersionView
+						channelId={room}
+						key={`${room}:${viewedVersion.id}`}
+						version={viewedVersion}
+					/>
+				)}
+				{!activityOpen && <DocumentContents area={documentArea} root={contentsRoot} />}
+			</div>
+			{activityOpen && (
+				<DocumentHistoryPanel
+					channelId={room}
+					closing={activityClosing}
+					id={activityId}
+					key={room}
+					onClose={closeActivity}
+					onClosed={() => {
+						setActivityOpen(false);
+						setActivityClosing(false);
+					}}
+					onSelect={setViewedVersion}
+					reload={historyReload}
+					self={handle}
+					{...(viewedVersion ? { selected: viewedVersion.id } : {})}
+				/>
+			)}
+		</div>
+	);
 	let titleProps: TitleProps = {
 		archivedAt: workspaceArchivedAt,
 		canManage: effectiveCanManage,
@@ -1568,16 +1644,6 @@ export function RoomWorkspace(
 		: presentation.type === "parent-with-child" && mode === "split"
 		? { motion: presentation.motion, slot: zoomChild ? childTitleSlot : null }
 		: undefined;
-	// A phone's top bar has no room for it; there it is Chat's alone.
-	let machineButton = (place: "build" | "chat") =>
-		ownsMachine && machineChoice.state && !!workspaceCanEdit && status === "connected" && (
-			<MachineButton
-				choice={machineChoice}
-				compact={phone && place === "chat"}
-				phone={phone}
-				planner={place === "chat"}
-			/>
-		);
 	// Build plan or the build capsule sits beside the people here; a child open beside its parent
 	// has no build of its own. A phone shows this room's bar only off Document, so it keeps it.
 	let buildSlot = profile.implementation && (presentation.type !== "parent-with-child" || phone)
@@ -1588,7 +1654,6 @@ export function RoomWorkspace(
 				build={build}
 				documentURL={new URL(documentPath(repository.owner, repository.name, slug), location.origin)
 					.href}
-				machine={phone ? undefined : machineButton("build")}
 				machineOffline={offlineChoice(machineChoice.state)}
 				canEdit={!!workspaceCanEdit && status === "connected"}
 				compact={mode !== "split"}
@@ -1687,7 +1752,6 @@ export function RoomWorkspace(
 							planner={plannerAttachment.wire === wire ? plannerAttachment.planner : undefined}
 							plannerMachine={plannerStartingOn(machineChoice.state)}
 							wire={wire}
-							machine={profile.implementation ? machineButton("chat") : undefined}
 						/>
 					}
 					chatActivity={chatActivity}
@@ -1742,17 +1806,58 @@ export function RoomWorkspace(
 					}
 					controls={
 						<>
-							<DecisionViewControl
-								attention={attention}
-								buildEnabled={profile.implementation ? build.tabReady : undefined}
-								buildGlyph={<BuildGlyph blockers={namedBuildBlockers} look={build.look} />}
-								buildHot={buildHover === "capsule"}
-								onBuildHover={on => setBuildHover(on ? "tab" : undefined)}
-								documentActivity={documentActivity(documentWatch, chatActivity.busy)}
-								onView={selectDestination}
-								unanswered={unanswered}
-								view={view}
-							/>
+							{viewedVersion
+								? (
+									<DocumentVersionBar
+										channelId={room}
+										key={`${room}:${viewedVersion.id}`}
+										onBack={() => setViewedVersion(undefined)}
+										{...(effectiveCanEdit && !archivedAt
+											? {
+												onRestored: () => {
+													setViewedVersion(undefined);
+													setHistoryReload(count => count + 1);
+												},
+											}
+											: {})}
+										self={handle}
+										version={viewedVersion}
+									/>
+								)
+								: (
+									<DecisionViewControl
+										attention={attention}
+										buildEnabled={profile.implementation ? build.tabReady : undefined}
+										buildGlyph={<BuildGlyph blockers={namedBuildBlockers} look={build.look} />}
+										buildHot={buildHover === "capsule"}
+										onBuildHover={on => setBuildHover(on ? "tab" : undefined)}
+										documentActivity={documentActivity(documentWatch, chatActivity.busy)}
+										onView={selectDestination}
+										unanswered={unanswered}
+										view={view}
+									/>
+								)}
+							<div className="views-bar-tools">
+								<button
+									aria-controls={activityOpen ? activityId : undefined}
+									aria-expanded={activityOpen && !activityClosing}
+									aria-label="History"
+									className="btn btn-icon btn-ghost"
+									ref={historyToggle}
+									onClick={() => {
+										if (activityOpen && !activityClosing) {
+											closeActivity();
+											return;
+										}
+										if (view !== "plan") selectDestination("plan");
+										setActivityClosing(false);
+										setActivityOpen(true);
+									}}
+									type="button"
+								>
+									<ClockIcon />
+								</button>
+							</div>
 						</>
 					}
 					// Build plan or its capsule closes the status, so the rule before the faces follows it.
@@ -1824,7 +1929,7 @@ export function RoomWorkspace(
 							wire={wire}
 						/>
 					}
-					plan={plan}
+					plan={planArea}
 					state={workspace}
 					presentation={presentation}
 					unanswered={unanswered}

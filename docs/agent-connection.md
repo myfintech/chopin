@@ -243,13 +243,13 @@ rests on ends or the document's Planner is reset. The server then sends
 `refused` and closes an attached connection at once, and any eligible account,
 including the same one, can attach again immediately:
 
-| Cause                                                                                                                                                                        | Refusal code       | Close code |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ---------- |
-| The owner's browser sign-in signs out or expires                                                                                                                             | `sign-in-required` | 4401       |
-| The machine whose credential attached it is disconnected, or GitHub refuses its authorization                                                                                | `access-revoked`   | 4403       |
-| Chopin started it on a machine and moved it to another, or stopped it: a new machine choice or favorite, the document unused for 30 minutes, or the machine lost push access | `access-revoked`   | 4403       |
-| A repository writer resets the document's Planner                                                                                                                            | `access-revoked`   | 4403       |
-| The stored ownership no longer names this attachment's sign-in                                                                                                               | `access-revoked`   | 4403       |
+| Cause                                                                                                                                                                                                                                              | Refusal code       | Close code |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ---------- |
+| The owner's browser sign-in signs out or expires                                                                                                                                                                                                   | `sign-in-required` | 4401       |
+| The machine whose credential attached it is disconnected, or GitHub refuses its authorization                                                                                                                                                      | `access-revoked`   | 4403       |
+| Chopin started it on a machine and moved it to another, or stopped it: a new machine choice or favorite, the document unused for 30 minutes (a Planner waiting on a question or a live or paused run is using it), or the machine lost push access | `access-revoked`   | 4403       |
+| A repository writer resets the document's Planner                                                                                                                                                                                                  | `access-revoked`   | 4403       |
+| The stored ownership no longer names this attachment's sign-in                                                                                                                                                                                     | `access-revoked`   | 4403       |
 
 The same checks before every `start` and `turn`, and the periodic one, also
 find an expired sign-in or a released ownership that nothing reported; an
@@ -366,7 +366,7 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
 { "type": "part", "session": "", "turn": "", "part": {} }
 { "type": "host-tool-call", "session": "", "turn": "", "toolCallId": "", "toolName": "", "input": "{}" }
 { "type": "turn-end", "session": "", "turn": "", "status": "finished", "message?": "" }
-{ "type": "input-request", "request": "", "session": "", "workflowRunId?": "", "workflowStageId?": "", "rootRunId?": "", "input": {} }
+{ "type": "input-request", "request": "", "session": "", "workflowRunId?": "", "workflowStageId?": "", "rootRunId?": "", "block?": { "index": 0, "digest": "sha256:<64 hex>" }, "input": {} }
 { "type": "input-cancel", "request": "" }
 { "type": "runs", "session": "", "active": [], "paused": [], "cards": [] }
 { "type": "control-result", "request": "", "ok": true, "message?": "" }
@@ -397,7 +397,10 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   fresh ids, such as UUIDs.
 - `runs` reports the session's workflow runs whenever they change. Report them
   before `turn-end` so the server keeps the session while runs are live. Reports
-  only change run cards and Chat notices; they never start a Planner turn.
+  only change run cards and Chat notices; they never start a Planner turn. To
+  have the Planner act on a run that ended, call `invoke_planner` with
+  `as: "system"` and a GitHub token of the account holding the Planner; see
+  [Automatic follow-ups](local-agent-mcp.md#automatic-follow-ups).
 - `control-result` answers `stop` or `resume`.
 - `detach` closes the connection with code 1000. The account keeps the document's
   Planner for the grace period in [Ownership](#ownership).
@@ -511,7 +514,9 @@ the host tool returned it, and a failed host call keeps its
 ## Questions
 
 An `input-request` carries one question call in `input`, and becomes Decisions
-in the document:
+in the document. It has no time limit: it waits until members answer it or it
+is withdrawn (the client sends `input-cancel`, the session ends, or the
+connection closes), and only then gets its `input-result`:
 
 ```text
 { "method": "questionnaire", "params": { "questions": [{ "question": "", "header": "", "options": [{ "label": "", "description": "", "preview?": "" }], "multiSelect?": true }] } }
@@ -524,6 +529,14 @@ in the document:
 A questionnaire has 1 to 16 questions of up to 32 options; `preview` may be
 16,000 characters; `select` offers up to 32 choices. The document's own limits
 still apply. Text is shown verbatim.
+
+`block` names the block of the document the question concerns, by the `index`
+and `digest` the Planner's latest `read_plan` or `edit_plan` result gave it. Its
+cards go directly after that block and are linked to it. When that block has
+changed since, its digest now repeats, or it is itself a decision card, the
+cards go at the end of the document, not linked to any passage, as they do
+without `block`. A Planner running in Chopin's own process (`HARNESS=atomic`)
+names the block the same way, in the options of its host input request.
 
 `input-result` is `{ "type": "input-result", "request": "", "status": "", "value?": json, "message?": "" }`.
 `status` and `value` by method:
@@ -538,8 +551,11 @@ still apply. Text is shown verbatim.
 - `answered`: members answered every question. `confirm` is `true` only for
   **Yes**. `select` is the chosen string from `choices`, or `null` when a member
   wrote an answer instead. `input` and `editor` are the text a member wrote.
-- `expired`: nobody answered within 30 minutes. The cards stay in Decisions
-  marked expired and no partial answers are returned.
+- `expired`: an earlier Chopin closed the question unanswered after a fixed time.
+  Chopin no longer sends it: a question waits until a member answers it or it is
+  withdrawn, however long that takes. A client may still accept it from an older
+  server, where the cards stayed in Decisions marked expired and no partial
+  answers were returned.
 - `cancelled`: a member cancelled a question, the client sent `input-cancel`,
   the question was withdrawn before it was asked, the session ended, or the connection
   closed. Open cards are withdrawn. When a member cancelled one question of a
@@ -741,4 +757,7 @@ A backend Chopin asked the machine to run (see
 Chopin's Planner poll still asks for it. Chopin closes the link of a Planner it
 no longer asks for, so the backend can exit before the poll's answer arrives;
 the connector then waits for that answer, and stops the backend for good when
-the answer leaves its document out.
+the answer leaves its document out. When a document is renamed, the poll's next
+answer names it at its new address; the connector shows that address in
+`chopin status` and its output, and starts the backend there next time, without
+restarting a backend that is running.

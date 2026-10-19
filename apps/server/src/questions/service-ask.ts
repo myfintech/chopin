@@ -1,4 +1,4 @@
-import { limits, ulid } from "@chopin/dialect";
+import { limits, parse, ulid } from "@chopin/dialect";
 import * as Question from "@chopin/question";
 import * as Y from "yjs";
 
@@ -22,24 +22,42 @@ import type { Ended } from "./store";
 import type { Record } from "./records";
 
 import { announce } from "./card-notifications";
-import { expire, withdraw } from "./service-cancel";
+import { withdraw } from "./service-cancel";
 import { type AskPlacement, validatePlacement } from "./service-definition";
+
+/**
+ * The prose block a question concerns, as a Planner's blocking question names it: the block at
+ * `index` when its digest still matches, else the one block with that digest. A changed, repeated
+ * or non-prose block resolves to nothing, and the card stays unlinked at the end of the document.
+ */
+export type AskNear = { near: { index: number; digest: string } };
+
+function nearBlock(plan: Plan, near: AskNear["near"]) {
+	let index = room.resolveBlock(plan.document, near);
+	if (index === undefined) return undefined;
+	let block = parse(room.project(plan.document)).children[index];
+	if (
+		!block || block.type === "mdxJsxFlowElement"
+			&& (block.name === "Questionnaire" || block.name === "Decision")
+	) return undefined;
+	let digest = room.digests(plan.document)[index]!;
+	return { at: { index, digest }, anchor: room.anchorAt(plan.document, index, digest) };
+}
 
 /**
  * Ask each decision independently; register its record before publishing its node.
  *
- * An abort withdraws the cards still open. After `expiresInMs` without an answer
- * they expire instead, and stay in the document marked as such.
+ * The cards wait until members answer them, however long that takes; an abort
+ * withdraws the ones still open.
  */
 export async function ask(
 	plan: Plan,
 	server: Server<SocketData>,
 	roomId: string,
 	definition: Definition,
-	placement?: AskPlacement,
+	placement?: AskPlacement | AskNear,
 	created?: () => void,
 	signal?: AbortSignal,
-	expiresInMs?: number,
 ): Promise<Ended[]> {
 	if (signal?.aborted) return [];
 	if (Service.implementationActive(plan)) throw new Error("implementation is active");
@@ -54,7 +72,12 @@ export async function ask(
 		at: room.QuestionnaireInsertion["at"];
 	}> = [];
 	await Service.exclusive(plan, async () => {
-		let anchors = placement ? validatePlacement(plan, definition, placement) : undefined;
+		let near = placement && "near" in placement ? nearBlock(plan, placement.near) : undefined;
+		let anchors = placement && "blocks" in placement
+			? validatePlacement(plan, definition, placement)
+			: near && definition.questions.map(() => [near.anchor]);
+		let placedAt = (index: number) =>
+			placement && "blocks" in placement ? placement.blocks[index]?.[0] : near?.at;
 		if (Service.implementationActive(plan)) throw new Error("implementation is active");
 		let questions: Store.Questions = {
 			open: new Map(plan.questions.open),
@@ -147,17 +170,11 @@ export async function ask(
 				record.anchors = Anchors.set(Anchors.read(record), question.id, anchors[index]!);
 			}
 			records.set(id, record);
-			return { id, single, value, waiting, at: placement?.blocks[index]?.[0] };
+			return { id, single, value, waiting, at: placedAt(index) };
 		});
-		// Verbatim host input has no per-field limits, and every card needs room to expire. Refuse before
-		// anything is registered or published.
-		if (
-			!room.fitsQuestionnaires(
-				plan.document,
-				asked.map(item => item.value),
-				plan.questions.open.size,
-			)
-		) {
+		// Verbatim host input has no per-field limits. Refuse before anything is registered or
+		// published.
+		if (!room.fitsQuestionnaires(plan.document, asked.map(item => item.value))) {
 			Question.reject(
 				`This input would take the document past its ${limits.MAX_SOURCE_BYTES / 1024} KiB limit`,
 			);
@@ -202,28 +219,19 @@ export async function ask(
 
 	let failed = Promise.withResolvers<never>();
 	let closing: Promise<unknown> | undefined;
-	let close = (status: "cancelled" | "expired") => {
+	let abort = () => {
 		closing ??= Promise.all(
-			asked.map(item =>
-				status === "expired"
-					? expire(plan, server, roomId, item.id)
-					: withdraw(plan, server, roomId, item.id, "chopin")
-			),
+			asked.map(item => withdraw(plan, server, roomId, item.id, "chopin")),
 		);
 		void closing.catch(failed.reject);
 	};
-	let abort = () => close("cancelled");
 	signal?.addEventListener("abort", abort, { once: true });
 	if (signal?.aborted) abort();
-	let timer = expiresInMs === undefined
-		? undefined
-		: setTimeout(() => close("expired"), expiresInMs);
 	try {
 		let ended = await Promise.race([Promise.all(asked.map(item => item.waiting)), failed.promise]);
 		await closing;
 		return ended;
 	} finally {
-		clearTimeout(timer);
 		signal?.removeEventListener("abort", abort);
 	}
 }

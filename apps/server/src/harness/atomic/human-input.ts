@@ -1,5 +1,3 @@
-import { limits } from "@chopin/question";
-
 import * as Questions from "../../questions/service";
 
 import type {
@@ -11,26 +9,40 @@ import type {
 } from "@bastani/atomic";
 import type { DocumentRoom } from "../../agent/tools";
 
-export type HumanInputStatus = "answered" | "expired" | "cancelled";
+export type HumanInputStatus = "answered" | "cancelled";
+
+/**
+ * A host input request's options, with the block it concerns: its `index` and `digest` from the
+ * Planner's latest read of the document. Its card goes beside that block and is linked to it; a
+ * changed or repeated block leaves the card unlinked at the end of the document.
+ */
+export type HumanInputOptions = HostInputOptions & { block?: { index: number; digest: string } };
+
+/** Chopin's HostInput, whose methods also take the block a request concerns. */
+export type HumanInput = {
+	[Method in keyof HostInput]: HostInput[Method] extends (...args: infer A) => infer R
+		? (...args: { [K in keyof A]: A[K] extends HostInputOptions ? HumanInputOptions : A[K] }) => R
+		: never;
+};
 
 /**
  * Atomic owns input requests; Chopin owns their shared decision records.
  *
- * A request nobody answers within `expiresInMs` expires: its cards stay in
- * Decisions marked expired, and Atomic gets no answer. An answer to a workflow
+ * A request has no time limit: it waits until a member answers it or it is
+ * withdrawn, as when its Planner stops, its run is cancelled, or its link
+ * closes. An answer to a workflow
  * question is returned only once `hold` allows it, so a paused run stays stopped.
  * `report` learns how each request ended, which the cancelled result alone
  * cannot tell apart.
  */
 export function createHumanInput(
 	room: DocumentRoom,
-	expiresInMs = limits.INPUT_EXPIRY_MS,
 	hold?: (workflowRunId: string, signal: AbortSignal) => Promise<void>,
 	report?: (status: HumanInputStatus) => void,
-): HostInput {
+): HumanInput {
 	async function questionnaire(
 		params: QuestionParams,
-		options: HostInputOptions,
+		options: HumanInputOptions,
 	): Promise<QuestionnaireResult> {
 		if (options.signal.aborted) {
 			report?.("cancelled");
@@ -56,13 +68,12 @@ export function createHumanInput(
 			room.server,
 			room.id,
 			definition,
-			undefined,
+			options.block ? { near: options.block } : undefined,
 			room.anchors,
 			options.signal,
-			expiresInMs,
 		);
-		if (options.signal.aborted || ended.some(outcome => outcome.status === "expired")) {
-			report?.(options.signal.aborted ? "cancelled" : "expired");
+		if (options.signal.aborted) {
+			report?.("cancelled");
 			return { answers: [], cancelled: true };
 		}
 		if (hold && options.workflowRunId !== undefined) {
@@ -108,7 +119,7 @@ export function createHumanInput(
 		header: string,
 		question: string,
 		choices: string[],
-		options: HostInputOptions,
+		options: HumanInputOptions,
 	) {
 		let result = await questionnaire({
 			questions: [{

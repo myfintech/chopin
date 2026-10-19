@@ -10,6 +10,7 @@ import { PostgresNavigationStore } from "./navigation";
 import { PostgresBackgroundJobStore } from "./jobs";
 import { PostgresExperimentStore } from "./experiments";
 import { PostgresImageStore } from "./images";
+import { PostgresDocumentVersionStore } from "./versions";
 import { PostgresMachineStore } from "./machines";
 import { PostgresResearchWorkspaceStore } from "./research";
 import { PostgresPreferenceStore } from "../../user-preferences/postgres";
@@ -537,6 +538,10 @@ export class PostgresStorage implements StorageAdapter {
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
 		);
+		this.versions = new PostgresDocumentVersionStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+		);
 		this.machines = new PostgresMachineStore(
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
@@ -693,6 +698,7 @@ export class PostgresStorage implements StorageAdapter {
 	readonly jobs: BackgroundJobStore;
 	readonly research: ResearchWorkspaceStore;
 	readonly images: PostgresImageStore;
+	readonly versions: PostgresDocumentVersionStore;
 	readonly machines: PostgresMachineStore;
 	readonly preferences: PreferenceStore;
 	readonly provenance: PostgresProvenanceStore;

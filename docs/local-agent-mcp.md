@@ -149,11 +149,36 @@ The result contains `id`, `title`, and the canonical `url` (plus any generated
 `description`). It returns after the instruction is durably posted, not after the
 Planner finishes. The message joins the existing Planner queue if busy. Progress
 and results appear in the document and Chat; questions appear in Decisions. Under
-`atomic`, Atomic input nobody answers within 30 minutes expires: the card stays in
-Decisions marked expired and the Planner proceeds on its own judgement. The
+`atomic`, Atomic input waits in Decisions until a member answers it or it is
+withdrawn, however long that takes. The
 browser need not already have the document open: Chopin keeps its room alive
 while the invoked turn and queue run. An interrupted turn is not replayed
 automatically on restart.
+
+### Automatic follow-ups
+
+Some instructions are not something anyone said. A client that watched a
+workflow run finish, for example, wants the Planner to update the document from
+its results. Add `"as": "system"` for those:
+
+```json
+{
+	"id": "/documents/octo-org/score/release-readiness",
+	"instruction": "The workflow run finished. Read its results and update the document.",
+	"as": "system"
+}
+```
+
+Chat then shows a short system notice, `Automatic follow-up requested by
+@octocat.`, instead of a message from you. The instruction goes to the Planner
+alone and stays out of the visible queue while it waits. Ownership,
+`planner-not-attached`, the queue, `checkout`, and the result work as for any
+other instruction.
+
+Only the document's creator, or the account whose client holds its Planner
+under `HARNESS=remote`, may send one; for a child document that means its root.
+Each document takes at most 10 an hour, counted in memory until the server
+restarts. Chopin logs each one it accepts or refuses.
 
 Refusals return an object with `code`, and `planner-not-attached` also a
 `message`:
@@ -169,6 +194,10 @@ Refusals return an object with `code`, and `planner-not-attached` also a
   repository origin.
 - `planner-unavailable`: the Planner is disabled or the room is closing.
 - `planner-queue-full`: wait for queued work to drain before invoking again.
+- `system-turn-forbidden`: `as: "system"` came from someone other than the
+  document's creator or the account holding its Planner.
+- `system-turn-limited`: the document has taken 10 automatic follow-ups in the
+  past hour; try again later.
 - `document-unavailable`, `document-archived`, and `repository-forbidden` retain
   their ordinary document/access meanings.
 
@@ -238,6 +267,11 @@ recorded with the update. Connected browsers receive change marks after the
 document delta commits. Their change list identifies the MCP client without
 displaying a Planner cursor. Calls without initialization are attributed to
 `unknown`.
+
+An answered decision stays linked to its text when the update leaves every
+block it is linked to unchanged. Any other answered decision, including one whose
+linked text changed or was removed, waits for a Planner turn to link it again
+and shows as not linked, or as having its related text removed, until then.
 
 ## Upload an image
 

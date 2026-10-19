@@ -146,6 +146,13 @@ export type DocumentTarget = {
 	editor?: string;
 	/** With `editor`: the source before this update, so a reader can tell what they changed. */
 	previousSource?: string;
+	/**
+	 * Who to credit in the document's history: the editor, or the person whose MCP client
+	 * rewrote it. Absent when Chopin itself wrote the change.
+	 */
+	author?: string;
+	/** Starts a new history session, so a restore never overwrites the session before it. */
+	newSession?: boolean;
 };
 
 /** Durable MCP context for a document created through the hosted surface. */
@@ -186,6 +193,10 @@ type Persistence = Backend & {
 	closing: boolean;
 	/** The member whose batch is committing, for derived work that follows their edit. */
 	editor?: string;
+	/** The person an MCP rewrite is committing for; credited in history but not an editor. */
+	author?: string;
+	/** The committing rewrite is a restore, which history keeps as its own session. */
+	newSession?: boolean;
 };
 
 type Captured = {
@@ -229,6 +240,8 @@ export type Plan = {
 	conversationPlanPendingEffects: Effect[];
 	/** Card actions waiting to be mirrored into their conversation thread. */
 	pendingCardActions: PendingCardAction[];
+	/** The title a Planner last drafted; any other non-generated title is a person's to keep. */
+	plannerTitle?: string;
 
 	/**
 	 * Every questionnaire this plan has ever held, answered or not.
@@ -315,6 +328,7 @@ type Sidecar = {
 	pendingCardActions?: PendingCardAction[];
 	workflowRuns?: NonNullable<Chat.Chat["runs"]>;
 	initiativePaused?: boolean;
+	plannerTitle?: string;
 };
 
 type ChatView = Pick<Chat.Chat, "entries" | "runs" | "initiativePaused">;
@@ -353,6 +367,7 @@ function state(plan: Plan, chat: ChatView = plan.chat): Sidecar {
 		...(plan.pendingCardActions.length ? { pendingCardActions: plan.pendingCardActions } : {}),
 		...(chat.runs?.length ? { workflowRuns: chat.runs } : {}),
 		...((chat.initiativePaused ?? plan.chat.initiativePaused) ? { initiativePaused: true } : {}),
+		...(plan.plannerTitle !== undefined ? { plannerTitle: plan.plannerTitle } : {}),
 	};
 }
 
@@ -542,6 +557,7 @@ function restoredState(
 	if (Object.hasOwn(item, "pendingCardActions")) expected.push("pendingCardActions");
 	if (Object.hasOwn(item, "workflowRuns")) expected.push("workflowRuns");
 	if (Object.hasOwn(item, "initiativePaused")) expected.push("initiativePaused");
+	if (Object.hasOwn(item, "plannerTitle")) expected.push("plannerTitle");
 	expected.sort();
 	if (
 		keys.length !== expected.length
@@ -558,6 +574,7 @@ function restoredState(
 		|| !Array.isArray(item.threads)
 		|| !Array.isArray(item.transcript)
 		|| (Object.hasOwn(item, "initiativePaused") && typeof item.initiativePaused !== "boolean")
+		|| (Object.hasOwn(item, "plannerTitle") && typeof item.plannerTitle !== "string")
 	) throw new Error("hosted channel has an invalid sidecar");
 	let execution = Object.hasOwn(item, "execution")
 		? restoreRun(item.execution, graph, item.revision)
@@ -732,6 +749,7 @@ function restoredState(
 		...(pendingCardActions.length ? { pendingCardActions } : {}),
 		...(workflowRuns.length > 0 ? { workflowRuns } : {}),
 		...(item.initiativePaused === true ? { initiativePaused: true } : {}),
+		...(typeof item.plannerTitle === "string" ? { plannerTitle: item.plannerTitle } : {}),
 	};
 }
 
@@ -1010,6 +1028,10 @@ async function commitHosted(
 					source: captured.source,
 					sourceHash: captured.sourceHash,
 					...(durable.editor ? { editor: durable.editor, previousSource } : {}),
+					...(durable.editor ?? durable.author
+						? { author: durable.editor ?? durable.author }
+						: {}),
+					...(durable.newSession ? { newSession: true } : {}),
 				});
 			} catch (err) {
 				console.warn(`[plan] could not schedule derived work for ${durable.channelId}:`, err);
@@ -1467,6 +1489,7 @@ export async function open(
 		conversationPlanEffects: sidecar.conversationPlanEffects ?? [],
 		conversationPlanPendingEffects: sidecar.conversationPlanPendingEffects ?? [],
 		pendingCardActions: sidecar.pendingCardActions ?? [],
+		...(sidecar.plannerTitle !== undefined ? { plannerTitle: sidecar.plannerTitle } : {}),
 		outlines: new Map(),
 		records: new Map(
 			sidecar.questions.map(record => [record.id, Questions.normalizeRecord(record)]),
@@ -1931,6 +1954,7 @@ export async function publishStaged(
 	plan.pendingCardActions = candidate.pendingCardActions;
 	plan.conversationPlanPendingEffects = candidate.conversationPlanPendingEffects;
 	plan.conversationPlanEffects = candidate.conversationPlanEffects;
+	plan.plannerTitle = candidate.plannerTitle;
 	if (mutation) {
 		try {
 			broadcast(server, roomId, {
@@ -1951,7 +1975,10 @@ export async function publishStaged(
 export async function rewrite(
 	plan: Plan,
 	nextSource: string,
-	record: (source: string, revision: number) => McpUpdateRecord,
+	/** An MCP rewrite's idempotency record; a restore from history has none. */
+	record: ((source: string, revision: number) => McpUpdateRecord) | undefined,
+	/** The person whose MCP client sent the rewrite, so history can credit them. */
+	author?: string,
 ): Promise<edit.Result> {
 	if (implementationActive(plan)) throw new Error("implementation is active");
 	let before = room.project(plan.document);
@@ -1974,6 +2001,8 @@ export async function rewrite(
 	try {
 		Questions.rebase(candidate);
 		Comments.rebase(candidate);
+		// A reviewed link whose blocks the rewrite left alone stays reviewed.
+		let reviewed = Questions.snapshot(candidate);
 		let outcome = edit.replace(candidate, plan.revision, nextSource);
 		if (outcome.ok && plan.persistence.documentTitles) room.trackTitle(document);
 		if (!outcome.ok) return outcome;
@@ -1981,7 +2010,7 @@ export async function rewrite(
 		let changed = source !== before;
 		if (changed) {
 			Questions.rebase(candidate);
-			Questions.invalidate(candidate, "plan_changed");
+			Questions.invalidate(candidate, "plan_changed", reviewed);
 			Comments.rebase(candidate);
 			Comments.invalidate(candidate, "plan_changed");
 		} else {
@@ -1990,8 +2019,8 @@ export async function rewrite(
 		}
 		if (outcome.mutation) document.seq++;
 		if (source !== plan.persistence.committedSource) candidate.revision++;
-		let recorded = record(source, candidate.revision);
-		candidate.mcpUpdates.push(recorded);
+		let recorded = record?.(source, candidate.revision);
+		if (recorded) candidate.mcpUpdates.push(recorded);
 		let operationId = outcome.mutation
 			? `server:${document.epoch}:${
 				createHash("sha256").update(outcome.mutation.update).digest("hex")
@@ -1999,10 +2028,17 @@ export async function rewrite(
 			: `state:${crypto.randomUUID()}`;
 		let captured = {
 			...capture(candidate),
-			finalizeTitleReceipt: candidate.document.titleKey !== undefined,
+			finalizeTitleReceipt: recorded !== undefined && candidate.document.titleKey !== undefined,
 		};
-		await commitHosted(plan, outcome.mutation?.update, operationId, captured);
-		if (captured.finalizeTitleReceipt) {
+		plan.persistence.author = author;
+		plan.persistence.newSession = record === undefined;
+		try {
+			await commitHosted(plan, outcome.mutation?.update, operationId, captured);
+		} finally {
+			plan.persistence.author = undefined;
+			plan.persistence.newSession = undefined;
+		}
+		if (recorded && captured.finalizeTitleReceipt) {
 			let receipt = (captured.sidecar as unknown as { mcpUpdates: McpUpdateRecord[] }).mcpUpdates
 				.at(-1)!;
 			recorded.document = receipt.document;
@@ -2014,11 +2050,11 @@ export async function rewrite(
 		if (candidate.document.titleKey !== undefined) room.trackTitle(plan.document);
 		plan.document.seq = document.seq;
 		plan.revision = candidate.revision;
-		plan.mcpUpdates.push(recorded);
+		if (recorded) plan.mcpUpdates.push(recorded);
 		plan.outlines = candidate.outlines;
 		if (changed) {
 			Questions.rebase(plan, before);
-			Questions.invalidate(plan, "plan_changed");
+			Questions.invalidate(plan, "plan_changed", reviewed);
 			Comments.rebase(plan);
 			Comments.invalidate(plan, "plan_changed");
 		}

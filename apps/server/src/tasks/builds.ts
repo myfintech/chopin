@@ -35,12 +35,17 @@ let buildSchema = z.object({
 	retryOf: z.string().uuid().optional(),
 	user: z.string().min(1).max(128),
 	connectionId: z.string().min(1).max(128),
+	/** The paired machine it runs on; builds stored before machines were recorded have none. */
+	machineId: z.string().min(1).max(128).optional(),
+	/** That machine's connection ran as a background service. */
+	machineService: z.literal(true).optional(),
 	repositoryId: z.string().min(1).max(128),
 	checkout: checkoutSchema,
 	planRevision: z.number().int().nonnegative(),
 	graphVersion: z.number().int().positive(),
 	graphRevision: z.number().int().positive(),
 	createdAt: z.string().datetime(),
+	finishedAt: z.string().datetime().optional(),
 	expiresAt: z.number().int().nonnegative(),
 	state: z.enum(["queued", "starting", "running", "stopped", "failed"]),
 	session: z.string().min(1).max(128).optional(),
@@ -169,6 +174,8 @@ type BuildInput = {
 	graphRevision: number;
 	user: string;
 	connectionId: string;
+	machineId: string;
+	machineService?: true;
 	repositoryId: string;
 	checkout: CheckoutContext;
 };
@@ -356,6 +363,8 @@ export async function queueRebuild(
 			kind: "rebuild",
 			user: owner,
 			connectionId: connection.id,
+			machineId: connection.machineId,
+			...(connection.about?.service ? { machineService: true } : {}),
 			repositoryId: live.repositoryId,
 			// A machine without a checkout of the repository rebuilds from the first build's.
 			checkout: checkoutFor(connection, live.repositoryId, original.checkout),
@@ -515,6 +524,11 @@ export function reportBuild(
 			...current,
 			...fields,
 			...(stoppedByUser ? { stoppedAtRevision: plan.revision } : {}),
+			// A build's age is counted from when it finished, not from when it was asked for.
+			...(current.state !== report.state
+					&& (report.state === "stopped" || report.state === "failed")
+				? { finishedAt: new Date().toISOString() }
+				: {}),
 			...(progress && progress !== current.activity?.text
 				? { activity: { text: progress, at: new Date().toISOString() } }
 				: {}),
@@ -935,7 +949,10 @@ export function reportRebuild(
 				}
 				: {}),
 		};
-		plan.builds = [...plan.builds.slice(0, -1), buildSchema.parse({ ...build, state: "stopped" })];
+		plan.builds = [
+			...plan.builds.slice(0, -1),
+			buildSchema.parse({ ...build, state: "stopped", finishedAt: at }),
+		];
 		try {
 			await persistExclusive(plan, true);
 		} catch {

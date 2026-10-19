@@ -75,7 +75,7 @@ each owner's GitHub App user token and does not consume `HARNESS_AUTH`;
 setting `auto` on loopback passes the startup guard but does not enable host
 login in that adapter.
 
-`HARNESS=atomic` runs Atomic 0.9.37 in the Chopin server process through its
+`HARNESS=atomic` runs Atomic 0.9.39 in the Chopin server process through its
 headless SDK (`createAgentSession()`). It does not spawn the `atomic` CLI or use
 RPC mode.
 
@@ -148,9 +148,15 @@ Atomic caveats:
   `auto` also runs `!command` API-key entries in `auth.json` to resolve them.
 - There is no per-session credit limit like Copilot's, so a worker's
   `maxAiCredits` does not apply. Use the provider's spend limits.
-- `@bastani/atomic` adds more than 250 MB of installed dependencies on Linux
-  x64, including glibc and musl native modules and the embedded PostgreSQL
-  that only Atomic workflows use. Expect a larger image.
+- `@bastani/atomic` adds more than 200 MB of installed dependencies on Linux
+  x64, including glibc and musl native modules. Expect a larger image.
+- Atomic workflows need no database server. Their runs are journaled in a
+  SQLite file, `$XDG_STATE_HOME/chopin/atomic/workflows.sqlite`, beside the
+  documents' Planner directories, which Chopin passes to each Planner session
+  as its `journal` rather than through the process environment (see
+  [Full Atomic Planner](hosted-agent.md#full-atomic-planner)). The Docker image
+  sets `XDG_STATE_HOME=/var/lib/chopin`; mount a volume there to keep runs
+  and those directories when the container is replaced.
 - Atomic depends on `typebox` 1.3.27 while Chopin pins 1.3.7. Host tool schemas
   pass to Atomic as plain JSON Schema, so the two versions never meet.
 
@@ -191,9 +197,9 @@ questions) appears as shared Decisions instead of terminal dialogs, including
 workflow run and stage labels. Unanchored batches append at the document's end.
 Dialog text and written answers stay verbatim, bounded only by the document's
 256 KiB source limit and the shared-draft limits rather than the Planner's own
-question limits. A request nobody answers within 30 minutes expires: its cards
-stay in Decisions marked as expired, and Atomic receives no answer. Cancellation
-withdraws pending cards; neither ever approves an action. See
+question limits. A request has no time limit: it waits until a member answers it
+or it is withdrawn. Cancellation withdraws pending cards and never approves an
+action. See
 [Full Atomic Planner](hosted-agent.md#full-atomic-planner) for the mapping,
 resource loading, persistence, and workflow restart boundaries.
 
@@ -323,6 +329,7 @@ the image.
 | `SERVER_HOST`                     | `127.0.0.1`             | Source-process bind address. The image sets `0.0.0.0`, which local mode refuses. A `HARNESS_AUTH` mode that falls back to a host-logged-in subscription is refused unless this stays loopback-only.                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `PORT`                            | `8787`                  | Source-process HTTP and WebSocket port. The supplied image and health check expect internal port 8787.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `MODEL`                           | `gpt-6-luna`            | Model requested for hosted agent sessions. Required under `HARNESS=atomic`, where it must be `provider/model` from Atomic's catalog. Optional under `HARNESS=remote`, where the attached client chooses its model and a set value is only passed along as the turn's request.                                                                                                                                                                                                                                                                                                                                                                                     |
+| `HISTORY_MODEL`                   | `MODEL`                 | Model for History's one-line summaries of editing sessions, written when someone opens History on a document with a Planner owner. A small, fast model suits it. Resolved like `MODEL` by the configured harness.                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `HARNESS`                         | `copilot-sdk`           | Adapter name selected from Chopin's harness map (`copilot-sdk`, `atomic`, or `remote`). An unknown name refuses at startup. `remote` runs Planner turns in a client attached at `/api/v1/agent`; see [The remote Planner](#the-remote-planner). `atomic` gives every Planner session shell and filesystem access as the server process's user, hosted instances included; see [Choose and trust a harness](#choose-and-trust-a-harness).                                                                                                                                                                                                                          |
 | `PLANNER_ATTACH_GRACE_MS`         | `120000`                | Under `HARNESS=remote`, how long a detached or dropped agent connection keeps the document's Planner ownership so the same account can reattach, in milliseconds, an integer between 0 and 3600000.                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `AGENT_CONNECTION_PING_MS`        | `15000`                 | Under `HARNESS=remote`, how often the server sends each agent connection a WebSocket protocol ping, in milliseconds, an integer between 1000 and 600000.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |

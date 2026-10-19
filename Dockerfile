@@ -39,7 +39,8 @@ WORKDIR /app
 
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends ca-certificates \
-	&& rm -rf /var/lib/apt/lists/*
+	&& rm -rf /var/lib/apt/lists/* \
+	&& install -d -o bun -g bun -m 0700 /var/lib/chopin
 
 # MANTL: npx and uvx for stdio Planner extension MCP servers (docs/planner-extensions.md).
 COPY --from=node:24.21.0-trixie-slim /usr/local/bin/node /usr/local/bin/node
@@ -51,9 +52,12 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 	&& apt-get install -y --no-install-recommends python3 \
 	&& rm -rf /var/lib/apt/lists/*
 
+# The atomic Planner's per-document directories and workflow journal live under
+# $XDG_STATE_HOME/chopin; mount a volume at /var/lib/chopin to keep them.
 ENV NODE_ENV=production \
 	PORT=8787 \
-	SERVER_HOST=0.0.0.0
+	SERVER_HOST=0.0.0.0 \
+	XDG_STATE_HOME=/var/lib/chopin
 
 COPY --from=production-dependencies --chown=bun:bun /app/node_modules ./node_modules
 COPY --from=production-dependencies --chown=bun:bun /app/apps/server/node_modules ./apps/server/node_modules

@@ -3,7 +3,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { failedBuild } from "./build-seed";
+import { builtBuild, failedBuild } from "./build-seed";
 import { seedChildChannel, testChannelPath } from "./database";
 import { ROOT } from "./servers";
 import { storedQuestion } from "../apps/server/src/testing/plan";
@@ -248,7 +248,6 @@ for (let width of [1280, 390]) {
 			await page.getByRole("button", { name: "Build", exact: true }).click();
 			let view = page.getByRole("region", { name: "Build", exact: true });
 			await expect(view.getByText("Running server tests", { exact: true })).toBeVisible();
-			await expect(view.getByText(/^Updated /)).toBeVisible();
 			let stop = view.getByRole("button", { name: "Stop build", exact: true });
 			await expect(stop).toBeInViewport({ ratio: 1 });
 			await stop.focus();
@@ -349,7 +348,8 @@ for (let mode of ["block", "complete", "startup-failure", "live"] as const) {
 			let blocked = view.getByRole("button", { name: /^Connect the local agent/ });
 			let dependent = view.getByRole("button", { name: /^Review the connection/ });
 			if (mode === "complete") {
-				await expect(view).toContainText("Built 2 pull requests");
+				await expect(view.getByText("Built", { exact: true })).toBeVisible();
+				await expect(view.getByText("2 pull requests", { exact: true })).toBeVisible();
 				await expect(view.getByRole("link", { name: /^Pull request #\d+/ })).toHaveCount(2);
 				await expect(blocked).toHaveAttribute("aria-expanded", "false");
 				// The tasks the connector started, completed and opened pull requests for show under
@@ -379,7 +379,7 @@ for (let mode of ["block", "complete", "startup-failure", "live"] as const) {
 			);
 			await openBuild();
 			await expect(view).toContainText(
-				mode === "complete" ? "Built 2 pull requests" : "Blocked: Choose the next tracer",
+				mode === "complete" ? "2 pull requests" : "Blocked: Choose the next tracer",
 			);
 			if (
 				process.env.CHOPIN_LAUNCHER_SCREENSHOT
@@ -393,7 +393,8 @@ for (let mode of ["block", "complete", "startup-failure", "live"] as const) {
 					"Choose the next tracer before continuing.",
 				);
 				await view.getByRole("button", { name: "Return to planning", exact: true }).click();
-				await expect(view).toContainText("Returned for changes. Build plan builds it again.");
+				await expect(view.getByText("Returned for changes", { exact: true })).toBeVisible();
+				await expect(view.getByText("Build plan builds it again.", { exact: true })).toBeVisible();
 				await page.getByRole("group", { name: "Document view" })
 					.getByRole("button", { name: "Document", exact: true }).click();
 				await expect(content(page)).toHaveAttribute("contenteditable", "true");
@@ -465,7 +466,7 @@ function capsuleBuild(page: import("@playwright/test").Page) {
 }
 
 /**
- * Build, with the machine button right after it, stays 12px from the faces, with the rule as far
+ * Build stays 12px from the faces, with the rule as far
  * from the last of them as from the first face; the faces sit as far from the rule as from the
  * bar's end, top and bottom.
  */
@@ -473,13 +474,7 @@ async function expectClearOfPeople(build: import("@playwright/test").Locator) {
 	let people = build.page().getByRole("group", { name: /^People here/ });
 	await expect(build).toBeVisible();
 	await expect(people.locator(":scope > [data-tooltip]").first()).toBeVisible();
-	let control = await build.evaluate(element => {
-		let machine = element.closest("[data-document-title-bar]")?.querySelector(".machine-button");
-		return Math.max(
-			element.getBoundingClientRect().right,
-			machine?.getBoundingClientRect().right ?? 0,
-		);
-	});
+	let control = (await build.boundingBox())!.x + (await build.boundingBox())!.width;
 	let gaps = await people.evaluate(group => {
 		let rule = parseFloat(getComputedStyle(group).borderInlineStartWidth);
 		let bar = group.closest("[data-document-title-bar]")!;
@@ -753,7 +748,10 @@ test("a build in progress shows who started it and offers no action", async ({ s
 		await expect(view).toBeVisible();
 		// The capsule stays while its own view is open.
 		await expect(capsule).toBeVisible();
-		await expect(view.getByText(/^Building 0 of 2 started by you/)).toBeVisible();
+		// A build waiting for its agent to pick it up reads as queued.
+		await expect(view.getByText(/^(Building|Queued)$/)).toBeVisible();
+		await expect(view.getByText("0 of 2 tasks", { exact: true })).toBeVisible();
+		await expect(view.getByText("You", { exact: true })).toBeVisible();
 		await expect(view.getByRole("button", { name: /Retry|Return to planning/ })).toHaveCount(0);
 		await expect(view.getByRole("list", { name: "Tasks" }).locator(":scope > li")).toHaveCount(2);
 		let snapshot = await (await page.request.get(`/api/channels/${room}/implementation`)).json();
@@ -761,6 +759,20 @@ test("a build in progress shows who started it and offers no action", async ({ s
 	} finally {
 		await local.close();
 	}
+});
+
+test("a build that ran for an hour reads as built when it finished, not when it was asked for", async ({ seed, join: enter }) => {
+	let now = Date.now();
+	await seed(
+		"# Long build\n\nIt took an hour to build.\n",
+		builtBuild(preparedGraph(), new Date(now - 65 * 60_000), new Date(now - 2 * 60_000)),
+	);
+	let page = await enter("ana");
+	await page.getByRole("group", { name: "Document view" })
+		.getByRole("button", { name: "Build", exact: true }).click();
+	let view = buildView(page);
+	await expect(view.getByText("Built", { exact: true })).toBeVisible();
+	await expect(view.getByText(/^built /)).toHaveText("built 2m ago");
 });
 
 test("on a phone, tapping Build or an inert Build plan says why, briefly", async ({ seed, join: enter }) => {
