@@ -1,4 +1,5 @@
 import { requestSchema } from "@chopin/experiment";
+import { activityText } from "@chopin/protocol/activity";
 import type { BuildRequest } from "@chopin/protocol/implementation";
 import { remote } from "./mcp";
 import { ConnectorStopped, redacted } from "./connection";
@@ -83,6 +84,7 @@ export async function runWork(
 	let implementation = kind === "implementation";
 	let claim = raw as {
 		build: BuildRequest;
+		documentId: string;
 		/** A living document's first build, whose run ends at its last complete_task. */
 		live?: boolean;
 		/** An unprompted prototype under a passage, run on a throwaway branch. */
@@ -107,12 +109,16 @@ export async function runWork(
 	// Kept so a failed start can show why without echoing every agent log line.
 	let agentTail: string[] = [];
 	let agentMessage = "";
-	let identity = implementation ? { id: input.id } : { id: input.id, generation: claim.generation };
+	let identity = implementation
+		? { id: input.id, documentId: claim.documentId }
+		: { id: input.id, generation: claim.generation };
 	let abort = new AbortController();
 	let cancel = () => abort.abort();
 	options.signal.addEventListener("abort", cancel, { once: true });
 	if (options.signal.aborted) abort.abort();
 	let latestProgress = "Preparing checkout";
+	/** Each tool call's ACP kind, which its later updates need not repeat. */
+	let toolKinds = new Map<string, string>();
 	let pendingPermissions = 0;
 	/** Why the connector stopped the agent itself, when Chopin ended the run or stayed out of reach. */
 	let ended: string | undefined;
@@ -171,7 +177,11 @@ export async function runWork(
 					failures++;
 					continue;
 				}
-				ended ??= `Chopin ended this run (${errorCode(error) ?? "refused"}).`;
+				let code = errorCode(error);
+				// A build claimed before Chopin restarted is one it no longer knows.
+				ended ??= code === "server-restarted"
+					? "Chopin restarted, so it ended this run."
+					: `Chopin ended this run (${code ?? "refused"}).`;
 				abort.abort();
 				return;
 			}
@@ -328,10 +338,14 @@ export async function runWork(
 			onUpdate(value) {
 				if (value.update.sessionUpdate === "tool_call") agentMessage = "";
 				if (
-					(value.update.sessionUpdate === "tool_call"
-						|| value.update.sessionUpdate === "tool_call_update") && value.update.title
+					value.update.sessionUpdate === "tool_call"
+					|| value.update.sessionUpdate === "tool_call_update"
 				) {
-					latestProgress = value.update.title.trim().slice(0, 2000) || latestProgress;
+					let { kind, title, toolCallId } = value.update;
+					if (kind) toolKinds.set(toolCallId, kind);
+					if (title) {
+						latestProgress = activityText(title, toolKinds.get(toolCallId)) ?? latestProgress;
+					}
 				} else if (
 					value.update.sessionUpdate === "agent_message_chunk"
 					&& value.update.content.type === "text"

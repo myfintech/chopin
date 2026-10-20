@@ -87,7 +87,7 @@
 				1
 			]
 		],
-		"sourceHash": "976bf62ec394e98b0ef030de872305b9e1ab02811d3b0c31453771bf354c78f0"
+		"sourceHash": "3d5a0587ed77dda3810f37f0a6d969fd8d6452ed00b6bff05e069ec44c6c98a4"
 	},
 	{
 		"file": "apps/web/src/project-sidebar.tsx",
@@ -101,7 +101,7 @@
 				1
 			]
 		],
-		"sourceHash": "df507245aa1ad48569787d624235ed4cfc2d5cd5593db116c024fbc2e6cf64eb"
+		"sourceHash": "6ec43a59cdb8231f0f33b2f57dc8e39c5a4fbed9121dab21c2cae61f1430e9c4"
 	},
 	{
 		"file": "apps/web/src/account-menu.tsx",
@@ -129,7 +129,7 @@
 				1
 			]
 		],
-		"sourceHash": "5b6fe38e2be10948e6f4de85f9ce2f4789add62fb5ec49a13071d1e9777f892e"
+		"sourceHash": "7d8196b64e109cb3443545541e427fcfe8ce157d7f04364b04a0340b6ee7b65d"
 	},
 	{
 		"file": "apps/web/src/design-audit/controls.tsx",
@@ -157,7 +157,7 @@
 				1
 			]
 		],
-		"sourceHash": "e07f8ebbc4c1befb74e7d739b82c26fbacc4fad43cb48f24a008faaf46cd60c5"
+		"sourceHash": "0a11fe298d25f70f899ec376a04f2e128b8de45e763d36c377d15f55aa8e2f8b"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -171,7 +171,7 @@
 				1
 			]
 		],
-		"sourceHash": "e07f8ebbc4c1befb74e7d739b82c26fbacc4fad43cb48f24a008faaf46cd60c5"
+		"sourceHash": "0a11fe298d25f70f899ec376a04f2e128b8de45e763d36c377d15f55aa8e2f8b"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -192,7 +192,7 @@
 				1
 			]
 		],
-		"sourceHash": "e07f8ebbc4c1befb74e7d739b82c26fbacc4fad43cb48f24a008faaf46cd60c5"
+		"sourceHash": "0a11fe298d25f70f899ec376a04f2e128b8de45e763d36c377d15f55aa8e2f8b"
 	},
 	{
 		"file": "apps/web/src/terminal-alert.tsx",
@@ -276,7 +276,7 @@
 				1
 			]
 		],
-		"sourceHash": "f84a3f2c9ca08fe38e3608e472837e902fe156733756d5bfd3db0b788d6b036f"
+		"sourceHash": "2e3c08c1ffa3e5e6c04e4a7a64331836157d6f37f80d62cea953e5b923413a79"
 	},
 	{
 		"file": "apps/web/src/navigation-dialog.tsx",
@@ -325,7 +325,7 @@
 				1
 			]
 		],
-		"sourceHash": "5de5fe00622291022e7add3c3fcb16b8ed371de9f5a6b07147d91e7b315f3cdc"
+		"sourceHash": "dc900a88bb31f1481af9ea0482e3c0e6d1eeecd85d8199c94275ac8ddb51809b"
 	},
 	{
 		"file": "apps/web/src/experiments/machine-setup.tsx",
@@ -339,7 +339,7 @@
 				1
 			]
 		],
-		"sourceHash": "0087b20231abe81d2c46e3c3becfd4a9babe56d749b7508146fabe7754fda5c1"
+		"sourceHash": "4b42c7403a9993457a148b25dbac8d2adeb48ef935b545e373442fce964e751f"
 	},
 	{
 		"file": "apps/web/src/experiments/machines.tsx",

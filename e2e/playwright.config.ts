@@ -31,9 +31,7 @@ function server(port: number, database: string, extra: Record<string, string>) {
 		 * `scripts/dev.ts` gives: the wrapper does not exit when the thing it
 		 * started dies, so Playwright would end up supervising nothing.
 		 */
-		command: "bun --preload ./e2e/github.ts"
-			+ (process.env.E2E_RESEARCH_OFFERS === "1" ? " --preload ./e2e/jev.ts" : "")
-			+ " apps/server/src/main.ts",
+		command: "bun --preload ./e2e/github.ts --preload ./e2e/jev.ts apps/server/src/main.ts",
 		cwd: ROOT,
 		url: `http://${HOST}:${port}/`,
 		env: {
@@ -179,12 +177,14 @@ export default defineConfig({
 				"**/responsive*.e2e.ts",
 				"**/sidecar.e2e.ts",
 				"**/harness.e2e.ts",
+				"**/planner-decisions.e2e.ts",
 				"**/conversation-initiative.e2e.ts",
 				"**/document-title-naming.e2e.ts",
 				"**/harness-comments.e2e.ts",
 				"**/harness-decisions-deck.e2e.ts",
 				"**/harness-children.e2e.ts",
 				"**/harness-investigation.e2e.ts",
+				"**/run-card.e2e.ts",
 				"**/auth-lifecycle.e2e.ts",
 				"**/demo-collaborators.e2e.ts",
 			],
@@ -214,12 +214,14 @@ export default defineConfig({
 			name: "harness",
 			testMatch: [
 				"**/harness.e2e.ts",
+				"**/planner-decisions.e2e.ts",
 				"**/conversation-initiative.e2e.ts",
 				"**/document-title-naming.e2e.ts",
 				"**/harness-comments.e2e.ts",
 				"**/harness-decisions-deck.e2e.ts",
 				"**/harness-children.e2e.ts",
 				"**/harness-investigation.e2e.ts",
+				"**/run-card.e2e.ts",
 			],
 			use: { ...devices["Desktop Chrome"], baseURL: `http://${HOST}:${HARNESS}` },
 		},

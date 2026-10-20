@@ -34,11 +34,26 @@ experience, verified behavior, hypotheses, its own recommendations, and human
 decisions. A suggested remedy, such as onboarding, does not become an agreed
 requirement merely because someone mentioned it.
 
-When intent is missing, it asks one useful open question in Chat. Concrete human
-choices with grounded alternatives use the existing `ask` decision tool; the
-Planner must not invent alternatives just to fit that tool. A factual question
-that repository evidence answers needs an answer, not a decision card. Optional
+Every request for human input, including missing intent and clarification, uses
+the `open_decisions` tool. The Planner drafts provisional prose, then batches the
+known independent questions (up to ten) into separate cards beside the passages
+they inform. Written answers capture intent, experience, constraints and unknown
+alternatives; choice cards offer grounded alternatives where useful. Both forms
+can appear in one batch. Cards stay open after the Planner finishes its turn,
+and people can answer in any order. Only Save settles an answer. Repository facts need answers, not votes. Optional
 exploration can remain provisional without becoming a Build blocker.
+
+On every harness, Chat buffers each complete Planner text message and checks it
+with the deployment's decisions classifier before publication. Requests for input
+are withheld and the same session gets one continuation to create inline cards.
+Completed tools and the original request are not replayed. Failed, missing,
+malformed or interrupted checks never publish unchecked prose; uncertain judgments
+also withhold it. Chat prose therefore arrives after validation rather than token
+by token. This is a semantic check and can misclassify language.
+If both generated replies are withheld after the turn durably captured new inline
+decisions, Chat reports their count in a fixed server-authored summary. It never
+publishes the withheld text or claims the whole request succeeded. Without new
+captured decisions, the turn still reports failure.
 
 An answer, correction, or contradictory finding should change the affected
 prose and its anchors, followed by the next useful authorized action. Disagreement
@@ -51,12 +66,16 @@ while leaving broader questions open. This is advice about scope, not technical
 readiness or approval. Graph preparation retains its separate read/edit workflow
 and does not edit prose; only people approve and start implementation.
 
-This policy changes behavior **inside an invoked turn**. It does not schedule
-turns, start background research without an explicit current request, or change
-tool authority. An open question in Chat ends the turn; a later invoked turn can
-follow the reply through. The `ask` tool instead keeps its current turn waiting
-for a shared answer or cancellation. Ordinary unaddressed Chat still follows the
-existing addressing and title-maintenance behavior.
+Saving an anchored Planner decision durably queues a scoped prose update, independently of
+conversation-analysis flags. It uses the complete saved answers affecting that passage and
+updates only its explicit target. Applied answer generations commit with the source, so an
+interrupted retry cannot write them twice. Lost or ambiguous targets refuse safely. Work waits
+for an existing authorized Planner owner; it never claims ownership from a viewer or saver.
+See [Decisions](decisions.md) for the shared answer lifecycle.
+
+This does not start background research without an explicit request. Blocking `ask` remains
+available for an explicitly synchronous exchange and keeps that turn waiting for answers or
+cancellation. Ordinary unaddressed Chat retains its addressing and title-maintenance behavior.
 
 The [coaching evaluation suite](../evals/planner-coach/README.md) separates live
 model transcripts and independent rubric review from deterministic tool-boundary
@@ -202,15 +221,26 @@ REST tools construct owner and repository coordinates on the server, bound
 response sizes and line ranges, reject path escape, and post-filter code search
 by GitHub repository node ID.
 
-With `PLANNER_VISUALS=on` and a decisions model, foreground `copilot-sdk`
-sessions for an explicit member request of at most 1,000 characters also
-receive `assess_visual`. It routes one explanatory paragraph through
-possibility, comprehension, and type choices before `edit_plan` can publish it.
-The route is bound to the member turn, document revision, passage, and placement.
-Comment turns, longer requests, background jobs, and `atomic` sessions
-keep their existing authoring prompt, tool set, and edit path. Atomic sessions
-may retain workflow ownership across turns and are outside this disposable-session
-prototype. This path is opt-in while the bounded authoring workflow is evaluated.
+Foreground Planner writes on every harness and MCP document creation and updates
+share a server-owned visual admission check. New prose, lists and nested passages
+are assessed for whether a faithful visual is possible, helpful, and which native
+type fits. A selected diagram or comparison table must appear beside its passage
+before the write is accepted. A successful prose judgment permits prose; there is
+no diagram quota. This applies to blank drafts, long requests, and imported plans
+without requiring `PLANNER_VISUALS`.
+
+Assessments run in bounded batches outside the room queue. Failed or malformed
+assessments refuse the write. Admission follows the shared assessment's probability
+thresholds and selected type, including an explicit no-suitable-type result. It
+does not add a confidence veto: confidence describes competition between types,
+not whether the document write is valid. Every selected visual is still required
+and validated. Refusals identify the passage and required representation and
+include syntax guidance for repair.
+Successful assessments are cached by passage and context while diagrams are
+repaired. Unchanged prose with its existing visual is preserved. A concurrent edit
+still invalidates the proposed revision. Background jobs retain their isolated
+contracts. The legacy `assess_visual` single-paragraph handoff remains available
+to sessions without the shared gate.
 
 The isolated Planner does not see a user's local checkout, current branch, working tree,
 or uncommitted changes. A coding agent must compare the repository context
@@ -487,7 +517,11 @@ for an Atomic Planner. **Stop Planner** and **Resume Planner** send `stop` and
 `resume`, optionally for one run, and wait for `control-result`. Unlike an
 Atomic Planner's, a reported run that ends blocked or failed between turns gets
 only its Chat notice: the reports are the client's word, so they never start a
-Planner turn that no writer asked for.
+Planner turn that no writer asked for. A client that asks for the `run-stage-deltas`
+feature sends only new and changed stages, so a run's stages have no count
+limit; Chopin merges them into the run's stored stages as it does an Atomic
+Planner's (see
+[Agent connection](agent-connection.md#run-stage-deltas)).
 
 **Trust boundary.** The server never holds the client's model credentials and
 gains no shell or filesystem access from this harness. The client, in turn,
@@ -600,11 +634,21 @@ elapsed time. Several runs can be live at once. Runs waiting on Decisions come
 first, then running, paused, and ended runs, newest first within each, and more
 than three rows fold behind "more" without ever hiding a waiting run. Only the
 first waiting run, or else the newest live one, shows its stages; any row opens
-on click to show its most recent stages with their status and duration, and a
-waiting row links to its Decisions. Each live row can be paused, and each paused
-row resumed, on its own; Chat records who did. The stack is stored with the
-document, so a reload or restart keeps it; a run that was live when the server
-stopped comes back stopped. Ended rows stay until the next workflow starts in the
+on click to show its six most recent stages with their status and duration, and
+a waiting row links to its Decisions. Chopin stores every stage of a run, with
+no limit on how many, in `workflow_run_stages` (see
+[Storage](storage.md#postgresql-schema)); the card itself carries only the latest
+12, with an unfinished stage under an ended ancestor already shown as stopped.
+Its "+N earlier" button unfolds every stage in a list that scrolls inside the
+card, loading the stored ones 200 at a time from
+`GET /api/channels/<id>/runs/<run id>/stages?offset=&limit=` (for anyone who can
+read the document; at most 500 a page) only when someone unfolds it, and says
+how many earlier stages nobody reported; "Show fewer" folds it back and forgets
+them. Each live row can be paused, and each paused row resumed, on its own; Chat
+records who did. The stack and every stage are stored with the document, so a
+reload or restart keeps them, including for finished runs; a run that was live
+when the server stopped comes back stopped. A stored run's stages go when its
+card does. Ended rows stay until the next workflow starts in the
 document. When a run ends, Chat also records a line saying how it ended and how
 long it took. The session is let go when its runs finish, when its owner
 binding ends, or when the document closes; run state is durable in Atomic's
@@ -676,14 +720,16 @@ the full native catalog, including bar, line, scatter, radar, polar, waterfall,
 treemap, heatmap, and Sankey. Numerical aliases have variant-specific purpose
 and data requirements; the guide includes labelled synthetic bar, Marimekko and
 dumbbell examples that are checked against the renderer.
-This capability does not require `PLANNER_VISUALS`; that flag selects the
-experimental Jev routing workflow described above. Ordinary and Atomic Planners
+This capability and the shared visual admission check do not require `PLANNER_VISUALS`.
+Ordinary and Atomic Planners
 prefer native `seecode` whenever a registered type can represent the required
 information. Mermaid is a fallback only for a representation the native catalogue
 cannot provide or an explicit user request; it supports numerical charts such as
 pie and bar/line charts. Jev-routed diagrams must keep the selected native type
 and SeeCode fence, with no Mermaid substitution. `wireframe` holds an indented
-outline of interface parts for layouts and mockups, and the prompt forbids
+outline of interface parts for layouts and mockups; the prompt asks for low
+fidelity (short labels on key areas, `lines`, `image` and `grid` with `repeat`
+for content, `w=` and `flush` for proportions and app chrome) and forbids
 box-drawing or ASCII art in text fences. `edit_plan` and MCP `update_document`
 refuse a batch that introduces or changes an invalid fence of either language;
 a wireframe refusal names the failing lines, counted inside the fence. An

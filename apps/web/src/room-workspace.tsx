@@ -18,6 +18,7 @@ import {
 	ClockIcon,
 	CloseIcon,
 	DocumentIcon,
+	EllipsisIcon,
 	MagnifierIcon,
 	PencilIcon,
 } from "@chopin/icons";
@@ -61,8 +62,8 @@ import {
 	showsMachineChoice,
 	useMachineChoice,
 } from "./machine-choice";
-import { useLiveMachines } from "./machine-summary";
-import type { MachineChoice } from "./machine-choice";
+import { MachineButton } from "./machine-button";
+import { machines as machineStore, summarizeMachines, useLiveMachines } from "./machine-summary";
 import { useLiveBuild } from "./live-build";
 import { BuildView } from "./build-view";
 import { Chat } from "./chat/chat";
@@ -81,6 +82,7 @@ import type { CardLink } from "./conversation-plan/links";
 import type { ExcerptCorrectionAction } from "./conversation-plan/analysis-overview";
 import { ConversationPlanStore, useConversationPlan } from "./conversation-plan/store";
 import { rememberChannel } from "./channel-recovery";
+import { QuestionMarkdownProvider } from "./question-markdown";
 import {
 	BUILD_UNAVAILABLE,
 	DecisionViewControl,
@@ -111,6 +113,14 @@ import { motionImmediately } from "./motion-input";
 import { useNavigationDocument } from "./navigation-shell";
 import { titleEdits } from "./title-edit";
 import { peopleHere } from "./presence";
+import {
+	discardDecision,
+	DiscardDecisionDialog,
+	QuestionPageActions,
+	QuestionPageContext,
+	QuestionPagePanel,
+	useQuestionPage,
+} from "./question-page";
 import { ResearchRequestStore } from "./research-requests";
 import { GitHubReferenceCache } from "./github-references";
 import { Wire } from "./wire";
@@ -125,6 +135,7 @@ import type {
 	DecisionView,
 	DecisionViewState,
 	ExperimentResources,
+	ExploreResources,
 	InvestigationResources,
 	PlanState,
 	ResearchLaunchResult,
@@ -135,6 +146,7 @@ import type { DocumentVersionSummary } from "./document-history";
 import type { TitleEdit } from "./title-edit";
 import type { HostedWorkspaceProps } from "./hosted";
 import type { ReactNode } from "react";
+import type { QuestionPageRoot } from "./question-page";
 import type { Status } from "./wire";
 import type { ChatDestination } from "./conversation-plan/source";
 import type { SourceDestination } from "./conversation-plan/card-parts";
@@ -208,8 +220,6 @@ type TitleProps = {
 	canManage: boolean;
 	editing?: TitleEdit;
 	label: string;
-	/** The person's machine choice for this document, offered as Machine in the title's menu. */
-	machine?: MachineChoice;
 	onAction: (action: DocumentAction) => void;
 	onEditingChange: (editing?: TitleEdit) => void;
 	onRenamed: (channel: DocumentMetadata) => void;
@@ -237,17 +247,17 @@ export function DocumentTitle(
 	{
 		archivedAt,
 		canManage,
+		decision,
 		editing,
 		icon,
 		label,
-		machine,
 		onAction,
 		onEditingChange,
 		onRenamed,
 		path,
 		project,
 		room,
-	}: TitleProps & { icon?: boolean; path?: TitlePath },
+	}: TitleProps & { decision?: boolean; icon?: boolean; path?: TitlePath },
 ) {
 	let group = useRef<HTMLDivElement>(null);
 	let title = useRef<HTMLButtonElement>(null);
@@ -333,7 +343,7 @@ export function DocumentTitle(
 							}}
 						/>
 					)
-					: canManage && !archivedAt
+					: canManage && !archivedAt && !decision
 					? (
 						<button
 							aria-label={`Rename ${label}`}
@@ -350,22 +360,28 @@ export function DocumentTitle(
 							<span className="truncate">{label}</span>
 						</button>
 					)
-					: <span className="title-control-label truncate">{label}</span>}
-				{canManage && (
+					: (
+						<span className="title-control-label">
+							<span className="truncate">{label}</span>
+						</span>
+					)}
+				{(canManage || decision) && (
 					<DocumentActionsMenu
 						openDocument
 						align="start"
 						channel={{ archivedAt, title: label }}
 						className="title-control-action"
-						machine={machine}
+						decision={decision}
 						onAction={action => action === "rename" ? onEditingChange("rename") : onAction(action)}
-						trigger={
-							<ChevronIcon
-								aria-hidden="true"
-								className="rotate-90"
-								size={12}
-							/>
-						}
+						trigger={decision
+							? <EllipsisIcon aria-hidden="true" size={14} />
+							: (
+								<ChevronIcon
+									aria-hidden="true"
+									className="rotate-90"
+									size={12}
+								/>
+							)}
 					/>
 				)}
 			</div>
@@ -609,6 +625,7 @@ export function RoomWorkspace(
 		};
 	}, [room, wire]);
 	let researchEnabled = profile.research;
+	let questionPage = useQuestionPage(room);
 	let [workspace, dispatch] = useWorkspaceState(profile);
 	// A `#task-` link waits for Build to be available, then opens it once.
 	let [taskLink, setTaskLink] = useState(false);
@@ -689,15 +706,15 @@ export function RoomWorkspace(
 	let typing = useDocumentEditing(room);
 	let plannerDetached = plannerAttachment.wire === wire && !!plannerAttachment.planner
 		&& plannerAttachment.planner.state !== "attached";
-	// Machine in the title menu chooses where work runs; Build plan says when it is offline.
+	// The machine button beside Build plan chooses where work runs; Build plan says when it is offline.
 	let machineChoice = useMachineChoice(
 		room,
 		profile.implementation && !!effectiveCanEdit && !(archivedAt ?? metadata.archivedAt),
 	);
 	// The choice shows only while the person has a paired machine, live: it appears with their
 	// first and goes with their last.
-	let ownsMachine = showsMachineChoice(useLiveMachines().machines);
-	// Refresh the title menu's choice when the Planner moves to another machine.
+	let ownsMachine = showsMachineChoice(useLiveMachines(true).machines);
+	// Refresh the machine choice when the Planner moves to another machine.
 	let refreshMachine = machineChoice.refresh;
 	useEffect(() => {
 		refreshMachine();
@@ -1247,6 +1264,9 @@ export function RoomWorkspace(
 	// Where this room's title goes when it is an open child, and where its own child's goes.
 	let childTitle = useContext(ChildTitleContext);
 	let [childTitleSlot, setChildTitleSlot] = useState<HTMLElement | null>(null);
+	// Where an open question page's actions go in its parent's title bar.
+	let [childActionsSlot, setChildActionsSlot] = useState<HTMLElement | null>(null);
+	let [discarding, setDiscarding] = useState(false);
 	let childRoom = presentation.type === "child";
 	let childOpen = presentation.type === "parent-with-child";
 	// A child opening over this document takes the pencil, so this one goes back to reading.
@@ -1312,6 +1332,60 @@ export function RoomWorkspace(
 		[formatDock, planVisible, reportChildEdit],
 	);
 	let investigationsEditable = !!workspaceCanEdit && status === "connected";
+	// Read through a ref so the editor keeps one stable set of resources while people come and go.
+	let pageRequest = useRef(0);
+	let exploreState = useRef({ cardMetadata, handle, members, presentation, wire });
+	exploreState.current = { cardMetadata, handle, members, presentation, wire };
+	let explore = useMemo<ExploreResources | undefined>(() => {
+		if (!profile.research || !workspaceCanEdit) return undefined;
+		let people = () => {
+			let { cardMetadata, handle, members } = exploreState.current;
+			let seen = new Set<string>(handle ? [handle.toLowerCase()] : []);
+			let found: string[] = [];
+			let add = (login: string) => {
+				if (
+					seen.has(login.toLowerCase())
+					|| !/^(?:[A-Za-z0-9-]{1,39}|demo:[a-z0-9-]{1,32})$/.test(login)
+				) return;
+				seen.add(login.toLowerCase());
+				found.push(login);
+			};
+			// A demo persona's handle is its roster id; the server checks it against the roster.
+			for (let member of members) {
+				if (!member.actor || member.handle.startsWith("demo:")) add(member.handle);
+			}
+			for (let card of cardMetadata.values()) card.involved.forEach(add);
+			return found;
+		};
+		return {
+			research: async (brief, requestId) => (await research.create(brief, requestId)).id,
+			spike: async (brief, id) => {
+				await experiments.action("", "", { id, brief });
+				await experiments.action(id, "run", {});
+			},
+			spikeUnavailable: () =>
+				summarizeMachines(machineStore.snapshot().machines ?? []).connected > 0
+					? undefined
+					: "No paired machine is online",
+			people,
+			openPage: async questionnaireId => {
+				let { presentation, wire } = exploreState.current;
+				if (!wire || presentation.type === "child") return;
+				// Only the latest click may navigate; an older reply is dropped.
+				let request = ++pageRequest.current;
+				let reply = await wire.ask<Question.Explore.Paged>("question:page", { id: questionnaireId })
+					.catch(() => undefined);
+				if (request !== pageRequest.current) return;
+				if (!reply?.ok) {
+					throw new Error(reply?.message ?? "Couldn’t open this decision. Try again.");
+				}
+				// A page opens over the document, so leave Decisions for it.
+				latestSelectDestination.current("plan");
+				presentation.onChildOpen?.(reply.childId);
+			},
+			subscribe: listener => machineStore.watch(listener),
+		};
+	}, [experiments, profile.research, research, workspaceCanEdit]);
 	let investigations = useMemo<InvestigationResources>(() => ({
 		create: (brief, requestId) => experiments.action("", "", { id: requestId, brief }),
 		cancel: id => experiments.action(id, "cancel", {}),
@@ -1418,6 +1492,19 @@ export function RoomWorkspace(
 			setResearchBusy(new Set(pendingResearchActions.current));
 		});
 	};
+	// Hooks stay above every early return: a live delete must render the same hooks.
+	let questionPageRoot = useMemo(
+		() => ({
+			entries,
+			metadata: cardMetadata,
+			wire,
+			explore,
+			self: handle,
+			canEdit: !!workspaceCanEdit,
+			connected: status === "connected",
+		}),
+		[cardMetadata, entries, explore, handle, status, wire, workspaceCanEdit],
+	);
 	if (deleted) {
 		return (
 			<div className="flex h-full items-center justify-center bg-ground p-4 text-sm text-text-secondary">
@@ -1484,9 +1571,34 @@ export function RoomWorkspace(
 				preface={presentation.type === "child" && presentation.parent || loading
 					? (
 						<>
-							{presentation.type === "child" && presentation.parent && (
-								<ChildProvenance channelId={room} parent={presentation.parent} />
-							)}
+							{questionPage
+								? (
+									<QuestionPagePanel
+										actions={!childTitle || childTitle.phone
+											? (
+												<QuestionPageActions
+													entry={questionPage.entry}
+													meta={questionPage.meta}
+													// Only a compact layout has no child context (a phone's top bar carries the menu), so the
+													// page's own menu shows there alone.
+													onAction={childTitle || !workspaceCanEdit
+														? undefined
+														: action =>
+															action === "discard-decision"
+																? setDiscarding(true)
+																: onDocumentAction(room, action)}
+													root={questionPage.root}
+												/>
+											)
+											: undefined}
+										entry={questionPage.entry}
+										meta={questionPage.meta}
+										root={questionPage.root}
+									/>
+								)
+								: presentation.type === "child" && presentation.parent && (
+									<ChildProvenance channelId={room} parent={presentation.parent} />
+								)}
 							{loading && <DocumentSkeleton />}
 						</>
 					)
@@ -1496,6 +1608,7 @@ export function RoomWorkspace(
 				readOnly={!workspaceCanEdit || implementation.locked}
 				research={profile.research ? research : undefined}
 				researchLauncher={researchLauncher}
+				explore={explore}
 				scrollTop={planScrollTop}
 				threads={threads}
 				authorship={authorship}
@@ -1536,14 +1649,15 @@ export function RoomWorkspace(
 			)}
 		</div>
 	);
+	let machinePicker = ownsMachine && machineChoice.state && workspaceCanEdit
+			&& status === "connected"
+		? machineChoice
+		: undefined;
 	let titleProps: TitleProps = {
 		archivedAt: workspaceArchivedAt,
 		canManage: effectiveCanManage,
 		editing: titleEdit,
 		label: metadata.title,
-		machine: ownsMachine && machineChoice.state && workspaceCanEdit && status === "connected"
-			? machineChoice
-			: undefined,
 		onAction: action => onDocumentAction(room, action),
 		onEditingChange: setTitleEdit,
 		onRenamed: updateMetadata,
@@ -1552,7 +1666,28 @@ export function RoomWorkspace(
 	};
 
 	if (presentation.type === "child") {
-		let childTitleControl = <DocumentTitle {...titleProps} project={undefined} />;
+		let childTitleControl = (
+			<DocumentTitle
+				{...titleProps}
+				decision={!!questionPage && !!workspaceCanEdit}
+				onAction={action =>
+					action === "discard-decision" ? setDiscarding(true) : onDocumentAction(room, action)}
+				project={undefined}
+			/>
+		);
+		let pageActions = questionPage && (
+			<QuestionPageActions
+				entry={questionPage.entry}
+				meta={questionPage.meta}
+				root={questionPage.root}
+			/>
+		);
+		// Beside its parent the bar holds them; a lifted sheet has its own bar; a phone has neither.
+		let barActions = childTitle?.motion === "lift"
+			? "own"
+			: childTitle?.actions && !childTitle.phone
+			? "parent"
+			: undefined;
 		return (
 			<div
 				className="child-document flex h-full min-h-0 flex-col bg-page"
@@ -1567,13 +1702,17 @@ export function RoomWorkspace(
 					? createPortal(
 						<PhoneHeaderContent
 							archivedAt={workspaceArchivedAt}
-							canManage={effectiveCanManage}
+							canManage={questionPage ? !!workspaceCanEdit : effectiveCanManage}
 							comments={openComments}
+							decision={!!questionPage}
 							editing={titleEdit}
 							editingDocument={editMode === "editing"}
 							label={metadata.title}
 							members={members}
-							onAction={action => onDocumentAction(room, action)}
+							onAction={action =>
+								action === "discard-decision"
+									? setDiscarding(true)
+									: onDocumentAction(room, action)}
 							onComments={() => {
 								childChrome?.showDocument();
 								openCommentList(room);
@@ -1586,6 +1725,19 @@ export function RoomWorkspace(
 						childTitle.slot,
 					)
 					: createPortal(childTitleControl, childTitle.slot))}
+				{questionPage && barActions === "parent" && childTitle?.actions
+					&& createPortal(pageActions, childTitle.actions)}
+				{questionPage && (
+					<DiscardDecisionDialog
+						onConfirm={async () => {
+							await discardDecision(questionPage.root, questionPage.entry.id);
+							setDiscarding(false);
+							presentation.onClose?.();
+						}}
+						onDismiss={() => setDiscarding(false)}
+						open={discarding}
+					/>
+				)}
 				{childTitle?.motion === "lift" && (
 					<div
 						className="document-title-bar panel-header flex shrink-0 items-center px-(--panel-toolbar-padding-inline) hairline-b"
@@ -1595,6 +1747,7 @@ export function RoomWorkspace(
 							<MagnifierIcon aria-hidden="true" size={16} />
 						</span>
 						<div className="document-title-slot">{childTitleControl}</div>
+						{barActions === "own" && pageActions}
 						<button
 							aria-label={`Back to ${presentation.parent?.label ?? "parent document"}`}
 							className="btn btn-icon btn-ghost shrink-0"
@@ -1642,7 +1795,11 @@ export function RoomWorkspace(
 	let childTitleValue = presentation.type === "parent-with-child" && phone
 		? { motion: "zoom" as const, parent: metadata.title, phone: true, slot: childTitleSlot }
 		: presentation.type === "parent-with-child" && mode === "split"
-		? { motion: presentation.motion, slot: zoomChild ? childTitleSlot : null }
+		? {
+			actions: zoomChild ? childActionsSlot : null,
+			motion: presentation.motion,
+			slot: zoomChild ? childTitleSlot : null,
+		}
 		: undefined;
 	// Build plan or the build capsule sits beside the people here; a child open beside its parent
 	// has no build of its own. A phone shows this room's bar only off Document, so it keeps it.
@@ -1665,6 +1822,14 @@ export function RoomWorkspace(
 				tabReady={build.tabReady}
 			/>
 		);
+	// The machine button sits just left of Build plan or the decisions capsule, whichever shows. A
+	// phone's is in its top bar instead.
+	let titleBuild = buildSlot && (
+		<>
+			{!phone && machinePicker && <MachineButton choice={machinePicker} />}
+			{buildSlot}
+		</>
+	);
 
 	// The tab bar's pencil edits the document on screen: an open child, or else this one.
 	let barEdit = childOpen
@@ -1672,270 +1837,295 @@ export function RoomWorkspace(
 		: editMode && { docked, editing: editMode === "editing", toggle: toggleEditing };
 
 	return (
-		<ChildPhoneChromeContext.Provider value={childChromeValue}>
-			<ChildTitleContext.Provider value={childTitleValue}>
-				<p aria-live="polite" className="sr-only" role="status">
-					<span key={announcement.sequence}>{announcement.text}</span>
-				</p>
-				<Workspace
-					available={available}
-					buildEnabled={build.tabReady}
-					buildGlyph={<BuildGlyph blockers={namedBuildBlockers} look={build.look} />}
-					buildHot={buildHover === "capsule"}
-					buildUnavailable={buildUnavailable}
-					onBuildHover={on => setBuildHover(on ? "tab" : undefined)}
-					onBuildUnavailable={() => explainBuild()}
-					phoneHint={buildHint?.text}
-					frame={frame}
-					chat={
-						<Chat
-							active={chatActive}
-							agent={agent}
-							focus={presentation.type === "parent-with-child" ? presentation.childId : undefined}
-							onOpenChild={presentation.onChildOpen}
-							connected={status === "connected"}
-							readonly={!workspaceCanEdit}
-							archived={!!workspaceArchivedAt}
-							handle={handle}
-							onActivity={onChatActivity}
-							notice={workspaceArchivedAt
-								? effectiveCanManage
-									? "Archived. Restore it to keep chatting."
-									: "This document is archived."
-								: !workspaceCanEdit
-								? "You have read-only access to this document."
-								: undefined}
-							onShowDecisions={() => selectDestination("decisions")}
-							onResearch={researchEnabled ? startResearch : undefined}
-							onShowResearch={showResearchDraft}
-							people={peopleHere(members)}
-							conversationPlan={conversation.state}
-							conversationPlanJobs={conversation.jobs}
-							onCardLink={showCard}
-							onAddExcerpt={addExcerpt}
-							onRetryAnalysis={retryAnalysis}
-							onRetryJob={retryJob}
-							sourceDestination={sourceDestination}
-							researchOffers={researchEnabled && conversation.enabled
-								? {
-									links: researchLinks.links,
-									busy: researchBusy,
-									errors: researchErrors,
-									canAct: status === "connected" && !!wire?.connected && !!workspaceCanEdit,
-									canCheckLink: status === "connected" && !!wire?.connected,
-									canExecute: researchExecution,
-									wire,
-									controllers: researchDrafts,
-									handle,
-									onSource: source =>
-										showSource({
-											source: { ...source, role: "support" },
-											itemId: source.messageId,
-										}),
-									store: research,
-									onAction: actOnResearchOffer,
-									onRetryLink: offerId => researchLinks.refresh(offerId, true),
-								}
-								: undefined}
-							decisions={{
-								questions,
-								meta: cardMeta,
-								wire,
-								connected: treatAsConnected,
-								canEdit: workspaceCanEdit,
-								onOpenCard: showDecisionCard,
-							}}
-							referencesEnabled={chatReferences.wire === wire && chatReferences.enabled}
-							repository={repository}
-							room={room}
-							sendAcknowledgements={chatSendAcks.wire === wire && chatSendAcks.enabled}
-							planner={plannerAttachment.wire === wire ? plannerAttachment.planner : undefined}
-							plannerMachine={plannerStartingOn(machineChoice.state)}
-							wire={wire}
-						/>
-					}
-					chatActivity={chatActivity}
-					documentActivity={documentActivity(documentWatch, chatActivity.busy)}
-					header={phone
-						? (
-							<PhoneHeader
-								// The child's bar goes with its document: Chat, Decisions and Build are this room's.
-								child={presentation.type === "parent-with-child" && planVisible
-									? { onReturn: presentation.onChildClose, slot: setChildTitleSlot }
+		<DecisionContexts document={room} page={questionPageRoot}>
+			<ChildPhoneChromeContext.Provider value={childChromeValue}>
+				<ChildTitleContext.Provider value={childTitleValue}>
+					<p aria-live="polite" className="sr-only" role="status">
+						<span key={announcement.sequence}>{announcement.text}</span>
+					</p>
+					<Workspace
+						available={available}
+						buildEnabled={build.tabReady}
+						buildGlyph={<BuildGlyph blockers={namedBuildBlockers} look={build.look} />}
+						buildHot={buildHover === "capsule"}
+						buildUnavailable={buildUnavailable}
+						onBuildHover={on => setBuildHover(on ? "tab" : undefined)}
+						onBuildUnavailable={() => explainBuild()}
+						phoneHint={buildHint?.text}
+						frame={frame}
+						chat={
+							<Chat
+								active={chatActive}
+								agent={agent}
+								focus={presentation.type === "parent-with-child" ? presentation.childId : undefined}
+								onOpenChild={presentation.onChildOpen}
+								connected={status === "connected"}
+								readonly={!workspaceCanEdit}
+								archived={!!workspaceArchivedAt}
+								handle={handle}
+								onActivity={onChatActivity}
+								notice={workspaceArchivedAt
+									? effectiveCanManage
+										? "Archived. Restore it to keep chatting."
+										: "This document is archived."
+									: !workspaceCanEdit
+									? "You have read-only access to this document."
 									: undefined}
-								label={metadata.title}
-								presentation={presentation}
-							>
-								<PhoneHeaderContent
-									archivedAt={workspaceArchivedAt}
-									canManage={effectiveCanManage}
-									comments={openComments}
-									context={buildSlot}
-									editing={titleEdit}
-									editingDocument={!childOpen && !!barEdit?.editing}
+								onShowDecisions={() => selectDestination("decisions")}
+								onResearch={researchEnabled ? startResearch : undefined}
+								onShowResearch={showResearchDraft}
+								people={peopleHere(members)}
+								conversationPlan={conversation.state}
+								conversationPlanJobs={conversation.jobs}
+								onCardLink={showCard}
+								onAddExcerpt={addExcerpt}
+								onRetryAnalysis={retryAnalysis}
+								onRetryJob={retryJob}
+								sourceDestination={sourceDestination}
+								researchOffers={researchEnabled && conversation.enabled
+									? {
+										links: researchLinks.links,
+										busy: researchBusy,
+										errors: researchErrors,
+										canAct: status === "connected" && !!wire?.connected && !!workspaceCanEdit,
+										canCheckLink: status === "connected" && !!wire?.connected,
+										canExecute: researchExecution,
+										wire,
+										controllers: researchDrafts,
+										handle,
+										onSource: source =>
+											showSource({
+												source: { ...source, role: "support" },
+												itemId: source.messageId,
+											}),
+										store: research,
+										onAction: actOnResearchOffer,
+										onRetryLink: offerId => researchLinks.refresh(offerId, true),
+									}
+									: undefined}
+								decisions={{
+									questions,
+									meta: cardMeta,
+									wire,
+									connected: treatAsConnected,
+									canEdit: workspaceCanEdit,
+									onOpenCard: showDecisionCard,
+								}}
+								referencesEnabled={chatReferences.wire === wire && chatReferences.enabled}
+								repository={repository}
+								room={room}
+								sendAcknowledgements={chatSendAcks.wire === wire && chatSendAcks.enabled}
+								planner={plannerAttachment.wire === wire ? plannerAttachment.planner : undefined}
+								plannerMachine={plannerStartingOn(machineChoice.state)}
+								wire={wire}
+							/>
+						}
+						chatActivity={chatActivity}
+						documentActivity={documentActivity(documentWatch, chatActivity.busy)}
+						header={phone
+							? (
+								<PhoneHeader
+									// The child's bar goes with its document: Chat, Decisions and Build are this room's.
+									child={presentation.type === "parent-with-child" && planVisible
+										? { onReturn: presentation.onChildClose, slot: setChildTitleSlot }
+										: undefined}
 									label={metadata.title}
-									machine={titleProps.machine}
+									presentation={presentation}
+								>
+									<PhoneHeaderContent
+										archivedAt={workspaceArchivedAt}
+										canManage={effectiveCanManage}
+										comments={openComments}
+										context={buildSlot}
+										editing={titleEdit}
+										editingDocument={!childOpen && !!barEdit?.editing}
+										label={metadata.title}
+										machine={machinePicker}
+										members={members}
+										onAction={action => onDocumentAction(room, action)}
+										onComments={() => {
+											// The list stands over the document, so it opens from any tab onto it.
+											selectDestination("plan");
+											openCommentList(room);
+										}}
+										onEditingChange={setTitleEdit}
+										onRenamed={updateMetadata}
+										lead={repository.name}
+										room={room}
+									/>
+								</PhoneHeader>
+							)
+							: (
+								<Header
+									{...titleProps}
+									build={titleBuild}
 									members={members}
-									onAction={action => onDocumentAction(room, action)}
-									onComments={() => {
-										// The list stands over the document, so it opens from any tab onto it.
-										selectDestination("plan");
-										openCommentList(room);
-									}}
-									onEditingChange={setTitleEdit}
-									onRenamed={updateMetadata}
-									lead={repository.name}
-									room={room}
+									tools={<AuthorshipToggle store={authorship} />}
 								/>
-							</PhoneHeader>
-						)
-						: (
-							<Header
+							)}
+						title={
+							<DocumentTitle
 								{...titleProps}
-								build={buildSlot}
-								members={members}
-								tools={<AuthorshipToggle store={authorship} />}
+								icon
+								path={zoomChild}
+							/>
+						}
+						controls={
+							<>
+								{viewedVersion
+									? (
+										<DocumentVersionBar
+											channelId={room}
+											key={`${room}:${viewedVersion.id}`}
+											onBack={() => setViewedVersion(undefined)}
+											{...(effectiveCanEdit && !archivedAt
+												? {
+													onRestored: () => {
+														setViewedVersion(undefined);
+														setHistoryReload(count => count + 1);
+													},
+												}
+												: {})}
+											self={handle}
+											version={viewedVersion}
+										/>
+									)
+									: (
+										<DecisionViewControl
+											attention={attention}
+											buildEnabled={profile.implementation ? build.tabReady : undefined}
+											buildGlyph={<BuildGlyph blockers={namedBuildBlockers} look={build.look} />}
+											buildHot={buildHover === "capsule"}
+											onBuildHover={on => setBuildHover(on ? "tab" : undefined)}
+											documentActivity={documentActivity(documentWatch, chatActivity.busy)}
+											onView={selectDestination}
+											unanswered={unanswered}
+											view={view}
+										/>
+									)}
+								<div className="views-bar-tools">
+									<button
+										aria-controls={activityOpen ? activityId : undefined}
+										aria-expanded={activityOpen && !activityClosing}
+										aria-label="History"
+										className="btn btn-icon btn-ghost"
+										ref={historyToggle}
+										onClick={() => {
+											if (activityOpen && !activityClosing) {
+												closeActivity();
+												return;
+											}
+											if (view !== "plan") selectDestination("plan");
+											setActivityClosing(false);
+											setActivityOpen(true);
+										}}
+										type="button"
+									>
+										<ClockIcon />
+									</button>
+								</div>
+							</>
+						}
+						// Build plan or its capsule closes the status, so the rule before the faces follows it.
+						status={
+							<>
+								{statusNotices}
+								{mode === "split" && titleBuild}
+								{zoomChild && <span className="child-actions-slot" ref={setChildActionsSlot} />}
+							</>
+						}
+						ids={workspaceIds}
+						phoneAction={barEdit && (
+							<button
+								aria-label={barEdit.editing ? "Done editing" : "Edit document"}
+								className="phone-tab-action"
+								data-editing={barEdit.editing || undefined}
+								onClick={barEdit.toggle}
+								type="button"
+							>
+								<PencilIcon aria-hidden="true" data-edit-icon="edit" size={24} />
+								<CheckIcon aria-hidden="true" data-edit-icon="done" size={24} />
+							</button>
+						)}
+						// Formatting rides above the keyboard while typing. With the keyboard down the tabs
+						// return, and a selection gets the ordinary bubble instead.
+						phoneToolbar={barEdit?.docked && <div className="contents" ref={setFormatDock} />}
+						identity={room}
+						mode={mode}
+						presence={
+							<>
+								<AuthorshipToggle store={authorship} />
+								<RoomMembers members={members} ring="page" />
+							</>
+						}
+						phone={phone}
+						onDesktopChatOpen={setDesktopChatOpen}
+						onChatOpen={open => dispatch({ type: "set-chat", open })}
+						onDestination={selectDestination}
+						build={profile.implementation && (
+							<BuildView
+								active={workspacePresentation.documentVisible && view === "build"}
+								build={build}
+								canEdit={!!workspaceCanEdit && status === "connected"}
+								comments={acceptedComments}
+								onShowDecisions={() => selectDestination("decisions")}
+								onShowDocument={() => selectDestination("plan")}
+								room={room}
+								unanswered={unanswered}
+								userId={userId}
 							/>
 						)}
-					title={
-						<DocumentTitle
-							{...titleProps}
-							icon
-							path={zoomChild}
-						/>
-					}
-					controls={
-						<>
-							{viewedVersion
-								? (
-									<DocumentVersionBar
-										channelId={room}
-										key={`${room}:${viewedVersion.id}`}
-										onBack={() => setViewedVersion(undefined)}
-										{...(effectiveCanEdit && !archivedAt
-											? {
-												onRestored: () => {
-													setViewedVersion(undefined);
-													setHistoryReload(count => count + 1);
-												},
-											}
-											: {})}
-										self={handle}
-										version={viewedVersion}
+						decisions={
+							<Decisions
+								explore={explore}
+								key={room}
+								additional={
+									<EvidenceDecisions
+										store={experiments}
+										canEdit={!!workspaceCanEdit && status === "connected"}
 									/>
-								)
-								: (
-									<DecisionViewControl
-										attention={attention}
-										buildEnabled={profile.implementation ? build.tabReady : undefined}
-										buildGlyph={<BuildGlyph blockers={namedBuildBlockers} look={build.look} />}
-										buildHot={buildHover === "capsule"}
-										onBuildHover={on => setBuildHover(on ? "tab" : undefined)}
-										documentActivity={documentActivity(documentWatch, chatActivity.busy)}
-										onView={selectDestination}
-										unanswered={unanswered}
-										view={view}
-									/>
+								}
+								hasAdditional={[...experiments.values.values()].some(item =>
+									item.decisions.length > 0
 								)}
-							<div className="views-bar-tools">
-								<button
-									aria-controls={activityOpen ? activityId : undefined}
-									aria-expanded={activityOpen && !activityClosing}
-									aria-label="History"
-									className="btn btn-icon btn-ghost"
-									ref={historyToggle}
-									onClick={() => {
-										if (activityOpen && !activityClosing) {
-											closeActivity();
-											return;
-										}
-										if (view !== "plan") selectDestination("plan");
-										setActivityClosing(false);
-										setActivityOpen(true);
-									}}
-									type="button"
-								>
-									<ClockIcon />
-								</button>
-							</div>
-						</>
-					}
-					// Build plan or its capsule closes the status, so the rule before the faces follows it.
-					status={<>{statusNotices}{mode === "split" && buildSlot}</>}
-					ids={workspaceIds}
-					phoneAction={barEdit && (
-						<button
-							aria-label={barEdit.editing ? "Done editing" : "Edit document"}
-							className="phone-tab-action"
-							data-editing={barEdit.editing || undefined}
-							onClick={barEdit.toggle}
-							type="button"
-						>
-							<PencilIcon aria-hidden="true" data-edit-icon="edit" size={24} />
-							<CheckIcon aria-hidden="true" data-edit-icon="done" size={24} />
-						</button>
-					)}
-					// Formatting rides above the keyboard while typing. With the keyboard down the tabs
-					// return, and a selection gets the ordinary bubble instead.
-					phoneToolbar={barEdit?.docked && <div className="contents" ref={setFormatDock} />}
-					identity={room}
-					mode={mode}
-					presence={
-						<>
-							<AuthorshipToggle store={authorship} />
-							<RoomMembers members={members} ring="page" />
-						</>
-					}
-					phone={phone}
-					onDesktopChatOpen={setDesktopChatOpen}
-					onChatOpen={open => dispatch({ type: "set-chat", open })}
-					onDestination={selectDestination}
-					build={profile.implementation && (
-						<BuildView
-							active={workspacePresentation.documentVisible && view === "build"}
-							build={build}
-							canEdit={!!workspaceCanEdit && status === "connected"}
-							comments={acceptedComments}
-							onShowDecisions={() => selectDestination("decisions")}
-							onShowDocument={() => selectDestination("plan")}
-							room={room}
-							unanswered={unanswered}
-							userId={userId}
-						/>
-					)}
-					decisions={
-						<Decisions
-							additional={
-								<EvidenceDecisions
-									store={experiments}
-									canEdit={!!workspaceCanEdit && status === "connected"}
-								/>
-							}
-							hasAdditional={[...experiments.values.values()].some(item =>
-								item.decisions.length > 0
-							)}
-							cardMeta={cardMeta}
-							canEdit={workspaceCanEdit}
-							connected={treatAsConnected && workspaceCanEdit}
-							headingId={workspaceIds.heading.decisions}
-							motion={motionContract("collapse")}
-							motionImmediately={settleMotionImmediately}
-							onShowPlan={showPlan}
-							planner={agent}
-							questionMotion={QUESTION_MOTION}
-							reveal={reveal}
-							self={handle}
-							store={questions}
-							wire={wire}
-						/>
-					}
-					plan={planArea}
-					state={workspace}
-					presentation={presentation}
-					unanswered={unanswered}
-					view={view}
-				/>
-			</ChildTitleContext.Provider>
-		</ChildPhoneChromeContext.Provider>
+								cardMeta={cardMeta}
+								canEdit={workspaceCanEdit}
+								connected={treatAsConnected && workspaceCanEdit}
+								headingId={workspaceIds.heading.decisions}
+								motion={motionContract("collapse")}
+								motionImmediately={settleMotionImmediately}
+								onShowPlan={showPlan}
+								planner={agent}
+								questionMotion={QUESTION_MOTION}
+								reveal={reveal}
+								self={handle}
+								store={questions}
+								wire={wire}
+							/>
+						}
+						plan={planArea}
+						state={workspace}
+						presentation={presentation}
+						unanswered={unanswered}
+						view={view}
+					/>
+				</ChildTitleContext.Provider>
+			</ChildPhoneChromeContext.Provider>
+		</DecisionContexts>
+	);
+}
+
+/** A decision's own page, and card text read as Markdown with this document's images. */
+function DecisionContexts(
+	{ children, document, page }: {
+		children: ReactNode;
+		document: string;
+		page: QuestionPageRoot | undefined;
+	},
+) {
+	return (
+		<QuestionPageContext.Provider value={page}>
+			<QuestionMarkdownProvider document={document}>{children}</QuestionMarkdownProvider>
+		</QuestionPageContext.Provider>
 	);
 }

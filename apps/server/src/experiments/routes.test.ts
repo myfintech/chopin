@@ -1194,6 +1194,22 @@ test("expired pairing and connections cannot be revived by replay", () => {
 	expect(() => connections.claim(pending.id, pending.secret)).toThrow("pairing-expired");
 });
 
+test("rebinding a build never replaces another document's assignment on the new connection", () => {
+	let connections = new Connections(() => 0);
+	let machine = { id: "machine", owner: "alice", login: "alice", autoRun: false };
+	let sources = [{ repository: "org/repo", repositoryId: "repo", commit: "a".repeat(40) }];
+	let from = connections.open(machine, "Laptop", sources).connection;
+	let busy = connections.open(machine, "Laptop", sources).connection;
+	let idle = connections.open(machine, "Laptop", sources).connection;
+	connections.assign(from.id, "doc-a");
+	connections.assign(busy.id, "doc-b");
+	connections.rebind(from.id, busy, "doc-a", "run-a");
+	expect(connections.assigned(busy.id)).toBe("doc-b");
+	// A new connection with none, after its predecessor's session already ended, takes it over.
+	connections.rebind(from.id, idle, "doc-a", "run-a");
+	expect(connections.assigned(idle.id)).toBe("doc-a");
+});
+
 test("a child document refuses new investigations", async () => {
 	let { storage, documentId, request, alice } = await setup();
 	let child = crypto.randomUUID();
@@ -1521,7 +1537,7 @@ test("a connector outside the supported protocol range is refused with the comma
 	}
 
 	// In range: pairing, claiming and connector calls all go through.
-	let current = headers("0.2.0", max);
+	let current = headers("0.2.0", 6);
 	let created = await request("/api/connector/pairings", source, undefined, undefined, current);
 	expect(created.status).toBe(200);
 	let pending = await created.json();
@@ -1539,7 +1555,9 @@ test("a connector outside the supported protocol range is refused with the comma
 	let opened = await request("/api/connector/connections", source, undefined, machine, current);
 	expect(opened.status).toBe(200);
 	let { token } = await opened.json();
-	expect((await mcp(token, current)).status).toBe(200);
+	for (let protocol of [2, 5, 6]) {
+		expect((await mcp(token, headers("0.2.0", protocol))).status).toBe(200);
+	}
 
 	// Too old or too new: each connector route refuses, even with a valid token, and says why.
 	for (

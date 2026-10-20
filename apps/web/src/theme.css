@@ -2,6 +2,7 @@
 @import "@chopin/visuals/theme.css";
 @import "./conversation-plan/source.css";
 @import "./build-view.css";
+@import "./criteria.css";
 @import "./local-agent-note.css";
 
 /*
@@ -799,7 +800,8 @@ body {
  */
 .document-title-bar {
 	position: relative;
-	gap: calc(var(--spacing) * 2);
+	gap: 0;
+	padding-inline: 0;
 	container: document-title-bar / inline-size;
 }
 
@@ -808,14 +810,18 @@ body {
 	min-width: 0;
 	flex: 1;
 	align-items: center;
+	padding-inline-start: var(--panel-toolbar-padding-inline);
+	/* Whatever cannot truncate is cut, never painted under the actions; rings keep their room. */
+	overflow: clip;
+	overflow-clip-margin: 4px;
 }
 
 /* After the Chat toggle's rule, the project sits as far in as the toggle's glyph sits from the edge. */
 .workspace-surface-toggle-slot + .document-title-slot {
-	padding-inline-start: var(--control-padding-inline);
+	padding-inline-start: var(--document-title-inset);
 }
 
-/* Both bars read at one size: the views' btn-md text. */
+/* Title text stays on the common interface scale; the view controls have their tuned role. */
 .document-title-bar
 	:is(.document-project-prefix, .document-project-separator, .document-title-crumb, .title-control) {
 	font-size: var(--text-sm);
@@ -837,8 +843,7 @@ body {
 
 /*
  * Status keeps its live regions mounted, so the rule before the faces follows visible notices and
- * Build. The rule sits 8px from each side, so the faces get 8px on every side and Build stays
- * more than 12px from them.
+ * Build. The face inset derives from the bar's inner height, including its hairline divider.
  */
 .document-title-status {
 	display: flex;
@@ -846,18 +851,31 @@ body {
 	gap: calc(var(--spacing) * 2);
 }
 
-.document-title-status:has(> :not(.sr-only, [data-level="hidden"])) {
+.document-title-status:has(> :not(.sr-only, [data-level="hidden"], .child-actions-slot:empty)) {
 	padding-inline-end: calc(var(--spacing) * 2);
 }
 
-.document-title-status:has(> :not(.sr-only, [data-level="hidden"])) + .room-members {
-	align-self: stretch;
-	padding-inline-start: calc(var(--spacing) * 2);
+.document-title-status:has(> :not(.sr-only, [data-level="hidden"], .child-actions-slot:empty))
+	+ .room-members {
 	border-inline-start: var(--edge-width) solid var(--color-divider);
+}
+
+.document-title-trailing > .room-members {
+	align-self: stretch;
+	padding-inline: var(--document-presence-inset);
 }
 
 .document-title-bar .title-control {
 	color: var(--color-text-primary);
+}
+
+.document-title-bar .title-control-label {
+	padding-inline: var(--document-title-label-padding);
+}
+
+.document-title-bar .build-plan {
+	height: auto;
+	padding: var(--document-control-padding-block) var(--document-control-padding-inline);
 }
 
 /* A covered Lift root's title dims with the rest of its bar. */
@@ -873,14 +891,45 @@ body {
 /* Bar 2 holds the views and sits directly on the paper, so it has no rule beneath it. */
 .document-views-bar {
 	gap: calc(var(--spacing) * 1.5);
+	block-size: calc(
+		var(--text-document-control) * var(--text-sm--line-height) +
+			var(--document-control-padding-block) * 2 +
+			var(--document-views-inset) * 2
+	);
+	padding: var(--document-views-inset);
 	transition:
 		block-size var(--child-close-dur) var(--child-ease),
 		opacity var(--child-close-dur) var(--child-ease);
 }
 
+.document-views-bar [data-document-view-control] {
+	gap: var(--document-tab-gap);
+}
+
+.document-views-bar [data-document-view-control] .btn {
+	height: auto;
+	min-height: 0;
+	padding: var(--document-control-padding-block) var(--document-control-padding-inline);
+	font-size: var(--text-document-control);
+	line-height: var(--text-sm--line-height);
+}
+
+.document-views-bar > .btn-icon {
+	width: calc(
+		var(--text-document-control) * var(--text-sm--line-height) +
+			var(--document-control-padding-block) * 2
+	);
+	height: calc(
+		var(--text-document-control) * var(--text-sm--line-height) +
+			var(--document-control-padding-block) * 2
+	);
+	padding: 0;
+}
+
 /* A Zoom child has no views of its own, so the root's fold away while it is open. */
 .document-views-bar[data-folded] {
 	block-size: 0;
+	padding-block: 0;
 	opacity: 0;
 	transition-duration: var(--child-open-dur);
 }
@@ -903,10 +952,16 @@ body {
 	color: var(--color-text-quaternary);
 }
 
+/* The child's title keeps room for its name and actions; the root crumb gives way first. */
 .document-child-title-slot {
 	display: flex;
 	min-width: 0;
 	flex: 1;
+}
+
+/* A question's actions share the bar, so its title keeps room for a name. */
+.document-title-bar:has(.child-actions-slot:not(:empty)) .document-child-title-slot {
+	min-width: calc(var(--spacing) * 32);
 }
 
 .child-title-icon {
@@ -922,6 +977,11 @@ body {
 /* The title truncates first; then status labels fold to their glyphs; then one face remains. */
 @container document-title-bar (max-width: 40rem) {
 	.document-title-status [data-status-label] {
+		display: none;
+	}
+
+	/* A question page's waiting pill keeps its face and gives the words back to the title. */
+	.child-actions-slot .explore-waiting-names {
 		display: none;
 	}
 }
@@ -959,15 +1019,15 @@ body {
 /* The divider spans the bar's full height, so the slot stretches rather than centring. */
 .workspace-surface-toggle-slot {
 	align-self: stretch;
-	padding-inline-end: calc(var(--spacing) * 2);
+	padding-inline: var(--document-expand-inset);
 	border-inline-end: var(--edge-width) solid var(--color-divider);
 }
 
 /* Compact, to match the tabs' height and keep an equal inset inside the bar. */
 .workspace-surface-toggle-slot .chat-toggle {
-	width: var(--icon-button-size-compact);
-	height: var(--icon-button-size-compact);
-	padding: calc((var(--icon-button-size-compact) - var(--icon-size-default)) / 2);
+	width: var(--icon-button-size);
+	height: var(--icon-button-size);
+	padding: var(--icon-button-padding);
 }
 
 /* The restore state carries a label, so it trades the square icon size for padding. */
@@ -1547,6 +1607,9 @@ body {
 
 /* The decision card: a question, lettered options, and a quiet footer. */
 .question-card {
+	/* The card's top and its inline padding plus the head's, for a corner rule inside it. */
+	--corner-pad-block: calc(var(--spacing) * 4);
+	--corner-pad-inline: calc(var(--spacing) * 4);
 	padding: 1rem 0.5rem 0.75rem;
 }
 
@@ -1572,6 +1635,20 @@ body {
 	border-radius: var(--radius-full);
 	background: var(--color-success-wash);
 	color: var(--color-success);
+}
+
+/* Tucked into the card's corner: undo the host's padding, which the host states in --corner-pad-*. */
+.question-head-actions {
+	display: flex;
+	flex: none;
+	align-items: center;
+	gap: calc(var(--spacing) * 2);
+	margin-block-start: calc(
+		var(--card-corner-inset) - var(--corner-pad-block, var(--card-corner-inset))
+	);
+	margin-inline-end: calc(
+		var(--card-corner-inset) - var(--corner-pad-inline, var(--card-corner-inset))
+	);
 }
 
 .question-head-text {
@@ -1601,6 +1678,191 @@ body {
 	font-size: var(--plan-text-sm, var(--text-sm));
 	line-height: var(--text-sm--line-height);
 	color: var(--color-text-tertiary);
+}
+
+/*
+ * A question's body: Markdown under its heading, read at the hint's size but in reading ink,
+ * so a list of earlier answers or a diagram reads as part of the question, not as chrome.
+ */
+.question-body {
+	margin: 0.375rem 0 0;
+	font-size: var(--plan-text-sm, var(--text-sm));
+	line-height: var(--text-sm--line-height);
+	color: var(--color-text-secondary);
+	overflow-wrap: break-word;
+}
+
+/* The same reading inside the document's editor, which keeps typed whitespace, as anywhere else. */
+[data-question-markdown] {
+	white-space: normal;
+}
+
+[data-question-markdown] > :first-child {
+	margin-block-start: 0;
+}
+
+[data-question-markdown] > :last-child {
+	margin-block-end: 0;
+}
+
+[data-question-markdown] :is(p, ul, ol, pre, blockquote, .question-diagram) {
+	margin-block: 0.375rem;
+}
+
+[data-question-markdown] :is(ul, ol) {
+	padding-inline-start: 1.25rem;
+}
+
+[data-question-markdown] ul {
+	list-style: disc;
+}
+
+[data-question-markdown] ol {
+	list-style: decimal;
+}
+
+[data-question-markdown] li + li {
+	margin-block-start: 0.125rem;
+}
+
+[data-question-markdown] blockquote {
+	border-inline-start: var(--edge-width) solid var(--color-edge);
+	padding-inline-start: 0.75rem;
+}
+
+:is([data-question-markdown], .question-title, .question-label, .question-desc, .question-hint) a {
+	color: var(--color-brand-ink);
+	text-decoration: underline;
+	text-underline-offset: 0.125rem;
+}
+
+[data-question-markdown] :not(pre) > code {
+	border-radius: var(--radius-sm);
+	background: var(--color-inset);
+	padding: 0.125em 0.3em;
+	color: var(--color-text-primary);
+	font-family: var(--font-mono);
+	font-size: inherit;
+}
+
+[data-question-markdown] pre {
+	overflow-x: auto;
+	border-radius: var(--radius-md);
+	background: var(--color-inset);
+	padding: 0.5rem 0.75rem;
+	font-family: var(--font-mono);
+	font-size: var(--text-xs);
+}
+
+/* Without a Markdown renderer, a body keeps the line breaks it was written with. */
+.question-plain-lines {
+	white-space: pre-line;
+}
+
+/* An answered question's long body, folded so the answer stays in view. */
+.question-body-more {
+	margin: 0.375rem 0 0;
+}
+
+.question-body-toggle {
+	padding: 0;
+	border: 0;
+	background: none;
+	cursor: pointer;
+	font: inherit;
+	font-size: var(--plan-text-sm, var(--text-sm));
+	color: var(--color-text-tertiary);
+}
+
+.question-body-toggle:hover {
+	color: var(--color-text-secondary);
+}
+
+/* The document's own image, at the card's width at most. */
+.question-image {
+	display: block;
+	max-inline-size: 100%;
+	block-size: auto;
+	border: var(--edge-width) solid var(--color-edge);
+	border-radius: var(--radius-md);
+}
+
+/* An image the card will not load, or that failed, says what it showed. */
+.question-image-alt {
+	font-style: italic;
+	color: var(--color-text-tertiary);
+}
+
+/*
+ * A diagram in a card: the document's own frame, held to a bounded height until the reader
+ * expands it, with a fade where it is cut.
+ */
+.question-diagram {
+	min-inline-size: 0;
+}
+
+.question-diagram-frame[data-bounded] {
+	max-block-size: 18rem;
+	overflow: hidden;
+}
+
+.question-diagram-frame[data-overflows] {
+	mask-image: linear-gradient(to bottom, black calc(100% - 3rem), transparent);
+}
+
+.question-diagram-pending {
+	block-size: 6rem;
+	border-radius: var(--radius-md);
+	background: var(--color-inset);
+}
+
+.question-diagram-more {
+	display: flex;
+	justify-content: center;
+}
+
+.question-diagram .plan-diagram {
+	--ace-diagram-fade: calc(var(--spacing) * 8);
+
+	max-inline-size: 100%;
+	overflow-x: auto;
+	overflow-y: hidden;
+	overscroll-behavior-inline: contain;
+}
+
+.question-diagram .plan-diagram svg {
+	display: block;
+	max-width: none;
+	margin-inline: auto;
+}
+
+.question-diagram .plan-diagram[data-fit] svg {
+	max-width: 100%;
+	height: auto;
+}
+
+.question-diagram .plan-diagram[data-more="end"] {
+	mask-image: linear-gradient(to right, black calc(100% - var(--ace-diagram-fade)), transparent);
+}
+
+.question-diagram .plan-diagram[data-more="start"] {
+	mask-image: linear-gradient(to right, transparent, black var(--ace-diagram-fade));
+}
+
+.question-diagram .plan-diagram[data-more="both"] {
+	mask-image: linear-gradient(
+		to right,
+		transparent,
+		black var(--ace-diagram-fade),
+		black calc(100% - var(--ace-diagram-fade)),
+		transparent
+	);
+}
+
+.question-diagram .plan-diagram-actions {
+	display: flex;
+	justify-content: flex-end;
+	padding-block-start: calc(var(--spacing) * 1);
 }
 
 .question-options {
@@ -1922,6 +2184,66 @@ button.question-add:disabled {
 	color: var(--color-text-tertiary);
 }
 
+.question-written {
+	display: grid;
+	gap: calc(var(--spacing) * 2);
+	min-width: 0;
+	padding-inline: calc(var(--spacing) * 2);
+}
+
+.question-written-field {
+	display: block;
+	width: 100%;
+	min-width: 0;
+	padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3);
+	border: var(--edge-width) solid var(--color-control-edge);
+	border-radius: var(--radius-md);
+	background: var(--color-page);
+	box-shadow: var(--shadow-resting);
+	font: inherit;
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
+	color: var(--color-text-primary);
+}
+
+textarea.question-written-field {
+	min-block-size: calc(4lh + var(--spacing) * 4);
+}
+
+.question-written-field:focus {
+	outline: var(--focus-ring-width) solid var(--focus-ring-color);
+	outline-offset: var(--focus-ring-offset);
+}
+
+.question-written-field:disabled {
+	background: var(--color-inset);
+	color: var(--color-text-tertiary);
+}
+
+.question-final-answer {
+	display: grid;
+	gap: var(--spacing);
+	margin: calc(var(--spacing) * 3) calc(var(--spacing) * 2) 0;
+	padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3);
+	border-radius: var(--radius-md);
+	background: var(--color-inset);
+}
+
+.question-final-answer-label {
+	font-size: var(--text-xs);
+	line-height: var(--text-xs--line-height);
+	color: var(--color-text-tertiary);
+}
+
+.question-written-answer {
+	margin: 0;
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
+	color: var(--color-text-primary);
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
 .question-card[data-saving] .question-options {
 	opacity: 0.6;
 }
@@ -1969,7 +2291,7 @@ button.question-add:disabled {
    squeezing the link off the attribution's edge. */
 .question-actions[data-resolved-actions] {
 	flex-wrap: wrap;
-	gap: var(--spacing);
+	gap: 0.375rem;
 	margin-block-start: var(--spacing);
 	padding-block-end: 0;
 }
@@ -2212,4 +2534,10 @@ button.question-add:disabled {
 
 .composer-surface .composer-draft-input {
 	outline: none;
+}
+
+/* A question page's actions sit at the end of its parent's bar, before the people. */
+.child-actions-slot {
+	display: flex;
+	align-items: center;
 }

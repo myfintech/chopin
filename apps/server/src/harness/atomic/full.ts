@@ -109,9 +109,6 @@ export function classifyRuns(
 	return runs;
 }
 
-/** Stages kept per run; earlier ones are counted, not listed. */
-const STORED_STAGES = 12;
-
 type Card = Wire.Run & { stageIndex: Map<string, number>; prompts: Set<string> };
 
 const ENDED: Record<string, Wire.Run["status"] | undefined> = {
@@ -234,14 +231,8 @@ export function runCards(
 			: card.status === "running" || card.status === "waiting"
 			? "finished"
 			: card.status;
-		let earlierStages = Math.max(0, card.stages.length - STORED_STAGES);
-		return {
-			...card,
-			status,
-			waiting,
-			stages: card.stages.slice(earlierStages).map(stage => ({ ...stage })),
-			...(earlierStages ? { earlierStages } : {}),
-		};
+		// Every stage: Chat stores them all and shows the latest.
+		return { ...card, status, waiting, stages: card.stages.map(stage => ({ ...stage })) };
 	});
 }
 

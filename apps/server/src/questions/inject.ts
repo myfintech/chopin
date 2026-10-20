@@ -41,18 +41,39 @@ const SAMPLE = {
 	],
 };
 
+/** `DEV_QUESTIONS=criteria` seeds one decision judged against criteria instead of the sample. */
+const MATRIX = {
+	questions: [{
+		header: "Progress",
+		question: "Where should onboarding progress live?",
+		multiple: false,
+		options: [
+			{ label: "Stored with the account", description: "Works on every device." },
+			{ label: "Inferred from their documents", description: "No new storage." },
+			{ label: "Kept in the browser", description: "Simplest, but per device." },
+		],
+		criteria: [{ label: "New device" }, { label: "No new storage" }, { label: "Easy reset" }],
+	}],
+};
+
 /**
  * Seed a document once. Its records outlive reopening, renaming and other
  * clients, so an empty record map means the sample was never asked.
  */
-export function enabled(plan: Pick<Plan, "records">): boolean {
+export function enabled(plan: Pick<Plan, "records" | "questionPage">): boolean {
+	// A decision's page keeps its decisions in the parent, so it is never seeded.
 	return !!process.env.DEV_QUESTIONS && process.env.NODE_ENV !== "production"
-		&& plan.records.size === 0;
+		&& !plan.questionPage && plan.records.size === 0;
 }
 
 /** Ask the sample questionnaire, and log what comes back. */
 export function ask(plan: Plan, server: Server<SocketData>, roomId: string): void {
-	void Questions.ask(plan, server, roomId, Questions.identify(SAMPLE))
+	void Questions.ask(
+		plan,
+		server,
+		roomId,
+		Questions.identify(process.env.DEV_QUESTIONS === "criteria" ? MATRIX : SAMPLE),
+	)
 		.then(ended => {
 			console.log(
 				`[dev] decisions settled: ${JSON.stringify(ended)}`,

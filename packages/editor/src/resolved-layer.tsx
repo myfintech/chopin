@@ -31,10 +31,11 @@ import {
 	ClockIcon,
 	CloseIcon,
 	DecisionIcon,
+	ExpandIcon,
 	MessageForwardIcon,
 	MessageIcon,
 } from "@chopin/icons";
-import { InlineCode, ResolvedActions } from "@chopin/question/react";
+import { MarkdownLine, questionHeading, ResolvedActions } from "@chopin/question/react";
 import { useCellValue } from "@mdxeditor/gurx";
 
 import { currentDecision, releaseDecision, subscribeDecision } from "./decision-pin";
@@ -174,13 +175,14 @@ function markerStyle(
 	} as CSSProperties;
 }
 
-type PopoverValue = {
+export type PopoverValue = {
 	item: Item;
 	pinned: boolean;
 	style: CSSProperties;
 };
 
-function Popover(
+/** Exported for the design jig, which renders it beside its real wrapper classes. */
+export function Popover(
 	{ actions, close, onSource, value }: {
 		actions?: ReactNode;
 		close: () => void;
@@ -199,7 +201,7 @@ function Popover(
 		<>
 			<div className="plan-decision-head">
 				<p className="plan-decision-question">
-					<InlineCode text={decision.prompt} />
+					<MarkdownLine text={questionHeading(decision.prompt)} />
 				</p>
 				<span className="plan-decision-tools" inert={!pinned}>
 					{onSource && (
@@ -344,6 +346,7 @@ export function ResolvedLayer(
 		noResolved,
 	);
 	let [reopening, setReopening] = useState<{ key: string; error?: string }>();
+	let [pageError, setPageError] = useState<{ key: string; message: string }>();
 	let options = useCellValue(widgets$);
 	let entries = useQuestionnaires(store);
 	let relations = useRelations(store);
@@ -834,6 +837,7 @@ export function ResolvedLayer(
 					}
 					let decision = current.item.decision;
 					let error = actions.error?.key === decision.key ? actions.error.message : undefined;
+					error ??= pageError?.key === decision.key ? pageError.message : undefined;
 					let pending = actions.pending?.key === decision.key
 						? actions.pending.kind
 						: undefined;
@@ -856,10 +860,31 @@ export function ResolvedLayer(
 										</p>
 									)}
 									<ResolvedActions
-										className="mt-3 flex flex-wrap items-center justify-end gap-2"
+										className="question-actions"
 										disabled={options.canEdit === false || options.connected !== true
 											|| !actionable || !options.wire}
 										key={`${decision.key}:${intent.current}`}
+										note={options.explore?.openPage && (
+											<button
+												aria-label="Expand decision"
+												className="btn btn-icon btn-ghost corner-bottom-start"
+												data-tooltip="Expand decision"
+												onClick={() => {
+													setPageError(undefined);
+													options.explore?.openPage?.(decision.widget).catch(failure =>
+														setPageError({
+															key: decision.key,
+															message: failure instanceof Error
+																? failure.message
+																: "Couldn’t open this decision",
+														})
+													);
+												}}
+												type="button"
+											>
+												<ExpandIcon aria-hidden="true" size={16} />
+											</button>
+										)}
 										onDiscard={() => actions.request("discard", decision)}
 										onReopen={() => actions.request("reopen", decision)}
 										submitting={!!pending}

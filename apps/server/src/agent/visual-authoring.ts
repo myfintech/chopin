@@ -12,6 +12,18 @@ let aliases = Object.entries(DIAGRAM_ALIASES)
 /** Chopin-owned guidance loaded with the Planner on every supported harness. */
 export const DIAGRAM_AUTHORING = `Chopin visual authoring guide v1
 
+Add useful diagrams proactively while developing the document. The server checks
+every new passage with Jev before accepting an edit, including multi-paragraph
+batches, lists and nested MDX. A refused write returns \`visuals-required\` with the
+required type and authoring instructions. Repair the write by adding that visual
+beside the factual prose. Keep each assessed passage and its headings unchanged
+and add the exact returned type immediately after that
+passage. Rewriting, merging or splitting the prose triggers a new assessment and
+can select another type. Do not replace the required type with your own preference.
+Keep every claim grounded in the evidence. Submit the
+prose and its diagram together; no separate assessment call is needed. If the
+document changes during assessment, read it again and retry against its revision.
+
 Start from the reader's question and the available evidence. Choose the smallest
 representation that answers it:
 - Architecture shows named parts, boundaries, dependencies, or data paths whose
@@ -88,7 +100,7 @@ qualify it:
   explanation, not to hide a short comparison.
 - Easily missed limit: place a brief \`<Callout type="note">\` after the relevant
   paragraph only for a source-backed caveat the reader could overlook. Keep
-  routine context in prose. A team selection belongs in \`ask\`, not hand-written
+  routine context in prose. A team selection belongs in \`open_decisions\`, not hand-written
   decision markup.
 
 Illustrative comparison (replace each cell with supported facts):

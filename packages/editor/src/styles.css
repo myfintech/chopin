@@ -2074,8 +2074,8 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 		opacity var(--save-bar-open-dur) var(--motion-smooth-out);
 }
 
-/* A text field has the keyboard up; the bar would only crowd it. */
-:is(.plan-decisions, .decision-save-host)[data-phone]:has(.question-field:focus)
+/* The option composer has its own confirm; written answers still need the shared bar. */
+:is(.plan-decisions, .decision-save-host)[data-phone]:has(.question-adding .question-field:focus)
 	.decision-save-bar[data-open] {
 	opacity: 0;
 	pointer-events: none;
@@ -2204,7 +2204,7 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 @media (prefers-reduced-motion: reduce) {
 	:is(.plan-decisions, .decision-save-host)[data-phone] .decision-save-bar,
 	:is(.plan-decisions, .decision-save-host)[data-phone] .decision-save-bar[data-open],
-	:is(.plan-decisions, .decision-save-host)[data-phone]:has(.question-field:focus)
+	:is(.plan-decisions, .decision-save-host)[data-phone]:has(.question-adding .question-field:focus)
 		.decision-save-bar[data-open] {
 		transform: none;
 		transition: opacity var(--duration-fast) var(--ease-out);
@@ -5393,7 +5393,7 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 
 .plan-decision-pop .plan-decision-tools {
 	display: flex;
-	margin: -0.125rem -0.25rem 0 0;
+	margin: calc(var(--card-corner-inset) - 0.75rem) calc(var(--card-corner-inset) - 0.75rem) 0 0;
 	opacity: 0;
 	pointer-events: none;
 	transition: opacity var(--duration-fast) var(--ease-out);
@@ -5442,10 +5442,9 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 
 .plan-decision-meta {
 	display: flex;
-	flex-wrap: wrap;
-	align-items: center;
-	column-gap: 1rem;
-	row-gap: 0.5rem;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 0.375rem;
 	/* A clear space separates what was decided from who and when. */
 	margin-block-start: 1rem;
 	font-size: var(--text-xs);
@@ -5856,4 +5855,255 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 
 .plan-format-panel-choice[aria-pressed="true"] .plan-format-panel-glyph {
 	color: inherit;
+}
+
+/* Exploring a decision: the footer's waiting faces lead; Explore sits before the save action. */
+.question-footer-start {
+	display: flex;
+	align-items: center;
+	gap: calc(var(--spacing) * 2);
+	flex: 0 1 auto;
+	margin-inline-end: auto;
+	min-width: 0;
+}
+
+.question-footer-start:empty {
+	display: none;
+}
+
+.explore-trigger[data-exploring] {
+	color: var(--color-text-primary);
+}
+
+.explore-trigger-chevron {
+	transform: rotate(90deg);
+	color: var(--color-text-tertiary);
+}
+
+/* Reduced motion keeps the still loader glyph; the words beside it say it is working. */
+@media (prefers-reduced-motion: no-preference) {
+	.explore-spin {
+		animation: button-loader-spin calc(var(--duration-base) * 4) linear infinite;
+	}
+}
+
+.explore-positioner {
+	z-index: 60;
+}
+
+.explore-menu {
+	width: 18rem;
+	max-width: calc(100vw - var(--spacing) * 4);
+	border: var(--edge-width) solid var(--color-edge);
+	border-radius: var(--radius-lg);
+	background: var(--color-page);
+	padding: var(--menu-padding);
+	box-shadow: var(--shadow-raised);
+	transform-origin: var(--transform-origin, top right);
+	transition:
+		opacity var(--duration-fast) var(--ease-out),
+		scale var(--duration-fast) var(--ease-out);
+}
+
+.explore-menu:is([data-starting-style], [data-ending-style]) {
+	opacity: 0;
+	scale: var(--dropdown-pre-scale);
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.explore-menu {
+		transition: opacity var(--duration-fast) var(--ease-out);
+	}
+
+	.explore-menu:is([data-starting-style], [data-ending-style]) {
+		scale: 1;
+	}
+}
+
+/* Each action folds open in place; the other rows stay where they are. */
+.explore-fold {
+	display: grid;
+	grid-template-rows: 0fr;
+	transition: grid-template-rows var(--duration-fast) var(--ease-out);
+}
+
+.explore-fold[data-open] {
+	grid-template-rows: 1fr;
+}
+
+.explore-fold-inner {
+	min-height: 0;
+	overflow: hidden;
+	opacity: 0;
+	transition: opacity var(--duration-fast) var(--ease-out);
+}
+
+.explore-fold[data-open] .explore-fold-inner {
+	opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.explore-fold,
+	.explore-fold-inner {
+		transition: none;
+	}
+}
+
+.explore-form {
+	display: grid;
+	gap: calc(var(--spacing) * 2);
+	padding: var(--spacing) calc(var(--spacing) * 1.5) calc(var(--spacing) * 1.5);
+}
+
+.explore-details {
+	display: block;
+	inline-size: 100%;
+	min-width: 0;
+	border: var(--edge-width) solid var(--color-control-edge);
+	border-radius: var(--radius-md);
+	background: var(--color-page);
+	padding: var(--spacing) calc(var(--spacing) * 1.5);
+	font: inherit;
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
+	color: var(--color-text-primary);
+	resize: none;
+}
+
+.explore-details::placeholder {
+	color: var(--color-text-quaternary);
+}
+
+.explore-details:disabled {
+	color: var(--color-text-tertiary);
+}
+
+.explore-start {
+	justify-self: end;
+}
+
+/* Each face lines up with the "Ask someone" label: past its 16px icon and the item gap. */
+.explore-people {
+	padding-inline-start: calc(var(--spacing) * 4 + var(--menu-item-gap-normal));
+}
+
+.explore-running {
+	margin: 0;
+	padding: var(--spacing) calc(var(--spacing) * 1.5);
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
+	color: var(--color-text-tertiary);
+	overflow-wrap: anywhere;
+}
+
+.explore-notice {
+	margin-block-start: var(--spacing);
+}
+
+.explore-empty {
+	margin: 0;
+	padding: var(--spacing) calc(var(--spacing) * 1.5);
+	font-size: var(--text-xs);
+	color: var(--color-text-tertiary);
+}
+
+/* Researching: a quiet capsule, after the Build status capsule, that still opens the menu. */
+.explore-capsule {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--spacing);
+	height: var(--control-height-compact);
+	padding-inline: calc(var(--spacing) * 2) calc(var(--spacing) * 2.5);
+	border-radius: var(--radius-full);
+	background: var(--color-inset);
+	font-size: var(--text-sm);
+	font-weight: var(--font-weight-medium);
+	white-space: nowrap;
+	color: var(--color-text-secondary);
+	transition:
+		background-color var(--duration-fast) var(--ease-out),
+		color var(--duration-fast) var(--ease-out);
+}
+
+.explore-capsule:is(:hover, [data-popup-open]) {
+	background: var(--color-selected);
+	color: var(--color-text-primary);
+}
+
+/* What exploring found: a small tinted preview pill at the footer's start; it is not a disclosure. */
+/* A count is never cut short; only waiting names give way. */
+.explore-count {
+	display: inline-flex;
+	flex: none;
+	align-items: center;
+	gap: var(--spacing);
+	height: var(--control-height-compact);
+	padding-inline: calc(var(--spacing) * 2);
+	border-radius: var(--radius-full);
+	background: var(--color-brand-wash);
+	font-size: var(--text-xs);
+	line-height: var(--text-xs--line-height);
+	font-weight: var(--font-weight-medium);
+	white-space: nowrap;
+	color: var(--color-brand-ink);
+}
+
+.explore-count svg {
+	--color-icon: var(--color-brand-ink);
+	color: var(--color-brand-ink);
+}
+
+button.explore-count:is(:hover, :focus-visible) {
+	background: color-mix(in oklch, var(--color-brand-wash), var(--color-brand-ink) 8%);
+}
+
+/* Waiting on a person is amber: the same quiet capsule family as the count and the Research status. */
+.explore-waiting {
+	display: inline-flex;
+	overflow: hidden;
+	align-items: center;
+	gap: var(--spacing);
+	min-width: 0;
+	height: var(--control-height-compact);
+	padding-inline: calc(var(--spacing) * 1.5) calc(var(--spacing) * 2.5);
+	border-radius: var(--radius-full);
+	background: var(--color-warning-surface);
+	font-size: var(--text-xs);
+	line-height: var(--text-xs--line-height);
+	font-weight: var(--font-weight-medium);
+	color: var(--color-warning-text);
+}
+
+.explore-waiting-names {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+button.explore-waiting:is(:hover, :focus-visible) {
+	background: color-mix(in oklch, var(--color-warning-surface), var(--color-warning-text) 8%);
+}
+
+/*
+ * A bottom-left corner button sits the shared inset from the card's left and bottom edges, by
+ * undoing the container's padding (--corner-pad). Mirrors the top-right rule.
+ */
+.corner-bottom-start {
+	margin-inline-start: calc(var(--card-corner-inset) - var(--corner-pad, 0px));
+	margin-block-end: calc(var(--card-corner-inset) - var(--corner-pad, 0px));
+}
+
+.question-actions > :has(> .corner-bottom-start) {
+	align-self: flex-end;
+}
+
+.plan-decision-pop {
+	--corner-pad: 0.75rem;
+}
+
+/* Actions in the popover read as the card's footer, inside the popover's own padding. */
+.plan-decision-pop .question-actions[data-resolved-actions] {
+	margin-block-start: 0.75rem;
+	padding-inline: 0;
 }

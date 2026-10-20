@@ -7,14 +7,14 @@ import type { JobIntent } from "./effects";
 export type Job = ConversationPlan.Job;
 export type JobOutcome =
 	| { status: "done"; output: string }
-	| { status: "failed" | "skipped"; reason: string };
+	| { status: "failed" | "skipped" | "deferred"; reason: string };
 
 export const MAX_JOBS = 128;
 const MAX_TARGET = 200;
 const MAX_TRIGGER = 200;
 const MAX_REASON = 500;
 const MAX_OUTPUT = 4096;
-const KINDS = new Set(["heading", "refine", "suggest", "prose"]);
+const KINDS = new Set(["heading", "refine", "suggest", "prose", "decision-followup"]);
 const STATUSES = new Set(["pending", "running", "done", "failed", "skipped"]);
 
 function invalid(): never {
@@ -110,14 +110,16 @@ export function settle(jobs: Job[], id: string, outcome: JobOutcome, at: string)
 	if (!running) return jobs;
 	if (
 		!isoTime(at) || running.attempts >= Number.MAX_SAFE_INTEGER
+		|| outcome.status === "deferred" && running.kind !== "decision-followup"
 		|| (outcome.status === "done"
 			? !jsonOutput(outcome.output)
-			: !["failed", "skipped"].includes(outcome.status)
+			: !["failed", "skipped", "deferred"].includes(outcome.status)
 				|| !bounded(outcome.reason, MAX_REASON))
 	) invalid();
 	return jobs.map(job => {
 		if (job.id !== id) return job;
 		let { reason: _reason, output: _output, ...rest } = job;
+		if (outcome.status === "deferred") return { ...rest, status: "pending", at };
 		return outcome.status === "done"
 			? { ...rest, status: "done", attempts: job.attempts + 1, output: outcome.output, at }
 			: { ...rest, status: outcome.status, attempts: job.attempts + 1, reason: outcome.reason, at };
@@ -213,6 +215,10 @@ export function restore(value: unknown): Job[] {
 		}
 	}
 	return value.map((job: Job) =>
-		job.status === "running" ? { ...job, status: "failed", reason: "interrupted" } : job
+		job.status === "running"
+			? job.kind === "decision-followup"
+				? { ...job, status: "pending" }
+				: { ...job, status: "failed", reason: "interrupted" }
+			: job
 	);
 }

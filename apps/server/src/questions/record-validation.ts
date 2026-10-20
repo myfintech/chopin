@@ -1,9 +1,13 @@
-import type { ConversationPlan, Plan as Wired } from "@chopin/protocol";
+import type { ConversationPlan, Plan as Wired, Question } from "@chopin/protocol";
+import { ULID } from "@chopin/dialect";
 import { limits } from "@chopin/question";
 import { assertSourceShape } from "../conversation-plan/sources";
 import type { DecisionEntry, Record } from "./record-types";
 import { invalid, object, ORIGINS, text, unix } from "./record-fields";
 import type { Known } from "./record-fields";
+import { MAX_WHY } from "./why";
+
+type Marks = Question.Marks;
 
 export function options(definition: unknown, pending: boolean): Known {
 	let source = object(definition);
@@ -13,7 +17,8 @@ export function options(definition: unknown, pending: boolean): Known {
 			&& !source.questions.every(question => object(question).verbatim === true)
 	) invalid();
 	let ids = new Map<string, string>();
-	let questions = new Map<string, { multiple: boolean; verbatim: boolean }>();
+	let criteria = new Set<string>();
+	let questions: Known["questions"] = new Map();
 	for (let candidate of source.questions) {
 		let question = object(candidate);
 		let id = text(question.id);
@@ -21,13 +26,44 @@ export function options(definition: unknown, pending: boolean): Known {
 		// Host dialogs keep their raw text and counts, so only the Planner's questions are bounded.
 		let verbatim = question.verbatim === true;
 		if (
+			Object.hasOwn(question, "response")
+			&& (question.response !== "text" || verbatim || question.multiple !== false)
+		) invalid();
+		if (
 			typeof question.multiple !== "boolean"
 			|| !Array.isArray(question.options)
-			|| question.options.length === 0 && !verbatim
+			|| question.options.length === 0 && !verbatim && question.response !== "text"
 				&& !(pending && source.questions.length === 1 && question.multiple === false)
+			|| question.response === "text" && question.options.length > 0
 			|| !verbatim && question.options.length > limits.MAX_OPTIONS
 		) invalid();
-		questions.set(id, { multiple: question.multiple as boolean, verbatim });
+		let held: Set<string> | undefined;
+		if (Object.hasOwn(question, "criteria")) {
+			if (
+				verbatim || question.response === "text" || !Array.isArray(question.criteria)
+				|| question.criteria.length === 0 || question.criteria.length > limits.MAX_CRITERIA
+			) invalid();
+			held = new Set();
+			let labels = new Set<string>();
+			for (let candidate of question.criteria) {
+				let criterion = object(candidate);
+				if (Object.keys(criterion).some(key => key !== "id" && key !== "label")) invalid();
+				let criterionId = text(criterion.id, 64);
+				let label = text(criterion.label, limits.MAX_CRITERION_LABEL).trim().toLowerCase();
+				if (!/^[A-Za-z0-9_-]+$/.test(criterionId) || held.has(criterionId) || labels.has(label)) {
+					invalid();
+				}
+				held.add(criterionId);
+				labels.add(label);
+				criteria.add(criterionId);
+			}
+		}
+		questions.set(id, {
+			multiple: question.multiple as boolean,
+			verbatim,
+			...(question.response === "text" ? { response: "text" } : {}),
+			...(held ? { criteria: held } : {}),
+		});
 		for (let candidate of question.options) {
 			let option = object(candidate);
 			let optionId = text(option.id);
@@ -35,7 +71,25 @@ export function options(definition: unknown, pending: boolean): Known {
 			ids.set(optionId, id);
 		}
 	}
-	return { questions, options: ids };
+	return { questions, options: ids, criteria };
+}
+
+const MARK_VALUES = new Set(["yes", "partly", "no"]);
+
+/** A saved matrix: `option/criterion` cells of the one question that has criteria. */
+export function marks(value: unknown, known: Known): Marks {
+	let matrix = object(value);
+	let holders = [...known.questions.values()].filter(question => question.criteria);
+	if (holders.length !== 1) invalid();
+	let criteria = holders[0]!.criteria!;
+	for (let [cell, mark] of Object.entries(matrix)) {
+		let slash = cell.lastIndexOf("/");
+		if (
+			slash < 1 || !known.options.has(cell.slice(0, slash)) || !criteria.has(cell.slice(slash + 1))
+			|| !MARK_VALUES.has(mark as string)
+		) invalid();
+	}
+	return value as Marks;
 }
 
 export function choices(value: unknown, known: Known): string[] {
@@ -46,6 +100,7 @@ export function choices(value: unknown, known: Known): string[] {
 		if (typeof id !== "string" || !known.options.has(id) || found.has(id)) invalid();
 		found.add(id);
 		let question = known.options.get(id)!;
+		if (known.questions.get(question)!.response === "text") invalid();
 		let count = (counts.get(question) ?? 0) + 1;
 		if (count > (known.questions.get(question)!.multiple ? limits.MAX_OPTIONS : 1)) invalid();
 		counts.set(question, count);
@@ -65,6 +120,12 @@ export function answers(value: unknown, known: Known): { [question: string]: str
 	return value as { [question: string]: string };
 }
 
+/** A decision's why: bounded, one line of plain text. */
+export function why(value: unknown): string {
+	if (typeof value !== "string" || value !== value.trim() || /[\r\n]/.test(value)) invalid();
+	return text(value, MAX_WHY);
+}
+
 export function editors(value: unknown): string[] {
 	if (!Array.isArray(value)) invalid();
 	let found = new Set<string>();
@@ -81,11 +142,14 @@ export function history(value: unknown, known: Known): DecisionEntry[] {
 	for (let candidate of value) {
 		let entry = object(candidate);
 		if (
-			Object.keys(entry).some(key => !["choices", "answers", "owner", "at"].includes(key))
+			Object.keys(entry).some(key =>
+				!["choices", "answers", "owner", "at", "why", "marks"].includes(key)
+			)
 			|| !Object.hasOwn(entry, "choices")
 			|| !Object.hasOwn(entry, "owner") || !Object.hasOwn(entry, "at")
 		) invalid();
 		let selected = choices(entry.choices, known);
+		if (Object.hasOwn(entry, "marks")) marks(entry.marks, known);
 		let legacy = Object.hasOwn(entry, "answers") ? answers(entry.answers, known) : {};
 		let chosenQuestions = new Set(selected.map(id => known.options.get(id)!));
 		for (let id of Object.keys(legacy)) {
@@ -95,6 +159,7 @@ export function history(value: unknown, known: Known): DecisionEntry[] {
 		if (chosenQuestions.size !== known.questions.size) invalid();
 		text(entry.owner);
 		unix(entry.at);
+		if (Object.hasOwn(entry, "why")) why(entry.why);
 	}
 	return value as DecisionEntry[];
 }
@@ -165,4 +230,92 @@ export function prose(value: unknown): Wired.Anchor[] {
 		}
 	}
 	return value as Wired.Anchor[];
+}
+
+export function followUp(value: unknown): NonNullable<Record["followUp"]> {
+	let entry = object(value);
+	if (
+		Object.keys(entry).some(key => !["scope", "target", "appliedGeneration"].includes(key))
+		|| typeof entry.scope !== "string" || !ULID.test(entry.scope)
+		|| !Array.isArray(entry.target) || entry.target.length === 0
+	) invalid();
+	prose(entry.target);
+	if (
+		Object.hasOwn(entry, "appliedGeneration")
+		&& (!Number.isSafeInteger(entry.appliedGeneration) || (entry.appliedGeneration as number) < 0)
+	) invalid();
+	return value as NonNullable<Record["followUp"]>;
+}
+
+export const MAX_FINDINGS = 20;
+export const MAX_FINDING_SOURCES = 20;
+export const MAX_FINDING_FOCUS = 500;
+export const MAX_FINDING_TITLE = 300;
+export const MAX_FINDING_SUMMARY = 4_000;
+const FINDING_KEYS = new Set([
+	"id",
+	"kind",
+	"status",
+	"focus",
+	"ref",
+	"title",
+	"summary",
+	"sources",
+	"sourceCount",
+	"stance",
+	"branch",
+	"childId",
+	"by",
+	"at",
+]);
+
+export function findings(value: unknown): Question.Finding[] {
+	if (!Array.isArray(value) || value.length > MAX_FINDINGS) invalid();
+	let ids = new Set<string>();
+	for (let candidate of value) {
+		let finding = object(candidate);
+		if (Object.keys(finding).some(key => !FINDING_KEYS.has(key))) invalid();
+		let id = text(finding.id, 128);
+		if (ids.has(id)) invalid();
+		ids.add(id);
+		if (finding.kind !== "research" && finding.kind !== "spike" && finding.kind !== "ask") {
+			invalid();
+		}
+		if (
+			finding.status !== "running" && finding.status !== "ready" && finding.status !== "failed"
+			&& finding.status !== "stopped"
+		) invalid();
+		text(finding.ref, 256);
+		text(finding.by);
+		unix(finding.at);
+		if (Object.hasOwn(finding, "focus")) text(finding.focus, MAX_FINDING_FOCUS);
+		if (Object.hasOwn(finding, "title")) text(finding.title, MAX_FINDING_TITLE);
+		if (Object.hasOwn(finding, "summary")) text(finding.summary, MAX_FINDING_SUMMARY);
+		if (Object.hasOwn(finding, "stance")) {
+			if (
+				finding.kind !== "ask" || (finding.stance !== "supports" && finding.stance !== "objects")
+			) {
+				invalid();
+			}
+		}
+		if (Object.hasOwn(finding, "branch")) text(finding.branch, 256);
+		if (Object.hasOwn(finding, "childId")) text(finding.childId, 128);
+		if (
+			Object.hasOwn(finding, "sourceCount")
+			&& (!Number.isSafeInteger(finding.sourceCount) || (finding.sourceCount as number) < 0)
+		) invalid();
+		if (Object.hasOwn(finding, "sources")) {
+			if (!Array.isArray(finding.sources) || finding.sources.length > MAX_FINDING_SOURCES) {
+				invalid();
+			}
+			for (let source of finding.sources) {
+				let item = object(source);
+				if (Object.keys(item).some(key => key !== "title" && key !== "url")) invalid();
+				text(item.title, MAX_FINDING_TITLE);
+				let url = text(item.url, 2048);
+				if (!/^https?:\/\//.test(url)) invalid();
+			}
+		}
+	}
+	return value as Question.Finding[];
 }

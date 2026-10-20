@@ -66,6 +66,7 @@ export function meta(plan: Plan, record: Record): Wire.CardMeta {
 		...(decided && record.owner ? { owner: record.owner } : {}),
 		...(decided && record.decidedAt !== undefined ? { decidedAt: record.decidedAt } : {}),
 		...(record.resolver ? { resolver: record.resolver } : {}),
+		...(decided && record.marks ? { marks: record.marks } : {}),
 		involved: involved(plan, record),
 		...(suggested ? { suggested } : {}),
 		history: record.history,
@@ -74,6 +75,10 @@ export function meta(plan: Plan, record: Record): Wire.CardMeta {
 		hasProse: prose.length > 0 && !Prose.orphaned(prose),
 		proseOrphaned: Prose.orphaned(prose),
 		...(written ? { writeup: written } : {}),
+		...(record.findings?.length ? { findings: record.findings } : {}),
+		...(record.childId ? { childId: record.childId } : {}),
+		...(decided && record.why ? { why: record.why } : {}),
+		...(decided && record.why && record.whyBy ? { whyBy: record.whyBy } : {}),
 	};
 }
 

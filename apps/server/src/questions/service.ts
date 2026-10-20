@@ -30,9 +30,12 @@ export {
 	questionMentionsOption,
 } from "./records";
 export type { DecisionEntry, OptionOrigin, Record } from "./records";
+export { appendCriterion as addCriterion } from "./service-append-criterion";
 export { appendOption as addOption } from "./service-append-option";
 export { ask } from "./service-ask";
 export { cancel, withdraw } from "./service-cancel";
+export { capture, captureDecisions, createDecision } from "./service-capture";
+export type { CaptureDecisionsInput, CaptureDecisionsResult } from "./service-capture";
 export { identify } from "./service-definition";
 export type { AskPlacement } from "./service-definition";
 export { discard } from "./service-discard";
@@ -51,8 +54,10 @@ export {
 export type { Placement } from "./service-relationships";
 export { reopen } from "./service-reopen";
 export { submit } from "./service-submit";
+export { setWhy } from "./service-why";
 export type { Questions, StoredOpen } from "./store";
 
 export const create = Store.create;
 export const dump = Store.dump;
 export const restore = Store.restore;
+export { changeFindings, updateFinding } from "./service-findings";

@@ -1,8 +1,16 @@
 import { expect, it, spyOn } from "bun:test";
 import { tool } from "ai";
+import { MCPClientError } from "@ai-sdk/mcp";
 import { z } from "zod";
 
-import { WebSearchTimeoutError, webSearchTool } from "./web-search";
+import {
+	WEB_SEARCH_MARGIN_MS,
+	WEB_SEARCH_MAX_CALLS,
+	WebSearchTimeoutError,
+	webSearchTool,
+} from "./web-search";
+
+import { executionDiagnostic } from "../jobs/registry";
 
 import type { MCPClientConfig } from "@ai-sdk/mcp";
 import type { JobExecutionCredential } from "../jobs/registry";
@@ -260,6 +268,229 @@ it("a timed-out authorization cannot start a search after it finally resolves", 
 		expect(calls).toBe(0);
 	} finally {
 		authorization.resolve(false);
+		await loaded.value.close();
+	}
+});
+
+for (
+	let scenario of ["rpc", "response", "error", "unknown", "cancel", "timeout", "success"] as const
+) {
+	it(`records sanitized web-search failure metadata for ${scenario}`, async () => {
+		let sensitive = "private query https://private.example/result Bearer secret-token";
+		let controller = new AbortController();
+		let owner = credential();
+		let diagnostics: unknown[] = [];
+		let rpc = new MCPClientError({
+			name: sensitive,
+			message: sensitive,
+			code: -32603,
+			statusCode: 502,
+			url: "https://private.example/result",
+			responseBody: sensitive,
+			data: { token: sensitive },
+		});
+		let loaded = await webSearchTool(owner, {
+			timeoutMs: 10,
+			onCall: (_result, _error, diagnostic) => {
+				if (diagnostic) diagnostics.push(diagnostic);
+			},
+			createClient: async () => ({
+				tools: async () => ({
+					web_search: tool({
+						inputSchema: z.object({ query: z.string() }),
+						execute: async () => {
+							if (scenario === "rpc") throw rpc;
+							if (scenario === "error") {
+								throw Object.assign(new Error(sensitive), { name: sensitive });
+							}
+							if (scenario === "unknown") throw { code: sensitive, name: sensitive };
+							if (scenario === "cancel") controller.abort(new Error(sensitive));
+							if (scenario === "cancel" || scenario === "timeout") {
+								return new Promise(() => {});
+							}
+							return {
+								isError: scenario === "response",
+								content: [{ type: "text", text: sensitive }],
+							};
+						},
+					}),
+				}),
+				close: async () => {},
+			}),
+		});
+		if (!loaded.ok) throw new Error("fixture failed");
+		try {
+			let call = loaded.value.tool.execute!({ query: sensitive }, {
+				context: { credential: owner },
+				toolCallId: scenario === "unknown" ? sensitive : "d9dc5586-b81f-442c-b9e1-feb5d186f334",
+				abortSignal: controller.signal,
+			} as never);
+			if (scenario === "success") {
+				await call;
+				expect(diagnostics).toEqual([]);
+				return;
+			}
+			await expect(Promise.resolve(call)).rejects.toBeDefined();
+			let kinds = {
+				rpc: "mcp-client",
+				error: "error",
+				response: "mcp-result-error",
+				unknown: "unknown",
+				cancel: "aborted",
+				timeout: "timeout",
+			};
+			expect(diagnostics).toEqual([{
+				webFailure: `local:request:${kinds[scenario]}${
+					scenario === "rpc" ? ":rpc:-32603:http:502" : ""
+				}`,
+				webFailureDurationMs: expect.any(Number),
+				...(scenario === "unknown"
+					? {}
+					: { webFailureToolCallId: "d9dc5586-b81f-442c-b9e1-feb5d186f334" }),
+			}]);
+			expect(() =>
+				executionDiagnostic({
+					stage: "public-web",
+					phase: "waiting-web-search",
+					webCalls: 1,
+					webSuccesses: 0,
+					webFailures: 1,
+					hostedCalls: 0,
+					hostedCompleted: 0,
+					citableSources: 0,
+					outputSources: 0,
+					resultSubmitted: false,
+					resultInvalid: false,
+					webSearchDenied: false,
+					elapsedMs: 100,
+					...diagnostics[0] as Record<string, string | number>,
+				})
+			).not.toThrow();
+			expect(JSON.stringify(diagnostics)).not.toContain(sensitive);
+			expect(JSON.stringify(diagnostics)).not.toContain("private.example");
+		} finally {
+			await loaded.value.close();
+		}
+	});
+}
+
+const OK = { content: [{ type: "text", text: "ok" }] };
+
+async function budgeted(
+	deadlineIn: number,
+	extra: Partial<NonNullable<Parameters<typeof webSearchTool>[1]>> = {},
+	execute: () => Promise<unknown> = async () => OK,
+) {
+	let owner = { ...credential(), expiresAt: new Date(Date.now() + 3_600_000) };
+	let at = 1_000_000;
+	let dispatched = 0;
+	let refused: string[] = [];
+	let loaded = await webSearchTool(owner, {
+		now: () => at,
+		budget: { deadline: new Date(at + deadlineIn) },
+		onRefused: reason => refused.push(reason),
+		log: () => {},
+		createClient: async () => ({
+			tools: async () => ({
+				web_search: tool({
+					inputSchema: z.object({ query: z.string() }),
+					execute: async () => {
+						dispatched++;
+						return execute();
+					},
+				}),
+			}),
+			close: async () => {},
+		}),
+		...extra,
+	});
+	if (!loaded.ok) throw new Error("fixture failed");
+	let run = () =>
+		loaded.value.tool.execute!({ query: "q" }, { context: { credential: owner } } as never);
+	return { run, dispatched: () => dispatched, refused, close: loaded.value.close };
+}
+
+it("refuses a call, without dispatching it, when too little time remains", async () => {
+	let search = await budgeted(60_000);
+	try {
+		let result = await search.run();
+		expect(JSON.stringify(result)).toContain("submit your result now");
+		expect(search.dispatched()).toBe(0);
+		expect(search.refused).toEqual(["time"]);
+	} finally {
+		await search.close();
+	}
+});
+
+it("clamps each call's timeout to the remaining time minus the margin", async () => {
+	let timers: number[] = [];
+	let spy = spyOn(AbortSignal, "timeout").mockImplementation(duration => {
+		timers.push(duration);
+		return new AbortController().signal;
+	});
+	let search = await budgeted(150_000);
+	try {
+		await search.run();
+		expect(timers).toEqual([150_000 - WEB_SEARCH_MARGIN_MS]);
+		let roomy = await budgeted(600_000);
+		await roomy.run();
+		expect(timers[1]).toBe(180_000);
+		await roomy.close();
+	} finally {
+		spy.mockRestore();
+		await search.close();
+	}
+});
+
+it("caps the calls one attempt may start, counting calls still in flight", async () => {
+	let pending = Promise.withResolvers<unknown>();
+	let search = await budgeted(600_000, {}, () => pending.promise);
+	try {
+		let started = Array.from({ length: WEB_SEARCH_MAX_CALLS }, () => search.run());
+		let extra = await search.run();
+		expect(JSON.stringify(extra)).toContain("call limit reached");
+		expect(search.refused).toEqual(["calls"]);
+		await new Promise(resolve => setTimeout(resolve, 5));
+		expect(search.dispatched()).toBe(WEB_SEARCH_MAX_CALLS);
+		pending.resolve(OK);
+		await Promise.all(started);
+	} finally {
+		await search.close();
+	}
+});
+
+it("logs only the failure classification, never upstream text or the token", async () => {
+	let secret = "ghu_abcdefghijklmnopqrstuvwxyz0123456789";
+	let owner = { ...credential(), token: secret };
+	let logs: string[] = [];
+	let loaded = await webSearchTool(owner, {
+		log: line => logs.push(line),
+		createClient: async () => ({
+			tools: async () => ({
+				web_search: tool({
+					inputSchema: z.object({ query: z.string() }),
+					execute: async () => ({
+						isError: true,
+						content: [{
+							type: "text",
+							text: `HTTP 429 rate limited. Authorization: Bearer ${secret} retry ${
+								"x".repeat(900)
+							}`,
+						}],
+					}),
+				}),
+			}),
+			close: async () => {},
+		}),
+	});
+	if (!loaded.ok) throw new Error("fixture failed");
+	try {
+		await expect(
+			loaded.value.tool.execute!({ query: "q" }, { context: { credential: owner } } as never),
+		).rejects.toThrow("MCP web_search returned an error");
+		expect(logs).toHaveLength(1);
+		expect(logs[0]).toBe("chopin: web_search failed - local:request:mcp-result-error");
+	} finally {
 		await loaded.value.close();
 	}
 });

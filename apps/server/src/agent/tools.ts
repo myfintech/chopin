@@ -9,7 +9,10 @@ import type { ActiveMemberRequest } from "../chat/service";
  */
 
 import * as Arguments from "./arguments";
+import { ASK_PLAN_SCHEMA, OPEN_DECISIONS_SCHEMA } from "./decision-schema";
+import * as OpenDecisions from "./open-decisions";
 import {
+	admitBlockEdit,
 	answer,
 	applyAnchors,
 	applyBlockEdit,
@@ -29,6 +32,7 @@ import type { InvestigationTools } from "./experiment-tools";
 
 import type { ActiveOwnerBinding } from "./active-owner";
 import type { VisualSession } from "./visual-handoff";
+import type { VisualAdmission } from "./visual-admission";
 
 import type { Server } from "bun";
 import { jsonSchema, tool } from "ai";
@@ -167,6 +171,12 @@ export type DocumentRoom = {
 	readReference?: (id: string, repositoryId: string) => Promise<unknown>;
 	/** Experimental foreground visual handoff; absent from production sessions. */
 	visual?: VisualSession;
+	/** Server-owned assessment of every new foreground Planner passage. */
+	visualAdmission?: VisualAdmission;
+	/** The current turn's cancellation, read per call when a session is retained. */
+	turnSignal?: () => AbortSignal | undefined;
+	/** The same server-owned prose check used before publishing ordinary Planner replies. */
+	checkReply?: (text: string, signal?: AbortSignal) => Promise<boolean>;
 	/** This root's children; absent in a child room and in tests that do not need them. */
 	children?: import("../chat/children").ChildDocuments;
 };
@@ -360,12 +370,12 @@ export const documentTools = {
 	}),
 
 	edit_plan: tool({
-		contextSchema: roomContext,
+		contextSchema: ownerContext,
 		description: "Edit the plan as an atomic batch against the revision you last read. Indices "
 			+ "address top-level blocks and are resolved against that revision, so they do "
 			+ "not shift under each other within one batch. If the plan changed since you "
 			+ "read it the whole batch is refused and you are told which blocks moved — read "
-			+ "again and retry. Questionnaires are created by `ask`; you cannot clear the "
+			+ "again and retry. Questionnaires are created by decision tools; you cannot clear the "
 			+ "plan, and other people may be editing it while you work.",
 		inputSchema: jsonSchema({
 			type: "object",
@@ -386,15 +396,22 @@ export const documentTools = {
 			required: ["revision", "operations"],
 			additionalProperties: false,
 		}),
-		execute: (raw, { context: { room: context } }) =>
+		execute: (raw, { context: { room: context, owner }, abortSignal }) =>
 			answer("edit_plan", async () => {
+				let signals = [abortSignal, owner?.signal, context.turnSignal?.()].filter(
+					(signal): signal is AbortSignal => !!signal,
+				);
+				let signal = signals.length ? AbortSignal.any(signals) : undefined;
 				let visual = context.visual
 					? await Promise.all([import("./visual-handoff"), import("./visual-receipt")])
 					: undefined;
 				let document = await documentIdentity(context.plan);
+				let args = Arguments.editPlan(raw);
+				let refusal = await admitBlockEdit(context, args, signal);
+				if (refusal) return { ...refusal, document };
 				let result = await context.exclusive(async () => {
+					if (signal?.aborted) return { ok: false, reason: "cancelled" };
 					if (implementationActive(context.plan)) return { ok: false, reason: "locked" };
-					let args = Arguments.editPlan(raw);
 					if (context.visual) {
 						let written = visual![0].visualWrite(args.operations);
 						if (written) {
@@ -422,6 +439,7 @@ export const documentTools = {
 					}
 					let { acting, actingChannel } = context.plan.chat;
 					return applyBlockEdit(context, args, {
+						signal,
 						// A thread in a child is answered by `edit_child`, not by an edit here.
 						acting: actingChannel ? undefined : acting,
 						applied: () => {
@@ -433,84 +451,91 @@ export const documentTools = {
 			}),
 	}),
 
+	open_decision: tool({
+		contextSchema: ownerContext,
+		description: "Capture a named human decision before alternatives or an answer are known. "
+			+ "Creates an open card with a shared working answer and returns immediately. "
+			+ "Use for choices such as how onboarding should work, not factual questions the "
+			+ "repository or research can settle. A recommendation is not agreement: only a "
+			+ "person pressing Save resolves this card. For planning questions beside prose, prefer "
+			+ "open_decisions, which also follows saved answers into the related prose. Reuse the same key when "
+			+ "retrying the same capture. Do not use ask for the same decision as well.",
+		inputSchema: jsonSchema({
+			type: "object",
+			properties: {
+				revision: { type: "integer", minimum: 0 },
+				key: {
+					type: "string",
+					pattern: "^[A-Za-z0-9_-]{8,64}$",
+					description: "Stable request key for this decision, such as onboarding-approach.",
+				},
+				question: { type: "string", minLength: 1, maxLength: 100 },
+				description: { type: "string", maxLength: 300 },
+			},
+			required: ["revision", "key", "question"],
+			additionalProperties: false,
+		}),
+		metadata: { skipPermission: true },
+		execute: (raw, { context: { room: context } }) =>
+			answer("open_decision", async () => {
+				if (context.focusedChild?.() || context.plan.chat.actingChannel) {
+					return { ok: false, reason: "child-decision-unavailable" };
+				}
+				let { revision, ...input } = Arguments.openDecision(raw);
+				let id = await Questions.capture(context.plan, context.server, context.id, input, {
+					revision,
+				});
+				context.anchors();
+				let status = Questions.meta(context.plan, context.plan.records.get(id)!).status;
+				return { id, status };
+			}),
+	}),
+
+	open_decisions: tool({
+		contextSchema: ownerContext,
+		description: "Create all known independent human decisions beside provisional prose and "
+			+ "return immediately. Use response: text, options: [], multiple: false for intent, "
+			+ "context and unknown alternatives; offer choices only when grounded alternatives help. "
+			+ "Batch up to ten written or choice cards. Every card needs a stable key and related "
+			+ "blocks from read_plan; reuse the key on retry. Only a person's Save settles a card "
+			+ "and schedules its related prose update. Captured cards stay open after this turn ends. "
+			+ "Use this instead of asking in Chat, and finish independent work without waiting.",
+		inputSchema: OPEN_DECISIONS_SCHEMA,
+		metadata: { skipPermission: true },
+		execute: (raw, { context: { room, owner }, abortSignal }) =>
+			answer("open_decisions", () => OpenDecisions.capture(room, raw, abortSignal, owner)),
+	}),
+
 	ask: tool({
 		contextSchema: ownerContext,
-		description: "Ask the people in the room one or more multiple-choice questions and wait for "
-			+ "their shared answer. Every question also accepts free text. Batch related "
-			+ "questions into one call. The questionnaire is recorded in the plan and the "
+		description: "Ask the people in the room one or more decisions and wait for "
+			+ "their shared answer. Use response: text with options: [] for a written answer; "
+			+ "omit response for existing multiple-choice questions. Add criteria only when "
+			+ "the options should be compared on a few named qualities. Prefer open_decisions "
+			+ "to capture anchored decisions without waiting; use ask only for an explicitly "
+			+ "requested synchronous exchange. All requests for human input, including "
+			+ "intent and clarification, use these inline cards, never plain Chat. Batch all known "
+			+ "independent questions into one call before waiting. Each question becomes a separate "
+			+ "card beside its related prose. The questionnaire is recorded in the plan and the "
 			+ "answer is attributed to whoever gave it. If current_plan is present after "
 			+ "an answer, it has read_plan's revision, source, and blocks; edit from that "
 			+ "revision. Otherwise call read_plan before editing. Reread if an edit is stale. "
 			+ "Ask only what the repository cannot tell you, and do not ask for permission "
 			+ "to proceed. Use the revision from "
 			+ "`read_plan` and relate every question to its returned blocks.",
-		inputSchema: jsonSchema({
-			type: "object",
-			properties: {
-				revision: {
-					type: "integer",
-					minimum: 0,
-					description: "The revision returned by the `read_plan` this ask relates to.",
-				},
-				questions: {
-					type: "array",
-					minItems: 1,
-					maxItems: 10,
-					items: {
-						type: "object",
-						properties: {
-							header: { type: "string", minLength: 1, maxLength: 80 },
-							question: {
-								type: "string",
-								minLength: 1,
-								maxLength: 100,
-								description: "A concise question that stands alone in compact summaries.",
-							},
-							description: {
-								type: "string",
-								maxLength: 140,
-								description: "Optional supporting context shown only in the full decision card.",
-							},
-							options: {
-								type: "array",
-								minItems: 1,
-								maxItems: 20,
-								items: {
-									type: "object",
-									properties: {
-										label: { type: "string", minLength: 1, maxLength: 60 },
-										description: { type: "string", maxLength: 160 },
-									},
-									required: ["label", "description"],
-									additionalProperties: false,
-								},
-							},
-							multiple: { type: "boolean" },
-							blocks: {
-								type: "array",
-								items: {
-									type: "object",
-									properties: {
-										index: { type: "integer", minimum: 0 },
-										digest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
-									},
-									required: ["index", "digest"],
-									additionalProperties: false,
-								},
-							},
-						},
-						required: ["header", "question", "options", "multiple", "blocks"],
-						additionalProperties: false,
-					},
-				},
-			},
-			required: ["revision", "questions"],
-			additionalProperties: false,
-		}),
+		inputSchema: ASK_PLAN_SCHEMA,
 		metadata: { skipPermission: true },
 		execute: (raw, { context: { room: context, owner }, abortSignal }) =>
 			answer("ask", async () => {
 				if (implementationActive(context.plan)) return { ok: false, reason: "locked" };
+				if (context.focusedChild?.() || context.plan.chat.actingChannel) {
+					return {
+						ok: false,
+						reason: "child-decision-unavailable",
+						message: "This turn concerns a child document. Its choices cannot be placed in "
+							+ "the root's Decisions. State what remains unresolved without asking in prose.",
+					};
+				}
 				let args = Arguments.askPlan(raw);
 				let definition = Questions.identify({
 					questions: args.questions.map(({ blocks, ...question }) => question),
@@ -726,7 +751,7 @@ export const documentTools = {
 			required: ["thread", "text"],
 			additionalProperties: false,
 		}),
-		execute: (raw, { context: { room: context, owner } }) =>
+		execute: (raw, { context: { room: context, owner }, abortSignal }) =>
 			answer("reply_comment", async () => {
 				let args = raw as Record<string, unknown>;
 				if (
@@ -735,6 +760,14 @@ export const documentTools = {
 					|| Object.keys(args).some(key => key !== "thread" && key !== "text")
 				) throw new Error("reply_comment takes only `thread` and `text`, both text");
 				let { thread, text } = args;
+				if (context.checkReply && !await context.checkReply(text, abortSignal)) {
+					return {
+						ok: false,
+						reason: "inline-decision-required",
+						message: "Requests for human input belong in inline decision cards. "
+							+ "Reply with factual context only; do not ask for input in comment prose.",
+					};
+				}
 				let { acting, actingChannel } = context.plan.chat;
 				// A comment sent from a child: its thread, and the reply, live in that child.
 				if (actingChannel) {
@@ -744,8 +777,10 @@ export const documentTools = {
 						if (!owner || owner.signal.aborted || !await owner.revalidate()) {
 							throw new Refusal("the Planner's repository access could not be confirmed");
 						}
-						return children.open(actingChannel, child =>
-							Comments.answer(child.plan, child.server, child.id, thread, text, acting));
+						return children.open(
+							actingChannel,
+							child => Comments.answer(child.plan, child.server, child.id, thread, text, acting),
+						);
 					});
 				}
 				return Comments.answer(context.plan, context.server, context.id, thread, text, acting);

@@ -11,6 +11,7 @@ import { delimiter, join } from "node:path";
 
 import { loadAuth } from "./auth/config";
 import { setupAgents } from "./setup-agents";
+import { DEFAULT_COPILOT_MODEL } from "./harness/copilot-sdk/model";
 
 import type { SetupAgent } from "@chopin/protocol/agents";
 import type { AuthConfig } from "./auth/config";
@@ -56,6 +57,8 @@ export type Config = {
 	agent: boolean;
 	backgroundJobs: boolean;
 	webResearch: boolean;
+	/** Attempt deadline of one public-web evidence attempt, in milliseconds. Defaults to 10 minutes. */
+	researchEvidenceTimeoutMs?: number;
 	/** Explicitly enables the conversation-derived cards prototype. */
 	conversationPlan?: boolean;
 	/** Exact classifier `provider/id` for the turn-taking judge; defaults to `decisionsModel`. */
@@ -67,7 +70,7 @@ export type Config = {
 	 */
 	decisionsModel?: string;
 	decisionsTimeoutMs?: number;
-	/** Explicitly enables decision-routed foreground visual authoring. */
+	/** Legacy single-paragraph visual tool; shared write admission is always enabled. */
 	plannerVisuals?: boolean;
 	/** The chopin release `chopin update` installs from this server, and a refusal names. */
 	connectorVersion?: string;
@@ -106,7 +109,6 @@ export const DEFAULT_LINK_TIMEOUT_MS = 120_000;
  * server queue toward it and answer the next ping.
  */
 export const DEFAULT_LINK_MAX_SILENCE_MS = 900_000;
-const DEFAULT_MODEL = "gpt-6-luna";
 /** An exact Atomic classifier selection: a provider ID, a slash, then the model ID. */
 const CLASSIFIER = /^[A-Za-z0-9._-]{1,100}\/\S{1,200}$/;
 
@@ -121,7 +123,7 @@ function model(harness: string): string {
 	if (harness === "atomic") {
 		throw new Error(`MODEL is required when HARNESS=${harness}`);
 	}
-	return DEFAULT_MODEL;
+	return DEFAULT_COPILOT_MODEL;
 }
 export function harnessSelection(): Pick<
 	Config,
@@ -152,6 +154,19 @@ function milliseconds(name: string, fallback: number, max = 600_000): number {
 	let value = Number(raw);
 	if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < 1_000 || value > max) {
 		throw new Error(`${name} must be an integer between 1000 and ${max} milliseconds`);
+	}
+	return value;
+}
+
+/** RESEARCH_EVIDENCE_TIMEOUT_MS: whole milliseconds, 2 minutes to 30 minutes, 10 minutes by default. */
+function researchEvidenceTimeoutMs(): number {
+	let raw = process.env.RESEARCH_EVIDENCE_TIMEOUT_MS;
+	if (raw === undefined) return 600_000;
+	let value = Number(raw);
+	if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < 120_000 || value > 1_800_000) {
+		throw new Error(
+			"RESEARCH_EVIDENCE_TIMEOUT_MS must be an integer between 120000 and 1800000 milliseconds",
+		);
 	}
 	return value;
 }
@@ -287,6 +302,7 @@ export function load(): Config {
 		agent,
 		backgroundJobs,
 		webResearch: agent && backgroundJobs && process.env.WEB_RESEARCH !== "off",
+		researchEvidenceTimeoutMs: researchEvidenceTimeoutMs(),
 		conversationPlan,
 		conversationInitiativeModel,
 		conversationInitiativeSilenceMs,
@@ -339,9 +355,7 @@ export function describe(config: Config): string {
 		config.conversationPlan
 			? `conversation plan: ${config.decisionsModel}`
 			: "conversation plan: off",
-		config.plannerVisuals
-			? `Planner visuals: ${config.decisionsModel}`
-			: "Planner visuals: off",
+		`visual assessment: ${config.decisionsModel ?? "unavailable"}`,
 		config.liveBuild ? "live build: on" : "live build: off",
 		config.liveSpikes ? "live spikes: on" : "live spikes: off",
 		admission,

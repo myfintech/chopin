@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ActiveOwnerBindings } from "../agent/active-owner";
+import { documentTools } from "../agent/tools";
 import { decideReplying } from "../conversation-plan/decisions.test-fixtures";
 import { Admission } from "../auth/admission";
 import { Sessions } from "../auth/session";
@@ -151,11 +152,122 @@ type Seen = {
 	tools: readonly string[];
 };
 
+test("withholds a fragmented Chat question and repairs within the same Planner session", async () => {
+	let { context, events } = await setup();
+	let prompts: string[] = [];
+	let checked: string[] = [];
+	context.decide = async request => {
+		let text = (request.state as { reply: string }).reply;
+		checked.push(text);
+		return {
+			model: "test/classifier",
+			answers: { input: { type: "noul", noul: checked.length === 1 ? 1 : 0 } },
+			usage: { input_tokens: 0, output_tokens: 0 },
+			latencyMs: 0,
+		};
+	};
+	let session = {
+		async stream(prompt: string) {
+			prompts.push(prompt);
+			return {
+				fullStream: (async function*() {
+					yield { type: "text-start", id: "reply" };
+					for (
+						let text of prompts.length === 1
+							? ["What are you ", "trying to accomplish?"]
+							: ["I updated the document."]
+					) {
+						yield { type: "text-delta", id: "reply", text };
+					}
+					yield { type: "text-end", id: "reply" };
+				})(),
+			} as never;
+		},
+		async destroy() {},
+	};
+	context.openPlannerSession = async () => ({ ok: true, value: session });
+	await browserTurn(context, "Help me draft a new plan.");
+	expect(events.some(event => JSON.stringify(event).includes("trying to accomplish"))).toBe(false);
+	expect(
+		context.chat.entries.filter(entry => entry.author.kind === "agent").map(entry => entry.text),
+	)
+		.toContain("I updated the document.");
+	expect(checked).toEqual(["What are you trying to accomplish?", "I updated the document."]);
+	expect(prompts).toHaveLength(2);
+	expect(prompts[1]).toContain("inline decision cards");
+});
+
+test.each(["new", "existing", "unanchored"])(
+	"a rejected reply reports only new durable captures (%s)",
+	async kind => {
+		let { context } = await setup();
+		let options = {
+			context: { room: Chat.documentRoom(context) },
+			toolCallId: "capture",
+			messages: [],
+		} as never;
+		let saved = JSON.parse(
+			await documentTools.edit_plan.execute!({
+				revision: 0,
+				operations: [{ op: "insert_root", source: "Today remains provisional." }],
+			}, options) as string,
+		);
+		let block = saved.blocks[0];
+		let capture = () =>
+			documentTools.open_decisions.execute!({
+				revision: context.plan.revision,
+				questions: [{
+					key: "today-value",
+					header: "Useful curation",
+					question: "What makes a Today suggestion useful?",
+					response: "text",
+					options: [],
+					multiple: false,
+					blocks: [{ index: block.index, digest: block.digest }],
+				}],
+			}, options);
+		if (kind === "existing") await capture();
+		context.decide = decideReplying({ input: { type: "noul", noul: 0.19 } });
+		let turns = 0;
+		context.openPlannerSession = async () => ({
+			ok: true,
+			value: {
+				async destroy() {},
+				async stream() {
+					if (turns++ === 0) {
+						if (kind === "new") await capture();
+						if (kind === "unanchored") {
+							await documentTools.open_decision.execute!({
+								revision: context.plan.revision,
+								key: "today-value",
+								question: "What makes a Today suggestion useful?",
+							}, options);
+						}
+					}
+					return {
+						fullStream: (async function*() {
+							yield { type: "text-delta", id: "reply", text: "Decisions await Save." };
+						})(),
+					} as never;
+				},
+			},
+		});
+		await browserTurn(context, "Help me draft Today.");
+		expect(turns).toBe(2);
+		let entries = context.chat.entries.map(entry => entry.text);
+		expect(entries).not.toContain("Decisions await Save.");
+		if (kind === "new") {
+			expect(entries).toContain("Added 1 inline decision to the document.");
+			expect(entries.some(text => text?.includes("could not move"))).toBe(false);
+		} else expect(entries.some(text => text?.includes("could not move"))).toBe(true);
+	},
+);
+
 /** The real session opener, over a harness stub that records what each turn runs with. */
 function observe(context: Chat.Room): Seen[] {
 	let seen: Seen[] = [];
-	context.openPlannerSession = (owner, channel) =>
-		openPlannerSession(owner, channel, {
+	context.openPlannerSession = async (owner, channel) => {
+		let result = await openPlannerSession(owner, channel, {
 			githubTools: async () => ({ ok: true, value: {} }),
 			createSandbox: async () => ({ destroy: async () => {} }) as never,
 			registerCredential: () => () => {},
@@ -181,6 +293,9 @@ function observe(context: Chat.Room): Seen[] {
 				},
 			} as never,
 		});
+		if (!result.ok) throw "cause" in result.error ? result.error.cause : result.error;
+		return result;
+	};
 	return seen;
 }
 
@@ -617,6 +732,24 @@ test("a Planner that still owns workflow runs outlives its turn, pauses, resumes
 	expect(planner.calls.at(-1)).toBe("destroy");
 });
 
+test("a failed foreground turn aborts late work and releases a Planner with workflow runs", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	let planner = runningSession();
+	let signal: AbortSignal | undefined;
+	planner.session.stream = async (_prompt: string, turnSignal?: AbortSignal) => {
+		signal = turnSignal;
+		throw new Error("The reply could not be verified.");
+	};
+	context.openPlannerSession = async () => ({ ok: true, value: planner.session });
+	await Chat.invoke(context, user, "Run the workflow");
+	await context.chat.running;
+	expect(signal?.aborted).toBe(true);
+	expect(planner.calls).toEqual(["destroy"]);
+	expect(context.chat.retained).toBeUndefined();
+	expect(context.chat.busy).toBe(false);
+	expect(context.chat.entries.at(-1)?.text).toBe("The reply could not be verified.");
+});
+
 test("concurrent Stop requests pause a retained Planner's workflows only once", async () => {
 	let { context, user } = await setup(configured(ATOMIC));
 	let planner = runningSession();
@@ -803,6 +936,143 @@ test("run cards keep ended runs until a new run starts, and a released session's
 	expect(Chat.mergeRuns([{ ...card("paused"), ended: undefined }], undefined, 2_000)[0])
 		.toMatchObject({ status: "stopped", ended: 2_000 });
 	expect(Chat.restoreRuns([])).toBeUndefined();
+});
+
+function longCard(count: number, status: Wire.Run["status"] = "running"): Wire.Run {
+	return {
+		...card(status),
+		stages: Array.from({ length: count }, (_, index) => ({
+			id: `run-1:s${index}`,
+			name: `stage ${index}`,
+			status: "completed" as const,
+			started: 1_000 + index,
+			ended: 1_001 + index,
+		})),
+	};
+}
+
+test("every stage of a run is stored while Chat's card carries only its latest ones", async () => {
+	let { context, events, user, backend } = await setup(configured(ATOMIC));
+	let planner = runningSession({ active: ["run-1"], paused: [], cards: [longCard(500)] });
+	context.openPlannerSession = async () => ({ ok: true, value: planner.session });
+	let stored = async (offset = 0, limit = 1_000) =>
+		await context.auth.storage.runStages.list(context.room, "run-1", { offset, limit });
+	let shown = () => events.findLast(event => event.kind === "chat:state")?.runs as Wire.Run[];
+
+	await Chat.invoke(context, user, "Run the workflow");
+	await context.chat.running;
+	await tick();
+	expect((await stored()).stages).toEqual(longCard(500).stages);
+	expect(context.chat.runs?.[0]?.stages.map(stage => stage.name)).toEqual(
+		Array.from({ length: 12 }, (_, index) => `stage ${488 + index}`),
+	);
+	expect(context.chat.runs?.[0]?.earlierStages).toBe(488);
+	expect(shown()[0]).toEqual(context.chat.runs![0]!);
+
+	// A failed early stage stops its unfinished descendant on the card, though it is not listed.
+	let next = longCard(501);
+	next.stages[3] = { ...next.stages[3]!, status: "failed" };
+	next.stages[500] = {
+		id: "run-1:late",
+		name: "late",
+		status: "running",
+		parentIds: ["run-1:s3"],
+	};
+	planner.set({ active: ["run-1"], paused: [], cards: [next] });
+	await tick();
+	await tick();
+	expect((await stored(3, 1)).stages[0]?.status).toBe("failed");
+	expect((await stored(500, 1)).stages[0]).toEqual(next.stages[500]!);
+	expect((await stored()).total).toBe(501);
+	expect(context.chat.runs?.[0]?.stages.at(-1)).toEqual({
+		...next.stages[500]!,
+		status: "stopped",
+	});
+	expect(context.chat.runs?.[0]?.earlierStages).toBe(489);
+
+	// The stored stages and the card survive closing and reopening the document.
+	planner.set({ active: [], paused: [], cards: [{ ...next, status: "finished", ended: 1_600 }] });
+	await tick();
+	await tick();
+	let reopened = await Plan.open(context.room, backend, context.server);
+	expect(reopened.chat.runs?.[0]).toMatchObject({ status: "finished", earlierStages: 489 });
+	expect((await stored()).total).toBe(501);
+	await Plan.close(reopened);
+});
+
+test("a run that replaces an ended card takes that card's stored stages with it", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	let planner = runningSession({ active: [], paused: [], cards: [longCard(20, "finished")] });
+	context.openPlannerSession = async () => ({ ok: true, value: planner.session });
+	await Chat.invoke(context, user, "Run the workflow");
+	await context.chat.running;
+	await tick();
+	let page = { offset: 0, limit: 100 };
+	expect((await context.auth.storage.runStages.list(context.room, "run-1", page)).total).toBe(20);
+	let fresh = runningSession({
+		active: ["run-2"],
+		paused: [],
+		cards: [{ ...longCard(13), id: "run-2" }],
+	});
+	context.openPlannerSession = async () => ({ ok: true, value: fresh.session });
+	await Chat.invoke(context, user, "Run another");
+	await context.chat.running;
+	await tick();
+	await tick();
+	expect(context.chat.runs?.map(run => run.id)).toEqual(["run-2"]);
+	expect((await context.auth.storage.runStages.list(context.room, "run-1", page)).total).toBe(0);
+	expect((await context.auth.storage.runStages.list(context.room, "run-2", page)).total).toBe(13);
+});
+
+test("a later session's stage-less card for a run keeps its stored stages, and a card with stages still replaces them", async () => {
+	for (let reported of [undefined, 16]) {
+		let { context, user, backend } = await setup(configured(ATOMIC));
+		let first = runningSession({ active: [], paused: [], cards: [longCard(16, "finished")] });
+		context.openPlannerSession = async () => ({ ok: true, value: first.session });
+		await Chat.invoke(context, user, "Run the workflow");
+		await context.chat.running;
+		await tick();
+		let stored = async () =>
+			await context.auth.storage.runStages.list(context.room, "run-1", { offset: 0, limit: 100 });
+		expect((await stored()).total).toBe(16);
+		let window = context.chat.runs![0]!;
+		expect(window.earlierStages).toBe(4);
+
+		// A reattached Planner reports the ended run again without its stages.
+		let bare: Wire.Run = {
+			...card("stopped"),
+			updated: 1_900,
+			ended: 1_900,
+			stages: [],
+			...(reported ? { earlierStages: reported } : {}),
+		};
+		let again = runningSession({ active: [], paused: [], cards: [bare] });
+		context.openPlannerSession = async () => ({ ok: true, value: again.session });
+		await Chat.invoke(context, user, "Check on it");
+		await context.chat.running;
+		await tick();
+		await tick();
+		expect(await stored()).toEqual({ stages: longCard(16, "finished").stages, total: 16 });
+		expect(context.chat.runs?.[0]).toEqual({
+			...window,
+			status: "stopped",
+			updated: 1_900,
+			ended: 1_900,
+		});
+		let reopened = await Plan.open(context.room, backend, context.server);
+		expect(reopened.chat.runs?.[0]).toMatchObject({ status: "stopped", earlierStages: 4 });
+		expect(reopened.chat.runs?.[0]?.stages).toEqual(window.stages);
+		await Plan.close(reopened);
+
+		let replaced = runningSession({ active: [], paused: [], cards: [longCard(13, "finished")] });
+		context.openPlannerSession = async () => ({ ok: true, value: replaced.session });
+		await Chat.invoke(context, user, "Run it again");
+		await context.chat.running;
+		await tick();
+		await tick();
+		expect((await stored()).total).toBe(13);
+		expect(context.chat.runs?.[0]?.earlierStages).toBe(1);
+	}
 });
 
 test("one run can be paused and resumed by name while others keep going", async () => {

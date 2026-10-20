@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { activityText } from "@chopin/protocol/activity";
 import { changedBlocks } from "./changes";
 import { approveGraph, validate } from "./graphs";
 import { planningReadiness } from "./plan-graphs";
@@ -489,6 +490,32 @@ export function pickBuild(
 	});
 }
 
+/**
+ * Hand a running build to a newer connection of the machine it runs on, as when the connector
+ * registers again after a dropped request; the run itself carries on.
+ */
+export function rebindBuild(
+	plan: Plan,
+	id: string,
+	from: string,
+	to: string,
+): Promise<boolean> {
+	return exclusive(plan, async () => {
+		let build = plan.builds.at(-1);
+		if (!build || build.id !== id || build.connectionId !== from) return false;
+		let previous = plan.builds;
+		plan.builds = [...previous.slice(0, -1), { ...build, connectionId: to }];
+		try {
+			await persistExclusive(plan, true);
+		} catch (error) {
+			plan.builds = previous;
+			throw error;
+		}
+		announceImplementation(plan);
+		return true;
+	});
+}
+
 export function reportBuild(
 	plan: Plan,
 	user: string,
@@ -519,7 +546,9 @@ export function reportBuild(
 		) {
 			throw new Error("build report is out of order");
 		}
-		let { progress, stoppedByUser, ...fields } = report;
+		let { progress: reported, stoppedByUser, ...fields } = report;
+		// Whatever a connector sends, the progress line never shows a raw command or a credential.
+		let progress = reported === undefined ? undefined : activityText(reported);
 		let next = buildSchema.parse({
 			...current,
 			...fields,

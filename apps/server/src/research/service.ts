@@ -64,6 +64,13 @@ export type ResearchWorkspaceServiceOptions = {
 		revision: number,
 	) => void | Promise<void>;
 	terminalNotice?: (channelId: string, id: string, text: string) => Promise<void>;
+	/**
+	 * Whether a decision finding follows this request. That finding posts its own notice when the
+	 * request settles, so the generic failure notice is skipped for it.
+	 */
+	followedByDecision?: (channelId: string, workspaceId: string) => Promise<boolean>;
+	/** Every request that reached ready or failed, whatever started it. Must be idempotent. */
+	settled?: (channelId: string, request: Research.RequestView) => Promise<void>;
 	clock?: () => Date;
 	id?: () => string;
 };
@@ -349,6 +356,12 @@ export function boundedResearchEvidence(evidence: ResearchEvidence[]): ResearchE
 	return bounded;
 }
 
+/** Whether `job` is research work in a state that can end its request. A failed attempt that will retry is `pending`, not `failed`. */
+export function researchJobSettles(job: Pick<JobView, "state" | "type">): boolean {
+	return (job.state === "completed" || job.state === "failed")
+		&& (job.type === "research-evidence" || job.type === "research-answer");
+}
+
 /** Coordinates durable workspace state with independently durable background jobs. */
 export class ResearchWorkspaceService {
 	#storage: StorageAdapter;
@@ -357,6 +370,8 @@ export class ResearchWorkspaceService {
 	#current: (channelId: string) => Promise<DocumentTarget | undefined>;
 	#publish: ResearchWorkspaceServiceOptions["publish"];
 	#terminalNotice: ResearchWorkspaceServiceOptions["terminalNotice"];
+	#settled: ResearchWorkspaceServiceOptions["settled"];
+	#followedByDecision: ResearchWorkspaceServiceOptions["followedByDecision"];
 	#clock: () => Date;
 	#id: () => string;
 	#tails = new Map<string, Promise<void>>();
@@ -368,6 +383,8 @@ export class ResearchWorkspaceService {
 		this.#current = options.current;
 		this.#publish = options.publish;
 		this.#terminalNotice = options.terminalNotice;
+		this.#settled = options.settled;
+		this.#followedByDecision = options.followedByDecision;
 		this.#clock = options.clock ?? (() => new Date());
 		this.#id = options.id ?? (() => crypto.randomUUID());
 	}
@@ -919,7 +936,7 @@ export class ResearchWorkspaceService {
 	async cancelRequest(input: CancelResearchRequest): Promise<Research.RequestView> {
 		let channelId = safeId(input.channelId, "Channel id");
 		let workspaceId = safeId(input.workspaceId, "Workspace id");
-		return this.#exclusive(channelId, workspaceId, async () => {
+		let view = await this.#exclusive(channelId, workspaceId, async () => {
 			let detail = await this.#cancellationDetail(channelId, workspaceId);
 			if (!detail) throw new ResearchWorkspaceError("not-found", "Research request not found.");
 			let initial = detail.turns.find(value => value.kind === "initial");
@@ -930,6 +947,15 @@ export class ResearchWorkspaceService {
 			let refreshed = await this.#cancellationDetail(channelId, workspaceId);
 			if (!refreshed) throw new ResearchWorkspaceError("not-found", "Research request not found.");
 			return this.#requestView(refreshed);
+		});
+		// Outside the workspace lock, as for a finished job: a listener opens the document.
+		if (view.stage === "cancelled") await this.#notifySettled(channelId, view);
+		return view;
+	}
+
+	async #notifySettled(channelId: string, request: Research.RequestView): Promise<void> {
+		await this.#settled?.(channelId, request).catch(error => {
+			console.error("[research] a settled request listener failed:", error);
 		});
 	}
 
@@ -1023,19 +1049,14 @@ export class ResearchWorkspaceService {
 	}
 
 	async jobChanged(job: JobView): Promise<void> {
-		if (
-			(job.state !== "completed" && job.state !== "failed")
-			|| (job.type !== "research-evidence" && job.type !== "research-answer")
-			|| !this.#validId(job.channelId)
-		) return;
+		if (!researchJobSettles(job) || !this.#validId(job.channelId)) return;
 		if (!await this.#isTopLevelChannel(job.channelId)) return;
 		let linked = await this.#storage.research.findTurnByJob(job.channelId, job.id);
 		if (!linked) return;
 		await this.#exclusive(job.channelId, linked.workspaceId, async () => {
 			let detail = await this.#reconciled(job.channelId, linked.workspaceId);
-			if (!detail || linked.kind !== "initial" || detail.workspace.inlineReference !== "placed") {
-				return;
-			}
+			if (!detail || linked.kind !== "initial") return;
+			let placed = detail.workspace.inlineReference === "placed";
 			let request = await this.#requestView(detail);
 			if (request.stage !== "ready" && request.stage !== "failed") return;
 			let activeTurn = detail.turns.find(value => value.id === linked.id);
@@ -1048,6 +1069,13 @@ export class ResearchWorkspaceService {
 			) {
 				return;
 			}
+			// Every terminal failure gets one notice. A ready notice stays with the placed
+			// reference, which is what it links; a decision finding speaks for its own request.
+			if (request.stage === "ready" && !placed) return;
+			if (
+				request.stage === "failed"
+				&& await this.#followedByDecision?.(job.channelId, detail.workspace.id)
+			) return;
 			let id = `research-${request.stage}:${detail.workspace.id}:${job.id}`;
 			let text = "Research could not be completed. You can retry it from the research card.";
 			if (request.stage === "ready") {
@@ -1065,6 +1093,13 @@ export class ResearchWorkspaceService {
 			}
 			await this.#terminalNotice?.(job.channelId, id, text);
 		});
+		if (this.#settled && linked.kind === "initial") {
+			// Outside the workspace lock: a listener opens the document, which may be closing.
+			let request = await this.request(job.channelId, linked.workspaceId).catch(() => undefined);
+			if (request && (request.stage === "ready" || request.stage === "failed")) {
+				await this.#notifySettled(job.channelId, request);
+			}
+		}
 	}
 
 	async #requiredView(channelId: string, workspaceId: string): Promise<ResearchWorkspaceView> {

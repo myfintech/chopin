@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { SQL } from "bun";
-import { withDocumentTitle } from "../packages/dialect/src/index";
+import { ulid, withDocumentTitle } from "../packages/dialect/src/index";
 import { storedDocument, storedLegacyCallout } from "../apps/server/src/testing/plan";
 
 import type { SeedState } from "../apps/server/src/testing/plan";
@@ -133,6 +133,52 @@ export async function seedChildChannel(
 	return { id, path: `${parentPath}/children/${slug}`, slug };
 }
 
+/** Before opening the root, give its Chat a document reference to this fixture child. */
+export async function seedLinkedChildChannel(
+	...args: Parameters<typeof seedChildChannel>
+): ReturnType<typeof seedChildChannel> {
+	let child = await seedChildChannel(...args);
+	let [port, parentId, , title] = args;
+	let entry: NonNullable<SeedState["transcript"]>[number] = {
+		id: `child-link:${child.id}`,
+		author: { kind: "member", handle: "ana" },
+		text: `#${title}`,
+		references: [{
+			id: ulid(),
+			kind: "document",
+			channelId: child.id,
+			label: `#${title}`,
+			href: child.path,
+			start: 0,
+			end: title.length + 1,
+			repositoryId: SCORE.id,
+			observedRevision: 0,
+			observedSourceHash: `sha256:${
+				createHash("sha256").update(await readSource(port, child.id)).digest("hex")
+			}`,
+		}],
+		ts: Math.floor(Date.now() / 1000),
+	};
+	let [snapshot] = await sql(port, database =>
+		database<{ sidecar: SeedState | string }[]>`
+		SELECT sidecar FROM channel_snapshots WHERE channel_id = ${parentId}
+	`);
+	if (!snapshot) {
+		await seedChannel(port, parentId, `# Test ${parentId.slice(0, 8)}\n`, { transcript: [entry] });
+	} else {
+		let sidecar: SeedState = typeof snapshot.sidecar === "string"
+			? JSON.parse(snapshot.sidecar)
+			: snapshot.sidecar;
+		let next = { ...sidecar, transcript: [...sidecar.transcript ?? [], entry] };
+		await sql(port, database =>
+			database`
+			UPDATE channel_snapshots SET sidecar = ${JSON.stringify(next)}::jsonb
+			WHERE channel_id = ${parentId}
+		`);
+	}
+	return child;
+}
+
 export async function countChildChannels(port: number, parentId: string): Promise<number> {
 	return sql(port, async database => {
 		let [row] = await database<{ count: number }[]>`
@@ -149,6 +195,30 @@ export async function seedChannel(
 	state: SeedState = {},
 ): Promise<void> {
 	return seed(port, id, source, state, storedDocument);
+}
+
+/** Store an image as this channel's own upload, as `upload_image` would, by an e2e account. */
+export async function seedChannelImage(
+	port: number,
+	id: string,
+	bytes: Uint8Array,
+	mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif",
+): Promise<string> {
+	let sha256 = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+	let now = new Date();
+	await sql(port, async database => {
+		await database`
+			INSERT INTO users (id, login, avatar_url, created_at, updated_at)
+			VALUES ('U_e2e-image-uploader', 'e2e-image-uploader', '', ${now}, ${now})
+			ON CONFLICT (id) DO NOTHING
+		`;
+		await database`
+			INSERT INTO plan_images (sha256, channel_id, mime_type, bytes, size, uploaded_by, created_at)
+			VALUES (${sha256}, ${id}, ${mimeType}, ${bytes}, ${bytes.byteLength}, 'U_e2e-image-uploader', ${now})
+			ON CONFLICT DO NOTHING
+		`;
+	});
+	return `/images/${sha256}.${mimeType === "image/jpeg" ? "jpg" : mimeType.slice(6)}`;
 }
 
 export async function seedChannelDescription(
@@ -198,6 +268,7 @@ async function seed(
 		...(state.graph ? { graph: state.graph } : {}),
 		...(state.builds ? { builds: state.builds } : {}),
 		...(state.lifecycle ? { lifecycle: state.lifecycle } : {}),
+		...(state.workflowRuns ? { workflowRuns: state.workflowRuns } : {}),
 	};
 	await sql(port, async database => {
 		await database`
@@ -210,6 +281,20 @@ async function seed(
 					${document.update}, ${JSON.stringify(sidecar)}::jsonb, ${new Date()}
 				)
 			`;
+		for (let [runId, stages] of Object.entries(state.runStages ?? {})) {
+			let rows = stages.map((stage, position) => ({ position, ...stage }));
+			await database`
+				INSERT INTO workflow_run_stages (
+					channel_id, run_id, stage_id, position, name, kind, status, parent_ids, started, ended
+				)
+				SELECT ${id}, ${runId}, x.id, x.position, x.name, x.kind, x.status, x."parentIds",
+					x.started, x.ended
+				FROM jsonb_to_recordset(${JSON.stringify(rows)}::text::jsonb) AS x(
+					position bigint, id text, name text, kind text, status text, "parentIds" jsonb,
+					started bigint, ended bigint
+				)
+			`;
+		}
 	});
 }
 

@@ -190,7 +190,7 @@ are only ever answered in the connector terminal; a drop never answers one.
 
 **How pairing works.** An unpaired connector prints a link and an
 eight-character code. Signing in at the link with push access, choosing
-**Connect** after checking the code, and the GitHub authorization that follows
+**Add machine** after checking the code, and the GitHub authorization that follows
 hand the machine a long-lived token. Each `connect` then registers the machine
 with that token, naming the repository, commit and branch of each checkout given
 with `--checkout`. One connector process runs for a state directory, and its
@@ -200,9 +200,20 @@ connector renews it continuously. Connections live in the server's memory, but
 the machine does not: after a server restart or a deploy, a running connector
 registers again with the machine token and carries on
 without pairing, and a stopped one does the same when you start `connect` again.
-A run that was going at the restart cannot go on: Chopin refuses it on the new
-connection, so the connector stops its agent with **Chopin ended this run
-(connection-forbidden).** and waits for the next work. When Chopin has answered
+The connector also registers again, mid-run, when one of its requests fails
+on the way (a long poll cut by a proxy, a timeout, a 5xx answer); the terminal says
+**Lost the connection to Chopin during a run** and **Registered this machine with
+Chopin again**. A build carries on through that: its next heartbeat comes on the
+new connection of the same paired machine and owner, and Chopin moves the build,
+and the agent's run credential, to it. A connection of any other machine, or of
+another person, is still refused (`build-forbidden`). A build that was going at a
+restart cannot go on, as Chopin forgot it with every connection: the connector
+stops its agent with **Chopin restarted, so it ended this run.** (an older
+connector says **Chopin ended this run (server-restarted).**) and waits for the
+next work, and Build says **Build stopped — Chopin restarted.** Build says **your
+local agent disconnected** only when the machine has no connection left, and
+**your local agent stopped responding** when its heartbeat stopped while the
+machine stayed connected. When Chopin has answered
 only that it does not know the connection (`connection-unavailable`, or HTTP 401)
 for two minutes, the connector stops any running agent, reports why, and exits
 with **Chopin no longer recognizes this
@@ -221,7 +232,7 @@ command in [Run without installing](chopin-cli-reference.md#run-without-installi
 
 **"Your local agent isn't connected" (HTTP 409 `no-workspace`).** No connector of
 yours is connected. Start the command shown, open
-its link, choose **Connect**, then press **Run** or **Build on my laptop** again.
+its link, choose **Add machine**, then press **Run** or **Build on my laptop** again.
 Another person's connector never runs your work.
 
 **Wrong repository, not a Git checkout, or a missing commit.** A `--checkout`
