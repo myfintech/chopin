@@ -166,7 +166,8 @@ test("a diagram is shown with its source hidden by default", async ({ join, seed
 	await seed("```mermaid\ngraph TD;\nA-->B;\n```\n");
 	let page = await join("ana");
 
-	await expect(content(page).locator("[data-plan-preview] svg")).toBeVisible();
+	await expect(content(page).getByRole("region", { name: "Diagram preview" }).locator("svg"))
+		.toBeVisible();
 	await expect(content(page).locator("[data-plan-source]")).toBeHidden();
 	await expect(content(page).getByRole("button", { name: "Show source" })).toBeVisible();
 });
