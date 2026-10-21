@@ -3,6 +3,8 @@ import {
 	documentTitleText,
 	normalizeDocumentTitleTree,
 	serialize,
+	validDocumentTitleChange,
+	validDocumentTitleText,
 	withDocumentTitle,
 } from "@chopin/dialect";
 import { locksEditing, restoreBuilds, restoreLive } from "../tasks/builds";
@@ -54,6 +56,7 @@ import { claimEligibility, restoreLifecycle, transition } from "../tasks/lifecyc
 import { broadcast, broadcastRepository, fail, relay, reply, tell } from "../wire";
 import { documentUrl } from "../channels/document-url";
 import * as DocumentProvenance from "../document-provenance";
+import { documentPath } from "@chopin/protocol/document-url";
 
 import type { Server } from "bun";
 import type { ConversationPlan, Plan as Wire, Request, Sidebar } from "@chopin/protocol";
@@ -933,6 +936,12 @@ export async function initial(
 ): Promise<InitialChannel> {
 	// A new document has no stored links to spare from the newer URL rules.
 	assertIntroducedUrls([], parse(source).children);
+	if (
+		!validDocumentTitleChange({ type: "root", children: [] }, parse(source))
+		|| title !== undefined && !validDocumentTitleText(title)
+	) {
+		throw new Error("Document title contains control characters or damaged Unicode text");
+	}
 	let document = await room.create(source);
 	if (title !== undefined) room.enableTitle(document, title);
 	try {
@@ -2034,6 +2043,7 @@ export async function rewrite(
 		Comments.rebase(candidate);
 		// A reviewed link whose blocks the rewrite left alone stays reviewed.
 		let reviewed = Questions.snapshot(candidate);
+		let sections = Questions.sections(candidate);
 		let outcome = edit.replace(candidate, plan.revision, nextSource);
 		if (outcome.ok && plan.persistence.documentTitles) room.trackTitle(document);
 		if (!outcome.ok) return outcome;
@@ -2042,6 +2052,7 @@ export async function rewrite(
 		if (changed) {
 			Questions.rebase(candidate);
 			Questions.invalidate(candidate, "plan_changed", reviewed);
+			Questions.keepOwnLinked(candidate, sections);
 			Comments.rebase(candidate);
 			Comments.invalidate(candidate, "plan_changed");
 		} else {
@@ -2086,6 +2097,7 @@ export async function rewrite(
 		if (changed) {
 			Questions.rebase(plan, before);
 			Questions.invalidate(plan, "plan_changed", reviewed);
+			Questions.keepOwnLinked(plan, sections);
 			Comments.rebase(plan);
 			Comments.invalidate(plan, "plan_changed");
 		}
@@ -2381,10 +2393,30 @@ export function source(plan: Plan): string {
 	return room.project(plan.document);
 }
 
-export async function documentIdentity(plan: Plan): Promise<{ id: string; url: string }> {
-	let channel = await plan.persistence.storage.channels.get(plan.id);
+/**
+ * The document's id and current link. A renamed top-level document also lists the links it had
+ * before, which still open it, so the Planner can say which link is current from this data
+ * rather than guess it from the links it has seen.
+ */
+export async function documentIdentity(
+	plan: Plan,
+): Promise<{ id: string; url: string; earlier_urls?: string[] }> {
+	let channels = plan.persistence.storage.channels;
+	let channel = await channels.get(plan.id);
 	if (!channel) throw new Error("document is unavailable");
-	return { id: channel.id, url: await documentUrl(channel, plan.persistence.storage.channels) };
+	let url = await documentUrl(channel, channels);
+	let earlier = channel.parentChannelId ? [] : await channels.earlierSlugs(channel.id);
+	return {
+		id: channel.id,
+		url,
+		...(earlier.length
+			? {
+				earlier_urls: earlier.map(slug =>
+					documentPath(channel.repositoryOwner, channel.repositoryName, slug)
+				),
+			}
+			: {}),
+	};
 }
 
 /** Size of the Yjs history, for the idle compaction check. */

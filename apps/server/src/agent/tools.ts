@@ -202,7 +202,9 @@ export const documentTools = {
 		contextSchema: roomContext,
 		description: "Read the plan: its revision, canonical source, the top-level blocks you can "
 			+ "address when editing, and the questions it holds. Read before editing — "
-			+ "`edit_plan` refuses a batch aimed at a revision that has moved on.",
+			+ "`edit_plan` refuses a batch aimed at a revision that has moved on. `document.url` is "
+			+ "this document's current link; `document.earlier_urls`, when present, are links it had "
+			+ "before a rename, which still open it.",
 		inputSchema: jsonSchema({ type: "object", properties: {}, additionalProperties: false }),
 		// Reading the document the agent is here to write is not a decision
 		// anybody needs to approve.
@@ -458,7 +460,9 @@ export const documentTools = {
 			+ "Use for choices such as how onboarding should work, not factual questions the "
 			+ "repository or research can settle. A recommendation is not agreement: only a "
 			+ "person pressing Save resolves this card. For planning questions beside prose, prefer "
-			+ "open_decisions, which also follows saved answers into the related prose. Reuse the same key when "
+			+ "open_decisions, which also follows saved answers into the related prose. Name the "
+			+ "block from read_plan the question concerns, such as its section heading; without one "
+			+ "the card goes beside the document's first section. Reuse the same key when "
 			+ "retrying the same capture. Do not use ask for the same decision as well.",
 		inputSchema: jsonSchema({
 			type: "object",
@@ -471,6 +475,20 @@ export const documentTools = {
 				},
 				question: { type: "string", minLength: 1, maxLength: 100 },
 				description: { type: "string", maxLength: 300 },
+				blocks: {
+					type: "array",
+					maxItems: 1,
+					description: "The block this decision concerns, from read_plan.",
+					items: {
+						type: "object",
+						properties: {
+							index: { type: "integer", minimum: 0 },
+							digest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+						},
+						required: ["index", "digest"],
+						additionalProperties: false,
+					},
+				},
 			},
 			required: ["revision", "key", "question"],
 			additionalProperties: false,

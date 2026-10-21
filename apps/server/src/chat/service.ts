@@ -49,6 +49,7 @@ import { broadcast, fail, reply, tell } from "../wire";
 import { MAX_MESSAGE_BYTES } from "./limits";
 import { contributed } from "./initiative";
 import { checkPlannerReply, publishPlannerReplies } from "./reply-policy";
+import { runDuration } from "./run-duration";
 import type { InitiativeSchedule } from "./initiative-schedule";
 
 import type { Server } from "bun";
@@ -1576,7 +1577,12 @@ async function publishReport(
 	// A card with no stages for a run Chat already shows stages of changes only the card's status
 	// and times: a reattached Planner reports an ended run without them, and they stay stored.
 	let kept = new Set<string>();
-	let incoming = runs?.cards?.map(card => {
+	let incoming = runs?.cards?.map(reported => {
+		// A run has finished only once its root ended, which a finished card carries as `ended`;
+		// one reported finished without it has just started and is still live.
+		let card: Wire.Run = reported.status === "finished" && reported.ended === undefined
+			? { ...reported, status: reported.waiting > 0 ? "waiting" : "running" }
+			: reported;
 		let shown = card.stages.length ? undefined : prior.find(run => run.id === card.id);
 		if (!shown || (!shown.stages.length && !shown.earlierStages)) return card;
 		kept.add(card.id);
@@ -1606,8 +1612,9 @@ async function publishReport(
 		let ended = ENDED_RUN[run.status];
 		let previous = before.get(run.id);
 		if (!ended || (previous && ENDED_RUN[previous])) continue;
-		let minutes = Math.max(1, Math.round(((run.ended ?? run.updated) - run.started) / 60));
-		let said = `${run.name} ${ended} after ${minutes} min.`;
+		let said = `${run.name} ${ended} after ${
+			runDuration((run.ended ?? run.updated) - run.started)
+		}.`;
 		if (followUp && !releasing && NEEDS_FOLLOW_UP[run.status] && known.get(run.id) === session) {
 			attention.push({ run, said });
 			continue;

@@ -37,16 +37,47 @@ lost or ambiguous, the update fails without guessing a new passage. Pending work
 authorized Planner owner after restart. Draft edits and research findings do not start this
 write-up. Child-focused Planner turns cannot create decisions in the root document.
 
+Saving a decision the Planner left open, whether captured with `open_decisions` or
+`open_decision` or asked with `ask` by a turn that has since ended, also starts one Planner turn
+that carries the saved answer, so the Planner acts on it: an answer that chose "start a new run"
+starts one. Chat shows a system notice naming who answered, and the turn leaves an anchored
+card's passage to its write-up. Like other turns nobody typed, it runs only under the existing
+Planner owner, and under `HARNESS=remote` only while a Planner is attached; it never claims
+ownership. An answer that found no Planner starts once an owner appears or a Planner attaches,
+unless the server restarts first. Reopening or saving again makes a waiting answer stale. An
+answer a blocking `ask` or a workflow's question is waiting for returns to it instead.
+
+After a foreground rewrite, `anchor_plan` explicitly reviews the replacement passage and
+refreshes its saved write-up links and future write scope in the same durable commit.
+Decisions sharing a scope must be re-anchored together to the same passage. A scope contains
+at most eight ordinary paragraphs, native diagrams or tables; intervening decision cards are
+preserved, and unrelated gaps are refused. Re-anchoring does not claim an unwritten answer
+was applied or retry failed work automatically. **Retry** keeps the failed job's identity and
+uses the current reviewed passage and saved answers.
+
 `open_decision` captures a written decision and returns its identity immediately.
 It takes the current document revision, a stable request key, a concise question
 and optional context. Repeating a request returns the same card. The Planner
 can continue inspecting or developing the document while the choice remains
-open. This tool cannot confirm an answer. It creates an unanchored card without the scoped
-follow-up above; the Planner uses `open_decisions` for questions beside plan prose.
+open. This tool cannot confirm an answer. It may name the one block the question concerns,
+such as its section heading, and the card goes beside that block, linked to it. Without one, or
+when that block changed since the Planner read it, the card goes beside the document's first
+section: the first heading after an opening title, else the first block of prose. A document
+with only a title has no section, so the card trails it unlinked. It has no scoped follow-up;
+the Planner uses `open_decisions` for questions beside plan prose.
 
 `ask` also accepts `response: "text"` when the Planner needs to wait for a
 person's answer. Set `options` to an empty array;
 `multiple` must be false. Omitting `response` keeps the existing choice mode.
+
+A whole-document rewrite, such as an MCP `update_document` from a workflow run, runs outside any
+Planner turn, so nothing would review a link it left pending. The Planner's own cards (not a
+workflow's questions, a person's or Chat's decisions) therefore stay linked through one: a card
+whose block survived keeps it, and one whose block was deleted or rewritten into a new block is
+linked to the nearest heading above it that survived, else the first section. Its scoped
+write-up, when the rewrite deleted that passage, is dropped instead of failing, and the answer
+still reaches the Planner as a turn of its own. Other cards keep owing a review as before, and a
+Planner `edit_plan` still reports `anchors_pending` for the Planner to re-anchor.
 
 ## Collaboration and persistence
 

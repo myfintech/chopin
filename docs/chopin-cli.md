@@ -157,7 +157,10 @@ your Chopin account in a browser:
 5. Choose **Add machine**. The page says **Connected.**
 
 The pairing lasts until you [disconnect the machine](#disconnect). It survives
-server restarts, deploys and signing out of the browser.
+server restarts, deploys and signing out of the browser. So does a build
+running on the machine: the connector keeps its agent working while Chopin
+restarts, registers the machine again, and its heartbeat carries the build on
+(see [Trouble connecting](local-experiments.md#trouble-connecting)).
 
 When the connection is up, you see:
 
@@ -276,6 +279,11 @@ service finds the same program each time. The service can't answer a
 permission prompt, so Copilot CLI runs with `--allow-all` to approve its tools
 without asking. Atomic doesn't ask, and `ATOMIC_ACP_HEADLESS=1` ends its
 questions at once instead of waiting for an answer.
+
+Atomic requires `atomic-acp` 0.0.3 or newer. Earlier adapters ignore the run's
+MCP servers, so an agent can chat but cannot read an investigation or build plan.
+Upgrade with `npm install -g @bastani/atomic-acp@latest`, then restart the connector
+with `chopin service restart`.
 
 Arguments after `--` go to the agent. For example,
 `chopin connect --agent atomic -- --model openai/gpt-5.5` runs

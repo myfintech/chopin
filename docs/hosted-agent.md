@@ -71,6 +71,8 @@ conversation-analysis flags. It uses the complete saved answers affecting that p
 updates only its explicit target. Applied answer generations commit with the source, so an
 interrupted retry cannot write them twice. Lost or ambiguous targets refuse safely. Work waits
 for an existing authorized Planner owner; it never claims ownership from a viewer or saver.
+The same Save also starts one Planner turn carrying the answer, so the Planner acts on what was
+decided rather than only rewriting the passage.
 See [Decisions](decisions.md) for the shared answer lifecycle.
 
 This does not start background research without an explicit request. Blocking `ask` remains
@@ -578,7 +580,9 @@ every turn.
   instead of receiving a stale embedded copy. That result, and every structured
   `edit_plan` result (success, or a locked, stale, or invalid refusal), carry
   `document: { id, url }`: the room's own document id and the canonical URL MCP
-  `read_document` returns for it, nested under the parent for a child document.
+  `read_document` returns for it, nested under the parent for a child document. A
+  renamed top-level document adds `earlier_urls`, the links it had before, which
+  still open it, so the Planner can tell its current link from an old one by data.
   Argument and storage errors return plain error text without it. Code running
   inside the session, such as an Atomic extension, can use either to address
   that document over MCP.
@@ -660,7 +664,11 @@ the journal and working directory it started in. Each Planner session is
 given that file through Atomic's `createAgentSession({ journal })`, so the
 server's process environment is left unchanged. An operator's non-empty
 `ATOMIC_WORKFLOW_JOURNAL_PATH` names another file instead; Atomic's
-`workflows.journal` setting is not used for Planner sessions. A Build is not a workflow run and has no card in Chat: its tasks, their
+`workflows.journal` setting and its `ATOMIC_WORKFLOWS_JOURNAL` and
+`ATOMIC_STORAGE` selections do not move a Planner session's journal. Atomic
+still checks every set `ATOMIC_STORAGE`, `ATOMIC_SESSIONS_STORAGE`, and
+`ATOMIC_WORKFLOWS_JOURNAL` when it creates a session, so an invalid value fails
+every Atomic turn with a `StorageConfigError` naming the variable. A Build is not a workflow run and has no card in Chat: its tasks, their
 state and pull requests show under **Build**, whichever machine runs it. The
 Planner's instructions say so, so it does not point people to Chat for a Build.
 
