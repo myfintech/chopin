@@ -6,10 +6,14 @@ import {
 	answers,
 	choices,
 	editors,
+	findings,
+	followUp,
 	history,
+	marks,
 	optionOrigins,
 	options,
 	prose,
+	why,
 } from "./record-validation";
 import type { Record } from "./record-types";
 
@@ -33,15 +37,22 @@ export function normalizeRecord(raw: unknown): Record {
 	if (Object.hasOwn(value, "at")) unix(value.at);
 	if (
 		Object.hasOwn(value, "origin") && value.origin !== "planner"
-		&& value.origin !== "conversation"
+		&& value.origin !== "conversation" && value.origin !== "human"
 	) invalid();
 	if (Object.hasOwn(value, "threadId")) text(value.threadId, dialectLimits.MAX_ID);
 	if (Object.hasOwn(value, "owner")) text(value.owner);
 	if (Object.hasOwn(value, "decidedAt")) unix(value.decidedAt);
 	if (Object.hasOwn(value, "choices")) choices(value.choices, known);
 	if (Object.hasOwn(value, "answers")) answers(value.answers, known);
+	if (Object.hasOwn(value, "marks")) marks(value.marks, known);
+	if (value.status === "answered") {
+		for (let [id, question] of known.questions) {
+			if (question.response === "text" && !Object.hasOwn(object(value.answers), id)) invalid();
+		}
+	}
 	if (Object.hasOwn(value, "history")) history(value.history, known);
 	if (Object.hasOwn(value, "prose")) prose(value.prose);
+	if (Object.hasOwn(value, "followUp")) followUp(value.followUp);
 	if (Object.hasOwn(value, "optionOrigins")) {
 		optionOrigins(
 			value.optionOrigins,
@@ -50,14 +61,18 @@ export function normalizeRecord(raw: unknown): Record {
 		);
 	}
 	if (Object.hasOwn(value, "editors")) editors(value.editors);
+	if (Object.hasOwn(value, "findings")) findings(value.findings);
+	if (Object.hasOwn(value, "childId")) text(value.childId, 128);
+	if (Object.hasOwn(value, "why")) why(value.why);
+	if (Object.hasOwn(value, "whyBy")) text(value.whyBy);
 	if (Object.hasOwn(value, "appended")) {
 		let appended = object(value.appended);
 		let seen = new Set<string>();
-		if (Object.keys(appended).length > known.options.size) invalid();
+		if (Object.keys(appended).length > known.options.size + known.criteria.size) invalid();
 		for (let [key, id] of Object.entries(appended)) {
 			if (
 				!/^[A-Za-z0-9_-]{8,64}$/.test(key) || typeof id !== "string"
-				|| !known.options.has(id) || seen.has(id)
+				|| !(known.options.has(id) || known.criteria.has(id)) || seen.has(id)
 			) invalid();
 			seen.add(id);
 		}

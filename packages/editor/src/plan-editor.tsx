@@ -49,7 +49,12 @@ import type { ThreadStore } from "./threads";
 import type { Connection, Transport } from "./transport";
 import type { EditMode } from "./edit-mode";
 import type { LexicalEditor } from "lexical";
-import type { CommentPresentation, QuestionStepMotion, ResearchStore } from "./widget-options";
+import type {
+	CommentPresentation,
+	ExploreResources,
+	QuestionStepMotion,
+	ResearchStore,
+} from "./widget-options";
 import type { Refusal } from "./history";
 import type { ResearchLauncher } from "./research-launcher";
 
@@ -125,6 +130,8 @@ export type PlanEditorProps = {
 	research?: ResearchStore;
 	/** Lets the host open the research composer at the end of the document. */
 	researchLauncher?: ResearchLauncher;
+	/** Research, spikes and asks for open decisions. */
+	explore?: ExploreResources;
 	/** The same arrangement for comment threads. */
 	threads?: ThreadStore;
 	/** Who wrote each block, when the deployment records provenance. */
@@ -193,6 +200,7 @@ export function PlanEditor(
 		readOnly,
 		research,
 		researchLauncher,
+		explore,
 		scrollTop,
 		threads,
 		user,
@@ -509,6 +517,7 @@ export function PlanEditor(
 						research,
 						researchDrafts,
 						researchLauncher,
+						explore,
 						investigations,
 						investigationDrafts,
 						threads,
@@ -549,6 +558,7 @@ export function PlanEditor(
 			research,
 			researchDrafts,
 			researchLauncher,
+			explore,
 			investigations,
 			investigationDrafts,
 			commentPresentation,

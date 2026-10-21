@@ -6,11 +6,15 @@
  * same validated, persisted-before-published batch as a root edit.
  */
 import * as Arguments from "./arguments";
+import * as Y from "yjs";
 import * as Comments from "../comments/service";
 import * as Store from "../comments/store";
 import * as edit from "../plan/edit";
+import * as room from "../plan/room";
 import * as Questions from "../questions/service";
-import { documentIdentity, implementationActive } from "../plan/service";
+import * as QuestionStore from "../questions/store";
+import { reanchorScopes } from "../questions/decision-followup-reanchor";
+import { documentIdentity, implementationActive, publishStaged } from "../plan/service";
 
 import type { Plan } from "../plan/service";
 import type { DocumentRoom } from "./tools";
@@ -112,6 +116,40 @@ export function documentSnapshot(
 	});
 }
 
+/** Snapshot under the queue, assess outside it, then refuse any intervening edit. */
+export async function admitBlockEdit(
+	target: DocumentRoom,
+	args: { revision: number; operations: Parameters<typeof edit.apply>[2] },
+	signal?: AbortSignal,
+) {
+	if (signal?.aborted) return { ok: false as const, reason: "cancelled" };
+	if (!target.visualAdmission) return;
+	let snapshot = await target.exclusive(async () => {
+		if (signal?.aborted) return { ok: false as const, reason: "cancelled" };
+		if (implementationActive(target.plan)) return { ok: false as const, reason: "locked" };
+		let proposed = edit.prepare(target.plan, args.revision, args.operations);
+		if (!proposed.ok) return proposed;
+		return { ok: true as const, before: edit.source(target.plan), source: proposed.source };
+	});
+	if (!snapshot.ok) return snapshot;
+	if (signal?.aborted) return { ok: false as const, reason: "cancelled" };
+	let issues = await target.visualAdmission({
+		before: snapshot.before,
+		sources: [snapshot.source],
+		signal,
+	});
+	if (signal?.aborted) return { ok: false as const, reason: "cancelled" };
+	return target.exclusive(async () => {
+		if (signal?.aborted) return { ok: false as const, reason: "cancelled" };
+		if (implementationActive(target.plan)) return { ok: false as const, reason: "locked" };
+		if (args.revision !== target.plan.revision) {
+			let changed = edit.prepare(target.plan, args.revision, args.operations);
+			if (!changed.ok) return changed;
+		}
+		if (issues.length) return { ok: false as const, reason: "visuals-required", issues };
+	});
+}
+
 /**
  * Apply one structural batch to `target`'s document. Run it inside `target.exclusive`.
  *
@@ -120,14 +158,76 @@ export function documentSnapshot(
 export async function applyBlockEdit(
 	target: DocumentRoom,
 	args: { revision: number; operations: Parameters<typeof edit.apply>[2] },
-	options: { acting?: string; applied?: () => void } = {},
+	options: { acting?: string; applied?: () => void; signal?: AbortSignal } = {},
 ) {
+	if (options.signal?.aborted) return { ok: false as const, reason: "cancelled" };
 	if (implementationActive(target.plan)) return { ok: false as const, reason: "locked" };
+	if (args.operations.some(operation => operation.op === "detach_question")) {
+		let document = await room.restore(
+			target.plan.document.epoch,
+			Y.encodeStateAsUpdate(target.plan.document.doc),
+			room.project(target.plan.document),
+			[],
+		);
+		if (target.plan.document.titleKey !== undefined) room.trackTitle(document);
+		document.seq = target.plan.document.seq;
+		let candidate: Plan = {
+			...target.plan,
+			document,
+			records: new Map(target.plan.records),
+			threads: new Map(target.plan.threads),
+			outlines: new Map(target.plan.outlines),
+			questions: {
+				open: new Map(target.plan.questions.open),
+				closed: new Map(target.plan.questions.closed),
+			},
+		};
+		try {
+			return await editBlocks(
+				{
+					...target,
+					plan: candidate,
+					publish: mutation =>
+						publishStaged(target.plan, target.server, target.id, candidate, mutation, {
+							agent: true,
+						}),
+				},
+				args,
+				options,
+			);
+		} finally {
+			document.doc.destroy();
+		}
+	}
+	return editBlocks(target, args, options);
+}
+
+async function editBlocks(
+	target: DocumentRoom,
+	args: { revision: number; operations: Parameters<typeof edit.apply>[2] },
+	options: { acting?: string; applied?: () => void; signal?: AbortSignal },
+) {
+	if (options.signal?.aborted) return { ok: false as const, reason: "cancelled" };
 	let outcome = edit.apply(target.plan, args.revision, args.operations);
 	if (!outcome.ok) return outcome;
-	options.applied?.();
+	if (!outcome.detached.length) options.applied?.();
 
+	let completed: Array<() => QuestionStore.Ended> = [];
 	for (let id of outcome.detached) {
+		let entry = QuestionStore.get(target.plan.questions, id);
+		if (entry) {
+			// Claims mutate entries; leave the live draft and its waiter untouched until commit.
+			target.plan.questions.open.set(id, { ...entry, editors: new Set(entry.editors) });
+			let claimed = QuestionStore.claimCancel(target.plan.questions, id, "chopin");
+			if (!claimed.ok) {
+				return {
+					ok: false as const,
+					reason: "invalid" as const,
+					message: "Questionnaire is resolving",
+				};
+			}
+			completed.push(QuestionStore.stage(target.plan.questions, claimed.claim));
+		}
 		let record = target.plan.records.get(id);
 		if (record) target.plan.records.set(id, { ...record, status: "cancelled" });
 	}
@@ -149,6 +249,8 @@ export async function applyBlockEdit(
 	if (options.acting) Comments.attribute(target.plan, options.acting, outcome.touched);
 
 	if (outcome.mutation) await target.publish(outcome.mutation);
+	for (let finish of completed) finish();
+	if (outcome.detached.length) options.applied?.();
 
 	// After the update that created them, never before it. Both
 	// go to the same topic in order, so by the time this arrives
@@ -171,51 +273,71 @@ export async function applyBlockEdit(
 /**
  * Relate decisions in `target`'s document to its blocks.
  *
- * Not inside `target.exclusive`: `persist` queues behind the same chain and would wait on itself.
+ * Stage reviewed links, follow-up targets and card placement in one fenced commit.
  */
 export async function applyAnchors(
 	target: DocumentRoom,
 	args: ReturnType<typeof Arguments.anchorPlan>,
 ) {
-	if (args.revision !== target.plan.revision) {
-		return {
-			ok: false,
-			reason: "stale",
-			revision: target.plan.revision,
-			message: "The plan changed. Read it again and re-anchor.",
-		};
-	}
-
-	let failures: string[] = [];
-	let placements: Questions.Placement[] = [];
-	for (let update of args.anchors) {
-		let failure = update.thread
-			? Comments.relate(target.plan, update.thread, update.blocks)
-			: update.widget && update.question
-			? Questions.relate(target.plan, update.widget, update.question, update.blocks)
-			: "give either `thread`, or both `widget` and `question`.";
-		if (failure) {
-			failures.push(failure);
-		} else if (update.widget !== undefined && update.question !== undefined) {
-			placements.push({
-				widget: update.widget,
-				blocks: update.blocks,
-			});
+	return target.exclusive(async () => {
+		if (implementationActive(target.plan)) return { ok: false, reason: "locked" };
+		if (args.revision !== target.plan.revision) {
+			return {
+				ok: false,
+				reason: "stale",
+				revision: target.plan.revision,
+				message: "The plan changed. Read it again and re-anchor.",
+			};
 		}
-	}
-	let mutation = Questions.place(target.plan, placements);
-	if (mutation) await target.publish(mutation);
-
-	await target.persist();
-	target.anchors();
-
-	return failures.length > 0
-		? { ok: false, reason: "invalid", errors: failures }
-		: {
-			ok: true,
-			anchors_pending: [
-				...Questions.outstanding(target.plan),
-				...Comments.outstanding(target.plan),
-			],
+		let source = room.project(target.plan.document);
+		let document = await room.restore(
+			target.plan.document.epoch,
+			Y.encodeStateAsUpdate(target.plan.document.doc),
+			source,
+			[],
+		);
+		if (target.plan.document.titleKey !== undefined) room.trackTitle(document);
+		document.seq = target.plan.document.seq;
+		let candidate: Plan = {
+			...target.plan,
+			document,
+			records: new Map(target.plan.records),
+			threads: new Map(target.plan.threads),
+			outlines: new Map(target.plan.outlines),
 		};
+		try {
+			let failures: string[] = [];
+			let placements: Questions.Placement[] = [];
+			for (let update of args.anchors) {
+				let failure = update.thread
+					? Comments.relate(candidate, update.thread, update.blocks)
+					: update.widget && update.question
+					? Questions.relate(candidate, update.widget, update.question, update.blocks)
+					: "give either `thread`, or both `widget` and `question`.";
+				if (failure) {
+					failures.push(failure);
+				} else if (update.widget !== undefined && update.question !== undefined) {
+					placements.push({ widget: update.widget, blocks: update.blocks });
+				}
+			}
+			failures.push(...reanchorScopes(candidate, placements));
+			if (failures.length) return { ok: false, reason: "invalid", errors: failures };
+			let mutation = Questions.place(candidate, placements);
+			Questions.rebase(candidate, source);
+			Comments.rebase(candidate);
+			await publishStaged(target.plan, target.server, target.id, candidate, mutation, {
+				agent: true,
+			});
+			target.anchors();
+			return {
+				ok: true,
+				anchors_pending: [
+					...Questions.outstanding(target.plan),
+					...Comments.outstanding(target.plan),
+				],
+			};
+		} finally {
+			document.doc.destroy();
+		}
+	});
 }

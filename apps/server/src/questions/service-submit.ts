@@ -19,7 +19,10 @@ import type { Plan } from "../plan/service";
 import type { Socket, SocketData } from "../wire";
 
 import type { Record } from "./records";
-import { appendProseEffect, proseIntent } from "../conversation-plan/prose-job";
+import { appendProseEffect, settleIntent } from "../conversation-plan/prose-job";
+import { appendFollowupEffect } from "./decision-followup";
+import { plannerToActOn } from "./answer-turns";
+import { decisionGeneration } from "./card-actions";
 
 import type { CardEvent } from "./card-event";
 import { announce, emit, pending } from "./card-notifications";
@@ -32,7 +35,9 @@ export async function submit(
 	roomId: string,
 	ws: Socket,
 	msg: Request<Wire.Submit.Ask>,
-	onCommitted?: (intent: NonNullable<ReturnType<typeof proseIntent>>) => void,
+	onCommitted?: (intent: NonNullable<ReturnType<typeof settleIntent>>) => void,
+	/** A saved answer the Planner asked for without waiting, which it should now act on. */
+	onPlannerAnswer?: (id: string, generation: number) => void,
 ): Promise<void> {
 	if (Service.implementationActive(plan)) return fail(ws, msg.rid, "implementation is active");
 	let paused = () => {
@@ -98,7 +103,9 @@ export async function submit(
 				optionIds = Object.values(chosen).flat();
 				let at = Math.floor(Date.now() / 1_000);
 				let settled = { by: ws.data.handle, at: new Date(at * 1_000).toISOString() };
-				let mutation = room.projectAnswer(stagedDocument, msg.id, answers, settled, chosen);
+				// The saved answer keeps a snapshot of the matrix: the draft is replaced on reopen.
+				let marks = claimed.answers[0]?.marks;
+				let mutation = room.projectAnswer(stagedDocument, msg.id, answers, settled, chosen, marks);
 				// A long answer can push the document past its size limit, after which the
 				// Planner can no longer edit it; check the staged copy so a refusal changes nothing.
 				try {
@@ -118,13 +125,18 @@ export async function submit(
 					owner: ws.data.handle,
 					decidedAt: at,
 					choices: optionIds,
+					...(marks ? { marks } : {}),
 					editors: [...new Set([...record.editors, ...claimed.claim.entry.editors])],
 					anchors: Anchors.answer(record),
 				};
 				records.set(msg.id, answered);
-				let intent = proseIntent(answered);
-				let effects = appendProseEffect(
-					plan.conversationPlanPendingEffects,
+				let intent = settleIntent(answered);
+				let effects = appendFollowupEffect(
+					appendProseEffect(
+						plan.conversationPlanPendingEffects,
+						plan.conversationPlanEffects,
+						answered,
+					),
 					plan.conversationPlanEffects,
 					answered,
 				);
@@ -224,6 +236,11 @@ export async function submit(
 			// An answer can put a review on the Planner's list; readers learn its prose is owed.
 			() => Service.anchors(plan, server, roomId),
 			() => emit(plan, event),
+			() => {
+				if (plannerToActOn(record, claimed.claim.entry)) {
+					onPlannerAnswer?.(msg.id, decisionGeneration(record));
+				}
+			},
 		]
 	) {
 		try {

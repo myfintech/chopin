@@ -49,7 +49,7 @@ export type InvestigationResources = {
 	cancel(id: string): Promise<unknown>;
 	/** False while the record still needs its card: unknown, queued, running or publishing. */
 	removable(id: string): boolean;
-	render(id: string, remove: () => void): ReactNode;
+	render(id: string, remove?: () => void): ReactNode;
 };
 
 /** A GitHub reference's summary as the host last saw it, or that one is on its way. */
@@ -67,6 +67,27 @@ export type GitHubReferenceStore = {
 	get(reference: GitHubReference): GitHubReferenceEntry;
 	/** Settles with a fresh answer, for a paste that wants a title. */
 	load(reference: GitHubReference): Promise<GitHubReferenceResult>;
+};
+
+/**
+ * App-owned ways to explore an open decision. The editor records findings over the question
+ * transport; the host starts the external work, which runs on the top-level document.
+ */
+export type ExploreResources = {
+	/** Start web research from `brief`; resolves with the request's id. */
+	research(brief: string, requestId: string): Promise<string>;
+	/** Build a spike on the viewer's paired machine; `id` becomes the investigation's id. */
+	spike(brief: string, id: string): Promise<void>;
+	/** Why a spike cannot run now, or undefined when it can. */
+	spikeUnavailable(): string | undefined;
+	/** People the viewer can ask, excluding themselves. */
+	people(): readonly string[];
+	/**
+	 * Open the decision as its own document; absent where it cannot have one. Rejects with a message
+	 * to show when it cannot open. A reply made stale by a later call resolves without navigating.
+	 */
+	openPage?(questionnaireId: string): Promise<void>;
+	subscribe(listener: () => void): () => void;
 };
 
 export type WidgetOptions = {
@@ -89,6 +110,7 @@ export type WidgetOptions = {
 	commentPlanner?: boolean;
 	evidence?: (questionnaireId: string) => ReactNode | null;
 	research?: ResearchStore;
+	explore?: ExploreResources;
 	researchDrafts?: ResearchDraftStore;
 	investigations?: InvestigationResources;
 	investigationDrafts?: ResearchDraftStore;

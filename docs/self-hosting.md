@@ -75,7 +75,7 @@ each owner's GitHub App user token and does not consume `HARNESS_AUTH`;
 setting `auto` on loopback passes the startup guard but does not enable host
 login in that adapter.
 
-`HARNESS=atomic` runs Atomic 0.9.39 in the Chopin server process through its
+`HARNESS=atomic` runs Atomic 0.9.40 in the Chopin server process through its
 headless SDK (`createAgentSession()`). It does not spawn the `atomic` CLI or use
 RPC mode.
 
@@ -328,7 +328,7 @@ the image.
 | `CHOPIN_LOCAL_CREDENTIALS_DIR`    | platform default        | Local mode only. Overrides the plaintext-fallback credential directory (default `~/.config/chopin` on Linux, `~/Library/Application Support/Chopin` on macOS, `%APPDATA%\Chopin` on Windows). Must resolve outside the repository and process working directory.                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `SERVER_HOST`                     | `127.0.0.1`             | Source-process bind address. The image sets `0.0.0.0`, which local mode refuses. A `HARNESS_AUTH` mode that falls back to a host-logged-in subscription is refused unless this stays loopback-only.                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `PORT`                            | `8787`                  | Source-process HTTP and WebSocket port. The supplied image and health check expect internal port 8787.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `MODEL`                           | `gpt-6-luna`            | Model requested for hosted agent sessions. Required under `HARNESS=atomic`, where it must be `provider/model` from Atomic's catalog. Optional under `HARNESS=remote`, where the attached client chooses its model and a set value is only passed along as the turn's request.                                                                                                                                                                                                                                                                                                                                                                                     |
+| `MODEL`                           | `gpt-6.1-sol`           | Model requested for hosted agent sessions. Required under `HARNESS=atomic`, where it must be `provider/model` from Atomic's catalog. Optional under `HARNESS=remote`, where the attached client chooses its model and a set value is only passed along as the turn's request.                                                                                                                                                                                                                                                                                                                                                                                     |
 | `HISTORY_MODEL`                   | `MODEL`                 | Model for History's one-line summaries of editing sessions, written when someone opens History on a document with a Planner owner. A small, fast model suits it. Resolved like `MODEL` by the configured harness.                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `HARNESS`                         | `copilot-sdk`           | Adapter name selected from Chopin's harness map (`copilot-sdk`, `atomic`, or `remote`). An unknown name refuses at startup. `remote` runs Planner turns in a client attached at `/api/v1/agent`; see [The remote Planner](#the-remote-planner). `atomic` gives every Planner session shell and filesystem access as the server process's user, hosted instances included; see [Choose and trust a harness](#choose-and-trust-a-harness).                                                                                                                                                                                                                          |
 | `PLANNER_ATTACH_GRACE_MS`         | `120000`                | Under `HARNESS=remote`, how long a detached or dropped agent connection keeps the document's Planner ownership so the same account can reattach, in milliseconds, an integer between 0 and 3600000.                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
@@ -340,6 +340,7 @@ the image.
 | `AGENT`                           | on                      | Set exactly `off` to prevent hosted agent turns, disable the entire background-job runner, and avoid Copilot CLI startup.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `BACKGROUND_JOBS`                 | on                      | Set exactly `off` to disable background job scheduling. `AGENT=off` disables the entire runner. `HARNESS=remote` requires `off`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `WEB_RESEARCH`                    | on                      | Set exactly `off` to disable new public-web research while retaining durable requests, artifacts, and other jobs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `RESEARCH_EVIDENCE_TIMEOUT_MS`    | `600000`                | Deadline of one public-web research evidence attempt in milliseconds, an integer between 120000 and 1800000. Web search calls take up to about two minutes each; the attempt budgets at most four calls against what remains of this deadline. The job retries once after a failed attempt.                                                                                                                                                                                                                                                                                                                                                                       |
 | `COPILOT_CLI_PATH`                | automatic               | Advanced override for the Copilot CLI executable. Applies only to the `copilot-sdk` adapter.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `CONVERSATION_PLAN`               | off                     | Set exactly `on` to enable experimental conversation-derived cards. Interpretation runs independently of `AGENT`; Planner jobs still obey the agent and job settings.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `PLANNER_VISUALS`                 | off                     | Set exactly `on` to enable the bounded visual handoff for foreground Planner turns. Requires `AGENT=on` and a decisions model.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -357,19 +358,16 @@ document. Group turn-taking asks the decisions model; solo replies bypass it.
 See [Background jobs and workers](background-jobs.md) for the combined
 `AGENT`, `BACKGROUND_JOBS`, and `WEB_RESEARCH` behavior and recovery model.
 
-`PLANNER_VISUALS` defaults to off. Set it exactly to `on` alongside `AGENT=on`
-to enable the bounded foreground visual handoff. The decisions model makes
-three decisions for each assessed paragraph: whether visualization is possible,
-whether it improves comprehension, and which SeeCode type or table fits. The
-Planner writes and validates the selected visual. This experimental path
-currently accepts one explanatory paragraph per edit, optionally followed by
-its selected visual; headings can be separate edits. Lists and nested MDX
-paragraphs are not yet supported in a routed edit.
+Foreground Planner writes on every harness and MCP document imports share visual
+assessment before acceptance. The decisions model judges whether a faithful
+visual is possible and helpful, then selects its native type or a comparison
+table. The author must supply the selected visual beside its passage before the
+write succeeds. Lists and nested prose are included, and there is no diagram
+quota. Failed or uncertain assessments refuse the write. Prose imports require a
+decisions model even with `AGENT=off`.
 
-Routing is limited to explicit member requests of at most 1,000 characters under
-`copilot-sdk`. Comment turns, longer member requests, background
-jobs, and `atomic` sessions retain their ordinary authoring behavior. Atomic's
-retained workflow sessions are outside this disposable-session prototype.
+`PLANNER_VISUALS` controls only the legacy single-paragraph tool for sessions
+without the shared admission check; it does not disable the shared check.
 
 Conversation-derived cards default to off. When enabled, interpretation sends
 current and recent Chat messages and selected decision context to the decisions
@@ -446,14 +444,14 @@ Chopin refuses to start when the value is malformed.
 ]
 ```
 
-| Field     | Value                                                                                                             |
-| --------- | ----------------------------------------------------------------------------------------------------------------- |
-| `id`      | Up to 40 lowercase letters, digits and dashes. Unique, and not a built-in agent's id.                             |
-| `name`    | What the picker shows, up to 60 characters.                                                                       |
-| `install` | Up to 20 lines, shown under **Show install steps**.                                                               |
-| `command` | The command for **Server or VM**. It must contain `{key}`.                                                        |
-| `keyless` | Optional. The command for **Your computer**, without `{key}`. Without it, only **Server or VM** offers the entry. |
-| `default` | Optional. `true` on one entry preselects it for anyone who hasn't picked an agent in that browser.                |
+| Field     | Value                                                                                              |
+| --------- | -------------------------------------------------------------------------------------------------- |
+| `id`      | Up to 40 lowercase letters, digits and dashes. Unique, and not a built-in agent's id.              |
+| `name`    | What the picker shows, up to 60 characters.                                                        |
+| `install` | Up to 20 lines, shown under **Show install steps**.                                                |
+| `command` | The command for **Cloud**. It must contain `{key}`.                                                |
+| `keyless` | Optional. The command for **Local**, without `{key}`. Without it, only **Cloud** offers the entry. |
+| `default` | Optional. `true` on one entry preselects it for anyone who hasn't picked an agent in that browser. |
 
 `install`, `command` and `keyless` also take an object with one value each for
 `linux`, `macos` and `windows`. The page fills in `{origin}`, `{key}` and
@@ -489,7 +487,7 @@ GITHUB_ALLOWED_USERS=<comma-separated-logins>
 GITHUB_ALLOWED_ORGANIZATIONS=
 SESSION_ENCRYPTION_KEY=<64-hex-character-key>
 AGENT=on
-MODEL=gpt-6-luna
+MODEL=gpt-6.1-sol
 HARNESS=copilot-sdk
 BACKGROUND_JOBS=on
 WEB_RESEARCH=on

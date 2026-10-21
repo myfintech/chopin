@@ -27,31 +27,66 @@ let choice = {
 	multiple: false,
 };
 
-test("a Planner persists provisional understanding before an open intent question in Chat", async () => {
+test("a new draft leaves six mixed inline decisions open after its turn finishes", async () => {
+	let subjects = ["Audience", "Scope", "Deployment", "Data", "Access", "Rollout"];
+	let source = "# New plan\n\n"
+		+ subjects.map(subject => `${subject} remains provisional.\n`).join("\n");
 	let fixture = await coachingFixture([
 		() => ({ tool: "read_plan", input: {} }),
 		output => ({
 			tool: "edit_plan",
 			input: {
 				revision: decoded<View>(output).revision,
-				operations: [{ op: "insert_root", source: provisional }],
+				operations: [{ op: "insert_root", source }],
 			},
 		}),
-		async output => {
-			expect(decoded<{ ok: boolean }>(output).ok).toBe(true);
-			expect((await fixture.saved()).source).toContain("Hypothesis: people may miss");
-			expect(fixture.host.plan.records.size).toBe(0);
-			return "What were you trying to accomplish when you looked for a decision?";
+		output => {
+			let view = decoded<View>(output);
+			return {
+				tool: "open_decisions",
+				input: {
+					revision: view.revision,
+					questions: subjects.map((subject, index) => ({
+						...choice,
+						key: `${subject.toLowerCase()}-decision`,
+						header: subject,
+						question: `What should we know about ${subject.toLowerCase()}?`,
+						...(index % 2 === 0 ? { response: "text", options: [] } : {}),
+						blocks: [address(view, `${subject} remains provisional.`)],
+					})),
+				},
+			};
 		},
+		() => "The provisional document and six decisions are ready.",
 	]);
 	opened.push(fixture);
-	let parts = await fixture.run();
-	expect(fixture.calls.map(call => call.tool)).toEqual(["read_plan", "edit_plan"]);
-	expect(
-		parts.some(part => part.type === "text-delta" && part.text.includes("trying to accomplish")),
-	)
-		.toBe(true);
-	expect(fixture.host.plan.records.size).toBe(0);
+	await fixture.run();
+	expect(fixture.host.plan.records.size).toBe(6);
+	let cards = await fixture.host.cards(6);
+	let saved = await fixture.saved();
+	expect(fixture.texts).toEqual(["The provisional document and six decisions are ready."]);
+	for (let [index, card] of cards.entries()) {
+		expect(fixture.host.plan.records.get(card.id)?.status).toBe("open");
+		expect(card.definition.questions[0]?.response).toBe(index % 2 === 0 ? "text" : undefined);
+		expect(fixture.host.plan.records.get(card.id)?.followUp?.target).toHaveLength(1);
+		let before = saved.source.indexOf(`${subjects[index]} remains provisional.`);
+		let position = saved.source.indexOf(card.id);
+		expect(position).toBeGreaterThan(before);
+		if (index < subjects.length - 1) {
+			expect(position).toBeLessThan(
+				saved.source.indexOf(`${subjects[index + 1]} remains provisional.`),
+			);
+		}
+	}
+	fixture.controller.abort();
+	expect([...fixture.host.plan.records.values()].every(record => record.status === "open")).toBe(
+		true,
+	);
+	expect(fixture.calls.map(call => call.tool)).toEqual([
+		"read_plan",
+		"edit_plan",
+		"open_decisions",
+	]);
 });
 
 test("a shared answer drives a current revision edit and settled anchors before the turn ends", async () => {

@@ -304,9 +304,10 @@ the installation includes that repository. See [Local agent MCP](local-agent-mcp
 administration access to the document's repository. Serving the uploaded image
 at `/images/<sha256>.<ext>` follows the browser rule instead: it needs a browser
 session whose installation-gated repository role includes pull access to a
-document the image was uploaded to. Every other request receives the same `404`
-as an unknown image, so an image URL reveals nothing to someone who cannot read
-the document.
+document the image was uploaded to. With `?document=<id>`, as a decision card
+asks, that document must be the one: an image only another document holds is
+`404`. Every other request receives the same `404` as an unknown image, so an
+image URL reveals nothing to someone who cannot read the document.
 
 `invoke_planner` is the one MCP tool that starts a hosted agent turn. It never
 lends the caller's bearer to the Planner: the turn runs under the channel's
@@ -367,7 +368,7 @@ retention policy and need the same key protection as the live database.
 
 A paired connector machine holds its own GitHub App user token pair, because
 refresh tokens are single-use and cannot be shared with the browser login that
-approved the pairing. Pressing **Connect** on the pairing page sends the
+approved the pairing. Pressing **Add machine** on the pairing page sends the
 browser through `/auth/github/connector`, a second authorization that GitHub
 grants at once for an App the person already authorized; the callback accepts
 it only for the account that approved the pairing and starts no browser

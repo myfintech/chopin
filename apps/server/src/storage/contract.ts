@@ -2,6 +2,7 @@ import { researchWorkspace } from "./research-inline-contract-fixtures";
 import { childChannelContract } from "./child-channel-contract";
 import { experimentContract } from "./experiment-contract";
 import { imageContract } from "./image-contract";
+import { runStageContract } from "./run-stage-contract";
 import { versionContract } from "./version-contract";
 import { machineContract } from "./machine-contract";
 import { plannerAttachmentContract } from "./planner-attachment-contract";
@@ -39,6 +40,7 @@ function attempt<T>(action: () => Promise<T>): Promise<T> {
 export function storageContract(name: string, factory: Factory): void {
 	experimentContract(name, factory);
 	imageContract(name, factory);
+	runStageContract(name, factory);
 	versionContract(name, factory);
 	machineContract(name, factory);
 	childChannelContract(name, factory);
@@ -1148,6 +1150,7 @@ export function storageContract(name: string, factory: Factory): void {
 				let { userId, channelId, repositoryId } = await userAndChannel(storage);
 				let original = await storage.channels.get(channelId);
 				expect(original?.slug).toBe("release-plan");
+				expect(await storage.channels.earlierSlugs(channelId)).toEqual([]);
 				expect((await storage.channels.resolve(repositoryId, "release-plan"))?.id)
 					.toBe(channelId);
 
@@ -1184,6 +1187,9 @@ export function storageContract(name: string, factory: Factory): void {
 					now: new Date("2026-01-06T03:04:05.000Z"),
 				});
 				expect(replacement.slug).toBe("release-plan-2");
+				expect(await storage.channels.earlierSlugs(channelId))
+					.toEqual(["résumé-計画", "release-plan"]);
+				expect(await storage.channels.earlierSlugs(replacement.id)).toEqual([]);
 				expect((await storage.channels.resolve(repositoryId, "release-plan"))?.id)
 					.toBe(channelId);
 				expect((await storage.channels.resolve(repositoryId, "release-plan-2"))?.id)

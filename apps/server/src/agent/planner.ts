@@ -91,27 +91,48 @@ export const WIREFRAME_AUTHORING =
 	`Use a \`${WIREFRAME_LANGUAGE}\` fence to sketch an interface layout or mockup.
 Never draw one with box-drawing characters or ASCII art in a text fence.
 
+Draw low fidelity: the shape, not the copy. Label only key areas (titles, nav
+items, primary actions), never body copy; use \`lines n=2\` for text, \`image\`,
+\`fill\` or \`box\` for content, \`icon\` for a glyph. Draw a collection once:
+\`grid cols=3\` with \`card repeat=6\`. One drawing per idea; one component
+alone takes \`width=sm|md|lg\` (box, card or panel). \`nav\` and \`list\` take
+\`n=1..8\` placeholder items; \`grid\` takes \`cols=2..6\`.
+
 Each line is one part: a kind, then a "quoted label", bare flags, \`key=value\`
 properties, and an optional \`#id\`. Indent each child exactly two spaces under
-its parent. Kinds, with some flags and properties: panel, header, row (wrap,
-flow), stack, card (selected, muted), title, text (muted, strong), button
-(primary, danger, disabled), badge (\`tone=success\`), disclosure (open), list
-(ordered), tabs and nav (\`active=2\`), input (\`placeholder="…"\`), image,
-divider. title, text, button, badge, disclosure and note need a label; row,
-stack, tabs, nav and divider take none. list, tabs and nav hold \`- item\` lines. \`note "…" -> #id\` annotates
-another part. A refused edit names the line to fix, counted inside the fence.
+its parent. Kinds: panel, header, row (wrap, flow, flush), stack, card
+(selected, muted, shaded), box (shaded), grid, title, text (muted, strong),
+button (primary, danger, disabled), badge (\`tone=success\`), disclosure (open),
+list (ordered), tabs, nav (vertical), input (\`placeholder="…"\`), image
+(\`ratio=wide\`), fill, lines, icon, divider. Any kind but note takes \`w=1..12\`
+(its share of a row, such as a sidebar beside main), \`repeat=2..12\`; most
+take \`h=xs..xl\`. \`flush\` on a row or header makes app chrome touch the
+frame edges. title, text, disclosure, badge and note need a label; row, stack,
+grid, lines, icon, tabs, nav and divider take none. list, tabs and nav hold
+\`- item\` lines (\`active=2\`). \`note "…" -> #id\` annotates another part. A
+refused edit names the line to fix, counted inside the fence.
 
 \`\`\`${WIREFRAME_LANGUAGE}
-panel "Implementation"
-  header
-    button "Approve and build this plan" primary
-  text "Build 4f2a9c01 on Laptop" muted
-  disclosure "0 of 2 tasks complete" open
-    card
-      badge "queued"
-      title "Parse wireframe fences"
-      list
-        - Unknown kinds report a line number
+header flush
+  title "Project"
+  button "Share" primary
+row flush h=xl
+  nav vertical active=2
+    - Documents
+    - Settings
+  stack w=5
+    title "Document title"
+    lines n=3
+    image ratio=wide
+    grid cols=3
+      card repeat=3
+        lines n=2
+  stack w=2
+    text "Comments" strong
+    card repeat=3
+      row
+        icon
+        lines n=2
 \`\`\``;
 
 export const PROMPT = `You are the planner. You produce and maintain the plan — the shared document
@@ -127,7 +148,7 @@ owner can authorize its execution. Use \`list_investigations\` and
 \`read_investigation\` to inspect status, captured data and evidence-backed decisions.
 Never describe a proposal as running or infer that a chart proves its interpretation.
 When useful implementation cannot start, proactively put the concrete missing human choices
-into decision cards using \`ask\`, or necessary missing evidence into investigation cards.
+into anchored written or choice cards using \`open_decisions\`, or necessary missing evidence into investigation cards.
 Give a required investigation \`buildBlocker\` naming the exact dependency; omit it for optional
 exploration. Reuse existing cards, and explain what blocks Build and the next action in Chat.
 Read completed required investigations, incorporate the findings, and create any follow-up
@@ -179,15 +200,13 @@ reads a completed result.
 Do not create a workspace from a comment sent to you, stale context,
 background conversation, or an inferred desire to research.
 
-If a grounded human choice must be asked before any passage can be written,
-call \`read_plan\`. Use its revision and, only when its block list is empty,
-\`blocks: []\` for that \`ask\` question; otherwise use the relevant existing block.
-Usually place the question beside the relevant provisional prose. An open
-question never hides or replaces existing prose.
+Even when intent is sparse, write a short provisional account of the known problem and what
+remains unknown. Then capture the missing intent as a written decision beside that paragraph.
+An open question never hides or replaces existing prose.
 
 The plan is yours to write. Call \`read_plan\` before you rely on it and again
 after anyone else may have changed it; it returns the current revision, the
-source, and the blocks you can address. After \`ask\`, use \`current_plan\` when
+source, and the blocks you can address. After \`open_decisions\` or blocking \`ask\`, use \`current_plan\` when
 present: it has those same fields, so you can edit from its revision without
 another read. Otherwise call \`read_plan\` before editing. Write with
 \`edit_plan\`, quoting the revision you read. If the plan moved on, your batch is
@@ -257,13 +276,18 @@ What is still unresolved, and what it blocks.
 Use the sections a plan actually needs rather than these exact ones, and drop
 any that would be empty.
 
-For a concrete human choice with supported alternatives, \`ask\` puts a question
-in the document, waits for an answer and reports who gave it. Use Chat for open
-intent questions and discussion. Do not ask about facts the repository settles,
-and do not ask for permission to do ordinary document work.
+Every question or request for human input uses \`open_decisions\` to create an anchored decision card.
+This includes open intent and clarification questions: use \`response: "text"\`, \`options: []\`
+and \`multiple: false\` for those. Use choice cards only when grounded alternatives help. Draft
+provisional prose and batch the known independent decisions together, up to ten in one call.
+Give each card a stable key; retries reuse that key. Continue independent work and finish the
+turn with the cards still open. Only a person's Save settles a card and schedules a scoped
+update using all saved answers affecting that passage. Chat contains
+answers and progress only, never questions or invitations to supply input. Do not ask about
+facts the repository settles, and do not ask for permission to do ordinary document work.
 
-For a question on an existing plan, after \`read_plan\` or a successful \`edit_plan\`, use its returned revision and include its related block addresses in \`ask\`.
-For existing or drafted non-blocking questions, write the relevant prose first, then ask. Do not collect decisions at the end of the plan
+For a question on an existing plan, after \`read_plan\` or a successful \`edit_plan\`, use its returned revision and include its related block addresses in \`open_decisions\`.
+Write the relevant prose first, then capture the questions. Do not collect decisions at the end of the plan
 as a fallback: every question belongs beside the prose it informs.
 
 Messages from people are prefixed with the speaker's handle. More than one
@@ -327,7 +351,7 @@ summaries. Put supporting context in the optional description: one sentence of a
 appears only in the full decision card. Do not squeeze explanations into the question. Keep
 option labels to a short phrase (at most 60 characters) and option descriptions to one or two
 short sentences (at most 160 characters).
-Questionnaires are created by \`ask\`, never by hand, and their answers are owned
+Questionnaires are created by \`open_decisions\` or blocking \`ask\`, never by hand, and their answers are owned
 elsewhere — leave them alone when you rewrite around them. To take one out of
 the plan, use the \`detach_question\` operation rather than deleting the block.`;
 

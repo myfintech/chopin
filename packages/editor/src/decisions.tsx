@@ -22,10 +22,11 @@ import { labels, QuestionnaireCard } from "./widgets/questionnaire";
 import type { Question } from "@chopin/protocol";
 import type { ReactNode } from "react";
 import type { CardMetaStore } from "./card-meta";
+import { MarkdownLine, questionHeading } from "@chopin/question/react";
 import type { Transport } from "@chopin/question/react";
 import type { MotionDisclosureContract } from "./disclosure-motion";
 import type { QuestionnaireEntry, QuestionnaireStore } from "./questionnaires";
-import type { QuestionStepMotion } from "./widget-options";
+import type { ExploreResources, QuestionStepMotion } from "./widget-options";
 
 export type DecisionsProps = {
 	additional?: ReactNode;
@@ -33,6 +34,8 @@ export type DecisionsProps = {
 	store: QuestionnaireStore;
 	cardMeta?: CardMetaStore;
 	canEdit?: boolean;
+	/** Research, spikes and asks for open decisions. */
+	explore?: ExploreResources;
 	/** The viewer's own handle, who is never shown as present on a card. */
 	self?: string;
 	/** False when no Planner will review where decisions live. */
@@ -169,7 +172,7 @@ function Confirmed(
 	{ by, closing, entry }: { by?: string; closing: Closing; entry: QuestionnaireEntry },
 ) {
 	let chosen = labels(entry.value);
-	let question = entry.value.questions.map(item => item.prompt).join(" ");
+	let question = entry.value.questions.map(item => questionHeading(item.prompt)).join(" ");
 	return (
 		<div
 			aria-hidden={closing.mine ? undefined : true}
@@ -188,7 +191,9 @@ function Confirmed(
 						<span className="decision-confirmed-label">
 							{by ? `Decided by ${by === "You" ? "you" : by}` : "Decided"}
 						</span>
-						<span className="decision-confirmed-question">{question}</span>
+						<span className="decision-confirmed-question">
+							<MarkdownLine links={false} text={question} />
+						</span>
 						<span className="decision-confirmed-answer">
 							{chosen.length ? chosen.join(", ") : "Saved decision"}
 						</span>
@@ -206,6 +211,7 @@ export function Decisions(
 		cardMeta,
 		canEdit = true,
 		connected,
+		explore,
 		headingId,
 		motionImmediately,
 		onShowPlan,
@@ -235,7 +241,6 @@ export function Decisions(
 	let heading = useRef<HTMLHeadingElement>(null);
 	let focusedQuestionnaire = useRef<HTMLElement | undefined>(undefined);
 	let revealed = useRef<number | undefined>(undefined);
-
 	// Leaving the pane should not leave the prose lit. A highlight belongs to
 	// the pointer that asked for it, and a pin to the pane that set it.
 	useEffect(() => () => {
@@ -380,6 +385,7 @@ export function Decisions(
 			relations={store.relations(entry.id)}
 			canEdit={canEdit}
 			connected={connected}
+			explore={explore}
 			key={entry.id}
 			motion={questionMotion}
 			onQuestionEnter={question => store.highlight(entry.id, question)}

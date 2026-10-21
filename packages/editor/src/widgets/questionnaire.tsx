@@ -7,10 +7,19 @@
  * the source reads correctly on its own.
  */
 
-import { useContext, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { Fragment, useContext, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { cardStatus } from "@chopin/dialect";
-import { ChevronIcon, DecisionIcon, MessageForwardIcon } from "@chopin/icons";
-import { cardRelation, NOT_LINKED, QuestionView, useQuestionnaire } from "@chopin/question/react";
+import { answered } from "@chopin/question";
+import { ChevronIcon, DecisionIcon, ExpandIcon, MessageForwardIcon } from "@chopin/icons";
+import {
+	cardRelation,
+	MarkdownLine,
+	NOT_LINKED,
+	plainInlineText,
+	questionHeading,
+	QuestionView,
+	useQuestionnaire,
+} from "@chopin/question/react";
 import { useCellValue } from "@mdxeditor/gurx";
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
 
@@ -18,9 +27,19 @@ import { Provenance, SidecarCard } from "../card";
 import { useCardMeta } from "../card-meta";
 import { ContentSwapLayer } from "../content-swap";
 import { Deck } from "../deck";
+import { CriteriaTable } from "./criteria-table";
 import { leaveDeck } from "../deck-leave";
 import { deckLayout } from "../deck-runs";
 import { EvidenceHover, EvidenceTrigger } from "./evidence-hover";
+import {
+	ExploreMenu,
+	FindingsCount,
+	shownFindings,
+	useOpenPage,
+	waitingOn,
+	WaitingStatus,
+} from "./explore";
+import { InlineNotice } from "@chopin/visuals/inline-notice";
 import { PresenceFaces, withoutSelf } from "../presence-faces";
 import { usePhone } from "../pointer";
 import { PendingAnswersContext } from "../save-bar";
@@ -34,9 +53,9 @@ import type { Question } from "@chopin/protocol";
 import type { ReactNode } from "react";
 import type { LexicalEditor } from "lexical";
 import type { Transport } from "@chopin/question/react";
-import type { Answer, Relation } from "@chopin/question";
+import type { Answer, Drafts, Marks, Relation } from "@chopin/question";
 import type { Questionnaire, QuestionnaireNode } from "@chopin/dialect";
-import type { QuestionStepMotion } from "../widget-options";
+import type { ExploreResources, QuestionStepMotion } from "../widget-options";
 import type { MemberState } from "../deck-runs";
 import type { QuestionnaireEntry, QuestionnaireStore } from "../questionnaires";
 
@@ -63,6 +82,7 @@ function definition(value: Questionnaire) {
 			id: question.id,
 			header: question.header,
 			question: question.prompt,
+			...(question.response === undefined ? {} : { response: question.response }),
 			...(question.description === undefined ? {} : { description: question.description }),
 			multiple: question.multiple,
 			options: question.options.map(option => ({
@@ -70,6 +90,9 @@ function definition(value: Questionnaire) {
 				label: option.label,
 				description: option.description ?? "",
 			})),
+			...(question.criteria
+				? { criteria: question.criteria.map(({ id, label }) => ({ id, label })) }
+				: {}),
 		})),
 	};
 }
@@ -79,6 +102,8 @@ export type QuestionnaireCardProps = {
 	/** Durable lifecycle state can arrive separately from the document node. */
 	meta?: Question.CardMeta;
 	presentation?: "inline" | "deck" | "list";
+	/** A decision's own page: the answer control sits on the paper, with no card box or head. */
+	page?: boolean;
 	motionImmediately?: () => boolean;
 	onCardSource?: (questionnaireId: string) => void;
 	/** The viewer's own handle, who is never shown as present on a card. */
@@ -101,6 +126,8 @@ export type QuestionnaireCardProps = {
 	motion?: QuestionStepMotion;
 	/** How many hidden decisions are being written up, when this card speaks for them all. */
 	writing?: number;
+	/** Research, spikes and asks; absent where the viewer cannot explore. */
+	explore?: ExploreResources;
 };
 
 export type CardPresentation = "hidden" | "resolved" | "open";
@@ -142,7 +169,9 @@ export function writingProse(
 	if (value.status === "expired" || cardPresentation(value, meta, "inline") !== "hidden") {
 		return false;
 	}
-	if ((meta?.status ?? cardStatus(value)) !== "decided" || meta?.hasProse) return false;
+	if ((meta?.status ?? cardStatus(value)) !== "decided") return false;
+	if (meta?.origin === "planner" && meta.writeup) return meta.writeup.status === "writing";
+	if (meta?.hasProse) return false;
 	if (meta?.proseOrphaned) return false;
 	if (meta?.origin === "conversation") return meta.writeup?.status === "writing";
 	return work.plannerBusy && work.unwritten;
@@ -168,8 +197,10 @@ export function QuestionnaireCard(
 		canEdit = true,
 		connected = false,
 		evidence,
+		explore,
 		motionImmediately,
 		onCardSource,
+		page,
 		presentation = "inline",
 		self,
 		onQuestionEnter,
@@ -208,11 +239,14 @@ export function QuestionnaireCard(
 	let immediate = motionImmediately?.() ?? false;
 	let presence = useTransitionPresence(shown === "hidden" ? undefined : value.id, 200, immediate);
 	let lastVisible = useRef<{ id: string; content: ReactNode } | undefined>(undefined);
-	let content = shown === "resolved"
+	let content = shown === "resolved" && page
+		? <PageAnswer marks={meta?.marks} value={value} />
+		: shown === "resolved"
 		? (
 			<Decided
 				canEdit={canEdit}
 				connected={connected}
+				explore={explore}
 				wire={wire}
 				discarded={current === "discarded"}
 				meta={meta}
@@ -223,6 +257,8 @@ export function QuestionnaireCard(
 		)
 		: (
 			<Undecided
+				explore={explore}
+				page={page}
 				onCardSource={onCardSource}
 				self={self}
 				canEdit={canEdit}
@@ -259,7 +295,7 @@ export function QuestionnaireCard(
 		<EvidenceHover
 			active={evidenceActive}
 			content={evidence ?? null}
-			question={value.questions[0]?.prompt ?? "this decision"}
+			question={questionHeading(value.questions[0]?.prompt ?? "this decision")}
 		>
 			<div
 				aria-hidden={closing || undefined}
@@ -335,13 +371,15 @@ function QuestionStepSwap(
 }
 
 function Undecided(
-	{ canEdit, connected, meta, motion, onCardSource, self, value, wire, ...pointing }:
+	{ canEdit, connected, explore, meta, motion, onCardSource, page, self, value, wire, ...pointing }:
 		& {
 			canEdit: boolean;
 			connected: boolean;
+			explore?: ExploreResources;
 			meta?: Question.CardMeta;
 			motion?: QuestionStepMotion;
 			onCardSource?: (questionnaireId: string) => void;
+			page?: boolean;
 			self?: string;
 			value: Questionnaire;
 			wire?: Transport;
@@ -362,17 +400,34 @@ function Undecided(
 	// Counted in the save bar only while the shared draft still says what this person chose.
 	let selections = useSelections(value.id);
 	let touched = stillMine(selections, state.drafts);
+	let { open: openPage, error: pageError } = useOpenPage(explore, value.id);
+	let waiting = waitingOn(meta?.findings);
+	let question = value.questions[0];
+	let explorable = !!explore && !!wire && editable && value.questions.length === 1 && !!question;
 
+	let Shell = page ? PageShell : SidecarCard;
 	return (
-		<SidecarCard
+		<Shell
 			data-plan-sidecar-questionnaire={value.id}
 			label={value.questions.length === 1 ? "Decision" : "Question"}
 			padded={false}
 		>
 			<QuestionView
+				bare={page}
 				headerActions={
 					<>
 						<EvidenceTrigger />
+						{openPage && (
+							<button
+								aria-label="Expand decision"
+								className="btn btn-icon btn-ghost"
+								onClick={openPage}
+								title="Expand decision"
+								type="button"
+							>
+								<ExpandIcon aria-hidden="true" size={16} />
+							</button>
+						)}
 						{meta?.thread && onCardSource && (
 							<button
 								aria-label="Show source in chat"
@@ -385,6 +440,32 @@ function Undecided(
 						)}
 					</>
 				}
+				footerActions={(explorable
+					|| (!page
+						&& (waiting.length > 0 || (!!openPage && shownFindings(meta?.findings).length > 0))))
+					&& (
+						<>
+							<span className="question-footer-start">
+								{!page && <WaitingStatus logins={waiting} onOpen={openPage || undefined} />}
+								{!page && (
+									<FindingsCount
+										findings={meta?.findings}
+										onOpen={openPage || undefined}
+									/>
+								)}
+							</span>
+							{explorable && (
+								<ExploreMenu
+									findings={meta?.findings}
+									id={value.id}
+									options={question.options.map(option => option.label)}
+									question={question.prompt}
+									resources={explore!}
+									wire={wire!}
+								/>
+							)}
+						</>
+					)}
 				collaborators={state.collaborators}
 				definition={state.definition ?? definition(value)}
 				// A draft that has not synced cannot be edited without discarding
@@ -397,6 +478,8 @@ function Undecided(
 				refining={meta?.refining}
 				previous={previous}
 				onAddOption={editable ? state.addOption : undefined}
+				onAddCriterion={editable ? state.addCriterion : undefined}
+				onMark={editable ? state.mark : undefined}
 				onDiscard={editable ? state.discard : undefined}
 				onChange={editable ? state.change : undefined}
 				onQuestionFocus={editable ? state.focusQuestion : undefined}
@@ -434,7 +517,90 @@ function Undecided(
 				onPending={pending && (answers => pending.set(value.id, answers))}
 				{...pointing}
 			/>
-		</SidecarCard>
+			{pageError && (
+				<div className="explore-notice">
+					<InlineNotice message={pageError} tone="danger" />
+				</div>
+			)}
+		</Shell>
+	);
+}
+
+/**
+ * The shared draft of an open decision, for chrome outside its card. The controller is shared
+ * per connection and decision, so this reads the same draft the control on the page edits.
+ */
+export function useQuestionPageDraft(
+	{ canEdit, connected, value, wire }: {
+		canEdit: boolean;
+		connected: boolean;
+		value: Questionnaire;
+		wire?: Transport;
+	},
+) {
+	let state = useQuestionnaire({
+		id: value.id,
+		bridge: wire,
+		connected: connected && canEdit,
+		definition: definition(value),
+	});
+	let item = (state.definition ?? definition(value)).questions[0];
+	let editable = canEdit && connected && !!state.definition;
+	return {
+		editable,
+		error: state.error,
+		ready: !!item && answered(item, state.drafts[item.id]),
+		save: () => state.submit(),
+		submitting: state.submitting,
+		syncing: state.syncing,
+	};
+}
+
+/** A settled decision's page shows the open control, read-only, with the saved answer selected. */
+function PageAnswer({ marks, value }: { marks?: Marks; value: Questionnaire }) {
+	let [question] = value.questions;
+	// With criteria the table replaces the options list: it shows every option and the chosen row.
+	if (value.questions.length === 1 && question?.criteria?.length) {
+		return (
+			<PageShell label="Decision">
+				<CriteriaTable marks={marks ?? question.marks} question={question} />
+			</PageShell>
+		);
+	}
+	let drafts: Drafts = {};
+	for (let question of value.questions) {
+		let chosen = question.choices ?? [];
+		drafts[question.id] = {
+			mode: question.options.length === 0 || question.response === "text" ? "custom" : "choices",
+			choice: chosen[0] ?? null,
+			options: Object.fromEntries(chosen.map(id => [id, true])),
+			custom: question.answer ?? "",
+		};
+	}
+	return (
+		<PageShell label={value.questions.length === 1 ? "Decision" : "Question"}>
+			<QuestionView bare definition={definition(value)} disabled drafts={drafts} status="open" />
+		</PageShell>
+	);
+}
+
+/** The answer control of a decision's own page: the card's content with no box around it. */
+function PageShell(
+	{ children, label, ...rest }: {
+		children: ReactNode;
+		label: string;
+		padded?: boolean;
+		"data-plan-sidecar-questionnaire"?: string;
+	},
+) {
+	return (
+		<section
+			aria-label={label}
+			className="question-page-shell"
+			data-plan-sidecar-questionnaire={rest["data-plan-sidecar-questionnaire"]}
+		>
+			{children}
+		</section>
 	);
 }
 
@@ -464,10 +630,11 @@ export function labels(value: Questionnaire): string[] {
 }
 
 function Decided(
-	{ canEdit, connected, discarded, meta, resolved, value, wire, ...pointing }: {
+	{ canEdit, connected, discarded, explore, meta, resolved, value, wire, ...pointing }: {
 		canEdit: boolean;
 		connected: boolean;
 		discarded: boolean;
+		explore?: ExploreResources;
 		meta?: Question.CardMeta;
 		resolved: Answer[] | undefined;
 		value: Questionnaire;
@@ -477,6 +644,7 @@ function Decided(
 	let [error, setError] = useState<string>();
 	let [submitting, setSubmitting] = useState(false);
 	let pending = useRef(false);
+	let { open: openPage, error: pageError } = useOpenPage(explore, value.id);
 	let editable = canEdit && connected && !!wire && !discarded;
 	let request = (kind: "question:reopen" | "question:discard") => {
 		if (!wire || pending.current) return;
@@ -510,15 +678,18 @@ function Decided(
 		<Provenance
 			at={meta ? meta.decidedAt : value.at}
 			by={resolver}
-			verb={discarded ? "Discarded" : "Answered"}
+			verb={discarded
+				? "Discarded"
+				: value.questions.some(question => question.response === "text")
+				? "Decided"
+				: "Answered"}
 		/>
 	);
-	// The document hides a decision without prose, so its write-up's progress and Retry live
-	// here until the paragraph lands.
+	// Captured Planner cards can update already-linked prose, including after a later Save.
 	let linked = cardRelation(pointing.relations, value.questions.map(question => question.id))
 		?.relation === "linked";
-	let writeup = !discarded && !linked && meta?.origin === "conversation" && !meta.hasProse
-		&& !meta.proseOrphaned && !!meta.writeup;
+	let writeup = !discarded && !!meta?.writeup && (meta.origin === "planner"
+		|| !linked && meta.origin === "conversation" && !meta.hasProse && !meta.proseOrphaned);
 	return (
 		<SidecarCard
 			data-plan-sidecar-questionnaire={value.id}
@@ -529,6 +700,17 @@ function Decided(
 		>
 			<QuestionView
 				answers={resolved}
+				headerActions={!discarded && openPage && (
+					<button
+						aria-label="Expand decision"
+						className="btn btn-icon btn-ghost"
+						onClick={openPage}
+						title="Expand decision"
+						type="button"
+					>
+						<ExpandIcon aria-hidden="true" size={16} />
+					</button>
+				)}
 				aside={discarded ? undefined : provenance}
 				definition={definition(value)}
 				disabled={!editable}
@@ -545,6 +727,11 @@ function Decided(
 				submitting={submitting}
 				{...pointing}
 			/>
+			{pageError && (
+				<div className="explore-notice">
+					<InlineNotice message={pageError} tone="danger" />
+				</div>
+			)}
 		</SidecarCard>
 	);
 }
@@ -779,6 +966,7 @@ function InlineCard({ deck = false, value }: { deck?: boolean; value: Questionna
 			canEdit={options.canEdit}
 			connected={options.connected}
 			evidence={evidence}
+			explore={options.explore}
 			motion={options.questionMotion}
 			motionImmediately={options.motionImmediately}
 			onCardSource={source}
@@ -808,7 +996,8 @@ function InlineCard({ deck = false, value }: { deck?: boolean; value: Questionna
 function DecisionChip(
 	{ onShow, value }: { onShow: (questionnaireId: string) => void; value: Questionnaire },
 ) {
-	let question = value.questions.map(item => item.prompt).join(" ");
+	let headings = value.questions.map(item => questionHeading(item.prompt));
+	let question = headings.map(plainInlineText).join(" ");
 	return (
 		<button
 			aria-label={`Decision: ${question}, answer in Decisions`}
@@ -819,7 +1008,14 @@ function DecisionChip(
 			type="button"
 		>
 			<DecisionIcon aria-hidden="true" className="decision-chip-icon" size={16} />
-			<span className="decision-chip-question">{question}</span>
+			<span className="decision-chip-question">
+				{headings.map((heading, index) => (
+					<Fragment key={index}>
+						{index > 0 && " "}
+						<MarkdownLine links={false} text={heading} />
+					</Fragment>
+				))}
+			</span>
 			<ChevronIcon aria-hidden="true" className="decision-chip-chevron" size={16} />
 		</button>
 	);

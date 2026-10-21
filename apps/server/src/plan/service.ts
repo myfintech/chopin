@@ -3,6 +3,8 @@ import {
 	documentTitleText,
 	normalizeDocumentTitleTree,
 	serialize,
+	validDocumentTitleChange,
+	validDocumentTitleText,
 	withDocumentTitle,
 } from "@chopin/dialect";
 import { locksEditing, restoreBuilds, restoreLive } from "../tasks/builds";
@@ -54,6 +56,7 @@ import { claimEligibility, restoreLifecycle, transition } from "../tasks/lifecyc
 import { broadcast, broadcastRepository, fail, relay, reply, tell } from "../wire";
 import { documentUrl } from "../channels/document-url";
 import * as DocumentProvenance from "../document-provenance";
+import { documentPath } from "@chopin/protocol/document-url";
 
 import type { Server } from "bun";
 import type { ConversationPlan, Plan as Wire, Request, Sidebar } from "@chopin/protocol";
@@ -161,6 +164,26 @@ export type CreationMetadata = {
 	origin: CreationOrigin;
 };
 
+/** Marks a child as the page of one decision record in its parent. */
+export type QuestionPage = { recordId: string };
+
+/** A decision page holds Notes, never decisions: those live in its parent. */
+export function isQuestionPage(plan: Pick<Plan, "questionPage">): boolean {
+	return plan.questionPage !== undefined;
+}
+
+export const QUESTION_PAGE_REFUSAL = "Decisions live in the parent document";
+
+function questionPage(value: JsonValue | undefined): QuestionPage | undefined {
+	if (value === undefined) return undefined;
+	if (
+		!value || typeof value !== "object" || Array.isArray(value)
+		|| Object.keys(value).length !== 1 || typeof value.recordId !== "string"
+		|| !value.recordId.trim()
+	) throw new Error("hosted channel has an invalid question page marker");
+	return { recordId: value.recordId };
+}
+
 /** Durable result of one accepted MCP document rewrite. */
 export type McpUpdateRecord = {
 	idempotencyKey: string;
@@ -218,6 +241,8 @@ export type Plan = {
 	readonly parentChannelId?: string;
 	/** Context retained for plans created through MCP. */
 	creation?: CreationMetadata;
+	/** Set when this child is a decision's page; its decisions live in the parent. */
+	questionPage?: QuestionPage;
 	/** Idempotent MCP rewrites retained so later edits do not change a replay. */
 	mcpUpdates: McpUpdateRecord[];
 	server: Server<SocketData>;
@@ -311,6 +336,7 @@ type Sidecar = {
 	revision: number;
 	documentSeq: number;
 	creation?: CreationMetadata;
+	questionPage?: QuestionPage;
 	graph?: Graph;
 	execution?: Run;
 	lifecycle?: Lifecycle;
@@ -339,6 +365,7 @@ function state(plan: Plan, chat: ChatView = plan.chat): Sidecar {
 		revision: plan.revision,
 		documentSeq: plan.document.seq,
 		...(plan.creation ? { creation: plan.creation } : {}),
+		...(plan.questionPage ? { questionPage: plan.questionPage } : {}),
 		...(plan.graph ? { graph: plan.graph } : {}),
 		...(plan.builds.length ? { builds: plan.builds } : {}),
 		...(plan.execution ? { execution: plan.execution } : {}),
@@ -499,6 +526,7 @@ function definitionShape(value: Question.Definition) {
 		question.question,
 		question.description,
 		question.multiple,
+		question.response,
 		question.options.map(option => [option.id, option.label, option.description]),
 	]);
 }
@@ -529,6 +557,7 @@ function restoredState(
 	let created = item.creation === undefined
 		? legacyCreation(item.brief, item.origin)
 		: creation(item.creation);
+	let page = questionPage(item.questionPage);
 	let graph = restoreGraph(item.graph);
 	let expected = [
 		"documentSeq",
@@ -540,6 +569,7 @@ function restoredState(
 		"version",
 	];
 	if (created) expected.push(...(legacy ? ["brief", "origin"] : ["creation"]));
+	if (page) expected.push("questionPage");
 	if (Object.hasOwn(item, "builds")) expected.push("builds");
 	let builds = restoreBuilds(item.builds, scope?.repositoryId);
 	if (Object.hasOwn(item, "graph")) expected.push("graph");
@@ -731,6 +761,7 @@ function restoredState(
 		revision: item.revision,
 		documentSeq: item.documentSeq,
 		...(created ? { creation: created } : {}),
+		...(page ? { questionPage: page } : {}),
 		...(graph ? { graph } : {}),
 		...(builds.length ? { builds } : {}),
 		...(execution ? { execution } : {}),
@@ -901,9 +932,16 @@ export async function initial(
 	source: string,
 	creation?: CreationMetadata,
 	title?: string,
+	page?: QuestionPage,
 ): Promise<InitialChannel> {
 	// A new document has no stored links to spare from the newer URL rules.
 	assertIntroducedUrls([], parse(source).children);
+	if (
+		!validDocumentTitleChange({ type: "root", children: [] }, parse(source))
+		|| title !== undefined && !validDocumentTitleText(title)
+	) {
+		throw new Error("Document title contains control characters or damaged Unicode text");
+	}
 	let document = await room.create(source);
 	if (title !== undefined) room.enableTitle(document, title);
 	try {
@@ -913,6 +951,7 @@ export async function initial(
 			revision: 0,
 			documentSeq: document.seq,
 			...(creation ? { creation } : {}),
+			...(page ? { questionPage: page } : {}),
 			questions: [],
 			openQuestions: [],
 			threads: [],
@@ -1476,6 +1515,7 @@ export async function open(
 			: {}),
 		builds: sidecar.builds ?? [],
 		...(sidecar.creation ? { creation: sidecar.creation } : {}),
+		...(sidecar.questionPage ? { questionPage: sidecar.questionPage } : {}),
 		mcpUpdates: sidecar.mcpUpdates ?? [],
 		server,
 		document,
@@ -2003,6 +2043,7 @@ export async function rewrite(
 		Comments.rebase(candidate);
 		// A reviewed link whose blocks the rewrite left alone stays reviewed.
 		let reviewed = Questions.snapshot(candidate);
+		let sections = Questions.sections(candidate);
 		let outcome = edit.replace(candidate, plan.revision, nextSource);
 		if (outcome.ok && plan.persistence.documentTitles) room.trackTitle(document);
 		if (!outcome.ok) return outcome;
@@ -2011,6 +2052,7 @@ export async function rewrite(
 		if (changed) {
 			Questions.rebase(candidate);
 			Questions.invalidate(candidate, "plan_changed", reviewed);
+			Questions.keepOwnLinked(candidate, sections);
 			Comments.rebase(candidate);
 			Comments.invalidate(candidate, "plan_changed");
 		} else {
@@ -2055,6 +2097,7 @@ export async function rewrite(
 		if (changed) {
 			Questions.rebase(plan, before);
 			Questions.invalidate(plan, "plan_changed", reviewed);
+			Questions.keepOwnLinked(plan, sections);
 			Comments.rebase(plan);
 			Comments.invalidate(plan, "plan_changed");
 		}
@@ -2350,10 +2393,30 @@ export function source(plan: Plan): string {
 	return room.project(plan.document);
 }
 
-export async function documentIdentity(plan: Plan): Promise<{ id: string; url: string }> {
-	let channel = await plan.persistence.storage.channels.get(plan.id);
+/**
+ * The document's id and current link. A renamed top-level document also lists the links it had
+ * before, which still open it, so the Planner can say which link is current from this data
+ * rather than guess it from the links it has seen.
+ */
+export async function documentIdentity(
+	plan: Plan,
+): Promise<{ id: string; url: string; earlier_urls?: string[] }> {
+	let channels = plan.persistence.storage.channels;
+	let channel = await channels.get(plan.id);
 	if (!channel) throw new Error("document is unavailable");
-	return { id: channel.id, url: await documentUrl(channel, plan.persistence.storage.channels) };
+	let url = await documentUrl(channel, channels);
+	let earlier = channel.parentChannelId ? [] : await channels.earlierSlugs(channel.id);
+	return {
+		id: channel.id,
+		url,
+		...(earlier.length
+			? {
+				earlier_urls: earlier.map(slug =>
+					documentPath(channel.repositoryOwner, channel.repositoryName, slug)
+				),
+			}
+			: {}),
+	};
 }
 
 /** Size of the Yjs history, for the idle compaction check. */

@@ -1,5 +1,6 @@
 import ReactMarkdown from "react-markdown";
 
+import { orderedRunsRemarkPlugin } from "./ordered-runs";
 import { referenceRemarkPlugin } from "./reference-markdown";
 import { referenceRenderModel } from "./references";
 import "./markdown.css";
@@ -7,7 +8,7 @@ import "./markdown.css";
 import type { Chat } from "@chopin/protocol";
 import type { Components } from "react-markdown";
 
-let ELEMENTS = [
+export const CHAT_ELEMENTS = [
 	"a",
 	"blockquote",
 	"br",
@@ -29,7 +30,7 @@ let ELEMENTS = [
 
 let paragraph: NonNullable<Components["p"]> = ({ children }) => <p>{children}</p>;
 
-let COMPONENTS: Components = {
+export const CHAT_COMPONENTS: Components = {
 	a: ({ children, href }) => (
 		<a href={href} rel="noopener noreferrer" target="_blank">
 			{children}
@@ -42,6 +43,35 @@ let COMPONENTS: Components = {
 	h5: paragraph,
 	h6: paragraph,
 };
+
+export const CHAT_INLINE = ["a", "code", "em", "strong"];
+
+/** Escapes what would open a block at the start of a line, so one line stays one line of text. */
+export function inlineSource(source: string): string {
+	let text = source.replace(/\s+/g, " ").trim();
+	if (/^([-*_])( ?\1){2,}$/.test(text)) return `\\${text}`;
+	return text
+		.replace(/^(\d{1,9})([.)])(?= |$)/, "$1\\$2")
+		.replace(/^([-+*]|#{1,6})(?= |$)/, "\\$1")
+		.replace(/^>/, "\\>");
+}
+
+/**
+ * One line of agent-written text, such as a task's title or criterion, with Chat's inline
+ * Markdown: code spans, emphasis and links. Pass `links={false}` inside another control.
+ */
+export function InlineMarkdown({ links = true, source }: { links?: boolean; source: string }) {
+	return (
+		<ReactMarkdown
+			allowedElements={links ? CHAT_INLINE : CHAT_INLINE.filter(name => name !== "a")}
+			components={CHAT_COMPONENTS}
+			skipHtml
+			unwrapDisallowed
+		>
+			{inlineSource(source)}
+		</ReactMarkdown>
+	);
+}
 
 /** The deliberately small Markdown dialect understood by Chat. */
 export function MessageMarkdown(
@@ -60,7 +90,7 @@ export function MessageMarkdown(
 ) {
 	let model = referenceRenderModel(source, references);
 	let components: Components = {
-		...COMPONENTS,
+		...CHAT_COMPONENTS,
 		a: ({ children, href, node }) => {
 			let property = node?.properties?.dataChatReferenceIndex
 				?? node?.properties?.["data-chat-reference-index"];
@@ -105,9 +135,9 @@ export function MessageMarkdown(
 				</>
 			)}
 			<ReactMarkdown
-				allowedElements={ELEMENTS}
+				allowedElements={CHAT_ELEMENTS}
 				components={components}
-				remarkPlugins={[[referenceRemarkPlugin, model]]}
+				remarkPlugins={[[referenceRemarkPlugin, model], orderedRunsRemarkPlugin]}
 				skipHtml
 				unwrapDisallowed
 			>

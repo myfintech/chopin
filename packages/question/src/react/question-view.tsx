@@ -15,16 +15,21 @@ import { CheckIcon, ChevronIcon, DecisionIcon, PlusIcon, WarningIcon } from "@ch
 import { MAX_NEW_LABEL, MAX_SHARED_OPTIONS } from "../limits";
 import { answered } from "../draft";
 import { InlineCode } from "./inline-code";
+import { MarkdownBlocks, MarkdownLine, MarkdownText } from "./question-markdown";
+import { questionHeading, questionParts } from "../text";
+import { CriteriaGrid } from "./criteria";
+import { Key, letter } from "./option-key";
 import { plainInlineList, plainInlineText } from "./inline-segments";
 import { projectSuggestion, reduceSuggestionEditState } from "./project-suggestion";
 import { cardRelation, RelationNote } from "./relation-note";
 import { ResolvedActions } from "./resolved-actions";
+import { TextAnswer } from "./text-answer";
 import type { VisibleSuggestion } from "./project-suggestion";
 import type { Relation } from "../relation";
 
 import type { ReactNode } from "react";
 import type { Question } from "@chopin/protocol";
-import type { Draft, Drafts } from "../draft";
+import type { Draft, Drafts, Mark } from "../draft";
 import type { Answer, Definition, Item } from "../schema";
 
 export type Collaborator = {
@@ -36,6 +41,9 @@ export type Collaborator = {
 
 /** `option` is the id the server gave the new option, so the view can select it. */
 export type AddOptionResult = { ok: true; option?: string } | { ok: false; message: string };
+
+/** `criterion` is the id the server gave the new column. */
+export type AddCriterionResult = { ok: true; criterion?: string } | { ok: false; message: string };
 
 export type QuestionStepRenderProps = {
 	children: ReactNode;
@@ -70,12 +78,21 @@ export type QuestionViewProps = {
 	previous?: PreviousAnswer | Record<string, PreviousAnswer>;
 	refining?: boolean;
 	showActions?: boolean;
+	/** Only the options or written answer: no head and no footer, for a host that owns both. */
+	bare?: boolean;
 	onCancel?: () => void;
 	/**
 	 * Append an option for everyone. Absent where the viewer may not write; the
 	 * row is then shown disabled. Resolves once the server has made it durable.
 	 */
 	onAddOption?: (question: string, label: string) => Promise<AddOptionResult>;
+	/**
+	 * Append a criterion for everyone. Absent where the viewer may not write, and a decision
+	 * without criteria never offers one: only the Planner starts a matrix.
+	 */
+	onAddCriterion?: (question: string, label: string) => Promise<AddCriterionResult>;
+	/** Mark one option against one criterion in the shared draft; `null` clears the cell. */
+	onMark?: (question: string, option: string, criterion: string, mark: Mark | null) => void;
 	disabled?: boolean;
 	submitting?: boolean;
 	status?: "open" | Question.Status | "discarded";
@@ -116,6 +133,8 @@ export type QuestionViewProps = {
 	aside?: ReactNode;
 	/** Controls in the trailing header, beside question-specific presence. */
 	headerActions?: ReactNode;
+	/** Host controls at the start of the footer, before Discard and Save. */
+	footerActions?: ReactNode;
 	/** Lets a host retain bounded steps for presentation without owning question state. */
 	renderStep?: (props: QuestionStepRenderProps) => ReactNode;
 	/**
@@ -185,82 +204,84 @@ function DecisionHeading() {
 	);
 }
 
-function letter(index: number): string {
-	return String.fromCharCode(65 + index);
-}
-
-/** A line-tall slot, so the tile centres on the label's first line, not the whole row. */
-function Key({ children }: { children: ReactNode }) {
-	return (
-		<span aria-hidden="true" className="question-key">
-			<span>{children}</span>
-		</span>
-	);
-}
-
 function Choices(
-	{ question, draft, disabled, name, onChange, suggestedOptionId }: {
+	{ question, draft, disabled, name, onChange, suggestedOptionId, onMark, onAddCriterion }: {
 		question: Item;
 		draft: Draft | undefined;
 		disabled: boolean;
 		name: string;
 		onChange?: (change: Partial<Draft>) => void;
 		suggestedOptionId?: string;
+		/** Absent where the viewer may not mark; the matrix then only shows marks. */
+		onMark?: (option: string, criterion: string, mark: Mark | null) => void;
+		onAddCriterion?: (label: string) => Promise<AddCriterionResult>;
 	},
 ) {
 	let custom = draft?.mode === "custom";
 
-	return (
-		<>
-			{question.options.map((option, index) => {
-				let selected = question.multiple
-					? !!draft?.options[option.id]
-					: draft?.choice === option.id;
+	let row = (option: Item["options"][number], index: number, matrix: boolean) => {
+		let selected = question.multiple
+			? !!draft?.options[option.id]
+			: draft?.choice === option.id;
 
-				return (
-					<label key={option.id} className="question-choice-row question-option">
-						<input
-							type={question.multiple ? "checkbox" : "radio"}
-							name={question.multiple ? undefined : name}
-							value={option.id}
-							checked={!custom && selected}
-							disabled={disabled}
-							onChange={event => {
-								// Choosing an option leaves custom mode; the two are
-								// alternatives, not additions.
-								onChange?.(
-									question.multiple
-										? {
-											mode: "choices",
-											options: { ...draft?.options, [option.id]: event.currentTarget.checked },
-										}
-										: { mode: "choices", choice: option.id },
-								);
-							}}
-							className="question-input"
-						/>
-						<Key>{letter(index)}</Key>
-						<span className="question-text">
-							<span className="question-label">
-								<InlineCode text={option.label} />
-							</span>
-							{!custom && selected && option.id === suggestedOptionId && (
-								<span className="text-sm text-text-tertiary">{" from chat"}</span>
-							)}
-							{option.description && (
-								<span className="question-desc">
-									<InlineCode text={option.description} />
-								</span>
-							)}
-						</span>
-						<span aria-hidden="true" className="question-check">
-							<CheckIcon />
-						</span>
-					</label>
-				);
-			})}
-		</>
-	);
+		return (
+			<label
+				key={option.id}
+				className={matrix ? "crit-pick" : "question-choice-row question-option"}
+			>
+				<input
+					type={question.multiple ? "checkbox" : "radio"}
+					name={question.multiple ? undefined : name}
+					value={option.id}
+					checked={!custom && selected}
+					disabled={disabled}
+					onChange={event => {
+						// Choosing an option leaves custom mode; the two are
+						// alternatives, not additions.
+						onChange?.(
+							question.multiple
+								? {
+									mode: "choices",
+									options: { ...draft?.options, [option.id]: event.currentTarget.checked },
+								}
+								: { mode: "choices", choice: option.id },
+						);
+					}}
+					className="question-input"
+				/>
+				<Key>{letter(index)}</Key>
+				<span className="question-text">
+					<span className="question-label">
+						<MarkdownLine links={false} text={option.label} />
+					</span>
+					{!custom && selected && option.id === suggestedOptionId && (
+						<span className="text-sm text-text-tertiary">{" from chat"}</span>
+					)}
+					{option.description && <MarkdownText place="desc" text={option.description} />}
+				</span>
+				{!matrix && (
+					<span aria-hidden="true" className="question-check">
+						<CheckIcon />
+					</span>
+				)}
+			</label>
+		);
+	};
+
+	if (question.criteria?.length) {
+		return (
+			<CriteriaGrid
+				criteria={question.criteria}
+				marks={draft?.marks}
+				onAddCriterion={onAddCriterion}
+				onMark={disabled ? undefined : onMark}
+				options={question.options}
+				renderPick={(option, index) => row(option, index, true)}
+			/>
+		);
+	}
+
+	return <>{question.options.map((option, index) => row(option, index, false))}</>;
 }
 
 /**
@@ -315,6 +336,7 @@ export function chooseAdded(
 	option: string,
 	mine: string | null | undefined,
 ): Partial<Draft> | undefined {
+	if (question.response === "text") return undefined;
 	if (question.multiple) {
 		return { mode: "choices", options: { ...draft?.options, [option]: true } };
 	}
@@ -578,10 +600,43 @@ function Related(
 	);
 }
 
+/** A body longer than this many characters or lines folds away once the question is answered. */
+const RESOLVED_BODY_CHARS = 360;
+const RESOLVED_BODY_LINES = 6;
+
+/**
+ * What an answered question showed beneath its heading. The answer is what a
+ * reader comes back for, so a long body folds behind a disclosure rather than
+ * pushing the answer out of view.
+ */
+function ResolvedBody({ text }: { text: string }) {
+	let [open, setOpen] = useState(false);
+	let id = useId();
+	let long = text.length > RESOLVED_BODY_CHARS || text.split("\n").length > RESOLVED_BODY_LINES;
+	if (!long) return <MarkdownBlocks place="body" text={text} />;
+	return (
+		<div className="question-body-more">
+			<button
+				aria-controls={id}
+				aria-expanded={open}
+				className="question-body-toggle"
+				onClick={() => setOpen(!open)}
+				type="button"
+			>
+				{open ? "Hide details" : "Show details"}
+			</button>
+			<div hidden={!open} id={id}>
+				<MarkdownBlocks place="body" text={text} />
+			</div>
+		</div>
+	);
+}
+
 function Resolved(
 	{
 		answers,
 		aside,
+		headerActions,
 		definition,
 		resolver,
 		places,
@@ -591,6 +646,7 @@ function Resolved(
 	}: {
 		answers: Answer[];
 		aside?: ReactNode;
+		headerActions?: ReactNode;
 		definition: Definition;
 		resolver?: string;
 		places?: QuestionViewProps["places"];
@@ -615,6 +671,8 @@ function Resolved(
 					let unmatched = answer.custom
 						? [answer.custom]
 						: (answer.choices ?? []).filter(label => !matchedLabels.has(label));
+					let { heading, body } = questionParts(answer.question);
+					let linked = !!id && (places?.[id] ?? 0) > 0;
 					return (
 						<section className="question-resolved-section" key={id ?? index}>
 							<header className="question-head">
@@ -626,69 +684,78 @@ function Resolved(
 										<Related
 											id={id}
 											count={(id ? places?.[id] : undefined) ?? 0}
-											label={answer.question}
+											label={heading}
 											className="question-title-link"
 											inline
 											onEnter={onQuestionEnter}
 											onLeave={onQuestionLeave}
 											onSelect={onQuestionSelect}
 										>
-											<InlineCode text={answer.question} />
+											<MarkdownLine links={!linked} text={heading} />
 										</Related>
 									</h4>
+									{body && <ResolvedBody text={body} />}
 									{question?.description && (
-										<p className="question-hint">
-											<InlineCode text={question.description} />
-										</p>
+										<MarkdownText place="hint" text={question.description} />
 									)}
 								</div>
+								{index === 0 && headerActions && (
+									<span className="question-head-actions">{headerActions}</span>
+								)}
 							</header>
-							<div className="question-options">
-								{options.map((option, optionIndex) => {
-									let isSelected = selected.includes(option);
-									return (
-										<div
-											className="question-choice-row question-option"
-											data-selected={isSelected ? "" : undefined}
-											key={option.id}
-										>
-											<Key>{letter(optionIndex)}</Key>
-											<span className="question-text">
-												<span className="question-label">
-													{isSelected && <span className="sr-only">{"Selected: "}</span>}
-													<InlineCode text={option.label} />
-												</span>
-												{option.description && (
-													<span className="question-desc">
-														<InlineCode text={option.description} />
-													</span>
-												)}
-											</span>
-											<span aria-hidden="true" className="question-check">
-												<CheckIcon />
-											</span>
-										</div>
-									);
-								})}
-								{unmatched.map((label, unmatchedIndex) => (
-									<div
-										className="question-choice-row question-option"
-										data-selected=""
-										key={`${label}-${unmatchedIndex}`}
-									>
-										<Key>{letter(options.length + unmatchedIndex)}</Key>
-										<span className="question-text">
-											<span className="question-label">
-												<span className="sr-only">{"Selected: "}</span>
-												<InlineCode text={label} />
-											</span>
-										</span>
-										<span aria-hidden="true" className="question-check">
-											<CheckIcon />
-										</span>
+							{question?.response === "text"
+								? (
+									<div className="question-final-answer">
+										<span className="question-final-answer-label">Final answer</span>
+										<p className="question-written-answer">{answer.custom}</p>
 									</div>
-								))}
-							</div>
+								)
+								: (
+									<div className="question-options">
+										{options.map((option, optionIndex) => {
+											let isSelected = selected.includes(option);
+											return (
+												<div
+													className="question-choice-row question-option"
+													data-selected={isSelected ? "" : undefined}
+													key={option.id}
+												>
+													<Key>{letter(optionIndex)}</Key>
+													<span className="question-text">
+														<span className="question-label">
+															{isSelected && <span className="sr-only">{"Selected: "}</span>}
+															<MarkdownLine links={false} text={option.label} />
+														</span>
+														{option.description && (
+															<MarkdownText place="desc" text={option.description} />
+														)}
+													</span>
+													<span aria-hidden="true" className="question-check">
+														<CheckIcon />
+													</span>
+												</div>
+											);
+										})}
+										{unmatched.map((label, unmatchedIndex) => (
+											<div
+												className="question-choice-row question-option"
+												data-selected=""
+												key={`${label}-${unmatchedIndex}`}
+											>
+												<Key>{letter(options.length + unmatchedIndex)}</Key>
+												<span className="question-text">
+													<span className="question-label">
+														<span className="sr-only">{"Selected: "}</span>
+														<InlineCode text={label} />
+													</span>
+												</span>
+												<span aria-hidden="true" className="question-check">
+													<CheckIcon />
+												</span>
+											</div>
+										))}
+									</div>
+								)}
 						</section>
 					);
 				})}
@@ -714,7 +781,9 @@ function Cancelled({ resolver }: { resolver?: string }) {
 }
 
 function Discarded({ definition, resolver }: { definition: Definition; resolver?: string }) {
-	let questions = definition.questions.map(question => question.question).join(", ");
+	let questions = definition.questions.map(question => questionHeading(question.question)).join(
+		", ",
+	);
 	let discarded = resolver && resolver !== "system" ? `Discarded by @${resolver}` : "Discarded";
 	return (
 		<div className="px-3 py-2.5">
@@ -757,11 +826,17 @@ const EXPIRED_NOTE =
 function Expired({ definition }: { definition: Definition }) {
 	return (
 		<div className="space-y-2 px-3 py-2.5">
-			{definition.questions.map(question => (
-				<p key={question.id} className="m-0 text-sm text-text-secondary">
-					<InlineCode text={question.question} />
-				</p>
-			))}
+			{definition.questions.map(question => {
+				let { heading, body } = questionParts(question.question);
+				return (
+					<div key={question.id}>
+						<p className="m-0 text-sm text-text-secondary">
+							<MarkdownLine text={heading} />
+						</p>
+						{body && <MarkdownBlocks place="body" text={body} />}
+					</div>
+				);
+			})}
 			<p className="m-0 text-sm text-text-primary">{EXPIRED_NOTE}</p>
 		</div>
 	);
@@ -780,7 +855,10 @@ export function QuestionView(props: QuestionViewProps) {
 		previous: priorAnswers,
 		refining,
 		showActions = false,
+		bare = false,
 		onAddOption,
+		onAddCriterion,
+		onMark,
 		disabled = false,
 		submitting = false,
 		status = "open",
@@ -792,6 +870,7 @@ export function QuestionView(props: QuestionViewProps) {
 		errorClassName,
 		aside,
 		headerActions,
+		footerActions,
 		places,
 		relations,
 		pendingRelation,
@@ -840,6 +919,7 @@ export function QuestionView(props: QuestionViewProps) {
 	let single = definition.questions.length === 1;
 	let [selected, setActive] = useState(() => definition.questions[0]?.id);
 	let current = currentQuestion(definition, selected);
+	let currentParts = questionParts(current.question);
 	let active = current.id;
 	let panelId = `${base}-panel-${active}`;
 	if (active !== selected) setActive(active);
@@ -924,7 +1004,9 @@ export function QuestionView(props: QuestionViewProps) {
 					if (!draft || !answered(question, draft)) continue;
 					onChange?.(
 						question.id,
-						question.multiple
+						question.response === "text"
+							? { mode: "custom", custom: "" }
+							: question.multiple
 							? {
 								mode: "choices",
 								options: Object.fromEntries(
@@ -991,6 +1073,7 @@ export function QuestionView(props: QuestionViewProps) {
 						<Resolved
 							answers={answers}
 							aside={aside}
+							headerActions={headerActions}
 							definition={definition}
 							resolver={resolver}
 							// One control per destination: a linked note takes over the jump.
@@ -1044,6 +1127,7 @@ export function QuestionView(props: QuestionViewProps) {
 		else if (arrived === total - 1) refocus.current = "previous";
 	};
 	let titleId = `${base}-title-${active}`;
+	let written = current.response === "text";
 	let choose = (question: string, change: Partial<Draft>) => {
 		if (change.choice !== undefined) picks.current[question] = change.choice;
 		markHumanEdit();
@@ -1067,7 +1151,7 @@ export function QuestionView(props: QuestionViewProps) {
 			picks.current[question],
 		);
 		if (change) choose(question, change);
-		if (focus) focusOption.current = option;
+		if (focus && item.response !== "text") focusOption.current = option;
 		setAnnouncement(change ? `Added and selected ${label}` : `Added ${label}`);
 	};
 
@@ -1099,67 +1183,93 @@ export function QuestionView(props: QuestionViewProps) {
 							}
 						}}
 					>
-						<header className="question-head" data-refining={refining ? "true" : undefined}>
-							<span className="question-mark" title="Decision">
-								<DecisionIcon />
-							</span>
-							<div className="question-head-text">
-								<h4 className="question-title" id={titleId}>
-									<Related
-										id={current.id}
-										count={places?.[current.id] ?? 0}
-										label={plainInlineText(current.question)}
-										className="question-title-link"
-										inline
-										onSelect={onQuestionSelect}
-									>
-										<InlineCode text={current.question} />
-									</Related>
-								</h4>
-								{current.description && (
-									<p className="question-hint">
-										<InlineCode text={current.description} />
-									</p>
-								)}
-								{current.multiple && <p className="question-hint">Choose any</p>}
-								{previousAnswer && (
-									<p className="question-hint">
-										Previously chosen by @{previousAnswer.by}:{" "}
-										{plainInlineList(previousAnswer.labels)}
-									</p>
-								)}
-								{refining && <p className="question-hint" role="status">Chopin is refining…</p>}
-							</div>
-							<span className="flex shrink-0 items-center gap-2">
-								<Presence
-									people={collaborators.filter(person =>
-										person.question === current.id
+						{!bare && (
+							<header className="question-head" data-refining={refining ? "true" : undefined}>
+								<span className="question-mark" title="Decision">
+									<DecisionIcon />
+								</span>
+								<div className="question-head-text">
+									<h4 className="question-title" id={titleId}>
+										<Related
+											id={current.id}
+											count={places?.[current.id] ?? 0}
+											label={plainInlineText(currentParts.heading)}
+											className="question-title-link"
+											inline
+											onSelect={onQuestionSelect}
+										>
+											<MarkdownLine
+												links={!(places?.[current.id] ?? 0)}
+												text={currentParts.heading}
+											/>
+										</Related>
+									</h4>
+									{currentParts.body && <MarkdownBlocks place="body" text={currentParts.body} />}
+									{current.description && <MarkdownText place="hint" text={current.description} />}
+									{current.multiple && <p className="question-hint">Choose any</p>}
+									{previousAnswer && (
+										<p className="question-hint">
+											Previously chosen by @{previousAnswer.by}:{" "}
+											{plainInlineList(previousAnswer.labels)}
+										</p>
 									)}
-									render={renderPeople}
-								/>
-								{headerActions}
-							</span>
-						</header>
+									{refining && <p className="question-hint" role="status">Chopin is refining…</p>}
+								</div>
+								<span className="question-head-actions">
+									<Presence
+										people={collaborators.filter(person =>
+											person.question === current.id
+										)}
+										render={renderPeople}
+									/>
+									{headerActions}
+								</span>
+							</header>
+						)}
 
+						{bare && previousAnswer && (
+							<p className="question-hint">
+								Previously chosen by @{previousAnswer.by}: {plainInlineList(previousAnswer.labels)}
+							</p>
+						)}
 						<fieldset disabled={disabled} className="question-options" ref={options}>
 							<legend className="sr-only">{current.header}</legend>
-							<Choices
-								question={current}
-								draft={projection.draft}
-								disabled={disabled}
-								name={`${base}-${current.id}`}
-								onChange={change =>
-									choose(current.id, change)}
-								suggestedOptionId={projection.suggestion?.optionId}
-							/>
-							{drafts[current.id]?.mode === "custom" && drafts[current.id]!.custom.trim() && (
+							{written
+								? (
+									<TextAnswer
+										disabled={disabled}
+										onChange={custom => choose(current.id, { mode: "custom", custom })}
+										value={drafts[current.id]?.custom ?? ""}
+									/>
+								)
+								: (
+									<Choices
+										question={current}
+										draft={projection.draft}
+										disabled={disabled}
+										name={`${base}-${current.id}`}
+										onChange={change => choose(current.id, change)}
+										suggestedOptionId={projection.suggestion?.optionId}
+										onMark={onMark
+											? (option, criterion, mark) => {
+												onMark(current.id, option, criterion, mark);
+											}
+											: undefined}
+										onAddCriterion={onAddCriterion
+											? label =>
+												onAddCriterion(current.id, label)
+											: undefined}
+									/>
+								)}
+							{!written && drafts[current.id]?.mode === "custom"
+								&& drafts[current.id]!.custom.trim() && (
 								<LegacyCustom
 									question={current}
 									draft={drafts[current.id]!}
 									name={`${base}-${current.id}`}
 								/>
 							)}
-							{onAddOption && current.options.length < MAX_SHARED_OPTIONS && (
+							{!written && onAddOption && current.options.length < MAX_SHARED_OPTIONS && (
 								<AddOption
 									key={current.id}
 									question={current}
@@ -1180,7 +1290,12 @@ export function QuestionView(props: QuestionViewProps) {
 			})()}
 
 			<span aria-live="polite" className="sr-only">{announcement}</span>
-			{addError && <Callout title="Couldn’t add option" message={addError} />}
+			{addError && (
+				<Callout
+					title="Couldn’t add option"
+					message={addError}
+				/>
+			)}
 			{error && (
 				<Callout
 					feedback={errorClassName}
@@ -1189,7 +1304,7 @@ export function QuestionView(props: QuestionViewProps) {
 				/>
 			)}
 
-			{(onSubmit || discard || multiple || showActions) && (
+			{!bare && (onSubmit || discard || multiple || showActions || footerActions) && (
 				<footer
 					className="question-actions"
 					data-confirm={discard && confirming ? "" : undefined}
@@ -1220,6 +1335,7 @@ export function QuestionView(props: QuestionViewProps) {
 						)
 						: (
 							<>
+								{footerActions}
 								{multiple && (
 									<div role="group" aria-label="Questions" className="question-stepper">
 										<button
@@ -1280,7 +1396,11 @@ export function QuestionView(props: QuestionViewProps) {
 										className="btn btn-sm btn-primary"
 										ref={primary}
 									>
-										{submitting ? "Saving…" : error ? "Try again" : "Save"}
+										{submitting
+											? "Saving…"
+											: error
+											? "Try again"
+											: "Save"}
 									</button>
 								)}
 								{deferSave && onSubmit && !suggestion && !touched && answeredCount > 0
@@ -1292,7 +1412,11 @@ export function QuestionView(props: QuestionViewProps) {
 											disabled={disabled || submitting || !ready}
 											className="btn btn-sm btn-primary"
 										>
-											{submitting ? "Saving…" : error ? "Try again" : "Save"}
+											{submitting
+												? "Saving…"
+												: error
+												? "Try again"
+												: "Save"}
 										</button>
 									)}
 								{deferSave && onSubmit && suggestion && (

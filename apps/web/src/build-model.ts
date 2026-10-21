@@ -17,7 +17,8 @@ export type BuildPhase =
 	| { kind: "failed" }
 	/** The build ended while its run still holds the tasks and the document lock. */
 	| { kind: "stopped" }
-	| { kind: "done"; pullRequests: number }
+	/** `noChange` counts tasks that needed no code change, so have no pull request. */
+	| { kind: "done"; pullRequests: number; noChange?: number }
 	/** A living document: its pull requests follow later edits. */
 	| { kind: "live"; sync: SyncStatus };
 
@@ -136,16 +137,27 @@ function quote(raw: string): string {
 }
 
 /**
- * Why an ended build stopped, when its local agent said so: Ctrl-C in the connector terminal, or
- * the connector disconnecting or going quiet. Other failures keep the phase's own words.
+ * Why an ended build stopped, when Chopin knows: Ctrl-C in the connector terminal, the connector
+ * disconnecting, its agent going quiet while the machine stayed connected, or Chopin restarting.
+ * Other failures keep the phase's own words.
  */
 export function endedReason(build: { error?: string } | undefined): string | undefined {
 	let error = build?.error;
 	if (error === "Stopped from the connector terminal.") {
 		return "Build stopped from the connector terminal.";
 	}
-	if (error === "Your local agent disconnected." || error?.startsWith("Workspace disconnected")) {
+	if (error === "Your local agent disconnected.") {
 		return "Build stopped — your local agent disconnected.";
+	}
+	if (error === "Your local agent stopped responding.") {
+		return "Build stopped — your local agent stopped responding.";
+	}
+	if (error === "Chopin restarted, so this build ended.") {
+		return "Build stopped — Chopin restarted.";
+	}
+	// Builds that ended before Chopin told these apart.
+	if (error?.startsWith("Workspace disconnected")) {
+		return "Build stopped — your local agent disconnected or stopped responding.";
 	}
 }
 
@@ -281,12 +293,10 @@ export function buildPhase(snapshot: Snapshot | undefined): BuildPhase {
 	let build = snapshot.build;
 	let ended = build?.state === "failed" || build?.state === "stopped";
 	if (run?.outcome.kind === "implemented" || run?.outcome.kind === "delivered") {
-		let urls = new Set(
-			(buildProgress(snapshot)?.tasks ?? []).flatMap(task =>
-				task.pullRequest ? [task.pullRequest.url] : []
-			),
-		);
-		return { kind: "done", pullRequests: urls.size };
+		let tasks = buildProgress(snapshot)?.tasks ?? [];
+		let urls = new Set(tasks.flatMap(task => task.pullRequest ? [task.pullRequest.url] : []));
+		let noChange = tasks.filter(task => task.state === "completed" && task.noChange).length;
+		return { kind: "done", pullRequests: urls.size, ...(noChange ? { noChange } : {}) };
 	}
 	if (active) return ended ? { kind: "stopped" } : { kind: "building" };
 	if (build && !ended) return { kind: "building" };
@@ -328,6 +338,11 @@ export const TASK_STATE_LABEL: Record<TaskState, string> = {
 	blocked: "blocked",
 	completed: "done",
 };
+
+/** A finished task's state for a screen reader, saying when it needed no change. */
+export function taskStateLabel(state: TaskState, noChange: boolean): string {
+	return state === "completed" && noChange ? "done, no change needed" : TASK_STATE_LABEL[state];
+}
 
 /** Active and blocked rows start open; so does a linked task. */
 export function taskStartsOpen(state: TaskState, linked: boolean): boolean {
@@ -551,7 +566,7 @@ export type BuildLook =
 	| { kind: "stopped"; tip: string; retry: boolean }
 	/** The last press found no local agent, so nothing ran; Build shows how to start one. */
 	| { kind: "agent"; tip: string; retry: boolean }
-	| { kind: "built"; pullRequests: number; tip: string }
+	| { kind: "built"; pullRequests: number; noChange?: number; tip: string }
 	/** `blocked` is why Build is inert, like Build plan's reason. */
 	| { kind: "stale"; changes: number; live: boolean; tip: string; build: boolean; blocked?: string }
 	| { kind: "rebuilding"; tip: string }
@@ -636,9 +651,13 @@ export function buildLook(snapshot: Snapshot | undefined, context: BuildContext)
 			return { kind: "building", done, total, tip: `${done} of ${total} tasks built` };
 		}
 		if (sync.kind === "in-sync") {
+			let noChange = snapshot.live!.tasks.filter(task =>
+				task.progress?.state === "completed" && task.progress.noChange
+			).length;
 			return {
 				kind: "built",
 				pullRequests: snapshot.live!.pullRequests.length,
+				...(noChange ? { noChange } : {}),
 				tip: `${who ? `Built by ${who}. ` : ""}Every pull request matches the document`,
 			};
 		}
@@ -703,7 +722,10 @@ export function buildLook(snapshot: Snapshot | undefined, context: BuildContext)
 		return {
 			kind: "built",
 			pullRequests: phase.pullRequests,
-			tip: "Every task has a pull request",
+			...(phase.noChange ? { noChange: phase.noChange } : {}),
+			tip: phase.noChange
+				? "Every task has a pull request or needed no change"
+				: "Every task has a pull request",
 		};
 	}
 	if (phase.kind === "stopped") {
@@ -741,6 +763,16 @@ export function buildLook(snapshot: Snapshot | undefined, context: BuildContext)
 		};
 	}
 	return { kind: "plan", blocked: planBlocker(snapshot, context) };
+}
+
+/** What a built document delivered: its pull requests, and apart from them any task that needed no change. */
+export function builtCount(look: Extract<BuildLook, { kind: "built" }>): string {
+	let noChange = look.noChange
+		? plural(look.noChange, "task needed no change", "tasks needed no change")
+		: undefined;
+	if (noChange && !look.pullRequests) return noChange;
+	let pullRequests = plural(look.pullRequests, "pull request", "pull requests");
+	return noChange ? `${pullRequests}, ${noChange}` : pullRequests;
 }
 
 /** The capsule's words; Build plan has none of its own. */

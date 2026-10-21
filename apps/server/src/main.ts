@@ -13,7 +13,7 @@ import { ReadinessReviews } from "./tasks/readiness-review";
  */
 
 import { join } from "node:path";
-import { parse, ulid } from "@chopin/dialect";
+import { displayTitle, parse, ulid } from "@chopin/dialect";
 
 import { harnessFor, shutdownHarnesses } from "./harness/harnesses";
 import {
@@ -83,6 +83,7 @@ import { spikeHost } from "./experiments/spike-host";
 import { spikeSettler, startSettle } from "./experiments/spike-settle";
 import { resolveInstruction } from "./experiments/spikes";
 import { openDecisions } from "./conversation-plan/decisions";
+import { createVisualAdmission } from "./agent/visual-admission";
 import { locksEditing, requestBuild } from "./tasks/builds";
 import { pendingLinks, relinkInstruction } from "./tasks/relink";
 import { BuildReadiness } from "./tasks/readiness";
@@ -96,9 +97,20 @@ import * as ProvenanceSocket from "./document-provenance/socket";
 import * as Inject from "./questions/inject";
 import * as Marks from "./comments/inject";
 import * as Questions from "./questions/service";
+import * as Explore from "./questions/explore";
+import { runningFindingRefs } from "./questions/service-findings";
+import { answerTurns } from "./questions/answer-turns";
+import { deterministicChannelId } from "./channels/id";
+import type { Research as ResearchWire } from "@chopin/protocol";
+import { investigationFinding } from "./experiments/document";
 import { backfillPlannerAskThreads } from "./questions/backfill";
 import { registerResearchWorkspaceRoutes } from "./research/routes";
-import { ResearchWorkspaceError, ResearchWorkspaceService } from "./research/service";
+import { demoRoster } from "./demo/roster";
+import {
+	researchJobSettles,
+	ResearchWorkspaceError,
+	ResearchWorkspaceService,
+} from "./research/service";
 import { placeResearchReference as placeResearch } from "./research/placement";
 import * as Rooms from "./rooms";
 import { admit, admitSidebar } from "./socket/admission";
@@ -135,9 +147,12 @@ import type {
 	SocketData,
 } from "./wire";
 
+type ResearchRequestView = ResearchWire.RequestView;
+
 const config = load();
 /** The one decisions boundary, checked against Atomic's registry before anything starts. */
 const decide = await openDecisions(config);
+const visualAdmission = createVisualAdmission(decide);
 harnessFor(config);
 const storage = createStorage(config.storage);
 const documentHistory = new DocumentHistory(storage);
@@ -362,6 +377,27 @@ const spikeSettlement = spikeSettler({
 		),
 });
 
+/**
+ * Hand a saved answer to a decision the Planner left open to the Planner, as a turn it acts on.
+ * Like other server-authored turns it runs only under the existing owner, and under the remote
+ * harness only while a Planner is attached; one that found no Planner starts once one is.
+ */
+const decisionAnswers = answerTurns({
+	start: async (channelId, compose) => {
+		if (!config.agent) return "drop";
+		let channel = await storage.channels.get(channelId);
+		if (!channel || channel.parentChannelId) return "drop";
+		if (plannerAttachments && !await plannerAttachments.confirmed(channelId)) return false;
+		return serverInstruction(channelId, compose);
+	},
+});
+
+function answerDecision(channelId: string, id: string, generation: number): void {
+	void decisionAnswers.answered(channelId, id, generation).catch(err =>
+		console.error("chopin: could not hand a saved decision to the Planner -", err)
+	);
+}
+
 function settlePendingSpikes(channelId: string): void {
 	if (!config.agent || !config.liveSpikes || !experiments) return;
 	void spikeSettlement.pending(channelId).catch(err =>
@@ -374,6 +410,9 @@ function ownerAvailable(channelId: string): Promise<void> {
 	let opened = Rooms.get(channelId)?.plan;
 	if (opened) conversationRuntime.wake(opened);
 	settlePendingSpikes(channelId);
+	void decisionAnswers.pending(channelId).catch(err =>
+		console.error("chopin: could not hand saved decisions to the Planner -", err)
+	);
 	void reviewCompletedInvestigations(channelId);
 	void currentDocumentTarget(channelId).then(target => {
 		if (target) buildReadiness?.schedule(target);
@@ -507,6 +546,11 @@ async function plan(room: Rooms.Room, server: Server<SocketData>): Promise<Servi
 			// Retrying only when unlocked keeps the retry's own room open from looping.
 			if (spikeScout && !Service.implementationActive(opened)) void spikeScout.refresh(room.id);
 			settlePendingSpikes(room.id);
+			// Work that ended while the document was closed, or whose commit failed, settles now.
+			if (!opened.parentChannelId) {
+				void Explore.sweep(opened, server, room.id, exploreDeps)
+					.catch(error => console.error("[questions] finding sweep failed:", error));
+			}
 		}
 		return opened;
 	});
@@ -543,6 +587,7 @@ function conversation(
 		room: room.id,
 		config,
 		decide,
+		visualAdmission,
 		auth: hostedAuth,
 		claimantSessionId,
 		repository,
@@ -1038,6 +1083,11 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 						? { working: thread => Chat.workingFor(Rooms.get(parent)?.plan?.chat, thread, room.id) }
 						: undefined,
 				);
+				// A reload while the room stays open settles a finding whose event was missed.
+				if (!parent) {
+					void Explore.sweep(opened, server, room.id, exploreDeps)
+						.catch(error => console.error("[questions] finding sweep failed:", error));
+				}
 			} catch (err) {
 				fail(ws, frame.rid, err instanceof Error ? err.message : "cannot open plan");
 			}
@@ -1192,6 +1242,10 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 			});
 			return;
 
+		case "question:create":
+			if (room.plan) await Questions.createDecision(room.plan, server, room.id, ws, frame);
+			return;
+
 		case "question:open":
 			if (room.plan) Questions.open(room.plan, ws, frame);
 			return;
@@ -1223,6 +1277,7 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 					ws,
 					frame,
 					intent => conversationRuntime.contexts.remember(opened, intent.trigger, claimant),
+					(id, generation) => answerDecision(room.id, id, generation),
 				);
 			}
 			return;
@@ -1231,8 +1286,32 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 			if (room.plan) await Questions.cancel(room.plan, server, room.id, ws, frame);
 			return;
 
+		case "question:why":
+			if (room.plan) await Questions.setWhy(room.plan, server, room.id, ws, frame);
+			return;
+
 		case "question:option":
 			if (room.plan) await Questions.addOption(room.plan, server, room.id, ws, frame);
+			return;
+
+		case "question:criterion":
+			if (room.plan) await Questions.addCriterion(room.plan, server, room.id, ws, frame);
+			return;
+
+		case "question:explore":
+			if (room.plan) await Explore.explore(room.plan, server, room.id, ws, frame, exploreDeps);
+			return;
+
+		case "question:explore-stop":
+			if (room.plan) await Explore.stop(room.plan, server, room.id, ws, frame, exploreDeps);
+			return;
+
+		case "question:take":
+			if (room.plan) await Explore.take(room.plan, server, room.id, ws, frame);
+			return;
+
+		case "question:page":
+			if (room.plan) await Explore.page(room.plan, server, room.id, ws, frame, createQuestionPage);
 			return;
 
 		// A note sent to the Planner starts a turn on the sender's entitlement, so
@@ -2099,6 +2178,152 @@ function announceResearchTerminal(channelId: string, id: string, text: string): 
 	});
 }
 
+/** Run `action` on a document's live plan, or open it detached for the duration. */
+function withDecisionPlan(channelId: string, action: (plan: Service.Plan) => Promise<void>) {
+	return withDocumentLock(channelId, async () => {
+		let active = Rooms.get(channelId)?.plan;
+		if (active) return action(active);
+		let detached = await Service.open(channelId, documentBackend(), server);
+		try {
+			await action(detached);
+		} finally {
+			await Service.close(detached);
+		}
+	});
+}
+
+function decisionNotice(
+	plan: Service.Plan,
+	roomId: string,
+	id: string,
+	text: string,
+	label: string,
+) {
+	return Chat.notice(
+		{ chat: plan.chat, plan, server, room: roomId },
+		{ text, decision: { questionnaireId: id, kind: "activity", label } },
+	).then(() => {});
+}
+
+const exploreDeps: Explore.ExploreDeps = {
+	research: (roomId, ref) =>
+		researchService?.request(roomId, ref).catch(() => undefined)
+			?? Promise.resolve(undefined),
+	async spike(roomId, ref) {
+		let value = await experiments?.service.store.get(ref).catch(() => undefined);
+		return value?.documentId === roomId ? spikeSnapshot(value) : undefined;
+	},
+	async stop(roomId, finding) {
+		if (finding.kind === "research") {
+			await researchService?.cancelRequest({ channelId: roomId, workspaceId: finding.ref });
+		} else if (finding.kind === "spike") {
+			await experiments?.service.stop(finding.ref, "cancelled");
+		}
+	},
+	demo: id => demoRoster(config.auth).get(id) !== undefined,
+	notice: decisionNotice,
+};
+
+/** The child document a decision opens as, created once under its deterministic id. */
+async function createQuestionPage(
+	input: { roomId: string; recordId: string; title: string; by: string },
+): Promise<string> {
+	let parent = await storage.channels.get(input.roomId);
+	if (!parent || parent.parentChannelId || parent.archivedAt) {
+		throw new Error("Only an open top-level document's decisions can open as pages");
+	}
+	let id = deterministicChannelId(parent.repositoryId, `question:${input.recordId}`);
+	let existing = await storage.channels.get(id);
+	if (existing) {
+		if (existing.parentChannelId !== parent.id) throw new Error("cannot open page");
+		return id;
+	}
+	let title = displayTitle(input.title);
+	let created = await storage.channels.create({
+		id,
+		repositoryId: parent.repositoryId,
+		repositoryOwner: parent.repositoryOwner,
+		repositoryName: parent.repositoryName,
+		parentChannelId: parent.id,
+		title,
+		initial: await Service.initial("", undefined, title, { recordId: input.recordId }),
+		createdBy: input.by,
+		now: new Date(),
+	}).catch(async error => {
+		// A concurrent open created it first.
+		if (await storage.channels.get(id)) return undefined;
+		throw error;
+	});
+	if (created) announceChannel(created);
+	return id;
+}
+
+/** A research request reached ready or failed: settle the findings that follow it. */
+function researchSettled(channelId: string, request: ResearchRequestView): Promise<void> {
+	return withDecisionPlan(channelId, async plan => {
+		if (![...plan.records.values()].some(record => record.findings?.length)) return;
+		await Explore.settleResearch(plan, server, channelId, request, decisionNotice);
+	});
+}
+
+/** Whether a decision's research finding follows `workspaceId`, whatever its status. */
+async function researchFollowed(channelId: string, workspaceId: string): Promise<boolean> {
+	let followed = false;
+	await withDecisionPlan(channelId, async plan => {
+		followed = [...plan.records.values()].some(record =>
+			record.findings?.some(finding => finding.kind === "research" && finding.ref === workspaceId)
+		);
+	});
+	return followed;
+}
+
+/** An investigation as its finding follows it. */
+function spikeSnapshot(
+	value: NonNullable<
+		Awaited<ReturnType<NonNullable<typeof experiments>["service"]["store"]["get"]>>
+	>,
+): Explore.SpikeSnapshot {
+	let summary = value.result ? investigationFinding(value.brief, value.result.report) : {};
+	return {
+		id: value.id,
+		state: value.state,
+		...summary,
+		...(value.input?.source.branch ? { branch: value.input.source.branch } : {}),
+		...(value.childId ? { childId: value.childId } : {}),
+	};
+}
+
+/**
+ * An investigation changed: settle the spike findings that follow a finished one. A document that
+ * is not open is loaded only when its stored records show a running spike finding.
+ */
+async function spikesChanged(documentId: string): Promise<void> {
+	let live = Rooms.get(documentId)?.plan;
+	let running: Set<string>;
+	if (live) {
+		running = new Set();
+		for (let record of live.records.values()) {
+			for (let finding of record.findings ?? []) {
+				if (finding.kind === "spike" && finding.status === "running") running.add(finding.ref);
+			}
+		}
+	} else {
+		let stored = await storage.collaboration.load(documentId, new Date());
+		running = runningFindingRefs(stored?.sidecar as { questions?: unknown } | undefined, "spike");
+	}
+	if (running.size === 0) return;
+	let finished = (await experiments?.service.store.list(documentId) ?? []).filter(value =>
+		running.has(value.id)
+		&& ["completed", "failed", "cancelled", "interrupted"].includes(value.state)
+	);
+	if (finished.length === 0) return;
+	await withDecisionPlan(documentId, async plan => {
+		for (let value of finished) {
+			await Explore.settleSpike(plan, server, documentId, spikeSnapshot(value), decisionNotice);
+		}
+	});
+}
+
 /** Open a document for implementation work, under its transition and document locks. */
 function withImplementationPlan<T>(id: string, action: (plan: Service.Plan) => Promise<T>) {
 	return withDocumentTransition(id, async () => {
@@ -2286,6 +2511,8 @@ experiments = registerExperimentRoutes(router, hostedAuth, {
 		}
 		void spikeScout?.refresh(documentId);
 		void reviewCompletedInvestigations(documentId);
+		void spikesChanged(documentId)
+			.catch(err => console.error("chopin: could not settle spike findings -", err));
 		void liveSync?.blockersChanged(documentId)
 			.catch(err => console.error("chopin: investigation build scheduling failed -", err));
 	},
@@ -2348,6 +2575,9 @@ let jobService = new JobService({
 			void descriptionProjector?.jobChanged(job).catch(err => {
 				console.error("chopin: document description reconciliation failed -", err);
 			});
+		}
+		// A failed job ends a request too; only completion used to reach the research service.
+		if (researchJobSettles(job)) {
 			void researchService?.jobChanged(job).catch(err => {
 				console.error("chopin: research workspace reconciliation failed -", err);
 			});
@@ -2376,6 +2606,8 @@ researchService = new ResearchWorkspaceService({
 	current: currentDocumentTarget,
 	publish: announceResearchChanged,
 	terminalNotice: announceResearchTerminal,
+	settled: researchSettled,
+	followedByDecision: researchFollowed,
 });
 referenceService = new ReferenceService({
 	storage,
@@ -2483,6 +2715,7 @@ registerMcpRoutes(router, hostedAuth, {
 	},
 }, {
 	// A child's instruction runs on its root's Chat with the child as focus.
+	visualAdmission,
 	invokePlanner: input =>
 		invokeRouted({
 			channels: storage.channels,

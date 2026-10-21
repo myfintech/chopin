@@ -13,6 +13,7 @@
 export * as limits from "./limits";
 
 export {
+	appendCriterion,
 	appendOption,
 	assertCallId,
 	decision,
@@ -21,17 +22,39 @@ export {
 	QuestionError,
 	reject,
 } from "./schema";
-export type { Answer, Appended, DecisionDefinition, Definition, Item, Option } from "./schema";
+export type {
+	Answer,
+	Appended,
+	Criterion,
+	CriterionAppended,
+	DecisionDefinition,
+	Definition,
+	Item,
+	Option,
+} from "./schema";
 
-export { answered, apply, assertPatch, create, read, restore } from "./draft";
-export type { Applied, Draft, Drafts, Mode, Model } from "./draft";
+export {
+	answered,
+	apply,
+	assertPatch,
+	create,
+	marked,
+	markKey,
+	read,
+	restore,
+	setMark,
+	upgrade,
+} from "./draft";
+export type { Applied, Draft, Drafts, Mark, Marks, Mode, Model } from "./draft";
 
 export { derive, incomplete, summarize } from "./answer";
 export type { Outcome } from "./answer";
 
-export { addOption } from "./options";
-export type { Added } from "./options";
+export { addCriterion, addOption } from "./options";
+export type { Added, CriterionAdded } from "./options";
 export type { Relation } from "./relation";
+export { multiline, questionHeading, questionParts } from "./text";
+export type { QuestionParts } from "./text";
 
 /**
  * The CRDT itself.

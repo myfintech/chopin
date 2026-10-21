@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, setSystemTime, test } from "bun:test";
 import { Machines } from "../auth/machines";
 import { Sessions } from "../auth/session";
 import { Admission } from "../auth/admission";
@@ -168,31 +168,39 @@ async function setup(
 		}),
 		pairings: {},
 	};
-	let router = new Router();
-	let implementations: ReturnType<typeof registerImplementationRoutes>;
-	let experiments = registerExperimentRoutes(router, auth, {
-		lease: () => context.lease,
-		changed: () => {},
-		context: async () => ({ source: "# Launcher plan", revision: 0 }),
-		implementations: () => implementations,
-	});
-	implementations = registerImplementationRoutes(router, auth, {
-		assess: options.assess,
-		liveBuild: options.liveBuild ?? false,
-		connections: experiments.connections,
-		refuseOffline: experiments.refuseOffline,
-		machineChoices: experiments.machineChoices,
-		busy: async connectionId =>
-			(await experiments.service.store.active()).some(item =>
-				item.connectionId === connectionId && ["running", "publishing"].includes(item.state)
-			),
-		withPlan: async (id, action) => {
-			let plan = plans.get(id);
-			if (!plan) throw new Error("document is unavailable");
-			return action(plan);
-		},
-	});
 	let plans = new Map([[context.plan.id, context.plan]]);
+	let router!: Router;
+	let implementations!: ReturnType<typeof registerImplementationRoutes>;
+	let experiments!: ReturnType<typeof registerExperimentRoutes>;
+	// Connections, run tokens and build assignments live in the process: a restart starts anew
+	// over the same storage and documents.
+	let start = () => {
+		router = new Router();
+		let current = registerExperimentRoutes(router, auth, {
+			lease: () => context.lease,
+			changed: () => {},
+			context: async () => ({ source: "# Launcher plan", revision: 0 }),
+			implementations: () => implementations,
+		});
+		experiments = current;
+		implementations = registerImplementationRoutes(router, auth, {
+			assess: options.assess,
+			liveBuild: options.liveBuild ?? false,
+			connections: current.connections,
+			refuseOffline: current.refuseOffline,
+			machineChoices: current.machineChoices,
+			busy: async connectionId =>
+				(await current.service.store.active()).some(item =>
+					item.connectionId === connectionId && ["running", "publishing"].includes(item.state)
+				),
+			withPlan: async (id, action) => {
+				let plan = plans.get(id);
+				if (!plan) throw new Error("document is unavailable");
+				return action(plan);
+			},
+		});
+	};
+	start();
 	await prepare(context.plan);
 	let path = `/api/channels/${context.plan.id}/implementation`;
 	let call = async (
@@ -201,6 +209,8 @@ async function setup(
 		token?: string,
 		origin = config.origin,
 		cookie = issued.cookie,
+		/** The connector protocol the caller speaks; null sends none, as a coding agent does. */
+		protocol: number | null = CONNECTOR_PROTOCOLS.max,
 	) => {
 		let response = await router.handle(
 			new Request(config.origin + url, {
@@ -210,7 +220,7 @@ async function setup(
 					cookie: cookie.split(";")[0],
 					...(token ? { authorization: `Bearer ${token}` } : {}),
 					// What a current connector sends; browser routes ignore it.
-					[CONNECTOR_PROTOCOL_HEADER]: String(CONNECTOR_PROTOCOLS.max),
+					...(protocol === null ? {} : { [CONNECTOR_PROTOCOL_HEADER]: String(protocol) }),
 				},
 				...(value ? { body: JSON.stringify(value) } : {}),
 			}),
@@ -221,14 +231,22 @@ async function setup(
 	return {
 		...context,
 		auth,
-		router,
+		get router() {
+			return router;
+		},
 		path,
 		call,
 		cookie: issued.cookie,
 		otherCookie: other.cookie,
-		implementations,
-		experiments,
+		get implementations() {
+			return implementations;
+		},
+		get experiments() {
+			return experiments;
+		},
 		plans,
+		/** The server restarts: everything it kept in memory is gone. */
+		restart: start,
 	};
 }
 
@@ -236,6 +254,7 @@ async function paired(
 	context: Awaited<ReturnType<typeof setup>>,
 	cookie?: string,
 	autoRun?: boolean,
+	protocol?: number,
 ) {
 	let pairing =
 		await (await context.call("/api/connector/pairings", { ...checkout, label: "Laptop" })).json();
@@ -250,12 +269,23 @@ async function paired(
 		secret: pairing.secret,
 	})).json();
 	// `chopin connect` registers the checkout with the machine token.
+	let connection = await reconnect(context, machine.token, cookie, protocol);
+	return { ...connection, machineToken: machine.token as string };
+}
+/** The paired machine registers again with its machine token, as the connector does after a drop. */
+async function reconnect(
+	context: Awaited<ReturnType<typeof setup>>,
+	machine: string,
+	cookie?: string,
+	protocol?: number,
+) {
 	return (await context.call(
 		"/api/connector/connections",
 		{ ...checkout, label: "Laptop" },
-		machine.token,
+		machine,
 		undefined,
 		cookie,
+		protocol,
 	)).json();
 }
 async function tool(
@@ -263,14 +293,26 @@ async function tool(
 	token: string,
 	name: string,
 	args: unknown = {},
+	protocol?: number | null,
 ) {
-	let response = await context.call("/connector/mcp", {
-		jsonrpc: "2.0",
-		id: 1,
-		method: "tools/call",
-		params: { name, arguments: args },
-	}, token);
-	let result = (await response.json()).result;
+	let response = await context.call(
+		"/connector/mcp",
+		{
+			jsonrpc: "2.0",
+			id: 1,
+			method: "tools/call",
+			params: { name, arguments: args },
+		},
+		token,
+		undefined,
+		undefined,
+		protocol,
+	);
+	let text = await response.text();
+	let body = JSON.parse(text);
+	// A refusal before the tool runs, such as an unknown credential, is the HTTP answer itself.
+	if (!body.result) return { status: response.status, ...body };
+	let result = body.result;
 	return result.isError ? result : JSON.parse(result.content[0].text);
 }
 
@@ -366,7 +408,7 @@ test("build heartbeats persist changed activity without resetting its age on eve
 		graphRevision: 1,
 	})).json();
 	await tool(context, connection.token, "claim_implementation_build", { id: built.id });
-	let heartbeat = { id: built.id, progress: "Running server tests" };
+	let heartbeat = { id: built.id, documentId: context.plan.id, progress: "Running server tests" };
 	expect((await tool(context, connection.token, "renew_implementation_build", heartbeat)).isError)
 		.toBeUndefined();
 	let first = (await (await context.call(context.path)).json()).build.activity;
@@ -385,6 +427,26 @@ test("build heartbeats persist changed activity without resetting its age on eve
 			.text,
 	)
 		.toBe("Opening the pull request");
+});
+
+test("a heartbeat's raw shell command never reaches the build's activity", async () => {
+	let context = await setup();
+	let connection = await paired(context);
+	let built = await (await context.call(context.path, {
+		planRevision: 0,
+		graphVersion: 1,
+		graphRevision: 1,
+	})).json();
+	await tool(context, connection.token, "claim_implementation_build", { id: built.id });
+	// An older connector forwards the agent's tool title, which for a shell tool is the command.
+	await tool(context, connection.token, "renew_implementation_build", {
+		id: built.id,
+		progress: "sleep 900; git -C $CHOPIN_RUN_WORKTREES/rewire status --short",
+	});
+	let snapshot = await (await context.call(context.path)).json();
+	expect(snapshot.build.activity.text).toBe("Running a command");
+	expect(JSON.stringify(snapshot)).not.toContain("sleep 900");
+	await Plan.close(context.plan);
 });
 
 test("a paired workspace claims a browser build once and reports through run-scoped MCP", async () => {
@@ -512,6 +574,102 @@ test("a run's parallel lifecycle batch lands in order and refusals say what to d
 	});
 	expect(foreign.isError).toBe(true);
 	expect(foreign.content[0].text).toBe("repository: repository");
+	await Plan.close(context.plan);
+});
+
+test("complete_task records a task that needed no change, and its dependent starts", async () => {
+	let context = await setup();
+	await implementationGraphs().revise(context.plan, {
+		planRevision: 0,
+		graphRevision: 1,
+		operations: [{
+			op: "add",
+			task: {
+				id: "second",
+				title: "Second",
+				context: "Follows the tracer",
+				goal: "Build on it",
+				acceptance: ["Builds", "Reports"],
+				dependsOn: ["first"],
+			},
+		}],
+	});
+	let connection = await paired(context);
+	let built = await (await context.call(context.path, {
+		planRevision: 0,
+		graphVersion: 1,
+		graphRevision: 2,
+	})).json();
+	let claim = await tool(context, connection.token, "claim_implementation_build", { id: built.id });
+	await tool(context, connection.token, "report_implementation_build", {
+		id: built.id,
+		state: "running",
+		session: "acp-session",
+	});
+	let listed = await (await context.call("/connector/mcp", {
+		jsonrpc: "2.0",
+		id: 1,
+		method: "tools/list",
+	}, claim.runToken)).json();
+	let schema = listed.result.tools.find((item: { name: string }) => item.name === "complete_task")
+		.inputSchema;
+	expect(schema.required).not.toContain("noChange");
+	expect(schema.properties.noChange.required).toEqual(["reason", "evidence"]);
+	expect(schema.properties.noChange.description).toContain("no pull request");
+	await tool(context, claim.runToken, "start_task", { taskId: "first", idempotencyKey: "start-1" });
+	let noChange = {
+		reason: "The behaviour already exists on the base commit.",
+		evidence: "Ran the focused suite in run 42: **12 passed**, 0 failed.",
+	};
+	let oversize = await tool(context, claim.runToken, "complete_task", {
+		taskId: "first",
+		summary: "Verified.",
+		noChange: { ...noChange, evidence: "x".repeat(5001) },
+		idempotencyKey: "complete-oversize",
+	});
+	expect(oversize.isError).toBe(true);
+	let long = await tool(context, claim.runToken, "complete_task", {
+		taskId: "first",
+		summary: "Verified.",
+		noChange: { ...noChange, reason: "x".repeat(1001) },
+		idempotencyKey: "complete-long-reason",
+	});
+	expect(long.isError).toBe(true);
+	let done = await tool(context, claim.runToken, "complete_task", {
+		taskId: "first",
+		summary: "Verified; nothing to change.",
+		noChange,
+		idempotencyKey: "complete-1",
+	});
+	expect(done.isError).toBeUndefined();
+	let snapshot = await (await context.call(context.path)).json();
+	expect(snapshot.lifecycle.activity.tasks[0]).toEqual({
+		id: "first",
+		state: "completed",
+		summary: "Verified; nothing to change.",
+		noChange,
+	});
+	// The dependent may start at once, and a task with a pull request cannot claim no change.
+	expect(
+		(await tool(context, claim.runToken, "start_task", {
+			taskId: "second",
+			idempotencyKey: "start-2",
+		})).isError,
+	).toBeUndefined();
+	await tool(context, claim.runToken, "report_pr", {
+		taskId: "second",
+		url: "https://github.com/owner/repository/pull/8",
+		state: "open",
+		idempotencyKey: "pr-2",
+	});
+	let refused = await tool(context, claim.runToken, "complete_task", {
+		taskId: "second",
+		summary: "Nothing to do.",
+		noChange,
+		idempotencyKey: "complete-2-no-change",
+	});
+	expect(refused.isError).toBe(true);
+	expect(refused.content[0].text).toContain("no-change-pull-request: The task has a pull request");
 	await Plan.close(context.plan);
 });
 
@@ -657,6 +815,376 @@ test("disconnecting fails a running build at once and announces it after persist
 	await Plan.close(context.plan);
 });
 
+test.each([false, true])("a reconnect keeps its build running (hint: %s)", async hinted => {
+	let clock = Date.now();
+	setSystemTime(new Date(clock));
+	let context = await setup();
+	try {
+		let first = await paired(context);
+		let built = await (await context.call(context.path, {
+			planRevision: 0,
+			graphVersion: 1,
+			graphRevision: 1,
+		})).json();
+		let claim = await tool(context, first.token, "claim_implementation_build", { id: built.id });
+		await tool(context, first.token, "report_implementation_build", {
+			id: built.id,
+			state: "running",
+			session: "acp-session",
+		});
+		let heartbeat = first.token;
+		// The connector renews every 10 seconds; the server sweeps as it does in production.
+		let run = async (minutes: number) => {
+			for (let beat = 0; beat < minutes * 6; beat++) {
+				// The process renews its writer lease as time passes, as in production.
+				await context.storage.leases.renew(context.lease, 60_000);
+				clock += 10_000;
+				setSystemTime(new Date(clock));
+				expect(
+					await tool(context, heartbeat, "renew_implementation_build", {
+						id: built.id,
+						...(hinted ? { documentId: context.plan.id } : {}),
+						progress: "Working",
+					}),
+				).toEqual({ accepted: true });
+				await context.implementations.sweep();
+			}
+		};
+		await run(55);
+		await tool(context, claim.runToken, "start_task", { taskId: "first", idempotencyKey: "s" });
+		// The Planner poll's long poll is cut; the connector drops that connection and registers the
+		// machine again, so the run's next heartbeat arrives on a new connection.
+		let second = await reconnect(context, first.machineToken);
+		expect(second.connection.id).not.toBe(first.connection.id);
+		heartbeat = second.token;
+		// Past the old connection's expiry, and on to more than an hour in all.
+		await run(10);
+		expect(context.plan.builds.at(-1)).toMatchObject({
+			state: "running",
+			connectionId: second.connection.id,
+		});
+		// The agent's own run credential still reports.
+		expect(
+			await tool(context, claim.runToken, "report_pr", {
+				taskId: "first",
+				idempotencyKey: "pr",
+				url: "https://github.com/owner/repository/pull/7",
+				state: "open",
+			}),
+		).toEqual({ state: "accepted" });
+		// Another machine of the same owner, and another owner's machine, still cannot report into it.
+		for (let other of [await paired(context), await paired(context, context.otherCookie)]) {
+			let refused = await tool(context, other.token, "renew_implementation_build", {
+				id: built.id,
+			});
+			expect(refused.content[0].text).toMatch(/^build-forbidden:/);
+		}
+		expect(
+			await tool(context, claim.runToken, "complete_task", {
+				taskId: "first",
+				idempotencyKey: "done",
+				summary: "Done",
+			}),
+		).toEqual({ state: "accepted" });
+		await tool(context, heartbeat, "report_implementation_build", {
+			id: built.id,
+			state: "stopped",
+		});
+		expect(context.plan.builds.at(-1)).toMatchObject({ state: "stopped" });
+		expect(context.plan.builds.at(-1)!.error).toBeUndefined();
+	} finally {
+		setSystemTime();
+		await Plan.close(context.plan);
+	}
+});
+
+test.each([false, true])(
+	"a reconnect after session end keeps its build (hint: %s)",
+	async hinted => {
+		let context = await setup();
+		try {
+			let first = await paired(context);
+			let built = await (await context.call(context.path, {
+				planRevision: 0,
+				graphVersion: 1,
+				graphRevision: 1,
+			})).json();
+			await tool(context, first.token, "claim_implementation_build", { id: built.id });
+			await tool(context, first.token, "report_implementation_build", {
+				id: built.id,
+				state: "running",
+				session: "acp-session",
+			});
+			let ended = await context.router.handle(
+				new Request(`${context.auth.config.origin}/connector/mcp`, {
+					method: "DELETE",
+					headers: {
+						authorization: `Bearer ${first.token}`,
+						[CONNECTOR_PROTOCOL_HEADER]: String(CONNECTOR_PROTOCOLS.max),
+					},
+				}),
+			);
+			expect(ended?.status).toBe(204);
+			expect(context.experiments.connections.assigned(first.connection.id)).toBeUndefined();
+			expect(context.plan.builds.at(-1)).toMatchObject({ state: "running" });
+			let second = await reconnect(context, first.machineToken);
+			let args = { id: built.id, ...(hinted ? { documentId: context.plan.id } : {}) };
+			expect(await tool(context, second.token, "renew_implementation_build", args))
+				.toEqual({ accepted: true });
+			expect(context.experiments.connections.assigned(second.connection.id)).toBe(context.plan.id);
+			expect(context.plan.builds.at(-1)).toMatchObject({
+				state: "running",
+				connectionId: second.connection.id,
+			});
+			expect(await tool(context, second.token, "renew_implementation_build", args))
+				.toEqual({ accepted: true });
+			expect(
+				await tool(context, second.token, "report_implementation_build", {
+					...args,
+					state: "stopped",
+				}),
+			).toEqual({ accepted: true });
+			expect(context.plan.builds.at(-1)).toMatchObject({ state: "stopped" });
+		} finally {
+			await Plan.close(context.plan);
+		}
+	},
+);
+
+/**
+ * A clock the test moves on, as time passes in production: the process renews its writer lease as
+ * it goes.
+ */
+function clockFor(context: Awaited<ReturnType<typeof setup>>, start = Date.now()) {
+	let now = start;
+	setSystemTime(new Date(now));
+	return {
+		get now() {
+			return now;
+		},
+		async advance(ms: number) {
+			for (let left = ms; left > 0; left -= 10_000) {
+				await context.storage.leases.renew(context.lease, 60_000);
+				now += Math.min(left, 10_000);
+				setSystemTime(new Date(now));
+			}
+			await context.storage.leases.renew(context.lease, 60_000);
+		},
+	};
+}
+
+/** A build claimed and running on a newly paired machine whose connector speaks `protocol`. */
+async function running(context: Awaited<ReturnType<typeof setup>>, protocol?: number) {
+	let connection = await paired(context, undefined, undefined, protocol);
+	let built = await (await context.call(context.path, {
+		planRevision: 0,
+		graphVersion: 1,
+		graphRevision: 1,
+	})).json();
+	let claim = await tool(
+		context,
+		connection.token,
+		"claim_implementation_build",
+		{ id: built.id },
+		protocol,
+	);
+	await tool(context, connection.token, "report_implementation_build", {
+		id: built.id,
+		state: "running",
+		session: "acp-session",
+	}, protocol);
+	return { connection, built, claim };
+}
+
+test("an older connector's build still ends at a restart, saying so", async () => {
+	let context = await setup();
+	try {
+		// Protocol 5 names no document on its heartbeat, so Chopin cannot find the build again.
+		let { connection, built } = await running(context, 5);
+		context.restart();
+		// Its connection is forgotten, so the connector registers the machine again.
+		let forgotten = await tool(context, connection.token, "renew_implementation_build", {
+			id: built.id,
+		}, 5);
+		expect(forgotten.error).toBe("connection-unavailable");
+		let second = await reconnect(context, connection.machineToken, undefined, 5);
+		let ended = "Chopin restarted, so this build ended.";
+		expect(
+			(await tool(context, second.token, "renew_implementation_build", { id: built.id }, 5))
+				.content[0].text,
+		).toBe(`server-restarted: ${ended}`);
+		// Opening the document tracks its build again, and the sweep ends it with the same reason.
+		await context.call(context.path);
+		await context.implementations.sweep();
+		expect(context.plan.builds.at(-1)).toMatchObject({ state: "failed", error: ended });
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a build carries on across a server restart once its machine comes back", async () => {
+	let context = await setup();
+	let clock = clockFor(context);
+	try {
+		let { connection, built, claim } = await running(context);
+		// The coding agent calls Chopin with only its run credential, and no connector protocol.
+		let agent = (name: string, args: Record<string, unknown>) =>
+			tool(context, claim.runToken, name, args, null);
+		expect(await agent("start_task", { taskId: "first", idempotencyKey: "start" }))
+			.toEqual({ state: "accepted" });
+		// The deploy takes two minutes, longer than a heartbeat keeps a build alive.
+		await clock.advance(120_000);
+		context.restart();
+		let pr = {
+			taskId: "first",
+			idempotencyKey: "pr",
+			url: "https://github.com/owner/repository/pull/7",
+			state: "open",
+		};
+		// The agent reports before its connector is back: it is asked to retry, and nothing ends.
+		expect(await agent("report_pr", pr)).toMatchObject({ status: 503, error: "unavailable" });
+		let hint = { id: built.id, documentId: context.plan.id };
+		expect(await tool(context, connection.token, "renew_implementation_build", hint))
+			.toMatchObject({ error: "connection-unavailable" });
+		// Another machine of the same person, and another person's machine, cannot take it over.
+		for (let other of [await paired(context), await paired(context, context.otherCookie)]) {
+			let refused = await tool(context, other.token, "renew_implementation_build", hint);
+			expect(refused.content[0].text).toMatch(/^build-forbidden:/);
+		}
+		// The connector registers its machine again and its heartbeat carries on with the build.
+		let second = await reconnect(context, connection.machineToken);
+		expect(
+			await tool(context, second.token, "renew_implementation_build", {
+				...hint,
+				progress: "Working",
+			}),
+		).toEqual({ accepted: true });
+		expect(context.plan.builds.at(-1)).toMatchObject({
+			state: "running",
+			connectionId: second.connection.id,
+		});
+		expect(await agent("report_pr", pr)).toEqual({ state: "accepted" });
+		expect(
+			await agent("complete_task", { taskId: "first", idempotencyKey: "done", summary: "Done" }),
+		).toEqual({ state: "accepted" });
+		expect(
+			await tool(context, second.token, "report_implementation_build", {
+				...hint,
+				state: "stopped",
+			}),
+		).toEqual({ accepted: true });
+		expect(context.plan.builds.at(-1)).toMatchObject({ state: "stopped" });
+		expect(context.plan.builds.at(-1)!.error).toBeUndefined();
+		// Its run credential ended with the build.
+		let late = await agent("start_task", { taskId: "first", idempotencyKey: "again" });
+		expect(late.content[0].text).toMatch(/^build-inactive:/);
+	} finally {
+		setSystemTime();
+		await Plan.close(context.plan);
+	}
+});
+
+test("a run credential Chopin did not issue is refused after a restart", async () => {
+	let context = await setup();
+	try {
+		let { claim } = await running(context);
+		context.restart();
+		await context.call(context.path);
+		let forged = claim.runToken.slice(0, -2) + (claim.runToken.endsWith("AA") ? "BB" : "AA");
+		for (let protocol of [null, undefined]) {
+			let refused = await tool(context, forged, "start_task", {
+				taskId: "first",
+				idempotencyKey: "start",
+			}, protocol);
+			expect(refused.status).toBe(409);
+			expect(refused.error).toBe(
+				protocol === null ? "connector-update-required" : "connection-unavailable",
+			);
+		}
+		let snapshot = await (await context.call(context.path)).json();
+		expect(snapshot.lifecycle.activity.tasks[0].state).toBe("queued");
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a build that ended before a restart stays ended", async () => {
+	let context = await setup();
+	try {
+		let { connection, built, claim } = await running(context);
+		expect((await context.call(`${context.path}/stop`, { id: built.id })).status).toBe(200);
+		context.restart();
+		let second = await reconnect(context, connection.machineToken);
+		let renewed = await tool(context, second.token, "renew_implementation_build", {
+			id: built.id,
+			documentId: context.plan.id,
+		});
+		expect(renewed.content[0].text).toMatch(/^build-inactive:/);
+		let agent = await tool(context, claim.runToken, "start_task", {
+			taskId: "first",
+			idempotencyKey: "start",
+		}, null);
+		expect(agent.content?.[0].text ?? agent.error).toMatch(/^build-inactive/);
+		expect(context.plan.builds.at(-1)).toMatchObject({
+			state: "failed",
+			error: "Stopped in Chopin.",
+		});
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test.each([
+	["comes back without it", "Your local agent stopped responding."],
+	["never comes back", "Your local agent disconnected."],
+])(
+	"a build its machine does not resume after a restart waits out the window, then ends (machine %s)",
+	async (machine, error) => {
+		let context = await setup();
+		let clock = clockFor(context);
+		try {
+			let { connection } = await running(context);
+			context.restart();
+			// Someone opens the document, so Chopin looks at its build again.
+			await context.call(context.path);
+			let after = async (ms: number) => {
+				await clock.advance(ms);
+				await context.implementations.sweep();
+				return context.plan.builds.at(-1)!;
+			};
+			expect(await after(0)).toMatchObject({ state: "running" });
+			expect(await after(60_000)).toMatchObject({ state: "running" });
+			// A connector whose agent stopped meanwhile registers its machine but never renews the build.
+			if (machine === "comes back without it") {
+				await reconnect(context, connection.machineToken);
+			}
+			expect(await after(25_000)).toMatchObject({ state: "running" });
+			expect(await after(10_000)).toMatchObject({ state: "failed", error });
+		} finally {
+			setSystemTime();
+			await Plan.close(context.plan);
+		}
+	},
+);
+
+test("a build whose heartbeat stops while its machine stays connected says the agent stopped responding", async () => {
+	let context = await setup();
+	let connection = await paired(context);
+	let built = await (await context.call(context.path, {
+		planRevision: 0,
+		graphVersion: 1,
+		graphRevision: 1,
+	})).json();
+	await tool(context, connection.token, "claim_implementation_build", { id: built.id });
+	context.plan.builds.at(-1)!.expiresAt = Date.now() - 1;
+	await context.implementations.sweep();
+	expect(context.plan.builds.at(-1)).toMatchObject({
+		state: "failed",
+		error: "Your local agent stopped responding.",
+	});
+	await Plan.close(context.plan);
+});
+
 test("a build report retried after its answer was lost lands once, and an invalid one is still refused", async () => {
 	let context = await setup();
 	let connection = await paired(context);
@@ -721,6 +1249,30 @@ test("a deleted document cannot block implementation recovery sweeps", async () 
 	await context.storage.channels.delete(context.plan.id);
 	await expect(context.implementations.sweep()).resolves.toBeUndefined();
 	await expect(context.implementations.sweep()).resolves.toBeUndefined();
+});
+
+test("a protocol 2 to 5 connector's unhinted calls resolve the build's document, not the connection's assignment", async () => {
+	let context = await setup();
+	try {
+		let first = await paired(context);
+		let built = await (await context.call(context.path, {
+			planRevision: 0,
+			graphVersion: 1,
+			graphRevision: 1,
+		})).json();
+		await tool(context, first.token, "claim_implementation_build", { id: built.id });
+		// The connection's assignment now names another document, as when it queued behind one.
+		context.experiments.connections.assign(first.connection.id, "another-document");
+		expect(await tool(context, first.token, "renew_implementation_build", { id: built.id }))
+			.toEqual({ accepted: true });
+		let hinted = await tool(context, first.token, "renew_implementation_build", {
+			id: built.id,
+			documentId: context.plan.id,
+		});
+		expect(hinted.content[0].text).toMatch(/^build-forbidden:/);
+	} finally {
+		await Plan.close(context.plan);
+	}
 });
 
 test("Build queues behind a running prototype and starts once it finishes (LIVE_BUILD)", async () => {
@@ -1028,11 +1580,14 @@ async function rebuilding(autoRun = false) {
 	});
 	expect(rebuild.build.kind).toBe("rebuild");
 	expect(rebuild.live).toBe(false);
-	await tool(context, connection.token, "report_implementation_build", {
-		id: queued.build.id,
-		state: "running",
-		session: "rebuild-session",
-	});
+	expect(
+		(await tool(context, connection.token, "report_implementation_build", {
+			id: queued.build.id,
+			documentId: rebuild.documentId,
+			state: "running",
+			session: "rebuild-session",
+		})).isError,
+	).toBeUndefined();
 	return { context, connection, built, claim, rebuild, builtSource, target, stopped };
 }
 
@@ -1242,6 +1797,125 @@ test("a landed rebuild keeps its heartbeat and a retried report harmless", async
 	}
 });
 
+test.each(["released", "another document", "newer rebuild"])(
+	"a landed rebuild accepts its controller's final reports after assignment to %s",
+	async assignment => {
+		let { context, connection, rebuild } = await rebuilding();
+		let second = await openSiblingPlan(context, "# Second plan\n");
+		try {
+			expect(
+				await tool(context, rebuild.runToken, "report_rebuild", {
+					summary: "Rendered the rebuilt paragraph.",
+					commits: [{ pullRequest, sha: "c".repeat(40), message: "Render paragraph" }],
+					tasks: [],
+				}),
+			).toEqual({ state: "stopped" });
+			await context.implementations.sweep();
+			expect(context.experiments.connections.assigned(connection.connection.id)).toBeUndefined();
+			if (assignment === "another document") {
+				await prepare(second);
+				context.plans.set(second.id, second);
+				expect(
+					(await context.call(`/api/channels/${second.id}/implementation`, {
+						planRevision: 0,
+						graphVersion: 1,
+						graphRevision: 1,
+					})).status,
+				).toBe(200);
+			} else if (assignment === "newer rebuild") {
+				expect((await edit(context.plan, "Another edit.")).ok).toBe(true);
+				expect((await queueRebuild(context.plan, context.experiments.connections)).kind)
+					.toBe("queued");
+			}
+			let before = structuredClone({
+				live: context.plan.live,
+				graph: context.plan.graph,
+				builds: context.plan.builds,
+				execution: context.plan.execution,
+				secondBuilds: second.builds,
+			});
+			let identity = { id: rebuild.build.id, documentId: rebuild.documentId };
+			expect(await tool(context, connection.token, "renew_implementation_build", identity))
+				.toEqual({ accepted: true, state: "stopped" });
+			expect(
+				await tool(context, connection.token, "report_implementation_build", {
+					...identity,
+					state: "stopped",
+				}),
+			).toEqual({ accepted: true });
+			expect({
+				live: context.plan.live,
+				graph: context.plan.graph,
+				builds: context.plan.builds,
+				execution: context.plan.execution,
+				secondBuilds: second.builds,
+			}).toEqual(before);
+		} finally {
+			await Plan.close(second);
+			await Plan.close(context.plan);
+		}
+	},
+);
+
+test("a landed rebuild's controller no-op still checks identities and repository access", async () => {
+	let { context, connection, rebuild } = await rebuilding();
+	try {
+		await tool(context, rebuild.runToken, "report_rebuild", {
+			summary: "Rendered the rebuilt paragraph.",
+			commits: [],
+			tasks: [],
+		});
+		await context.implementations.sweep();
+		let identity = { id: rebuild.build.id, documentId: rebuild.documentId };
+		let otherConnection = await paired(context);
+		let otherOwner = await paired(context, context.otherCookie);
+		for (let token of [otherConnection.token, otherOwner.token]) {
+			expect((await tool(context, token, "renew_implementation_build", identity)).isError)
+				.toBe(true);
+		}
+		for (
+			let args of [
+				{ ...identity, id: crypto.randomUUID() },
+				{ ...identity, documentId: crypto.randomUUID() },
+			]
+		) {
+			expect((await tool(context, connection.token, "renew_implementation_build", args)).isError)
+				.toBe(true);
+		}
+		for (let state of ["running", "failed"]) {
+			expect(
+				(await tool(context, connection.token, "report_implementation_build", {
+					...identity,
+					state,
+					session: "another-session",
+				})).isError,
+			).toBe(true);
+		}
+		let own = context.experiments.connections.get(connection.connection.id)!;
+		let build = context.plan.builds.at(-1)!;
+		let user = build.user;
+		build.user = "U_other";
+		expect((await tool(context, connection.token, "renew_implementation_build", identity)).isError)
+			.toBe(true);
+		build.user = user;
+		let access = context.auth.github.repositoryAccess;
+		context.auth.github.repositoryAccess = async (...args) => {
+			let repository = await access(...args);
+			return repository
+				&& { ...repository, permissions: { pull: true, push: false, admin: false } };
+		};
+		expect((await tool(context, connection.token, "renew_implementation_build", identity)).isError)
+			.toBe(true);
+		context.auth.github.repositoryAccess = access;
+		own.anyRepository = false;
+		own.checkouts = [];
+		expect((await tool(context, connection.token, "renew_implementation_build", identity)).isError)
+			.toBe(true);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
 test("a rebuild that ends without a report fails and leaves the live base alone", async () => {
 	let { context, connection, rebuild } = await rebuilding();
 	try {
@@ -1261,6 +1935,16 @@ test("a rebuild that ends without a report fails and leaves the live base alone"
 				tasks: [],
 			})).isError,
 		).toBe(true);
+		await context.implementations.sweep();
+		for (let name of ["renew_implementation_build", "report_implementation_build"]) {
+			expect(
+				(await tool(context, connection.token, name, {
+					id: rebuild.build.id,
+					documentId: rebuild.documentId,
+					...(name === "report_implementation_build" ? { state: "stopped" } : {}),
+				})).isError,
+			).toBe(true);
+		}
 		let again = await queueRebuild(context.plan, context.experiments.connections);
 		expect(again.kind).toBe("queued");
 	} finally {

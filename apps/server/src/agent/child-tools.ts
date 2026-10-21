@@ -14,6 +14,7 @@ import { z } from "zod";
 
 import * as Arguments from "./arguments";
 import {
+	admitBlockEdit,
 	answer,
 	applyAnchors,
 	applyBlockEdit,
@@ -143,18 +144,32 @@ export const childTools = {
 			// So a stray `visual_route` reaches the explicit refusal; `editPlan` rejects the rest.
 			additionalProperties: true,
 		}),
-		execute: (raw, { context: { room, owner } }) =>
+		execute: (raw, { context: { room, owner }, abortSignal }) =>
 			respond("edit_child", async () => {
+				let signals = [abortSignal, owner?.signal, room.turnSignal?.()].filter(
+					(signal): signal is AbortSignal => !!signal,
+				);
+				let signal = signals.length ? AbortSignal.any(signals) : undefined;
 				let { child, rest } = Arguments.childTarget(raw, "edit_child");
 				let args = Arguments.editPlan(rest);
 				if (args.visualRoute) return { ok: false, reason: "visual-routing-unavailable" };
 				let children = await permitted(room, owner);
 				return children.open(child, async opened => {
 					let { acting, actingChannel } = room.plan.chat;
+					let refusal = await admitBlockEdit(
+						{
+							...opened,
+							visualAdmission: room.visualAdmission,
+						},
+						args,
+						signal,
+					);
+					if (refusal) return { ...refusal, child: opened.id };
 					let result = await opened.exclusive(async () => {
 						await stillChild(children, owner, opened.id);
 						// Only a thread in this child is the one the root's turn was sent about.
 						return applyBlockEdit(opened, args, {
+							signal,
 							acting: actingChannel === opened.id ? acting : undefined,
 						});
 					});
@@ -183,7 +198,7 @@ export const childTools = {
 				let { child, rest } = Arguments.childTarget(raw, "anchor_child");
 				let args = Arguments.anchorPlan(rest);
 				let children = await permitted(room, owner);
-				// Not inside `exclusive`, exactly like `anchor_plan`: `persist` queues on that chain.
+				// `applyAnchors` owns the child's queue and stages its durable commit.
 				return children.open(child, async opened => {
 					await stillChild(children, owner, opened.id);
 					if (implementationActive(opened.plan)) return { ok: false, reason: "locked" };

@@ -49,7 +49,7 @@ function stopped(reason: Exclude<ErrorClass, "retry" | "forgotten">, error: unkn
 
 const USERINFO = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi;
 const TOKEN =
-	/\b(?:gh[opsur]_|github_pat_|chopin_[kmp]_|sk-)[A-Za-z0-9_-]{8,}|\b(Bearer\s+)\S{8,}/g;
+	/\b(?:gh[opsur]_|github_pat_|chopin_[kmpr]_|sk-)[A-Za-z0-9_-]{8,}|\b(Bearer\s+)\S{8,}/g;
 
 /**
  * `text` with URL credentials, token-shaped strings and each of the `secrets` it knows, such as
@@ -159,6 +159,16 @@ export async function serveWork(options: {
 	let connected = false;
 	let current: Api | undefined;
 	let connecting: Promise<Api> | undefined;
+	/** Runs in progress; a connection that drops under one is said, since Chopin may see a new one. */
+	let running = 0;
+	let run: typeof options.run = async (api, kind, claim) => {
+		running++;
+		try {
+			return await options.run(api, kind, claim);
+		} finally {
+			running--;
+		}
+	};
 	let drop = (api: Api) => {
 		if (current === api) current = undefined;
 		void api.close().catch(() => {});
@@ -190,14 +200,19 @@ export async function serveWork(options: {
 	let link: Link = {
 		async call(name, args, callSignal) {
 			let api = current ?? await abandoned(
-				connecting ??= open().then(value => current = value)
-					.finally(() => connecting = undefined),
+				connecting ??= open().then(value => {
+					if (running) output.runReconnected();
+					return current = value;
+				}).finally(() => connecting = undefined),
 				callSignal,
 			);
 			try {
 				return await api.call(name, args, callSignal);
 			} catch (error) {
-				if (!signal.aborted && transient(classify(error))) drop(api);
+				if (!signal.aborted && transient(classify(error))) {
+					if (running && current === api) output.runConnectionLost(failureCause(error));
+					drop(api);
+				}
 				throw error;
 			}
 		},
@@ -211,7 +226,7 @@ export async function serveWork(options: {
 			forgottenSince = undefined;
 			connected = true;
 			connectedAt = now();
-			await serveBoth(link, { ...options, classify });
+			await serveBoth(link, { ...options, run, classify });
 			// Leaving promptly matters more than being heard: a silent connection also expires.
 			let last = current;
 			if (last) {

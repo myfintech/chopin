@@ -23,6 +23,12 @@ export type SeedState = {
 	threads?: unknown[];
 	transcript?: unknown[];
 	parent?: string;
+	/** Seed the sidecar marker of a decision's page. */
+	questionPage?: { recordId: string };
+	/** Workflow run cards Chat showed before the document was last stored. */
+	workflowRuns?: unknown[];
+	/** Every stored stage of those runs, by run id, in run order. */
+	runStages?: Record<string, import("../storage/model").RunStageRecord[]>;
 };
 
 export function storedQuestion(definition: Definition): number[] {
@@ -186,6 +192,7 @@ export async function checkpointSource(
 		openQuestions: state.openQuestions ?? [],
 		threads: state.threads ?? [],
 		transcript: state.transcript ?? [],
+		...(state.questionPage ? { questionPage: state.questionPage } : {}),
 		...(state.graph ? { graph: state.graph } : {}),
 		...(state.builds ? { builds: state.builds } : {}),
 		...(state.lifecycle ? { lifecycle: state.lifecycle } : {}),

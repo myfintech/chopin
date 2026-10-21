@@ -5,6 +5,8 @@
  * helpers without pulling React into a headless process.
  */
 
+export { questionHeading, questionParts } from "../text";
+export { MarkGlyph, markName, MARKS, ReadOnlyMark } from "./criteria";
 export { InlineCode, InlineCodeList } from "./inline-code";
 export { plainInlineList, plainInlineText } from "./inline-segments";
 export { projectSuggestion, reduceSuggestionEditState } from "./project-suggestion";
@@ -14,8 +16,16 @@ export type {
 	SuggestionProjection,
 	VisibleSuggestion,
 } from "./project-suggestion";
+export {
+	MarkdownBlocks,
+	MarkdownLine,
+	MarkdownText,
+	QuestionMarkdownContext,
+} from "./question-markdown";
+export type { QuestionMarkdownRenderer } from "./question-markdown";
 export { QuestionView } from "./question-view";
 export type {
+	AddCriterionResult,
 	AddOptionResult,
 	Collaborator,
 	PendingAnswers,

@@ -27,10 +27,12 @@ import { rememberCheckout } from "../harness/atomic/workspace";
 import { plannerInstructions } from "../agent/planner";
 import type { ActiveOwnerBinding } from "../agent/active-owner";
 import type { DocumentRoom, ResearchWorkspaceRequest } from "../agent/tools";
+import type { VisualAdmission } from "../agent/visual-admission";
 import type { ChildDocuments } from "./children";
 import * as Service from "../plan/service";
 import * as DocumentProvenance from "../document-provenance";
 import { instruction } from "@chopin/protocol/address";
+import { settledStages } from "@chopin/protocol/run-stages";
 
 import { annotatedText, compose, focusContext, referenceCatalog, remember } from "./address";
 import { createNotices } from "./notices";
@@ -40,12 +42,14 @@ import { argsText, outputText, textOutput } from "./activity";
 import { toolErrorSchema } from "@chopin/agent-link";
 import { watchJobAbort } from "./job-fence";
 import { JOB_TOOLS } from "../agent/job-scope";
-import type { JobOutcome } from "../conversation-plan/jobs";
+import type { Job, JobOutcome } from "../conversation-plan/jobs";
 export type { Announcer, NoticeInput } from "./notices";
 import { isChannelId } from "../channels/id";
 import { broadcast, fail, reply, tell } from "../wire";
 import { MAX_MESSAGE_BYTES } from "./limits";
 import { contributed } from "./initiative";
+import { checkPlannerReply, publishPlannerReplies } from "./reply-policy";
+import { runDuration } from "./run-duration";
 import type { InitiativeSchedule } from "./initiative-schedule";
 
 import type { Server } from "bun";
@@ -55,6 +59,7 @@ import type { Config } from "../config";
 import type { Decide } from "../conversation-plan/decisions";
 import type { JevRequest } from "../conversation-plan/jev";
 import type { HostedAuth } from "../auth/routes";
+import type { PutRunStages } from "../storage/model";
 import type { HostedRepository } from "../agent/repository";
 import type { JobService } from "../jobs/service";
 import type { Plan } from "../plan/service";
@@ -610,6 +615,8 @@ export type Room = {
 	config: Config;
 	/** The deployment's decisions boundary; absent when no decisions model is configured. */
 	decide?: Decide;
+	/** Shared admission for new Planner-authored passages, independent of harness or request kind. */
+	visualAdmission?: VisualAdmission;
 	auth: HostedAuth;
 	/**
 	 * Login session that may claim Planner ownership for this room's turns.
@@ -1446,6 +1453,77 @@ export function restoreRuns(runs: Wire.Run[] | undefined): Wire.Run[] | undefine
 	return runs?.length ? mergeRuns(runs, undefined, now()) : undefined;
 }
 
+/** The latest stages a run card carries; every stage is stored, and Chat pages in the rest. */
+const CARD_STAGES = 12;
+
+/** What storage holds for each run reported to this chat: stage ids in order, and each as JSON. */
+const storedStages = new WeakMap<Chat, Map<string, { ids: string[]; json: Map<string, string> }>>();
+
+/**
+ * Stores every stage of the reported cards before their window is shown, once a run has more
+ * than its card carries. A report that only adds and changes stages writes those; one that drops
+ * or reorders stages replaces the run's.
+ */
+function storeStages(context: Room, cards: Wire.Run[]): Promise<void> | undefined {
+	let known = storedStages.get(context.chat)
+		?? new Map<string, { ids: string[]; json: Map<string, string> }>();
+	storedStages.set(context.chat, known);
+	let writes: Array<
+		{ card: Wire.Run; ids: string[]; json: Map<string, string>; put: PutRunStages }
+	> = [];
+	for (let card of cards) {
+		let before = known.get(card.id);
+		// The card itself keeps a run that has never outgrown it.
+		if (!before && card.stages.length <= CARD_STAGES && !card.earlierStages) continue;
+		let ids = card.stages.map(stage => stage.id);
+		let json = new Map(card.stages.map(stage => [stage.id, JSON.stringify(stage)]));
+		let appends = before !== undefined && before.ids.length <= ids.length
+			&& before.ids.every((id, index) => ids[index] === id) && json.size === ids.length;
+		let stages = appends
+			? card.stages.filter(stage => before!.json.get(stage.id) !== json.get(stage.id))
+			: card.stages;
+		if (appends && !stages.length) continue;
+		let put = {
+			channelId: context.room,
+			runId: card.id,
+			stages,
+			...(appends ? {} : { replace: true }),
+		};
+		writes.push({ card, ids, json, put });
+	}
+	// Nothing to write leaves publication on the same tick.
+	if (!writes.length) return undefined;
+	return (async () => {
+		for (let { card, ids, json, put } of writes) {
+			await context.auth.storage.runStages.put(put);
+			known.set(card.id, { ids, json });
+		}
+	})();
+}
+
+/** A card as Chat shows it: its latest stages, settled against every earlier one, and a count of the rest. */
+function cardWindow(run: Wire.Run): Wire.Run {
+	if (run.stages.length <= CARD_STAGES) return run;
+	let earlier = run.stages.length - CARD_STAGES;
+	return {
+		...run,
+		stages: settledStages(run.stages).slice(earlier),
+		earlierStages: earlier + (run.earlierStages ?? 0),
+	};
+}
+
+/** Forgets the stored stages of runs Chat no longer shows. */
+async function forgetStages(context: Room, shown: Wire.Run[] | undefined): Promise<void> {
+	let ids = (shown ?? []).map(run => run.id);
+	let known = storedStages.get(context.chat);
+	for (let id of known?.keys() ?? []) if (!ids.includes(id)) known!.delete(id);
+	try {
+		await context.auth.storage.runStages.retain(context.room, ids);
+	} catch (err) {
+		console.error("[chat] forgetting workflow run stages failed:", err);
+	}
+}
+
 const publishing = new WeakMap<Chat, Promise<void>>();
 const owners = new WeakMap<Chat, Map<string, PlannerSession>>();
 const unsaved = new WeakMap<PlannerSession, Runs>();
@@ -1496,7 +1574,26 @@ async function publishReport(
 	let mine = prior.filter(run => !theirs(run)).map(run =>
 		known.get(run.id) === session || ENDED_RUN[run.status] ? run : stopped(run, at)
 	);
-	let own = mergeRuns(mine, runs?.cards, at);
+	// A card with no stages for a run Chat already shows stages of changes only the card's status
+	// and times: a reattached Planner reports an ended run without them, and they stay stored.
+	let kept = new Set<string>();
+	let incoming = runs?.cards?.map(reported => {
+		// A run has finished only once its root ended, which a finished card carries as `ended`;
+		// one reported finished without it has just started and is still live.
+		let card: Wire.Run = reported.status === "finished" && reported.ended === undefined
+			? { ...reported, status: reported.waiting > 0 ? "waiting" : "running" }
+			: reported;
+		let shown = card.stages.length ? undefined : prior.find(run => run.id === card.id);
+		if (!shown || (!shown.stages.length && !shown.earlierStages)) return card;
+		kept.add(card.id);
+		let { earlierStages: _, ...fields } = card;
+		return {
+			...fields,
+			stages: shown.stages,
+			...(shown.earlierStages ? { earlierStages: shown.earlierStages } : {}),
+		};
+	});
+	let own = mergeRuns(mine, incoming, at);
 	if (releasing) own = mergeRuns(own, undefined, at);
 	let fresh = (runs?.cards ?? []).some(run => !before.has(run.id));
 	let cards = [...others.filter(run => fresh ? !ENDED_RUN[run.status] : true), ...own];
@@ -1515,16 +1612,19 @@ async function publishReport(
 		let ended = ENDED_RUN[run.status];
 		let previous = before.get(run.id);
 		if (!ended || (previous && ENDED_RUN[previous])) continue;
-		let minutes = Math.max(1, Math.round(((run.ended ?? run.updated) - run.started) / 60));
-		let said = `${run.name} ${ended} after ${minutes} min.`;
+		let said = `${run.name} ${ended} after ${
+			runDuration((run.ended ?? run.updated) - run.started)
+		}.`;
 		if (followUp && !releasing && NEEDS_FOLLOW_UP[run.status] && known.get(run.id) === session) {
 			attention.push({ run, said });
 			continue;
 		}
 		finished.push({ id: ulid(), author: { kind: "system" }, text: said, ts: now() });
 	}
-	let next = cards.length ? cards : undefined;
+	let next = cards.length ? cards.map(cardWindow) : undefined;
 	try {
+		let storing = storeStages(context, (runs?.cards ?? []).filter(card => !kept.has(card.id)));
+		if (storing) await storing;
 		await context.persist(() => ({ entries: [...chat.entries, ...finished], runs: next }));
 	} catch (err) {
 		console.error("[chat] storing workflow runs failed:", err);
@@ -1537,6 +1637,7 @@ async function publishReport(
 	chat.runs = next;
 	for (let entry of finished) announce(server, room, entry);
 	state(chat, server, room);
+	if (prior.some(run => !shown.has(run.id))) await forgetStages(context, next);
 	for (let { run, said } of attention) await followUpEndedRun(context, run, said);
 }
 
@@ -1640,7 +1741,8 @@ function currentMemberRequest(chat: Chat): ActiveMemberRequest | undefined {
 
 function visualRouting(context: Room): boolean {
 	if (
-		!context.config?.plannerVisuals || !context.decide || context.chat.job
+		context.visualAdmission || !context.config?.plannerVisuals || !context.decide
+		|| context.chat.job
 		|| context.config.harness !== "copilot-sdk"
 	) return false;
 	let request = currentMemberRequest(context.chat);
@@ -1661,6 +1763,28 @@ export function documentRoom(context: Room): DocumentRoom {
 		changes: found => Service.changes(plan, server, room, found),
 		jobs: context.jobs,
 		children: context.children,
+		turnSignal: () => chat.turnController?.signal,
+		...((!chat.job || chat.job.kind === "decision-followup") && context.visualAdmission && {
+			visualAdmission: input => {
+				let signals = [input.signal, chat.turnController?.signal].filter(
+					(signal): signal is AbortSignal => !!signal,
+				);
+				return context.visualAdmission!({
+					...input,
+					signal: signals.length > 1 ? AbortSignal.any(signals) : signals[0],
+				});
+			},
+		}),
+		...(!chat.job && {
+			checkReply: (text, signal) =>
+				checkPlannerReply(
+					text,
+					context.decide,
+					signal && chat.turnController
+						? AbortSignal.any([signal, chat.turnController.signal])
+						: signal ?? chat.turnController?.signal ?? new AbortController().signal,
+				),
+		}),
 		currentMemberRequest: () => currentMemberRequest(chat),
 		focusedChild: () =>
 			!chat.closed && chat.busy && chat.turnController && !chat.turnController.signal.aborted
@@ -1814,10 +1938,18 @@ export function consumeBootstrapBackscroll(chat: Chat): void {
 }
 
 /** Readiness is a scheduling hint; the turn and live tools still revalidate ownership. */
-export async function jobReady(context: Room, claimantSessionId: string): Promise<boolean> {
+export async function jobReady(
+	context: Room,
+	claimantSessionId: string | undefined,
+	job?: Pick<Job, "kind">,
+): Promise<boolean> {
 	if (!context.config.agent || context.chat.closed || Service.implementationActive(context.plan)) {
 		return false;
 	}
+	if (
+		job?.kind === "decision-followup" && context.chat.busy
+		&& context.chat.waiting.length >= MAX_QUEUE
+	) return false;
 	if (await context.plannerNotAttached?.()) return false;
 	try {
 		await resolveOwner(
@@ -1853,7 +1985,9 @@ async function repositorySession(
 		context.room,
 		context.plannerNotAttached ? undefined : claimantSessionId,
 	);
-	if (context.ownerAvailable) void context.ownerAvailable().catch(() => {});
+	if (context.ownerAvailable && context.chat.job?.kind !== "decision-followup") {
+		void context.ownerAvailable().catch(() => {});
+	}
 	let { chat, auth } = context;
 	let lifecycle = chat.lifecycle;
 	let ownerSessionId = ownership.ownerSessionId!;
@@ -1873,7 +2007,7 @@ async function repositorySession(
 			|| binding.credentialRevision !== owner.access.revision
 			|| binding.repository.id !== repository.id
 			|| chat.lifecycle !== lifecycle || chat.openingOwner !== openingOwner
-		) throw new Error("The Planner owner changed while opening. Try again.");
+		) throw new PlannerOwnerUnavailableError("The Planner owner changed while opening. Try again.");
 		await auth.storage.channels.updateAgentContext({
 			channelId: context.room,
 			ownerSessionId,
@@ -1906,12 +2040,21 @@ async function repositorySession(
 			model: context.config.model || undefined,
 			harness: context.config.harness,
 		});
-		if (!result.ok) throw new Error(`Planner session unavailable (${result.error.kind})`);
+		if (!result.ok) {
+			if (binding.signal.aborted) {
+				throw new PlannerOwnerUnavailableError("Planner owner unavailable");
+			}
+			throw new Error(`Planner session unavailable (${result.error.kind})`);
+		}
 		opened = result.value;
 		if (
 			chat.lifecycle !== lifecycle || chat.openingOwner !== openingOwner
 			|| binding.signal.aborted || !await binding.revalidate()
-		) throw new Error("The Planner session changed while opening. Try again.");
+		) {
+			throw new PlannerOwnerUnavailableError(
+				"The Planner session changed while opening. Try again.",
+			);
+		}
 		chat.agent = opened;
 		chat.owner = openingOwner;
 		if (!chat.job) consumeBootstrapBackscroll(chat);
@@ -1941,6 +2084,8 @@ function claimant(context: Room): string | undefined {
 	return context.plannerNotAttached ? undefined : context.claimantSessionId;
 }
 
+class PlannerOwnerUnavailableError extends Error {}
+
 /**
  * The channel's Planner owner, claimed for the claimant when it has none.
  * Without a claimant only an owner the channel already has will do.
@@ -1956,11 +2101,13 @@ export async function resolveOwner(
 		: (await auth.storage.channels.readAgent(channelId, new Date()))?.agent;
 	let ownerSessionId = ownership?.ownerSessionId;
 	if (!ownership || !ownerSessionId) {
-		throw new Error("This channel's Copilot owner is unavailable.");
+		throw new PlannerOwnerUnavailableError("This channel's Copilot owner is unavailable.");
 	}
 	let owner = await auth.sessions.resolve(ownerSessionId);
 	if (!owner) {
-		throw new Error("The Copilot owner must sign in again or reset this channel's agent.");
+		throw new PlannerOwnerUnavailableError(
+			"The Copilot owner must sign in again or reset this channel's agent.",
+		);
 	}
 	let checked = await auth.sessions.use(
 		owner,
@@ -1972,7 +2119,11 @@ export async function resolveOwner(
 		!current
 		|| current.id !== repository.id
 		|| (!current.permissions.push && !current.permissions.admin)
-	) throw new Error("The Copilot owner no longer has repository write access.");
+	) {
+		throw new PlannerOwnerUnavailableError(
+			"The Copilot owner no longer has repository write access.",
+		);
+	}
 	return { ownership, owner, repository };
 }
 
@@ -2122,10 +2273,25 @@ async function run(
 		}
 		let signal = AbortSignal.any([opened.binding.signal, turnController.signal]);
 		if (jobTurn) releaseJobAbort = watchJobAbort(chat, jobTurn, signal);
-		let result = await opened.session.stream(prompt, signal);
-		for await (let part of result.fullStream) {
-			if (turnController.signal.aborted) break;
-			translate(context, part);
+		if (jobTurn) {
+			let result = await opened.session.stream(prompt, signal);
+			for await (let part of result.fullStream) {
+				if (turnController.signal.aborted) break;
+				translate(context, part);
+			}
+		} else {
+			let existingDecisions = new Set(plan.records.keys());
+			await publishPlannerReplies({
+				session: opened.session,
+				prompt,
+				signal,
+				decide: context.decide,
+				capturedDecisions: () =>
+					[...plan.records.values()].filter(record =>
+						!existingDecisions.has(record.id) && record.origin === "planner" && !!record.followUp
+					).length,
+				publish: part => translate(context, part),
+			});
 		}
 		if (jobTurn && chat.closed) throw new Error("The document closed.");
 		if (chat.interruption) throw new Error(chat.interruption);
@@ -2143,14 +2309,20 @@ async function run(
 		console.error("[chat] turn failed:", err);
 		// A stop the room asked for is not a failure; an interruption is.
 		failed = !turnController.signal.aborted || !!chat.interruption;
+		turnController.abort();
 		if (jobTurn) {
 			outcome = chat.closed
 				? { status: "failed", reason: "The document closed." }
 				: {
-					status: sendStarted || chat.interruption ? "failed" : "skipped",
+					status: sendStarted || chat.interruption
+						? "failed"
+						: jobTurn.job.kind === "decision-followup"
+								&& err instanceof PlannerOwnerUnavailableError
+						? "deferred"
+						: "skipped",
 					reason: jobReason(err),
 				};
-		} else if (!chat.closed && (!turnController.signal.aborted || chat.interruption)) {
+		} else if (!chat.closed && failed) {
 			say(chat, server, room, {
 				id: ulid(),
 				author: { kind: "system" },
@@ -2170,7 +2342,7 @@ async function run(
 		chat.toolProgress = undefined;
 		let kept = false;
 		try {
-			if (opened && !chat.closed && !jobTurn) kept = retain(context, opened);
+			if (opened && !chat.closed && !jobTurn && !failed) kept = retain(context, opened);
 			if (!kept) {
 				if (!jobTurn && chat.retained?.session === opened?.session) await chat.retained?.release();
 				else await opened?.session.destroy();
@@ -2212,7 +2384,7 @@ async function run(
 		chat.messageIds = undefined;
 		chat.writing = undefined;
 		chat.tooling = undefined;
-		settle(chat, server, room, turnController.signal.aborted);
+		settle(chat, server, room, turnController.signal.aborted && !failed);
 		if (jobTurn) {
 			chat.job = undefined;
 			chat.jobOutput = undefined;
@@ -2317,7 +2489,11 @@ async function run(
 			next.handle,
 			next.text,
 			next,
-			next.invokedBy ? next.sessionId : next.sessionId ?? context.claimantSessionId,
+			next.job?.job.kind === "decision-followup"
+				? undefined
+				: next.invokedBy
+				? next.sessionId
+				: next.sessionId ?? context.claimantSessionId,
 			false,
 			next.message && next.userId
 				? { entryId: next.id, userId: next.userId, ...(next.focus ? { focus: next.focus } : {}) }
@@ -2332,7 +2508,10 @@ async function run(
 	chat.acting = undefined;
 	chat.actingChannel = undefined;
 	(jobTurn ? jobState : state)(chat, server, room);
-	if (context.ownerAvailable && !chat.closed) void context.ownerAvailable().catch(() => {});
+	// A pre-start availability deferral must wait for a real owner or queue change.
+	if (context.ownerAvailable && !chat.closed && outcome?.status !== "deferred") {
+		void context.ownerAvailable().catch(() => {});
+	}
 }
 
 function startRun(

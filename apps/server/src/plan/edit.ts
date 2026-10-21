@@ -1,4 +1,8 @@
-import { documentTitleText, normalizeDocumentTitleTree } from "@chopin/dialect";
+import {
+	documentTitleText,
+	normalizeDocumentTitleTree,
+	validDocumentTitleChange,
+} from "@chopin/dialect";
 /**
  * Agent edits to the plan, addressed by block.
  *
@@ -123,14 +127,21 @@ export function outline(plan: Plan, value = source(plan)): Block[] {
 }
 
 /**
- * Apply a batch of operations, all or nothing.
+ * Prepare a batch of operations without changing the live document.
  *
  * Every operation is resolved against the document as it was read, so indices
  * within one batch do not shift under each other; the result is serialised and
  * re-parsed before it replaces anything, so a batch that would produce a
  * document outside the dialect fails without touching the plan.
  */
-export function apply(plan: Plan, revision: number, operations: Operation[]): Result {
+export function prepare(
+	plan: Plan,
+	revision: number,
+	operations: Operation[],
+):
+	| { ok: true; source: string; root: Root; children: RootContent[]; detached: string[] }
+	| Extract<Result, { ok: false }>
+{
 	if (revision !== plan.revision) {
 		let blocks = outline(plan);
 		return {
@@ -197,6 +208,9 @@ export function apply(plan: Plan, revision: number, operations: Operation[]): Re
 
 	let next: string;
 	try {
+		if (!validDocumentTitleChange(root, { ...root, children })) {
+			throw new Error("Document title contains control characters or damaged Unicode text");
+		}
 		next = serialize({ ...root, children });
 		// Parsing only proves the result is MDX. `<script>` is perfectly good
 		// MDX and utterly outside this dialect, so validate what we are about
@@ -211,6 +225,14 @@ export function apply(plan: Plan, revision: number, operations: Operation[]): Re
 	} catch (err) {
 		return { ok: false, reason: "invalid", message: reason(err) };
 	}
+	return { ok: true, source: next, root, children, detached: detach };
+}
+
+/** Reconcile only after the same preparation used by pre-acceptance checks succeeds. */
+export function apply(plan: Plan, revision: number, operations: Operation[]): Result {
+	let prepared = prepare(plan, revision, operations);
+	if (!prepared.ok) return prepared;
+	let { root, children, detached } = prepared;
 
 	// Proven; now reconcile it into the live document rather than replacing
 	// one. Untouched blocks keep their Lexical identity, so nobody editing
@@ -226,7 +248,7 @@ export function apply(plan: Plan, revision: number, operations: Operation[]): Re
 
 	return {
 		ok: true,
-		detached: detach,
+		detached,
 		mutation,
 		revision: plan.revision,
 		blocks: outline(plan),
@@ -254,6 +276,9 @@ export function replace(plan: Plan, revision: number, nextSource: string): Resul
 	try {
 		root = parse(source(plan));
 		proposed = parse(nextSource);
+		if (!validDocumentTitleChange(root, proposed)) {
+			throw new Error("Document title contains control characters or damaged Unicode text");
+		}
 		if (plan.document.titleKey !== undefined || plan.persistence?.documentTitles) {
 			proposed = normalizeDocumentTitleTree(
 				proposed,

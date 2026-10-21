@@ -25,6 +25,18 @@ function clip(value: string, length: number): string {
 	return points.length <= length ? value : `${points.slice(0, length - 1).join("").trimEnd()}…`;
 }
 
+/** A finished investigation's one-line result and opening paragraph, for a decision's findings. */
+export function investigationFinding(
+	brief: string,
+	report: string,
+): { title: string; summary?: string } {
+	let { title, body } = split(brief, report);
+	let paragraph = body.split(/\n{2,}/).map(block => block.trim()).find(block =>
+		!!block && !/^(?:#|<|```|\||[-*] |\d+\. )/.test(block)
+	);
+	return { title, ...(paragraph ? { summary: plain(paragraph) } : {}) };
+}
+
 /** The report's own top heading leads the child; otherwise the brief names it. */
 function split(brief: string, report: string): { title: string; lead: string; body: string } {
 	let match = /^# (.+)\n+/.exec(report);

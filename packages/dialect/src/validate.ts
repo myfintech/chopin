@@ -208,14 +208,67 @@ class Validator {
 
 	#questionChoices(node: Jsx, path: string): void {
 		let elements = children(node).filter(isJsx);
+		let written = stringAttribute(node, "response") === "text";
+		if (written && stringAttribute(node, "multiple") !== "false") {
+			this.add("text-question-multiple", "A written response cannot be multiple", path, node);
+		}
 		let options = new Set(
 			elements.filter(item => item.name === "Option")
 				.map(item => stringAttribute(item, "id")),
 		);
+		if (written && options.size > 0) {
+			this.add("text-question-options", "A written response cannot have options", path, node);
+		}
+		let criteria = new Set(
+			elements.filter(item => item.name === "Criterion").map(item => stringAttribute(item, "id")),
+		);
+		let criterionCount = elements.filter(item => item.name === "Criterion").length;
+		if (criterionCount > limits.MAX_CRITERIA || criteria.size !== criterionCount) {
+			this.add(
+				"invalid-criteria",
+				`A question has at most ${limits.MAX_CRITERIA} distinct criteria`,
+				path,
+				node,
+			);
+		}
+		if (written && criterionCount > 0) {
+			this.add("text-question-criteria", "A written response cannot have criteria", path, node);
+		}
 		for (let answer of elements.filter(item => item.name === "Answer")) {
+			let marks = stringAttribute(answer, "marks");
+			if (marks !== undefined) {
+				let cells = marks.trim().split(/\s+/).filter(Boolean);
+				let seen = new Set<string>();
+				let bad = criterionCount === 0 || cells.length === 0
+					|| cells.length > options.size * criteria.size
+					|| cells.some(cell => {
+						let colon = cell.lastIndexOf(":");
+						let slash = cell.lastIndexOf("/", colon);
+						if (colon < 0 || slash < 1 || seen.has(cell.slice(0, colon))) return true;
+						seen.add(cell.slice(0, colon));
+						return !options.has(cell.slice(0, slash))
+							|| !criteria.has(cell.slice(slash + 1, colon))
+							|| !["yes", "partly", "no"].includes(cell.slice(colon + 1));
+					});
+				if (bad) {
+					this.add(
+						"invalid-answer-marks",
+						"Answer marks must be option/criterion:yes|partly|no cells of this question",
+						path,
+						answer,
+					);
+				}
+			}
+			let value = stringAttribute(answer, "value");
+			if (written && (!value?.trim() || value.length > limits.MAX_CUSTOM_ANSWER)) {
+				this.add("invalid-text-answer", "A written answer requires bounded prose", path, answer);
+			}
 			let raw = stringAttribute(answer, "choices");
 			if (raw === undefined) continue;
 			let chosen = raw.trim().split(/\s+/).filter(Boolean);
+			if (written) {
+				this.add("text-answer-choices", "A written answer cannot select options", path, answer);
+			}
 			if (chosen.length > limits.MAX_OPTIONS) {
 				this.add(
 					"too-many-answer-choices",
@@ -257,6 +310,14 @@ class Validator {
 			}
 			if (raw === undefined) continue;
 			let chosen = raw.trim().split(/\s+/).filter(Boolean);
+			if (written) {
+				this.add(
+					"text-previous-choices",
+					"A previous written answer cannot select options",
+					path,
+					item,
+				);
+			}
 			if (chosen.length > limits.MAX_OPTIONS) {
 				this.add(
 					"too-many-previous-choices",
@@ -435,7 +496,9 @@ class Validator {
 				let freeTextQuestion = spec.name === "Question" && parent?.name === "Questionnaire"
 					&& !stringAttribute(parent, "thread")
 					&& [undefined, "expired"].includes(stringAttribute(parent, "status"));
-				if (found === 0 && !pendingQuestion && !freeTextQuestion) {
+				let writtenQuestion = spec.name === "Question"
+					&& stringAttribute(node, "response") === "text";
+				if (found === 0 && !pendingQuestion && !freeTextQuestion && !writtenQuestion) {
 					this.add(
 						"missing-children",
 						`\`${spec.name}\` requires at least one ${allowed.join(" or ")}`,

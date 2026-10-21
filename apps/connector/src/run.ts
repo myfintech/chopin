@@ -1,4 +1,5 @@
 import { requestSchema } from "@chopin/experiment";
+import { activityText } from "@chopin/protocol/activity";
 import type { BuildRequest } from "@chopin/protocol/implementation";
 import { remote } from "./mcp";
 import { ConnectorStopped, redacted } from "./connection";
@@ -83,6 +84,7 @@ export async function runWork(
 	let implementation = kind === "implementation";
 	let claim = raw as {
 		build: BuildRequest;
+		documentId: string;
 		/** A living document's first build, whose run ends at its last complete_task. */
 		live?: boolean;
 		/** An unprompted prototype under a passage, run on a throwaway branch. */
@@ -107,12 +109,16 @@ export async function runWork(
 	// Kept so a failed start can show why without echoing every agent log line.
 	let agentTail: string[] = [];
 	let agentMessage = "";
-	let identity = implementation ? { id: input.id } : { id: input.id, generation: claim.generation };
+	let identity = implementation
+		? { id: input.id, documentId: claim.documentId }
+		: { id: input.id, generation: claim.generation };
 	let abort = new AbortController();
 	let cancel = () => abort.abort();
 	options.signal.addEventListener("abort", cancel, { once: true });
 	if (options.signal.aborted) abort.abort();
 	let latestProgress = "Preparing checkout";
+	/** Each tool call's ACP kind, which its later updates need not repeat. */
+	let toolKinds = new Map<string, string>();
 	let pendingPermissions = 0;
 	/** Why the connector stopped the agent itself, when Chopin ended the run or stayed out of reach. */
 	let ended: string | undefined;
@@ -135,8 +141,11 @@ export async function runWork(
 			abort.abort();
 		},
 	});
-	// A heartbeat that fails while Chopin is out of reach retries on the reconnect backoff and
-	// leaves the agent running; only Chopin ending the run, or the grace period, stops it.
+	// A heartbeat that fails while Chopin is out of reach retries on the reconnect backoff, never
+	// waiting longer than a heartbeat apart, and leaves the agent running; only Chopin ending the
+	// run, or the grace period, stops it. A Chopin back from a restart hears the build again soon
+	// enough to let it carry on.
+	let heartbeatMs = options.heartbeatMs ?? 10_000;
 	let beating = new AbortController();
 	// Ctrl-C, the run ending and the grace period running out each abandon a heartbeat in flight.
 	let beat = AbortSignal.any([beating.signal, options.signal, reports.signal]);
@@ -145,8 +154,8 @@ export async function runWork(
 		while (!beat.aborted) {
 			await delay(
 				failures
-					? Math.min(backoff(failures - 1, options.random), reports.remaining())
-					: options.heartbeatMs ?? 10_000,
+					? Math.min(backoff(failures - 1, options.random), heartbeatMs, reports.remaining())
+					: heartbeatMs,
 				beat,
 			);
 			if (beat.aborted) return;
@@ -171,7 +180,11 @@ export async function runWork(
 					failures++;
 					continue;
 				}
-				ended ??= `Chopin ended this run (${errorCode(error) ?? "refused"}).`;
+				let code = errorCode(error);
+				// A build claimed before Chopin restarted is one it no longer knows.
+				ended ??= code === "server-restarted"
+					? "Chopin restarted, so it ended this run."
+					: `Chopin ended this run (${code ?? "refused"}).`;
 				abort.abort();
 				return;
 			}
@@ -328,10 +341,14 @@ export async function runWork(
 			onUpdate(value) {
 				if (value.update.sessionUpdate === "tool_call") agentMessage = "";
 				if (
-					(value.update.sessionUpdate === "tool_call"
-						|| value.update.sessionUpdate === "tool_call_update") && value.update.title
+					value.update.sessionUpdate === "tool_call"
+					|| value.update.sessionUpdate === "tool_call_update"
 				) {
-					latestProgress = value.update.title.trim().slice(0, 2000) || latestProgress;
+					let { kind, title, toolCallId } = value.update;
+					if (kind) toolKinds.set(toolCallId, kind);
+					if (title) {
+						latestProgress = activityText(title, toolKinds.get(toolCallId)) ?? latestProgress;
+					}
 				} else if (
 					value.update.sessionUpdate === "agent_message_chunk"
 					&& value.update.content.type === "text"

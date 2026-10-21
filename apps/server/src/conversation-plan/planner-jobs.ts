@@ -126,7 +126,7 @@ export function createPlannerJobs(deps: PlannerJobDeps) {
 				return { status: "skipped", reason: "The decision card is no longer open." };
 			}
 		}
-		if (job.kind === "prose") {
+		if ((job.kind === "prose" || job.kind === "decision-followup")) {
 			if (!currentProse(plan, job)) {
 				return { status: "skipped", reason: "The saved decision has changed." };
 			}
@@ -137,6 +137,9 @@ export function createPlannerJobs(deps: PlannerJobDeps) {
 				return { status: "failed", reason: `no prompt for ${job.kind} jobs` };
 			}
 			let result = outcome(await deps.runner(job, prompt, controller.signal));
+			if (result.status === "deferred" && job.kind !== "decision-followup") {
+				return { status: "failed", reason: "Only decision follow-ups may defer for availability." };
+			}
 			if (job.threadId && !initialThread(plan, job)) {
 				return { status: "skipped", reason: "The conversation decision is no longer open." };
 			}
@@ -149,7 +152,7 @@ export function createPlannerJobs(deps: PlannerJobDeps) {
 					reason: "The Planner did not create the decision card. Retry to prepare it.",
 				};
 			}
-			return job.kind === "prose" && !currentProse(plan, job)
+			return (job.kind === "prose" || job.kind === "decision-followup") && !currentProse(plan, job)
 				? { status: "skipped", reason: "The saved decision has changed." }
 				: result;
 		} catch (error) {
@@ -178,7 +181,10 @@ export function createPlannerJobs(deps: PlannerJobDeps) {
 			let activity = result.status === "done" ? line(plan, running, result.output) : undefined;
 			let settled = await change(
 				jobs => {
-					if (running.kind === "prose" && !currentProse(plan, running)) {
+					if (
+						(running.kind === "prose" || running.kind === "decision-followup")
+						&& !currentProse(plan, running)
+					) {
 						finalResult = { status: "skipped", reason: "The saved decision has changed." };
 						activity = undefined;
 					}
@@ -191,6 +197,8 @@ export function createPlannerJobs(deps: PlannerJobDeps) {
 			);
 			if (!settled) continue;
 			announce(settled.find(job => job.id === running.id));
+			// A later owner or Chat capacity notification retries this pending generation.
+			if (finalResult.status === "deferred") return;
 			if (!stopped && (finalResult.status === "done" || finalResult.status === "skipped")) {
 				try {
 					deps.onCapacityAvailable?.();

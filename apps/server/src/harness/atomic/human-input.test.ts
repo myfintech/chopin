@@ -51,6 +51,29 @@ let params: QuestionParams = {
 	],
 };
 
+test("Atomic and remote input cannot put a child-focused choice into the root", async () => {
+	for (let thread of [false, true]) {
+		let f = await fixture();
+		if (thread) f.plan.chat.actingChannel = crypto.randomUUID();
+		else f.room.focusedChild = () => "child";
+		let opened = Promise.withResolvers<void>();
+		let publish = f.server.publish.bind(f.server);
+		f.server.publish = (topic, body, ...rest) => {
+			if (typeof body === "string" && JSON.parse(body).kind === "question:asked") opened.resolve();
+			return publish(topic, body, ...rest);
+		};
+		let pending = f.input.questionnaire(params, f.options);
+		let result = await Promise.race([
+			pending.then(() => "cancelled"),
+			opened.promise.then(() => "opened"),
+		]);
+		if (result === "opened") f.controller.abort();
+		await pending;
+		expect(f.plan.records.size).toBe(0);
+		expect(result).toBe("cancelled");
+	}
+});
+
 test("HostInput appends one ordered questionnaire batch and returns typed answers verbatim", async () => {
 	let f = await fixture();
 	let edited = Edit.apply(f.plan, f.plan.revision, [{
@@ -99,6 +122,39 @@ test("HostInput appends one ordered questionnaire batch and returns typed answer
 			{ questionIndex: 2, question: "Or free text?", kind: "custom", answer: "  typed\n" },
 		],
 	});
+});
+
+test("a Markdown question keeps its exact text, indentation included, in its record and its card", async () => {
+	let f = await fixture();
+	let question = [
+		"Confirm the earlier answers",
+		"",
+		"- Storage: **PostgreSQL**",
+		"  - kept for drafts",
+		"- Rollout: `pilot`",
+		"",
+		"```mermaid",
+		"flowchart LR",
+		"  A[Before] --> B[After]",
+		"```",
+	].join("\n");
+	let response = f.input.questionnaire({
+		questions: [{
+			header: "Confirm",
+			question,
+			options: [{ label: "Confirm all", description: "Keeps:\n  (1) storage\n  (2) pilot" }],
+		}],
+	}, f.options);
+	let [card] = await f.cards(1);
+	expect(card!.definition.questions[0].question).toBe(question);
+	// The canonical document, re-imported, says the same.
+	let projected = await documentCards(Plan.source(f.plan));
+	expect(projected[0]?.questions[0]?.prompt).toBe(question);
+	expect(projected[0]?.questions[0]?.options[0]?.description).toBe(
+		"Keeps:\n  (1) storage\n  (2) pilot",
+	);
+	await f.answer(card!.id, [0]);
+	expect((await response).answers[0]).toMatchObject({ question, answer: "Confirm all" });
 });
 
 test("Atomic's own HostInput validator accepts every answer a member can give", async () => {

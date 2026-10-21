@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { activityText } from "@chopin/protocol/activity";
 import { changedBlocks } from "./changes";
 import { approveGraph, validate } from "./graphs";
 import { planningReadiness } from "./plan-graphs";
@@ -56,6 +57,7 @@ let buildSchema = z.object({
 		at: z.string().datetime(),
 	}).strict().optional(),
 	reportKey: z.string().uuid().optional(),
+	resumable: z.literal(true).optional(),
 	kind: z.literal("rebuild").optional(),
 	baseRevision: z.number().int().nonnegative().optional(),
 	targetRevision: z.number().int().nonnegative().optional(),
@@ -92,7 +94,10 @@ let liveSchema = z.object({
 	checkout: checkoutSchema,
 	baseRevision: z.number().int().nonnegative(),
 	baseSource: z.string(),
-	/** Empty only when a first build stopped on a blocker before opening any pull request. */
+	/**
+	 * Empty only when a first build stopped on a blocker before opening any pull request, or every
+	 * task it completed needed no change.
+	 */
 	pullRequests: z.array(z.string().url()).max(100),
 	/** Commits rebuilds landed on the live pull requests, newest last. */
 	commits: z.array(
@@ -466,6 +471,8 @@ export function pickBuild(
 	plan: Plan,
 	user: string,
 	connectionId: string,
+	/** Its run credential outlives a restart and its connector names the document as it reports. */
+	resumable = false,
 ): Promise<BuildRequest | undefined> {
 	return exclusive(plan, async () => {
 		let build = plan.builds.at(-1);
@@ -476,7 +483,12 @@ export function pickBuild(
 			return;
 		}
 		let previous = plan.builds;
-		let next: BuildRequest = { ...build, state: "starting", expiresAt: Date.now() + 60_000 };
+		let next: BuildRequest = {
+			...build,
+			state: "starting",
+			expiresAt: Date.now() + 60_000,
+			...(resumable ? { resumable: true as const } : {}),
+		};
 		plan.builds = [...previous.slice(0, -1), next];
 		try {
 			await persistExclusive(plan, true);
@@ -486,6 +498,37 @@ export function pickBuild(
 		}
 		announceImplementation(plan);
 		return structuredClone(next);
+	});
+}
+
+/**
+ * Hand a running build to a newer connection of the machine it runs on, as when the connector
+ * registers again after a dropped request; the run itself carries on.
+ */
+export function rebindBuild(
+	plan: Plan,
+	id: string,
+	from: string,
+	to: string,
+): Promise<boolean> {
+	return exclusive(plan, async () => {
+		let build = plan.builds.at(-1);
+		if (!build || build.id !== id || build.connectionId !== from) return false;
+		let previous = plan.builds;
+		// A build its machine carries on with after a restart may have gone longer than a heartbeat.
+		plan.builds = [...previous.slice(0, -1), {
+			...build,
+			connectionId: to,
+			expiresAt: Math.max(build.expiresAt, Date.now() + 60_000),
+		}];
+		try {
+			await persistExclusive(plan, true);
+		} catch (error) {
+			plan.builds = previous;
+			throw error;
+		}
+		announceImplementation(plan);
+		return true;
 	});
 }
 
@@ -519,7 +562,9 @@ export function reportBuild(
 		) {
 			throw new Error("build report is out of order");
 		}
-		let { progress, stoppedByUser, ...fields } = report;
+		let { progress: reported, stoppedByUser, ...fields } = report;
+		// Whatever a connector sends, the progress line never shows a raw command or a credential.
+		let progress = reported === undefined ? undefined : activityText(reported);
 		let next = buildSchema.parse({
 			...current,
 			...fields,
@@ -771,7 +816,10 @@ function liveTasks(plan: Plan) {
 				? [{
 					title: task.title,
 					goal: task.goal,
-					pullRequest: item.pullRequest.url,
+					// A task that needed no change has no pull request; say why instead.
+					...(item.pullRequest
+						? { pullRequest: item.pullRequest.url }
+						: { noChange: item.noChange.reason }),
 					summary: item.summary,
 				}]
 				: [];
@@ -794,7 +842,7 @@ export function readRebuild(plan: Plan, buildId: string) {
 			targetRevision: live.target.revision,
 			pullRequests: live.pullRequests.map(url => ({
 				url,
-				title: tasks.find(task => task.pullRequest === url)?.title ?? "",
+				title: tasks.find(task => "pullRequest" in task && task.pullRequest === url)?.title ?? "",
 			})),
 			tasks,
 			...(outstanding.length ? { outstanding } : {}),

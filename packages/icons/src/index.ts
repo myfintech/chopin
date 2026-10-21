@@ -53,6 +53,7 @@ export {
 	PencilIcon,
 	PlayIcon,
 	PlusIcon,
+	ProgressHalfIcon,
 	RestartIcon,
 	SignInIcon,
 	SirenIcon,
@@ -66,6 +67,7 @@ export { ListIcon } from "./list";
 export { ProgressRingIcon } from "./progress";
 export {
 	ArchiveIcon,
+	CloudIcon,
 	DocumentIcon,
 	LoaderIcon,
 	MachineIcon,

@@ -10,6 +10,7 @@ import { PostgresNavigationStore } from "./navigation";
 import { PostgresBackgroundJobStore } from "./jobs";
 import { PostgresExperimentStore } from "./experiments";
 import { PostgresImageStore } from "./images";
+import { PostgresRunStageStore } from "./run-stages";
 import { PostgresDocumentVersionStore } from "./versions";
 import { PostgresMachineStore } from "./machines";
 import { PostgresResearchWorkspaceStore } from "./research";
@@ -538,6 +539,10 @@ export class PostgresStorage implements StorageAdapter {
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
 		);
+		this.runStages = new PostgresRunStageStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+		);
 		this.versions = new PostgresDocumentVersionStore(
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
@@ -698,6 +703,7 @@ export class PostgresStorage implements StorageAdapter {
 	readonly jobs: BackgroundJobStore;
 	readonly research: ResearchWorkspaceStore;
 	readonly images: PostgresImageStore;
+	readonly runStages: PostgresRunStageStore;
 	readonly versions: PostgresDocumentVersionStore;
 	readonly machines: PostgresMachineStore;
 	readonly preferences: PreferenceStore;
@@ -735,6 +741,15 @@ export class PostgresStorage implements StorageAdapter {
 						AND channel_slugs.slug = ${slug}
 				`;
 				return found ? channel(found) : undefined;
+			}),
+		earlierSlugs: id =>
+			this.#run("list earlier channel slugs", async () => {
+				let rows = await this.#sql<{ slug: string }[]>`
+					SELECT slug FROM channel_slugs
+					WHERE channel_id = ${id} AND NOT canonical
+					ORDER BY created_at DESC, slug
+				`;
+				return rows.map(row => row.slug);
 			}),
 		rename: input => this.#renameChannel(input),
 		archive: input => this.#setChannelArchived(input, true),

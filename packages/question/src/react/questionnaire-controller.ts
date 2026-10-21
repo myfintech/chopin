@@ -1,8 +1,10 @@
 import { derive } from "../answer";
-import { crdt } from "../draft";
+import { crdt, setMark } from "../draft";
+import type { Model as DraftModel } from "../draft";
 import { decision, identified } from "../schema";
-import type { Definition, Drafts } from "../index";
-import type { AddOptionResult, Collaborator } from "./question-view";
+import { textSplice } from "./text-splice";
+import type { Definition, Drafts, Mark } from "../index";
+import type { AddCriterionResult, AddOptionResult, Collaborator } from "./question-view";
 import type { Snapshot, Transport, Unsubscribe } from "./questionnaire-types";
 
 type Model = crdt.Model<crdt.JsonNode<Drafts>>;
@@ -88,6 +90,7 @@ export class QuestionnaireController {
 		this.bridge?.send("question:presence", { id: this.id, question });
 	});
 	#adding: { question: string; label: string; key: string } | undefined;
+	#addingCriterion: { question: string; label: string; key: string } | undefined;
 
 	constructor(
 		bridge: Transport | undefined,
@@ -167,13 +170,23 @@ export class QuestionnaireController {
 			}
 			if (patch.custom !== undefined) {
 				let value = doc.api.str([question, "custom"]);
-				let text = patch.custom as string;
+				let edit = textSplice(value.view(), patch.custom as string);
 				// json-joy 17 binary-encodes a zero-length delete so that the receiver decodes
 				// garbage that swallows the following insert, and it throws on an empty insert.
-				if (value.length() > 0) value.del(0, value.length());
-				if (text) value.ins(0, text);
+				if (edit?.remove) value.del(edit.start, edit.remove);
+				if (edit?.insert) value.ins(edit.start, edit.insert);
 			}
 		});
+	};
+
+	/** Mark one option against one criterion, or clear the cell with `null`. */
+	mark = (question: string, option: string, criterion: string, mark: Mark | null): void => {
+		let doc = this.#model;
+		if (!doc || this.#snapshot.closed || this.#terminal || this.#snapshot.submitting) return;
+		this.#set({ error: undefined, focus: undefined });
+		doc.api.transaction(() =>
+			setMark(doc as unknown as DraftModel, question, option, criterion, mark)
+		);
 	};
 
 	/** Report the question this person is working on; undefined when they leave it. */
@@ -393,13 +406,49 @@ export class QuestionnaireController {
 		return { ok: true, option: reply.option?.id };
 	};
 
-	/** Take the server's definition when it has gained options. */
+	addCriterion = async (question: string, label: string): Promise<AddCriterionResult> => {
+		if (!this.bridge || this.#snapshot.closed || this.#terminal) {
+			return { ok: false, message: "This question is no longer open." };
+		}
+		if (!this.#connected) return { ok: false, message: "Reconnect to add a criterion." };
+		// A retry of the same text after a lost reply must not add a second criterion.
+		let last = this.#addingCriterion;
+		let key = last && last.question === question && last.label === label
+			? last.key
+			: crypto.randomUUID();
+		this.#addingCriterion = { question, label, key };
+
+		let reply: {
+			ok?: boolean;
+			message?: string;
+			criterion?: { id: string };
+			definition?: Definition;
+		};
+		try {
+			reply = await this.bridge.ask("question:criterion", {
+				id: this.id,
+				question,
+				key,
+				label,
+			}) as never;
+		} catch {
+			return { ok: false, message: "Could not add this criterion. Try again." };
+		}
+		if (!reply.ok) return { ok: false, message: reply.message ?? "Could not add this criterion." };
+		this.#addingCriterion = undefined;
+		if (reply.definition) this.#redefine(reply.definition);
+		return { ok: true, criterion: reply.criterion?.id };
+	};
+
+	/** Take the server's definition when it has gained options or criteria. */
 	#redefine(next: Definition): void {
 		let current = this.#definition ?? this.#snapshot.definition;
 		let added = next.questions[0]?.options.length ?? 0;
 		let held = current?.questions[0]?.options.length ?? 0;
-		// Only ever forward: a late duplicate must not erase a newer option.
-		if (added <= held) return;
+		let criteria = next.questions[0]?.criteria?.length ?? 0;
+		let heldCriteria = current?.questions[0]?.criteria?.length ?? 0;
+		// Only ever forward: a late duplicate must not erase a newer option or criterion.
+		if (added <= held && criteria <= heldCriteria) return;
 		try {
 			let definition = decision(identified(next));
 			if (this.#definition) this.#definition = definition;
@@ -504,6 +553,10 @@ export class QuestionnaireController {
 				this.#set({ collaborators: event.question ? [...next, person] : next });
 			}),
 			channel.on("question:option-added", (raw: never) => {
+				let event = raw as unknown as { id: string; definition?: Definition };
+				if (event.id === this.id && event.definition) this.#redefine(event.definition);
+			}),
+			channel.on("question:criterion-added", (raw: never) => {
 				let event = raw as unknown as { id: string; definition?: Definition };
 				if (event.id === this.id && event.definition) this.#redefine(event.definition);
 			}),

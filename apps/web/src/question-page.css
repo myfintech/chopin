@@ -1,0 +1,328 @@
+/* A decision's own page: the record's sections above the Notes the child document holds. */
+.question-page {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	color: var(--color-text-primary);
+}
+
+.question-page :is(h1, h2) {
+	margin: 0;
+	font-family: var(--font-document-heading);
+	font-weight: var(--font-weight-document-heading);
+}
+
+.question-page h2 {
+	font-size: var(--text-xl);
+	line-height: var(--text-xl--line-height);
+}
+
+/* The page starts 16px higher than the document's own top inset; the design's pill sits 84px from the pane top. */
+.question-page {
+	margin-block-start: calc(var(--spacing) * -4);
+}
+
+/* The status row is one 24px line (faces are 20px), so the question sits at the same height in every state. */
+.question-page-status-row {
+	display: flex;
+	align-items: center;
+	gap: calc(var(--spacing) * 2);
+}
+
+.question-page-note {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--spacing);
+	font-size: var(--text-2xs);
+	line-height: var(--text-2xs--line-height);
+	color: var(--color-text-tertiary);
+}
+
+/* Pill, then the question, sit at the same heights whether the decision is open or settled. */
+.question-page .question-page-title {
+	margin-block-start: calc(var(--spacing) * 3.5);
+	font-size: var(--text-2xl);
+	line-height: var(--text-2xl--line-height);
+}
+
+/* The reason reads as the question's caption: close under it, then the control at its usual gap. */
+.question-page-why {
+	align-self: stretch;
+	margin: calc(var(--spacing) * 3) calc(var(--spacing) * -1.5) 0;
+	padding-inline: calc(var(--spacing) * 1.5);
+	min-height: var(--text-base--line-height);
+	border-radius: var(--radius-sm);
+	font-size: var(--text-base);
+	line-height: var(--text-base--line-height);
+	color: var(--color-text-secondary);
+	overflow-wrap: anywhere;
+	text-size-adjust: 100%;
+}
+
+.question-page-why[data-editable] {
+	cursor: text;
+}
+
+.question-page-why[data-editable]:empty::before {
+	content: attr(data-placeholder);
+	color: var(--color-text-quaternary);
+}
+
+.question-page-why[data-editable]:hover,
+.question-page-why[data-editable]:focus {
+	background: var(--color-hover);
+}
+
+.question-page-why-error {
+	margin: var(--spacing) 0 0;
+	font-size: var(--text-xs);
+	line-height: var(--text-xs--line-height);
+	color: var(--color-danger-text);
+}
+
+.question-page-control {
+	align-self: stretch;
+	margin-block-start: calc(var(--spacing) * 6);
+}
+
+.question-page-section {
+	align-self: stretch;
+	margin-block-start: calc(var(--spacing) * 14);
+}
+
+.question-page-section > h2,
+.question-page h2.question-page-notes {
+	margin-block-end: calc(var(--spacing) * 4);
+}
+
+.question-page h2.question-page-notes {
+	margin-block-start: calc(var(--spacing) * 14);
+	margin-block-end: 0;
+}
+
+/* The title bar's actions, when a phone or compact layout has no bar room for them. */
+.question-page-inline-actions {
+	align-self: stretch;
+	margin-block-end: calc(var(--spacing) * 4);
+}
+
+.question-page-actions {
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
+	gap: calc(var(--spacing) * 2);
+}
+
+.question-page-action-error {
+	font-size: var(--text-xs);
+	color: var(--color-danger-text);
+}
+
+.question-page-findings,
+.question-page-takes,
+.question-page-sources {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+.question-page-findings > li + li {
+	border-block-start: var(--edge-width) solid var(--color-edge);
+}
+
+/*
+ * One row geometry for every finding. The icon, the meta and the chevron are each centred on the
+ * title's first line, so they stay beside it when the title wraps.
+ */
+.question-page-findings {
+	/* The title's line box as a length: the token itself is a bare ratio. */
+	--finding-line: calc(1rem * var(--text-base--line-height));
+	--finding-indent: calc(var(--spacing) * 6);
+}
+
+.question-page-finding-head {
+	display: flex;
+	flex: 1;
+	align-items: flex-start;
+	gap: calc(var(--spacing) * 2);
+	min-width: 0;
+}
+
+.question-page-finding-static {
+	display: flex;
+	padding-block: calc(var(--spacing) * 3);
+}
+
+/* Rows are flush: no inset and no hover surface. */
+.question-page-finding .cv-unfold-section-toggle {
+	align-items: flex-start;
+	gap: calc(var(--spacing) * 2);
+	border-radius: 0;
+	background: none;
+	padding: calc(var(--spacing) * 3) 0;
+	font-size: var(--text-base);
+	line-height: var(--text-base--line-height);
+}
+
+.question-page-finding .cv-unfold-chevron {
+	margin-block: calc((var(--finding-line) - var(--spacing) * 3) / 2);
+}
+
+.question-page-finding-icon {
+	display: flex;
+	flex: none;
+	align-items: center;
+	justify-content: center;
+	inline-size: calc(var(--spacing) * 4);
+	block-size: var(--finding-line);
+	color: var(--color-text-tertiary);
+}
+
+.question-page-finding-title {
+	flex: 1;
+	min-width: 0;
+	font-size: var(--text-base);
+	line-height: var(--text-base--line-height);
+	font-weight: var(--font-weight-medium);
+	text-align: start;
+	color: var(--color-text-primary);
+}
+
+.question-page-finding-meta {
+	display: flex;
+	flex: none;
+	align-items: center;
+	block-size: var(--finding-line);
+	font-size: var(--text-xs);
+	color: var(--color-text-tertiary);
+}
+
+/* The panel's text lines up with the title, past the icon column. */
+.question-page-finding-summary,
+.question-page-finding-branch {
+	margin: 0 0 calc(var(--spacing) * 3);
+	padding-inline-start: var(--finding-indent);
+	color: var(--color-text-secondary);
+}
+
+.question-page-sources {
+	display: grid;
+	gap: var(--spacing);
+	padding-block-end: calc(var(--spacing) * 4);
+	padding-inline-start: var(--finding-indent);
+}
+
+.question-page-sources a {
+	color: var(--color-brand);
+	text-decoration: underline;
+	text-underline-offset: calc(var(--spacing) / 2);
+}
+
+.question-page-take {
+	display: flex;
+	align-items: flex-start;
+	gap: calc(var(--spacing) * 2);
+	padding-block: calc(var(--spacing) * 2);
+}
+
+.question-page-take-body {
+	display: grid;
+	flex: 1;
+	gap: var(--spacing);
+	min-width: 0;
+}
+
+.question-page-take-head {
+	display: flex;
+	align-items: center;
+	gap: calc(var(--spacing) * 2);
+	min-block-size: calc(var(--spacing) * 6);
+}
+
+.question-page-take-name {
+	font-size: var(--text-sm);
+	font-weight: var(--font-weight-medium);
+}
+
+.question-page-take-text {
+	margin: 0;
+	color: var(--color-text-secondary);
+}
+
+.question-page-take-text[data-waiting] {
+	color: var(--color-text-tertiary);
+}
+
+.question-page-take-form {
+	display: grid;
+	justify-items: start;
+	gap: calc(var(--spacing) * 2);
+}
+
+.question-page-stances {
+	display: flex;
+	gap: calc(var(--spacing) * 2);
+}
+
+.question-page-stances [aria-pressed="true"] {
+	background: var(--color-selected);
+}
+
+.question-page-take-field {
+	inline-size: 100%;
+	border: var(--edge-width) solid var(--color-control-edge);
+	border-radius: var(--radius-md);
+	background: var(--color-page);
+	padding: calc(var(--spacing) * 2);
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
+}
+
+.question-page-take-error {
+	margin: 0;
+	font-size: var(--text-xs);
+	color: var(--color-danger-text);
+}
+
+/*
+ * The page's question is the record's, shown above; the child's own title stays in the document
+ * for its name and crumb but is not shown twice.
+ */
+.plan:has(.plan-preface [data-question-page]) .plan-content > h1:first-child {
+	display: none;
+}
+
+/* With the title hidden, the Notes heading is the only head: sit the body just below it. */
+.plan:has(.plan-preface [data-question-page]) .plan-content {
+	padding-block-start: 0;
+}
+
+/* An empty Notes area says where to write; the caret stays at the start of the line. */
+.plan:has(.plan-preface [data-question-page])
+	.plan-content[contenteditable="true"]
+	> h1:first-child
+	+ p:has(> br:only-child)::before {
+	content: "Add a note";
+	float: left;
+	block-size: 0;
+	color: var(--color-text-tertiary);
+	pointer-events: none;
+}
+
+/* The control is the options or written answer alone; the page owns the head and actions. */
+.question-page-shell {
+	margin-inline: calc(var(--spacing) * -2);
+}
+
+.question-page-shell .question-card {
+	padding: 0;
+}
+
+.question-page-shell .question-options {
+	margin-block-start: 0;
+}
+
+/* The editor's own empty-document hint would draw over "Add a note"; show one. */
+.plan:has(.plan-preface [data-question-page]) .plan-body-placeholder {
+	display: none;
+}

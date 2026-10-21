@@ -135,17 +135,23 @@ export async function reopen(
 					status: "reopened",
 					history: [...record.history, {
 						choices: [...selected],
+						...(record.marks ? { marks: record.marks } : {}),
 						...(Object.keys(text).length ? { answers: text } : {}),
 						owner,
 						at,
+						// The why belongs to the answer it explained; the next settle writes its own.
+						...(record.why ? { why: record.why } : {}),
 					}],
 				};
 				delete next.answers;
 				delete next.choices;
+				delete next.marks;
 				delete next.resolver;
 				delete next.at;
 				delete next.owner;
 				delete next.decidedAt;
+				delete next.why;
+				delete next.whyBy;
 				candidate.records.set(msg.id, next);
 				let questions: Store.Questions = {
 					open: new Map(plan.questions.open),

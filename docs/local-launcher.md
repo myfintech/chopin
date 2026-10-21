@@ -54,6 +54,8 @@ controls pickup and heartbeat. Investigations and implementations share the
 same workspace busy check. The connector uses HTTP MCP when advertised by the
 ACP agent, falling back to the stdio bridge otherwise. This also makes the
 investigation tools available to Copilot ACP versions that reject stdio MCP.
+Atomic ACP must be version 0.0.3 or newer; older adapters ignore the supplied
+MCP servers even though ordinary agent turns work.
 
 The Build view loads a snapshot when opened and refreshes on document,
 workspace and implementation notifications. It does not poll in the background
@@ -79,7 +81,11 @@ MCP reporting; it does not prove delivery of a complete multi-PR implementation.
 New implementation decisions appear as task blockers. Configurable decision
 policy, human resolution/resume controls and a browser PR-creation action
 remain future work. Multiple reported PRs already
-appear beside their tasks; Chopin never merges them automatically.
+appear beside their tasks; Chopin never merges them automatically. The connector
+tells its agent to complete a task that needs no code change with `complete_task`
+and `noChange` rather than an empty pull request; Build shows that task as
+**No change needed** with its reason and evidence. See
+[Tasks that need no change](implementation-lifecycle.md#tasks-that-need-no-change).
 
 Inspect failures in the connector terminal and retained worktree. If startup
 failed before the graph was claimed, **Retry** in the header creates a
@@ -115,6 +121,9 @@ through successful verification. GitHub responses and the ACP agent are fixtures
 they do not create real GitHub PRs.
 
 Set `CHOPIN_TEST_ACP_COMMAND` to a JSON array containing your agent's ACP command
-to enable the additional live test. It uses local credentials and model usage to
-read the approved graph and report a blocker. It changes disposable test state
-and does not implement code or create PRs.
+to enable the additional live tests. `bun test apps/connector/src/acp.test.ts`
+checks that the real agent calls an authenticated, disposable
+`read_implementation` tool supplied through ACP; a plain-text reply cannot pass.
+The browser test reads a disposable approved graph and reports a blocker.
+These tests use local credentials and model usage; they do not implement code
+or create PRs.

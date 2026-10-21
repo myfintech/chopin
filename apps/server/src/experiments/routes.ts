@@ -170,8 +170,9 @@ export const PLANNER_IDLE_MS = 30 * 60_000;
  * and those Default machine gives it.
  * Protocol 5 connects the machine rather than one checkout: it takes work in any repository its
  * owner can push to. An older connector still connects, for its one checkout's repository.
+ * Protocol 6 keeps the claimed document ID on build renewals and reports after assignment cleanup.
  */
-export const CONNECTOR_PROTOCOLS: { min: number; max: number } = { min: 2, max: 5 };
+export const CONNECTOR_PROTOCOLS: { min: number; max: number } = { min: 2, max: 6 };
 
 /** The chopin release a connector says it runs; a script or source run has none. */
 function releaseVersion(request: Request): string | undefined {
@@ -256,7 +257,7 @@ function described(live: Connection[]) {
 }
 
 export function registerExperimentRoutes(router: Router, auth: HostedAuth, options: Options) {
-	let connections = new Connections();
+	let connections = new Connections(undefined, auth.config.encryptionKey);
 	/**
 	 * The stored machine choices, read before any work is routed. A read that fails is retried a
 	 * few times, then refuses the work with `machine-choice-unavailable`; it is never taken to mean
@@ -1395,6 +1396,10 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 	 * A connection that serves any repository is checked per document, as its work is claimed.
 	 */
 	async function connector(token: string) {
+		// A build's run credential from before a restart is accepted again for the connection that
+		// now holds its build, once its machine has come back.
+		let durable = !connections.holds(token) ? connections.durableRun(token) : undefined;
+		if (durable) await options.implementations?.()?.adopt(token, durable);
 		let found = connections.lookup(token);
 		let machine: StoredMachine;
 		try {
@@ -1705,7 +1710,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 				value ??= { waiting: true };
 			} else if (implementationRun || Object.hasOwn(implementationSchemas(false), name)) {
 				if (!implementation) fail("tool-forbidden");
-				let documentId = grant.run?.documentId ?? connections.assigned(connection.id);
+				let documentId = implementation.document(connection, grant, name, args);
 				let channel = documentId ? await target(caller, connection, documentId) : undefined;
 				if (name === "claim_implementation_build") {
 					value = await connections.locked(connection.id, async () => {

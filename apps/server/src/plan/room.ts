@@ -43,6 +43,8 @@ import {
 	ResearchNode,
 	serialize,
 	ulid,
+	validDocumentTitleChange,
+	validDocumentTitleText,
 } from "@chopin/dialect";
 import { $getAnchorAndFocusForUserState } from "@lexical/yjs";
 import {
@@ -376,6 +378,10 @@ export async function apply(
 ): Promise<Applied> {
 	if (updates.length === 0) return { ok: true, seq: target.seq, researchProjections: [] };
 	let before = parse(project(target)).children;
+	let beforeState = target.editor.getEditorState();
+	let beforeTitle = target.titleKey === undefined ? undefined : beforeState.read(
+		() => $getNodeByKey(target.titleKey!)?.getTextContent(),
+	);
 	let researchProjections: ResearchProjectionChange[] = [];
 	let held = open > 0 ? Buffer.byteLength(project(target)) : 0;
 	try {
@@ -388,6 +394,39 @@ export async function apply(
 
 	try {
 		let after = parse(project(target)).children;
+		// Title normalization restores this node's position and H1 tag after validation.
+		let afterTitle = target.titleKey === undefined
+			? undefined
+			: target.editor.getEditorState().read(
+				() => $getNodeByKey(target.titleKey!)?.getTextContent(),
+			);
+		if (
+			afterTitle !== undefined && afterTitle !== beforeTitle && !validDocumentTitleText(afterTitle)
+		) {
+			return { ok: false, issues: ["invalid-title-text"] };
+		}
+		let first = target.editor.getEditorState().read(() => {
+			let node = $getRoot().getFirstChild();
+			return $isHeadingNode(node) && node.getTag() === "h1"
+				? { key: node.getKey(), text: node.getTextContent() }
+				: undefined;
+		});
+		// Deleting the known title inserts a blank H1; an unchanged body heading stays body prose.
+		let preservedBodyHeading = target.titleKey !== undefined && afterTitle === undefined && first
+			&& beforeState.read(() => {
+				let node = $getNodeByKey(first.key);
+				return $isHeadingNode(node) && node.getTag() === "h1"
+					&& node.getParent() === $getRoot() && node.getKey() !== target.titleKey
+					&& node.getTextContent() === first.text;
+			});
+		if (
+			!preservedBodyHeading && !validDocumentTitleChange({ type: "root", children: before }, {
+				type: "root",
+				children: after,
+			})
+		) {
+			return { ok: false, issues: ["invalid-title-text"] };
+		}
 		assertIntroducedUrls(before, after);
 		let added = new Set<string>();
 		let removed = new Set<string>();
@@ -725,6 +764,33 @@ export function appendQuestionOption(
 	});
 }
 
+/** Append one shared criterion to a question's projection in the plan. */
+export function appendQuestionCriterion(
+	target: Document,
+	id: string,
+	question: string,
+	criterion: { id: string; label: string },
+): Mutation | undefined {
+	return mutate(target, () => {
+		let found = false;
+		for (let node of $nodesOfType(QuestionnaireNode)) {
+			if (node.getId() !== id) continue;
+			let value = node.getQuestionnaire();
+			if (!value.questions.some(item => item.id === question)) continue;
+			found = true;
+			node.setQuestionnaire({
+				...value,
+				questions: value.questions.map(item =>
+					item.id === question
+						? { ...item, criteria: [...(item.criteria ?? []), criterion] }
+						: item
+				),
+			});
+		}
+		return found;
+	});
+}
+
 /** Take a questionnaire out of the plan, leaving its record as history. */
 export function removeQuestionnaire(target: Document, id: string): Mutation | undefined {
 	return mutate(target, () => {
@@ -873,6 +939,24 @@ export function hasProse(target: Document): boolean {
 		node.type !== "mdxJsxFlowElement"
 		|| (node.name !== "Questionnaire" && node.name !== "Decision")
 	);
+}
+
+/**
+ * The block a card about no particular passage goes beside: the first section heading after an
+ * opening title, else the first block of prose. A document with only a title, or nothing, has
+ * no section, and such a card stays where it was put.
+ */
+export function firstSection(target: Document): { index: number; digest: string } | undefined {
+	let blocks = parse(project(target)).children;
+	let body = blocks[0]?.type === "heading" && blocks[0].depth === 1 ? 1 : 0;
+	let index = blocks.findIndex((node, at) => at >= body && node.type === "heading");
+	if (index < 0) {
+		index = blocks.findIndex((node, at) =>
+			at >= body && (node.type !== "mdxJsxFlowElement"
+				|| (node.name !== "Questionnaire" && node.name !== "Decision"))
+		);
+	}
+	return index < 0 ? undefined : { index, digest: digests(target)[index]! };
 }
 
 export function headingAllowed(target: Document): boolean {

@@ -45,19 +45,21 @@ async function run(
 		await writeFile(join(root, "source.txt"), "committed");
 		git(root, "add", ".");
 		git(root, "commit", "-m", "fixture");
-		/** Calls as sent, and without their report keys, which are random. */
+		/** Calls as sent, and with report identity metadata omitted for lifecycle assertions. */
 		let sent: Array<[string, Record<string, unknown>]> = [];
 		let calls: Array<[string, Record<string, unknown>]> = [];
 		let api = {
 			call: async (name: string, args: Record<string, unknown> = {}, signal?: AbortSignal) => {
 				sent.push([name, args]);
-				let { idempotencyKey: _key, ...rest } = args;
+				let { idempotencyKey: _key, documentId: _document, ...rest } = args;
 				calls.push([name, rest]);
 				return respond(name, args, signal);
 			},
 		} as unknown as Awaited<ReturnType<typeof remote>>;
 		let id = crypto.randomUUID();
+		let documentId = crypto.randomUUID();
 		await runWork(api, "implementation", {
+			documentId,
 			build: {
 				id,
 				...(build.kind ? { kind: build.kind } : {}),
@@ -81,7 +83,7 @@ async function run(
 			...options,
 		});
 		await inspect?.({ root, state, id });
-		return { id, calls, sent, branches: git(root, "branch", "--list", "chopin/*") };
+		return { id, documentId, calls, sent, branches: git(root, "branch", "--list", "chopin/*") };
 	} finally {
 		await rm(root, { recursive: true, force: true });
 		await rm(state, { recursive: true, force: true });
@@ -109,6 +111,12 @@ test("a rebuild whose report landed stops renewing and exits cleanly", async () 
 	);
 	expect(calls.filter(([name]) => name === "renew_implementation_build")).toHaveLength(1);
 	expect(calls.at(-1)).toEqual(["report_implementation_build", { id, state: "stopped" }]);
+});
+
+test("the controller keeps the claimed document on every rebuild renewal and status report", async () => {
+	let { documentId, sent } = await run({ kind: "rebuild" }, ["--rebuild", "--slow"]);
+	expect(sent.some(([name]) => name === "renew_implementation_build")).toBe(true);
+	for (let [, args] of sent) expect(args.documentId).toBe(documentId);
 });
 
 test("a living document's first build gets a prompt without verification or revision", async () => {
@@ -495,6 +503,12 @@ test.each([
 						: "Open small reviewable draft pull requests (`gh pr create --draft`)",
 				);
 				expect(prompt).toMatch(/Never merge/);
+				// A task that needs no code change is completed as such, never with an empty pull request.
+				if (!flags.includes("--rebuild")) {
+					expect(prompt).toContain(
+						"If a task needs no code change, open no pull request: call complete_task with noChange",
+					);
+				}
 			});
 		});
 	},
@@ -541,7 +555,7 @@ function unreachable() {
 test("a network drop mid-run keeps the agent running and delivers its completion once back", async () => {
 	let renewals = 0;
 	let reports = 0;
-	let { id, sent } = await run(
+	let { id, documentId, sent } = await run(
 		{ kind: "rebuild" },
 		["--rebuild", "--slow"],
 		(name, args) => {
@@ -560,17 +574,59 @@ test("a network drop mid-run keeps the agent running and delivers its completion
 	expect(reported).toEqual([
 		["report_implementation_build", {
 			id,
+			documentId,
 			state: "running",
 			session: "implementation-acp-session",
 			idempotencyKey: expect.any(String),
 		}],
-		["report_implementation_build", { id, state: "stopped", idempotencyKey: expect.any(String) }],
-		["report_implementation_build", { id, state: "stopped", idempotencyKey: expect.any(String) }],
+		["report_implementation_build", {
+			id,
+			documentId,
+			state: "stopped",
+			idempotencyKey: expect.any(String),
+		}],
+		["report_implementation_build", {
+			id,
+			documentId,
+			state: "stopped",
+			idempotencyKey: expect.any(String),
+		}],
 	]);
 	// The retry is the same report, so Chopin can tell it from a second one.
 	let [running, stopped, retried] = reported.map(([, args]) => args.idempotencyKey);
 	expect(retried).toBe(stopped);
 	expect(stopped).not.toBe(running);
+});
+
+test("a build keeps its agent through a server restart and its heartbeat is heard soon after", async () => {
+	let abort = new AbortController();
+	let renewals: Array<Record<string, unknown>> = [];
+	let started = performance.now();
+	let { documentId, calls } = await run(
+		{},
+		["--hang"],
+		(name, args) => {
+			if (name !== "renew_implementation_build") return {};
+			renewals.push(args);
+			// Chopin is down for eight heartbeats, then forgets the connection the connector had.
+			if (renewals.length <= 8) throw unreachable();
+			if (renewals.length === 9) {
+				throw new ConnectorError("connection-unavailable", "connection-unavailable");
+			}
+			// It carries on with the build; the person then stops the agent from the terminal.
+			abort.abort();
+			return { accepted: true };
+		},
+		abort.signal,
+		{ random: () => 0.999 },
+	);
+	// Retries wait no longer than a heartbeat apart, rather than backing off for minutes, so a
+	// restarted Chopin hears the build again within its window.
+	expect(performance.now() - started).toBeLessThan(4000);
+	expect(renewals).toHaveLength(10);
+	// Each heartbeat names the document, so a restarted Chopin can find the build again.
+	expect(renewals.every(args => args.documentId === documentId)).toBe(true);
+	expect(calls.at(-1)?.[1]).toMatchObject({ state: "failed", error: STOPPED });
 });
 
 test("a run out of reach for its whole grace period stops its agent", async () => {
@@ -658,6 +714,19 @@ test("a run Chopin has ended stops its agent at once", async () => {
 	}]);
 });
 
+test("a build Chopin forgot by restarting stops saying so", async () => {
+	let { calls } = await run({}, ["--hang"], name => {
+		if (name === "renew_implementation_build") {
+			throw new ConnectorError(
+				"server-restarted",
+				"server-restarted: Chopin restarted, so this build ended.",
+			);
+		}
+		return {};
+	});
+	expect(calls.at(-1)?.[1].error).toBe("Chopin restarted, so it ended this run.");
+});
+
 test(
 	"a build carries agent activity on its heartbeat and stops when Chopin cancels it",
 	async () => {
@@ -682,6 +751,26 @@ test(
 	},
 	20_000,
 );
+
+test("a build's activity names a shell command's step without the command", async () => {
+	let abort = new AbortController();
+	let timer = setTimeout(() => abort.abort(), 15_000);
+	try {
+		let { calls } = await run({}, ["--hang", "--activity", "--command-activity"], (name, args) => {
+			if (name === "renew_implementation_build" && args.progress === "Running a command") {
+				throw new ConnectorError("build-inactive", "build-inactive");
+			}
+			return {};
+		}, abort.signal);
+		let progress = calls
+			.filter(([name]) => name === "renew_implementation_build")
+			.map(([, args]) => args.progress);
+		expect(progress).toContain("Running a command");
+		expect(progress.join("\n")).not.toContain("sleep");
+	} finally {
+		clearTimeout(timer);
+	}
+}, 20_000);
 
 test("activity follows tool updates after a permission is answered", async () => {
 	let descriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
