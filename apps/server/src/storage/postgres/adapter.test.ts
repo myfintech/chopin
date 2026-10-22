@@ -1013,6 +1013,7 @@ if (url) {
 				"024_document_versions",
 				"025_document_version_summaries",
 				"026_workflow_run_stages",
+				"027_decision_answers",
 				"mantl_document_provenance",
 				"mantl_user_preferences",
 			]);

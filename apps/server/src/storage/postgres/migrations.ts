@@ -101,6 +101,9 @@ const MIGRATIONS = [{
 	id: "026_workflow_run_stages",
 	path: join(import.meta.dir, "migrations/026_workflow_run_stages.sql"),
 }, {
+	id: "027_decision_answers",
+	path: join(import.meta.dir, "migrations/027_decision_answers.sql"),
+}, {
 	id: "mantl_user_preferences",
 	path: join(import.meta.dir, "migrations/mantl_user_preferences.sql"),
 }, {

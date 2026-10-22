@@ -71,8 +71,8 @@ conversation-analysis flags. It uses the complete saved answers affecting that p
 updates only its explicit target. Applied answer generations commit with the source, so an
 interrupted retry cannot write them twice. Lost or ambiguous targets refuse safely. Work waits
 for an existing authorized Planner owner; it never claims ownership from a viewer or saver.
-The same Save also starts one Planner turn carrying the answer, so the Planner acts on what was
-decided rather than only rewriting the passage.
+The same Save also hands the answer to a Planner turn, so the Planner acts on what was decided
+rather than only rewriting the passage; answers saved close together share one turn.
 See [Decisions](decisions.md) for the shared answer lifecycle.
 
 This does not start background research without an explicit request. Blocking `ask` remains
@@ -112,7 +112,14 @@ existing body prose. When the topic changes it may refine a blank title, the
 generated name of a document created without one, or the title a Planner last
 drafted (kept in the sidecar as `plannerTitle`). A title a person set, at
 creation, by renaming or by editing the heading, is never replaced; the job may
-still seed a goal beneath it.
+still seed a goal beneath it. Once a person renames the document or edits its
+heading, the sidecar records `titleChosen` and no later draft replaces their title,
+even a blank, a generated-looking name or the Planner's own earlier draft.
+A drafted title also waits for a person who is renaming: while anyone has the
+header's title field open or the caret in the heading (`plan:titling`), while
+anyone still connected has typed in either, and for a minute after the last of
+them lets go, the job keeps the current title. The drafted title is not offered
+elsewhere; the next saved message drafts again.
 Missing credentials, an absent remote attachment and an implementation lock keep
 new work pending. Closing or detaching interrupts live work; reconnecting never
 replays an interrupted job. Under `remote`, title work uses only the attached owner
@@ -631,7 +638,9 @@ is between turns starts a Planner turn about it, on the kept session, so the
 Planner reports what happened and what the team needs to do; Chat records the
 run's end as that turn's reason, and the session is let go after the turn. The
 adapter stops any turn Atomic starts on its own, such as for its lifecycle
-notices, because Chopin would neither show nor record it.
+notices or, since Atomic 0.9.41, for a message queued while the session is
+idle, because Chopin would neither show nor record it. The Planner's next turn
+still starts normally.
 Chat shows the session's runs as one stack, one row
 per run: its name, status (running, waiting on Decisions, paused, or ended), and
 elapsed time. Several runs can be live at once. Runs waiting on Decisions come
@@ -657,7 +666,11 @@ document. When a run ends, Chat also records a line saying how it ended and how
 long it took. The session is let go when its runs finish, when its owner
 binding ends, or when the document closes; run state is durable in Atomic's
 workflow journal, so runs interrupted that way can be resumed from a later
-session. Chopin keeps that journal at
+session. Before disposing the session, the adapter waits, for at most 10
+seconds, on Atomic's `session.workflows.waitForSettled()` for each run that
+finished, failed or was stopped, so a session let go right after a run ends
+never leaves that run `running` in the journal; a run whose ending could not be
+recorded is logged by its ID. Chopin keeps that journal at
 `$XDG_STATE_HOME/chopin/atomic/workflows.sqlite` under the same per-user state
 directory as the documents' own directories, because a run resumes only with
 the journal and working directory it started in. Each Planner session is
