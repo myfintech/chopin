@@ -6,6 +6,7 @@ import { planningReadiness, reportImplementationLifecycle } from "./plan-graphs"
 import { exclusive } from "../plan/service";
 import { GitHubError } from "../github/client";
 import { AdmissionDenied } from "../auth/admission";
+import { ownOrigin } from "../auth/config";
 import { implementationConnector } from "./connector";
 import { checkoutOf } from "../experiments/connections";
 import type { Connection, Connections } from "../experiments/connections";
@@ -24,6 +25,8 @@ type Options = {
 	assess?: (id: string, planRevision: number) => void;
 	/** LIVE_BUILD: builds may queue behind a prototype or another document's build. */
 	liveBuild?: boolean;
+	/** CHOPIN_BUILD_RESUME_MS: how long after a restart a build's machine may come back to it. */
+	resumeMs?: number;
 	/** Throws `machine-offline` naming the machine the person chose, else `no-workspace`. */
 	refuseOffline?: (owner: string, documentId: string) => Promise<never>;
 	/** Reads the stored machine choices, or throws `machine-choice-unavailable`. */
@@ -98,6 +101,7 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 		},
 		async id => !!await auth.storage.channels.get(id),
 		options.liveBuild ? options.busy : undefined,
+		options.resumeMs === undefined ? {} : { resumeMs: options.resumeMs },
 	);
 	let safe = (handler: RouteHandler): RouteHandler => async (request, url, params) => {
 		try {
@@ -273,7 +277,7 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 		"POST",
 		"/api/channels/:id/implementation",
 		safe(async (request, _url, { id }) => {
-			if (request.headers.get("origin") !== auth.config.origin) {
+			if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 				throw new GitHubError("origin is not allowed", 403);
 			}
 			let { session, channel, repository } = await browser(request, id);
@@ -347,7 +351,7 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 		"POST",
 		"/api/channels/:id/implementation/rebuild",
 		safe(async (request, _url, { id }) => {
-			if (request.headers.get("origin") !== auth.config.origin) {
+			if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 				throw new GitHubError("origin is not allowed", 403);
 			}
 			let { session, channel, repository } = await browser(request, id);
@@ -396,7 +400,7 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 		"POST",
 		"/api/channels/:id/implementation/stop",
 		safe(async (request, _url, { id }) => {
-			if (request.headers.get("origin") !== auth.config.origin) {
+			if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 				throw new GitHubError("origin is not allowed", 403);
 			}
 			let { session, channel, repository } = await browser(request, id);
@@ -439,7 +443,7 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 		"DELETE",
 		"/api/channels/:id/implementation/request",
 		safe(async (request, _url, { id }) => {
-			if (request.headers.get("origin") !== auth.config.origin) {
+			if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 				throw new GitHubError("origin is not allowed", 403);
 			}
 			let { channel, repository } = await browser(request, id);
@@ -454,7 +458,7 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 		"POST",
 		"/api/channels/:id/implementation/revise",
 		safe(async (request, _url, { id }) => {
-			if (request.headers.get("origin") !== auth.config.origin) {
+			if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 				throw new GitHubError("origin is not allowed", 403);
 			}
 			let { channel, repository } = await browser(request, id);

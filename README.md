@@ -121,7 +121,7 @@ and tool vocabulary remain optimized for planning.
 
 The development path requires:
 
-- Bun 1.4.2;
+- Bun 1.4.4;
 - Docker Engine with Docker Compose, used for PostgreSQL;
 - a GitHub App owned by the deployment; and
 - a GitHub account with push or administration access to a test repository and,
@@ -201,7 +201,8 @@ The recent channel chat transcript is supplied as bounded context for the next t
 even when those messages did not address the Planner. Saved member messages also
 maintain the document's title independently of conversation-derived cards. Weak
 or incidental discussion leaves the title alone; topic changes may refine a blank,
-generated or Planner-drafted title, but never one a person set. This work obeys `AGENT`, ownership and implementation locks, and
+generated or Planner-drafted title, but never one a person set or renamed, and never
+while someone is renaming. This work obeys `AGENT`, ownership and implementation locks, and
 does not require Jev. A title job can seed a goal only before body prose exists.
 
 The first eligible model-backed action, including title maintenance, a Planner turn

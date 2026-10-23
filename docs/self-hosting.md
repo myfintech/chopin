@@ -75,7 +75,7 @@ each owner's GitHub App user token and does not consume `HARNESS_AUTH`;
 setting `auto` on loopback passes the startup guard but does not enable host
 login in that adapter.
 
-`HARNESS=atomic` runs Atomic 0.9.40 in the Chopin server process through its
+`HARNESS=atomic` runs Atomic 0.9.41-alpha.1 in the Chopin server process through its
 headless SDK (`createAgentSession()`). It does not spawn the `atomic` CLI or use
 RPC mode.
 
@@ -256,7 +256,7 @@ headers.
 
 ## Prerequisites
 
-- Docker for the application image, or Bun 1.4.2 for a source deployment.
+- Docker for the application image, or Bun 1.4.4 for a source deployment.
 - A reachable PostgreSQL database and credentials with schema migration access.
 - A stable DNS name with TLS termination and WebSocket proxying.
 - Outbound HTTPS access to GitHub and the selected harness's model provider
@@ -317,6 +317,7 @@ the image.
 | `STORAGE_DRIVER`                  | `postgres`              | Storage adapter. `postgres` is currently the only accepted value.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `DATABASE_URL`                    | required                | `postgres:` or `postgresql:` connection URL. It is not printed by Chopin.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `APP_ORIGIN`                      | required                | Exact public origin, without credentials, path, query, fragment, or trailing slash. HTTPS is required unless the host is loopback.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `PREVIOUS_ORIGINS`                | empty                   | Comma-separated origins this deployment was served from before `APP_ORIGIN`, each validated like `APP_ORIGIN`. Paired machines, browser logins, Origin checks, and document links from those origins keep working; see [Moving to a new origin](#moving-to-a-new-origin).                                                                                                                                                                                                                                                                                                                                                                                         |
 | `GITHUB_APP_SLUG`                 | required                | Lowercase slug from the App's public URL.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `GITHUB_APP_CLIENT_ID`            | required                | OAuth client ID, not the numeric GitHub App ID.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `GITHUB_APP_CLIENT_SECRET`        | required (hosted)       | OAuth client secret used for user-token exchange and refresh. Unused when `AUTH_MODE=local`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
@@ -350,6 +351,7 @@ the image.
 | `JEV_API_KEY`                     | unset                   | TypeSafe API key for `typesafe/jev-latest`. Server-only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `CONNECTOR_VERSION`               | the bundled connector's | The `chopin` release this server recommends: `chopin update` installs it by default, and a refused connector is told to run `chopin update <version>` with it. Defaults to the version in `apps/connector/package.json`. A `cli-v` or `v` prefix is dropped; anything but a version like `0.2.0` fails startup.                                                                                                                                                                                                                                                                                                                                                   |
 | `CHOPIN_SETUP_AGENTS`             | unset                   | Setups the Machines page offers before the built-in coding agents, as a JSON array. See [Setup agents](#setup-agents). The supplied Compose file forwards it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `CHOPIN_BUILD_RESUME_MS`          | `600000`                | How long after it starts the server waits for a paired machine to come back and carry on with a build it was running before a restart or deploy, in milliseconds, an integer between 1000 and 3600000. Until then the build stays running and its agent's calls are answered `unavailable`; after it, a build no machine took back ends as disconnected. A machine that registered again without its build has one minute, whatever this is. The connector stops an agent after 10 minutes without reaching Chopin, so a much longer window mostly keeps a build nobody will resume showing as running.                                                           |
 
 [Automatic participation](conversation-initiative.md) is part of the enabled Planner,
 with no separate feature flag. The shared Chat control pauses automatic replies per
@@ -519,7 +521,8 @@ The proxy must:
 - proxy `/mcp` and the `/api/v1/agent` upgrade without removing their
   `Authorization` header, nor the upgrade's `Sec-WebSocket-Protocol` header;
 - serve Chopin at `/`, not below a path prefix; and
-- redirect alternate hosts to the canonical origin before application traffic.
+- redirect alternate hosts to the canonical origin before application traffic,
+  except the paths a [moved deployment](#moving-to-a-new-origin) keeps serving.
 
 Chopin derives OAuth callbacks from `APP_ORIGIN`, never from incoming `Host` or
 forwarded headers. A proxy cannot repair a mismatched configuration after the
@@ -658,6 +661,35 @@ Migration files are checksummed once applied. Never edit an applied migration.
 Because migrations are forward-only, returning to an older application image
 may require restoring the pre-upgrade database rather than merely changing the
 image tag.
+
+### Moving to a new origin
+
+Paired machines' GitHub authorizations and browser logins are encrypted for the
+origin they were stored under, so changing `APP_ORIGIN` alone signs everyone out
+and makes every machine run `chopin pair` again. To move a deployment from
+`https://old.example.com` to `https://new.example.com` instead:
+
+1. Add `https://new.example.com/auth/github/callback` to the GitHub App's
+   callback URLs, keeping the old one, and point its Homepage and Setup URLs at
+   the new origin.
+2. Serve the new name, and keep serving the old one. On the old name, keep
+   proxying `/mcp`, `/api`, `/connector*`, `/auth/github/callback`, and
+   `/auth/github/setup` to Chopin, because paired machines, MCP clients, and
+   GitHub still use it; redirect browsers on other paths to the new name.
+3. Restart with `APP_ORIGIN=https://new.example.com` and
+   `PREVIOUS_ORIGINS=https://old.example.com`.
+
+A machine or browser login stored under a previous origin is re-encrypted under
+`APP_ORIGIN` the first time it is used, and the server logs once per kind that
+it moved one. Browser cookies belong to a host, so people sign in once on the
+new name. Origin and WebSocket checks accept the previous origins, and document
+links on them resolve to the same documents; Chopin itself only writes links on
+`APP_ORIGIN`. A sign-in that was in progress when the deployment restarted has
+to start again.
+
+Remove `PREVIOUS_ORIGINS` once machines have reconnected and you stop serving
+the old name. Never list an origin you no longer control: its pages would pass
+Chopin's Origin checks.
 
 ### Writer lease
 

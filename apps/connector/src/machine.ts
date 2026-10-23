@@ -12,7 +12,7 @@ import {
 	CONNECTOR_UPDATE_REQUIRED,
 } from "@chopin/protocol/connector";
 import { redacted } from "./connection";
-import { CONNECTOR_HEADERS, ConnectorError, refusal } from "./mcp";
+import { CONNECTOR_HEADERS, ConnectorError, jsonObject, refusal } from "./mcp";
 import type { Output } from "./output";
 
 /**
@@ -188,7 +188,7 @@ async function post(
 	});
 	let refused = await refusal(response);
 	if (refused) throw refused;
-	let value = await response.json().catch(() => ({})) as Record<string, unknown>;
+	let value = await jsonObject(response);
 	if (!response.ok) {
 		let code = typeof value.error === "string" ? value.error : `http-${response.status}`;
 		throw new ConnectorError(
