@@ -628,7 +628,9 @@ launched it, and its runs belong to that session, so Chopin keeps the session
 and its owner binding, and keeps the document loaded, until every run has
 finished. The next turn reuses that session, so the Planner can still see and
 steer its runs over Intercom; people steer through Chat and Decisions, never a
-stage directly. **Stop Planner** also pauses the session's live runs, resumably,
+stage directly. Since Atomic 0.9.44 such a message reaches a busy stage after
+its current tool calls finish rather than cancelling them, unless the Planner
+sends it as an `interrupt`. **Stop Planner** also pauses the session's live runs, resumably,
 through Atomic's session run control, and **Resume Planner** resumes the runs it
 paused. A run waiting on a question pauses too: Atomic withdraws the question
 from Decisions while the run is paused and presents it again on Resume, and an
@@ -678,7 +680,12 @@ given that file through Atomic's `createAgentSession({ journal })`, so the
 server's process environment is left unchanged. An operator's non-empty
 `ATOMIC_WORKFLOW_JOURNAL_PATH` names another file instead; Atomic's
 `workflows.journal` setting and its `ATOMIC_WORKFLOWS_JOURNAL` and
-`ATOMIC_STORAGE` selections do not move a Planner session's journal. Atomic
+`ATOMIC_STORAGE` selections do not move a Planner session's journal, and
+neither does the shared top-level `storage` setting, including an adapter named
+by package such as the libSQL selection `atomic storage join` writes. That
+setting does reach the Planner's Intercom: its sessions use the machine's
+Intercom broker, which keeps its routing in the selected database and so can
+reach sessions on every machine that selects the same one. Atomic
 still checks every set `ATOMIC_STORAGE`, `ATOMIC_SESSIONS_STORAGE`, and
 `ATOMIC_WORKFLOWS_JOURNAL` when it creates a session, so an invalid value fails
 every Atomic turn with a `StorageConfigError` naming the variable. A Build is not a workflow run and has no card in Chat: its tasks, their
