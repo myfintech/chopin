@@ -1859,6 +1859,8 @@ function listen(): Server<SocketData> {
 
 /** Nothing in memory is worth losing to a Ctrl-C. */
 let draining: Promise<void> | undefined;
+/** Startup's session reset, which replaces the held writer lease with a re-fenced one. */
+let resettingLease: Promise<unknown> | undefined;
 
 function drain(): Promise<void> {
 	return draining ??= (async () => {
@@ -1873,7 +1875,7 @@ function drain(): Promise<void> {
 				record(err);
 			}
 		};
-		await attempt(() => server.stop(true));
+		if (server) await attempt(() => server.stop(true));
 		if (researchRecoveryTimer) clearTimeout(researchRecoveryTimer);
 		if (experimentTimer) clearInterval(experimentTimer);
 		if (recoveringResearch) await attempt(() => recoveringResearch!);
@@ -1909,6 +1911,7 @@ function drain(): Promise<void> {
 		}
 		await attempt(() => shutdownHarnesses());
 		await attempt(() => writerLease.stop());
+		if (resettingLease) await attempt(() => resettingLease!);
 		let lease = writerLease.held;
 		if (lease) await attempt(() => storage.leases.release(lease));
 		await attempt(() => storage.close());
@@ -2880,8 +2883,15 @@ try {
 	);
 	if (!acquired) throw new Error("another Chopin instance owns the database");
 	writerLease.hold(acquired);
-	let reset = await storage.sessions.reset(new Date(), acquired, LEASE_TTL_MS);
-	writerLease.held = reset.lease;
+	// A stop that arrives while startup still runs must release the lease, or the next start finds it held.
+	process.on("SIGINT", signal);
+	process.on("SIGTERM", signal);
+	let resetting = storage.sessions.reset(new Date(), acquired, LEASE_TTL_MS).then(reset => {
+		writerLease.held = reset.lease;
+		return reset;
+	});
+	resettingLease = resetting;
+	let reset = await resetting;
 	// Before any room opens, so no child Conversation is ever loaded or served.
 	let children = await storage.collaboration.dropChildConversations(reset.lease);
 	if (children.cleared.length) {
@@ -2939,7 +2949,5 @@ try {
 	await storage.close().catch(() => {});
 	throw err;
 }
-process.on("SIGINT", signal);
-process.on("SIGTERM", signal);
 
 console.log(describe(config));
