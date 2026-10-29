@@ -127,6 +127,8 @@ export interface MachineStore {
 	rename(id: string, userId: string, label: string): Promise<boolean>;
 	/** Add a repository the machine connected a checkout of, unless it already serves it. */
 	serve(id: string, repository: MachineRepository): Promise<void>;
+	/** The owner shares one of their machines with teammates, or stops; false when it isn't theirs. */
+	share(id: string, userId: string, shared: boolean): Promise<boolean>;
 	/** Every choice of an unrevoked machine. Revoking a machine forgets its choices. */
 	choices(): Promise<MachineChoice[]>;
 	/** Set one person's machine for one document, or without `machineId` go back to automatic. */
@@ -216,6 +218,12 @@ export interface NavigationStore {
 	projects(userId: string): Promise<UserProject[]>;
 	firstDocument(userId: string, repositoryIds: string[]): Promise<string | undefined>;
 	addProject(input: AddUserProject): Promise<AddUserProjectResult>;
+	/**
+	 * Takes a repository out of a person's projects; false when it wasn't one. Their last
+	 * document is forgotten when it is in that repository. Visiting one of its documents adds
+	 * the project again.
+	 */
+	removeProject(userId: string, repositoryId: string, now: Date): Promise<boolean>;
 	get(userId: string): Promise<UserNavigation | undefined>;
 	setLastDocument(
 		userId: string,

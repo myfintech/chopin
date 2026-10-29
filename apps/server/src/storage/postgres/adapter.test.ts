@@ -1014,6 +1014,7 @@ if (url) {
 				"025_document_version_summaries",
 				"026_workflow_run_stages",
 				"027_decision_answers",
+				"028_machine_sharing",
 				"mantl_document_provenance",
 				"mantl_user_preferences",
 			]);
