@@ -374,8 +374,12 @@ test("sidebar Rename opens that document with its title ready to edit", async ({
 	let page = await join("ana");
 	let projects = sidebar(page);
 
-	await projects.getByRole("link", { name: otherTitle, exact: true }).hover();
-	await projects.getByRole("button", { name: `Actions for ${otherTitle}` }).click();
+	// Rows other tests create here can move this one from under the pointer; hover again.
+	await expect(async () => {
+		await projects.getByRole("link", { name: otherTitle, exact: true }).hover();
+		await projects.getByRole("button", { name: `Actions for ${otherTitle}` })
+			.click({ timeout: 1_000 });
+	}).toPass();
 	await page.getByRole("menuitem", { name: "Rename", exact: true }).click();
 	await expect(headerDocument(page)).toHaveAccessibleName(`Document: ${otherTitle}`);
 	let field = page.getByRole("textbox", { name: "Document title" });
@@ -576,9 +580,12 @@ test("a long description card stays inside the window beside a bottom row", asyn
 	await page.evaluate(() =>
 		new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
 	);
-	await link.hover();
 	let card = page.locator("[data-icon-tooltip]");
-	await expect(card).toBeVisible();
+	// Other projects' rows can arrive above this one and move it from under the pointer.
+	await expect(async () => {
+		await link.hover();
+		await expect(card).toBeVisible({ timeout: 1_000 });
+	}).toPass();
 	let box = (await card.boundingBox())!;
 	expect(box.height).toBeGreaterThan(100);
 	expect(box.y).toBeGreaterThanOrEqual(8);
@@ -634,6 +641,12 @@ test("document switches preserve navigation state and avoid catalogue reloads", 
 	});
 	let latestVisit = () =>
 		requested.findLast(request => request.method === "PATCH" && request.path === "/api/navigation");
+	// Documents other tests create here reread the catalogue; only those reads are allowed.
+	let catalogues = 0;
+	page.on("websocket", socket =>
+		socket.on("framereceived", ({ payload }) => {
+			if (typeof payload === "string" && payload.includes('"sidebar:catalogue"')) catalogues++;
+		}));
 	page = await join("ana");
 	let initialNavigationRequests =
 		requested.filter(request => request.method === "GET" && request.path === "/api/navigation")
@@ -722,8 +735,10 @@ test("document switches preserve navigation state and avoid catalogue reloads", 
 			.length
 	).toBe(2);
 	expect(latestVisit()?.documentId).toBe(createdDocumentId);
-	expect(requested.filter(request => request.path === "/api/repositories/octo-org/score/channels"))
-		.toHaveLength(0);
+	expect(
+		requested.filter(request => request.path === "/api/repositories/octo-org/score/channels")
+			.length,
+	).toBeLessThanOrEqual(catalogues);
 	expect(
 		requested.filter(request =>
 			request.path === "/api/repositories/octo-org/score/research-workspaces"
@@ -1220,14 +1235,10 @@ test("archiving a sidebar row by keyboard moves focus to a neighbouring row", as
 			exact: true,
 		}),
 	).toBeVisible();
-	let names = (await links.allInnerTexts()).map(name => name.trim());
-	let index = await links.evaluateAll(
-		(elements, path) => elements.findIndex(element => element.getAttribute("href") === path),
-		roomPath(document),
+	let link = sidebar(page).locator(
+		`.project-sidebar-document-link[href="${roomPath(document)}"]`,
 	);
-	expect(index).toBeGreaterThanOrEqual(0);
-	let neighbour = names[index + 1] ?? names[index - 1];
-	let row = links.nth(index).locator(
+	let row = link.locator(
 		"xpath=ancestor::div[contains(@class,'project-sidebar-document')][1]",
 	);
 	await expect(row.getByRole("button", {
@@ -1243,8 +1254,15 @@ test("archiving a sidebar row by keyboard moves focus to a neighbouring row", as
 	await page.keyboard.press("ArrowDown");
 	await page.keyboard.press("ArrowDown");
 	await expect(page.getByRole("menuitem", { name: "Archive", exact: true })).toBeFocused();
+	// Other tests' documents reach this sidebar at any time, so read the neighbour last, by link.
+	let paths = await links.evaluateAll(elements =>
+		elements.map(element => element.getAttribute("href"))
+	);
+	let index = paths.indexOf(roomPath(document));
+	expect(index).toBeGreaterThanOrEqual(0);
+	let neighbour = paths[index + 1] ?? paths[index - 1];
 	await page.keyboard.press("Enter");
-	await expect(links).toHaveCount(names.length - 1);
-	await expect(sidebar(page).locator(".project-sidebar-document-link", { hasText: neighbour! }))
+	await expect(link).toHaveCount(0);
+	await expect(sidebar(page).locator(`.project-sidebar-document-link[href="${neighbour!}"]`))
 		.toBeFocused();
 });
