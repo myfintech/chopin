@@ -3,6 +3,7 @@ import * as Plan from "../plan/service";
 import { documentPath } from "@chopin/protocol/document-url";
 import { MAX_GITHUB_REFERENCES, parseGitHubReferenceKey } from "@chopin/protocol/github-reference";
 
+import { ownOrigin } from "../auth/config";
 import { GitHubError } from "../github/client";
 import { StorageError } from "../storage/errors";
 
@@ -252,6 +253,8 @@ export function registerChannelRoutes(
 		onChannelArchived?: (channelId: string, now: Date) => Promise<ChannelArchiveResult>;
 		onChannelDeleted?: (channelId: string) => Promise<boolean>;
 		onChannelRenamed?: (channel: ChannelRecord) => void;
+		/** A person created a document. */
+		onChannelCreated?: (channel: ChannelRecord) => void;
 		renameChannel?: (id: string, title: string) => Promise<RenameResult>;
 		onChannelRestored?: (channelId: string, now: Date) => Promise<ChannelArchiveResult>;
 		/** Restores an earlier version's prose as a new edit by `author` (a user id). */
@@ -340,7 +343,7 @@ export function registerChannelRoutes(
 		"POST",
 		"/api/repositories/:owner/:repository/channels",
 		async (request, _url, params) => {
-			if (request.headers.get("origin") !== auth.config.origin) {
+			if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 				return json({ error: "origin is not allowed" }, 403);
 			}
 			try {
@@ -386,6 +389,7 @@ export function registerChannelRoutes(
 					}
 				}
 				if (!channel) throw new StorageError("conflict", "could not reserve a generated title");
+				options.onChannelCreated?.(channel);
 				return json(
 					{
 						repository: repository(repo),
@@ -534,7 +538,7 @@ export function registerChannelRoutes(
 		"POST",
 		"/api/channels/:channelId/version-summaries",
 		async (request, _url, params) => {
-			if (request.headers.get("origin") !== auth.config.origin) {
+			if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 				return json({ error: "origin is not allowed" }, 403);
 			}
 			try {
@@ -556,7 +560,7 @@ export function registerChannelRoutes(
 		"POST",
 		"/api/channels/:channelId/versions/:versionId/restore",
 		async (request, _url, params) => {
-			if (request.headers.get("origin") !== auth.config.origin) {
+			if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 				return json({ error: "origin is not allowed" }, 403);
 			}
 			try {
@@ -638,7 +642,7 @@ export function registerChannelRoutes(
 	}
 
 	router.on("PATCH", "/api/channels/:channelId", async (request, _url, params) => {
-		if (request.headers.get("origin") !== auth.config.origin) {
+		if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 			return json({ error: "origin is not allowed" }, 403);
 		}
 		try {
@@ -691,7 +695,7 @@ export function registerChannelRoutes(
 		action: "archive" | "restore",
 	) => {
 		router.on("POST", path, async (request, _url, params) => {
-			if (request.headers.get("origin") !== auth.config.origin) {
+			if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 				return json({ error: "origin is not allowed" }, 403);
 			}
 			try {
@@ -734,7 +738,7 @@ export function registerChannelRoutes(
 	registerArchiveTransition("/api/channels/:channelId/restore", "restore");
 
 	router.on("DELETE", "/api/channels/:channelId", async (request, _url, params) => {
-		if (request.headers.get("origin") !== auth.config.origin) {
+		if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 			return json({ error: "origin is not allowed" }, 403);
 		}
 		try {
@@ -771,7 +775,7 @@ export function registerChannelRoutes(
 	});
 
 	router.on("POST", "/api/channels/:channelId/agent/reset", async (request, _url, params) => {
-		if (request.headers.get("origin") !== auth.config.origin) {
+		if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 			return json({ error: "origin is not allowed" }, 403);
 		}
 		try {

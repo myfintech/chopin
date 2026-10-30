@@ -47,7 +47,7 @@ bun run docker:up       # build and start app plus PostgreSQL locally
 bun run docker:down     # tear down the local Compose project
 ```
 
-The repository pins Bun 1.4.2. `mise.toml` selects that version automatically for
+The repository pins Bun 1.4.4. `mise.toml` selects that version automatically for
 contributors who use [mise](https://mise.jdx.dev); run `mise install` once. Keep
 the package metadata, `mise.toml`, Docker image, CI, and documentation
 synchronized when changing it.
@@ -100,7 +100,7 @@ harnesses as runtime package boundaries.
 The browser edits Lexical bound to Yjs. One WebSocket multiplexes session,
 document (`plan:*` on the wire), conversation, questions, comments, and
 implementation lifecycle messages; the Projects sidebar's own `/ws/sidebar`
-socket carries only decision counts. The server keeps each open channel as an
+socket carries decision counts and says when a repository's documents change. The server keeps each open channel as an
 authoritative Y.Doc with a headless Lexical mirror so it can validate and
 serialize the document without trusting a browser.
 

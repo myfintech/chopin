@@ -118,7 +118,7 @@ describe("configuration", () => {
 		});
 	});
 
-	it("accepts a remote Planner on a public bind with no MODEL, and only without background jobs", () => {
+	it("accepts a remote Planner on a public bind with no MODEL, with or without background jobs", () => {
 		let remote = { HARNESS: "remote", SERVER_HOST: "0.0.0.0", BACKGROUND_JOBS: "off" };
 		let config = configured(remote);
 		expect(config).toMatchObject({ harness: "remote", host: "0.0.0.0", model: "" });
@@ -127,8 +127,11 @@ describe("configuration", () => {
 			"Planner: attached client over /api/v1/agent (model and client tools run on its machine)",
 		);
 		expect(configured({ ...remote, MODEL: "openai/gpt-6" }).model).toBe("openai/gpt-6");
-		expect(() => configured({ HARNESS: "remote" }))
-			.toThrow("HARNESS=remote requires BACKGROUND_JOBS=off");
+		expect(configured({ HARNESS: "remote" })).toMatchObject({
+			harness: "remote",
+			backgroundJobs: true,
+			webResearch: true,
+		});
 	});
 
 	it("keeps a detached remote Planner's ownership two minutes unless PLANNER_ATTACH_GRACE_MS says otherwise", () => {
@@ -239,6 +242,26 @@ describe("configuration", () => {
 		);
 		expect(() => configured({ APP_ORIGIN: "http://127.0.0.1:8787" })).not.toThrow();
 		expect(() => configured({ SESSION_ENCRYPTION_KEY: "short" })).toThrow("32 bytes");
+	});
+
+	it("accepts the exact origins a moved deployment was served from", () => {
+		expect(configured().auth.previousOrigins).toBeUndefined();
+		expect(configured({ PREVIOUS_ORIGINS: " " }).auth.previousOrigins).toBeUndefined();
+		expect(
+			configured({
+				PREVIOUS_ORIGINS:
+					"https://old.example.com, https://older.example.com,https://chopin.example",
+			}).auth.previousOrigins,
+		).toEqual(["https://old.example.com", "https://older.example.com"]);
+		expect(() => configured({ PREVIOUS_ORIGINS: "http://old.example.com" })).toThrow(
+			"PREVIOUS_ORIGINS must use HTTPS",
+		);
+		expect(() => configured({ PREVIOUS_ORIGINS: "https://old.example.com/path" })).toThrow(
+			"PREVIOUS_ORIGINS must contain only an HTTP or HTTPS origin",
+		);
+		expect(() => configured({ PREVIOUS_ORIGINS: "https://old.example.com,," })).toThrow(
+			"PREVIOUS_ORIGINS must be a comma-separated list of origins",
+		);
 	});
 
 	it("loads normalized user and organization admission lists", () => {

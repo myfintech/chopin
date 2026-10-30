@@ -7,6 +7,7 @@ import {
 	parseDocumentPath,
 } from "@chopin/protocol/document-url";
 
+import { ownOrigin } from "../auth/config";
 import { documentUrl } from "../channels/document-url";
 import { notAttachedMessage } from "../harness/remote/attachments";
 import { deterministicChannelId, isChannelId } from "../channels/id";
@@ -67,6 +68,8 @@ export type HostedCallbacks = {
 	isChannelDeleting?: (channelId: string) => boolean;
 	serializeDocument?: <T>(channelId: string, action: () => Promise<T>) => Promise<T>;
 	onChannelRenamed?: (channel: ChannelRecord) => void;
+	/** `create_document` created a document. */
+	onChannelCreated?: (channel: ChannelRecord) => void;
 	onDocumentPersisted?: (target: Plan.DocumentTarget) => void;
 	invokePlanner?: (input: PlannerInvocation) => Promise<InvokePlannerError | undefined>;
 	/** What `planner-not-attached` says for a document, at its URL; how to attach one by default. */
@@ -194,7 +197,8 @@ export async function locateDocument(auth: LocatorAuth, caller: HostedCaller, lo
 	} catch {
 		path = undefined;
 	}
-	let local = path?.origin === auth.config.origin ? path.pathname : undefined;
+	// A link from before the deployment moved names the same document.
+	let local = ownOrigin(auth.config, path?.origin) ? path!.pathname : undefined;
 	let child = local === undefined ? undefined : parseChildDocumentPath(local);
 	if (child) {
 		let repository = await directRepositoryFor(auth, caller, child.owner, child.repository);
@@ -221,9 +225,9 @@ export async function locateDocument(auth: LocatorAuth, caller: HostedCaller, lo
 		return channel ? { channel, repository } : undefined;
 	}
 
-	let legacy = path?.origin === auth.config.origin
-		? /^\/channels\/([0-9a-f-]{36})\/?$/i.exec(path.pathname)
-		: undefined;
+	let legacy = local === undefined
+		? undefined
+		: /^\/channels\/([0-9a-f-]{36})\/?$/i.exec(local);
 	let id = legacy?.[1]?.toLowerCase();
 	let channel = await auth.storage.channels.get(id && isChannelId(id) ? id : locator);
 	if (!channel) return undefined;
@@ -616,6 +620,7 @@ export function hosted(
 					if (!stored) return { kind: "title-taken" };
 					return replay(stored);
 				}
+				callbacks.onChannelCreated?.(created);
 				callbacks.onDocumentPersisted?.({
 					channelId: id,
 					revision: 0,

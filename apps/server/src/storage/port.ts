@@ -31,6 +31,7 @@ import type {
 	CreateResearchWorkspace,
 	CreateResearchWorkspaceResult,
 	CreateWebSession,
+	DecisionAnswer,
 	DocumentVersion,
 	EnqueueBackgroundJob,
 	FailBackgroundJob,
@@ -67,6 +68,7 @@ import type {
 	ResumeBackgroundJob,
 	RunStageRecord,
 	SaveCheckpoint,
+	SaveDecisionAnswer,
 	SessionCredentials,
 	SettleBackgroundJob,
 	StartResearchWorkspace,
@@ -125,6 +127,8 @@ export interface MachineStore {
 	rename(id: string, userId: string, label: string): Promise<boolean>;
 	/** Add a repository the machine connected a checkout of, unless it already serves it. */
 	serve(id: string, repository: MachineRepository): Promise<void>;
+	/** The owner shares one of their machines with teammates, or stops; false when it isn't theirs. */
+	share(id: string, userId: string, shared: boolean): Promise<boolean>;
 	/** Every choice of an unrevoked machine. Revoking a machine forgets its choices. */
 	choices(): Promise<MachineChoice[]>;
 	/** Set one person's machine for one document, or without `machineId` go back to automatic. */
@@ -170,6 +174,33 @@ export interface RunStageStore {
 	retain(channelId: string, runIds: string[]): Promise<void>;
 }
 
+/**
+ * Saved answers to decisions the Planner left open, one row per document and decision, waiting
+ * for one Planner turn to carry them. A delivered row stays marked, so it never runs twice.
+ */
+export interface DecisionAnswerStore {
+	/**
+	 * Keeps a decision's newest saved generation: a newer one replaces a waiting, claimed or
+	 * delivered row and waits afresh; the same or an older one changes nothing.
+	 */
+	save(input: SaveDecisionAnswer): Promise<void>;
+	/** The document's undelivered answers, oldest saved first. */
+	pending(channelId: string): Promise<DecisionAnswer[]>;
+	/**
+	 * Names the turn that carries these answers, each only while still undelivered, unclaimed and
+	 * at that generation. Returns how many it claimed.
+	 */
+	claim(
+		channelId: string,
+		turnId: string,
+		answers: Array<{ decisionId: string; generation: number }>,
+	): Promise<number>;
+	/** Returns a turn that never started to waiting, for the next one. */
+	release(channelId: string, turnId: string): Promise<void>;
+	/** Marks the turn's answers delivered. */
+	delivered(channelId: string, turnId: string, at: Date): Promise<void>;
+}
+
 /** A document's editing sessions, newest first. History is derived; nothing replays it. */
 export interface DocumentVersionStore {
 	/** Extend the latest session when it is the same author's and recent, otherwise start one. */
@@ -187,6 +218,12 @@ export interface NavigationStore {
 	projects(userId: string): Promise<UserProject[]>;
 	firstDocument(userId: string, repositoryIds: string[]): Promise<string | undefined>;
 	addProject(input: AddUserProject): Promise<AddUserProjectResult>;
+	/**
+	 * Takes a repository out of a person's projects; false when it wasn't one. Their last
+	 * document is forgotten when it is in that repository. Visiting one of its documents adds
+	 * the project again.
+	 */
+	removeProject(userId: string, repositoryId: string, now: Date): Promise<boolean>;
 	get(userId: string): Promise<UserNavigation | undefined>;
 	setLastDocument(
 		userId: string,
@@ -357,6 +394,7 @@ export interface StorageAdapter {
 	readonly research: ResearchWorkspaceStore;
 	readonly images: ImageStore;
 	readonly runStages: RunStageStore;
+	readonly decisionAnswers: DecisionAnswerStore;
 	readonly versions: DocumentVersionStore;
 	readonly machines: MachineStore;
 	readonly preferences: PreferenceStore;

@@ -27,6 +27,11 @@ export type Connection = {
 	 * Stored with the machine, so a reconnect keeps it.
 	 */
 	autoRun?: boolean;
+	/**
+	 * Its owner shares the machine with teammates: Default machine may run the Planner of a
+	 * document whose creator has no machine that can. Stored with the machine.
+	 */
+	shared?: boolean;
 	/** The chopin release that opened it, when it said; known only while it is connected. */
 	version?: string;
 	/**
@@ -53,6 +58,7 @@ export type Approval = {
 	owner: string;
 	login: string;
 	autoRun: boolean;
+	shared?: boolean;
 	repositoryId?: string;
 };
 type Pending = {
@@ -131,6 +137,8 @@ export class Connections {
 	#runs = new Map<string, string>();
 	/** When each connection that ended in the last hour ended, by id. */
 	#ended = new Map<string, number>();
+	/** When each live connection opened, by id. */
+	#opened = new Map<string, number>();
 	#waiters = new Map<string, Set<() => void>>();
 	#builds = new Map<string, string>();
 	/** Documents whose builds wait behind a connection's current one, first queued first. */
@@ -258,6 +266,7 @@ export class Connections {
 			owner: string;
 			login: string;
 			autoRun: boolean;
+			shared?: boolean;
 			version?: string;
 			protocol?: number;
 		},
@@ -287,21 +296,46 @@ export class Connections {
 			anyRepository,
 			expiresAt: this.now() + CONNECTION_MS,
 			autoRun: machine.autoRun,
+			...(machine.shared ? { shared: true } : {}),
 			...(machine.version ? { version: machine.version } : {}),
 			...(machine.protocol !== undefined ? { protocol: machine.protocol } : {}),
 			about,
 		};
 		let token = randomBytes(32).toString("base64url");
 		this.#connections.set(connection.id, connection);
+		this.#opened.set(connection.id, this.now());
 		this.#about.set(machine.id, about);
 		this.#tokens.set(fingerprint(token), { connectionId: connection.id });
 		return { connection, token };
+	}
+	/** Its owner shared a machine with teammates or stopped: its live connections follow at once. */
+	share(machineId: string, shared: boolean) {
+		for (let connection of this.machine(machineId)) {
+			if (shared) connection.shared = true;
+			else delete connection.shared;
+		}
+	}
+	/**
+	 * Live connections of machines their owners share with teammates, other than `owner`'s, that
+	 * serve a repository: each owner's favorite first, then the most recently heard from.
+	 */
+	shared(repositoryId: string, owner: string) {
+		return this.list(repositoryId).filter(value => value.shared && value.owner !== owner)
+			.sort((a, b) =>
+				Number(this.#favorites.get(b.owner) === b.machineId)
+				- Number(this.#favorites.get(a.owner) === a.machineId)
+			);
 	}
 	/** Live connections of one paired machine. */
 	machine(machineId: string) {
 		return [...this.#connections.values()].filter(value =>
 			value.machineId === machineId && value.expiresAt > this.now()
 		);
+	}
+	/** Since when a paired machine has been connected: its oldest live connection's opening. */
+	connectedSince(machineId: string) {
+		let opened = this.machine(machineId).map(value => this.#opened.get(value.id) ?? this.now());
+		return opened.length ? Math.min(...opened) : undefined;
 	}
 	/** What a machine last said about itself while this server ran, connected or not. */
 	about(machineId: string): About | undefined {
@@ -538,6 +572,7 @@ export class Connections {
 	revoke(id: string) {
 		let connection = this.#connections.get(id);
 		this.#connections.delete(id);
+		this.#opened.delete(id);
 		if (connection) this.#ended.set(id, this.now());
 		this.#builds.delete(id);
 		this.#queued.delete(id);

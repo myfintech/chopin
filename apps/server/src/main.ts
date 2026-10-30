@@ -128,7 +128,16 @@ import { SessionSockets } from "./socket/session-sockets";
 import { StorageError } from "./storage/errors";
 import { createStorage } from "./storage/registry";
 import { WriterLease } from "./storage/writer-lease";
-import { broadcast, fail, relay, reply, repositoryTopic, tell, topic } from "./wire";
+import {
+	broadcast,
+	broadcastRepository,
+	fail,
+	relay,
+	reply,
+	repositoryTopic,
+	tell,
+	topic,
+} from "./wire";
 
 import { AGENT_PATH, LINK_CLOSE } from "@chopin/agent-link";
 
@@ -378,11 +387,13 @@ const spikeSettlement = spikeSettler({
 });
 
 /**
- * Hand a saved answer to a decision the Planner left open to the Planner, as a turn it acts on.
- * Like other server-authored turns it runs only under the existing owner, and under the remote
- * harness only while a Planner is attached; one that found no Planner starts once one is.
+ * Hand saved answers to decisions the Planner left open to the Planner, as one turn it acts on
+ * for the answers saved close together. Like other server-authored turns it runs only under the
+ * existing owner, and under the remote harness only while a Planner is attached; answers that
+ * found no Planner wait in storage and start once one is, after a restart too.
  */
 const decisionAnswers = answerTurns({
+	store: storage.decisionAnswers,
 	start: async (channelId, compose) => {
 		if (!config.agent) return "drop";
 		let channel = await storage.channels.get(channelId);
@@ -390,11 +401,17 @@ const decisionAnswers = answerTurns({
 		if (plannerAttachments && !await plannerAttachments.confirmed(channelId)) return false;
 		return serverInstruction(channelId, compose);
 	},
+	// Answers saved while a Planner turn runs or waits join the turn after it.
+	busy: channelId => {
+		let chat = Rooms.get(channelId)?.plan?.chat;
+		if (!chat || chat.closed || (!chat.busy && chat.waiting.length === 0)) return undefined;
+		return chat.running ?? Bun.sleep(1_000);
+	},
 });
 
 function answerDecision(channelId: string, id: string, generation: number): void {
 	void decisionAnswers.answered(channelId, id, generation).catch(err =>
-		console.error("chopin: could not hand a saved decision to the Planner -", err)
+		console.error("chopin: could not keep a saved decision for the Planner -", err)
 	);
 }
 
@@ -1100,6 +1117,12 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 
 		case "plan:awareness":
 			if (room.plan) Service.awareness(room.plan, ws, frame);
+			return;
+
+		case "plan:titling":
+			if (room.plan && typeof frame.active === "boolean") {
+				Service.titling(room.plan, ws, { active: frame.active, edited: frame.edited === true });
+			}
 			return;
 
 		case "plan:close":
@@ -1845,6 +1868,8 @@ function listen(): Server<SocketData> {
 
 /** Nothing in memory is worth losing to a Ctrl-C. */
 let draining: Promise<void> | undefined;
+/** Startup's session reset, which replaces the held writer lease with a re-fenced one. */
+let resettingLease: Promise<unknown> | undefined;
 
 function drain(): Promise<void> {
 	return draining ??= (async () => {
@@ -1859,7 +1884,7 @@ function drain(): Promise<void> {
 				record(err);
 			}
 		};
-		await attempt(() => server.stop(true));
+		if (server) await attempt(() => server.stop(true));
 		if (researchRecoveryTimer) clearTimeout(researchRecoveryTimer);
 		if (experimentTimer) clearInterval(experimentTimer);
 		if (recoveringResearch) await attempt(() => recoveringResearch!);
@@ -1885,6 +1910,8 @@ function drain(): Promise<void> {
 		liveSync?.close();
 		buildReadiness?.close();
 		spikeScout?.close();
+		// Answers still collecting stay stored; the next process delivers them.
+		decisionAnswers.close();
 		let stoppingJobs = jobRunner?.shutdown();
 		ownerBindings?.revokeAll();
 		plannerAttachments?.close();
@@ -1893,6 +1920,7 @@ function drain(): Promise<void> {
 		}
 		await attempt(() => shutdownHarnesses());
 		await attempt(() => writerLease.stop());
+		if (resettingLease) await attempt(() => resettingLease!);
 		let lease = writerLease.held;
 		if (lease) await attempt(() => storage.leases.release(lease));
 		await attempt(() => storage.close());
@@ -1932,9 +1960,21 @@ async function resetOpenAgents(
 	);
 }
 
+/** Tell every sidebar watching the document's repository that its documents changed. */
+function announceCatalogue(channel: Pick<ChannelRecord, "id" | "repositoryId">): void {
+	if (!server || draining) return;
+	broadcastRepository(server, channel.repositoryId, {
+		kind: "sidebar:catalogue",
+		ts: 0,
+		repositoryId: channel.repositoryId,
+		channelId: channel.id,
+	});
+}
+
 function announceChannel(channel: ChannelRecord): void {
 	// A machine running its Planner hears a new address on its next Planner poll; wake that poll.
 	experiments?.connections.wake(channel.repositoryId);
+	announceCatalogue(channel);
 	let room = Rooms.get(channel.id);
 	if (!room) return;
 	for (let ws of room.members.values()) {
@@ -2088,6 +2128,7 @@ async function deleteChannelLocked(channelId: string): Promise<boolean> {
 		if (room) Rooms.forget(room);
 		buildReadiness?.forget(channelId);
 		void Service.announceDeletedUnanswered(server, storage, channel);
+		announceCatalogue(channel);
 		summaryCoordinator?.resume(channelId);
 		return true;
 	} catch (err) {
@@ -2657,6 +2698,8 @@ jobRunner = new JobRunner({
 		return writerLease.held;
 	},
 	resolveActivePlanner: async job => {
+		// A remote document's workers run in its attached Planner client; without one, work waits.
+		if (plannerAttachments && !plannerAttachments.attached(job.channelId)) return undefined;
 		let binding = await ownerBindings!.resolve(job.channelId);
 		if (!binding) return undefined;
 		return {
@@ -2729,6 +2772,7 @@ registerMcpRoutes(router, hostedAuth, {
 	archiveChannel,
 	isChannelDeleting: channelId => deletingChannels.has(channelId),
 	onChannelRenamed: announceChannel,
+	onChannelCreated: announceCatalogue,
 	onDocumentPersisted: target => {
 		void documentHistory.record(target);
 		if (summaryCoordinator) void summaryCoordinator.enqueueNow(target).catch(() => {});
@@ -2744,6 +2788,7 @@ implementations = registerImplementationRoutes(router, hostedAuth, {
 		buildReadiness!.ready(id, revision);
 	}),
 	liveBuild: !!config.liveBuild,
+	resumeMs: config.buildResumeMs,
 	connections: experiments.connections,
 	refuseOffline: experiments.refuseOffline,
 	machineChoices: experiments.machineChoices,
@@ -2793,6 +2838,7 @@ registerChannelRoutes(router, hostedAuth, {
 	onAgentReset: channelOwnerReset,
 	onChannelArchived: archiveChannel,
 	onChannelDeleted: deleteChannel,
+	onChannelCreated: announceCatalogue,
 	renameChannel: (id, title) =>
 		withImplementationPlan(
 			id,
@@ -2861,8 +2907,15 @@ try {
 	);
 	if (!acquired) throw new Error("another Chopin instance owns the database");
 	writerLease.hold(acquired);
-	let reset = await storage.sessions.reset(new Date(), acquired, LEASE_TTL_MS);
-	writerLease.held = reset.lease;
+	// A stop that arrives while startup still runs must release the lease, or the next start finds it held.
+	process.on("SIGINT", signal);
+	process.on("SIGTERM", signal);
+	let resetting = storage.sessions.reset(new Date(), acquired, LEASE_TTL_MS).then(reset => {
+		writerLease.held = reset.lease;
+		return reset;
+	});
+	resettingLease = resetting;
+	let reset = await resetting;
 	// Before any room opens, so no child Conversation is ever loaded or served.
 	let children = await storage.collaboration.dropChildConversations(reset.lease);
 	if (children.cleared.length) {
@@ -2920,7 +2973,5 @@ try {
 	await storage.close().catch(() => {});
 	throw err;
 }
-process.on("SIGINT", signal);
-process.on("SIGTERM", signal);
 
 console.log(describe(config));

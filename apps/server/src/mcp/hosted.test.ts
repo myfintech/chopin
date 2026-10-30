@@ -237,6 +237,22 @@ describe("the hosted MCP adapter", () => {
 		expect(await adapter.create!.create(caller, creation)).toMatchObject({ kind: "replayed" });
 	});
 
+	it("tells sidebars about a document create_document made, once, not on a replay", async () => {
+		let context = setup();
+		context.github.repositoryValue.permissions.push = true;
+		let lease = (await context.storage.leases.acquire("writer", "announce-create", 60_000))!;
+		let created: string[] = [];
+		let adapter = hosted(context.auth, { lease: () => lease }, {
+			onChannelCreated: channel => created.push(`${channel.repositoryId} ${channel.id}`),
+		});
+		let caller = (await adapter.caller(request("Bearer allowed")))!;
+		expect(await adapter.create!.create(caller, creation)).toMatchObject({ kind: "created" });
+		let id = deterministicChannelId("R_score", creation.idempotencyKey);
+		expect(created).toEqual([`R_score ${id}`]);
+		expect(await adapter.create!.create(caller, creation)).toMatchObject({ kind: "replayed" });
+		expect(created).toEqual([`R_score ${id}`]);
+	});
+
 	it("never recreates an import deleted after its durable replay was read", async () => {
 		let context = setup();
 		context.github.repositoryValue.permissions.push = true;
@@ -1010,6 +1026,46 @@ describe("the hosted MCP adapter", () => {
 			).toBeUndefined();
 		} finally {
 			await Service.close(childPlan);
+			await Service.close(opened.plan);
+		}
+	});
+
+	it("reads documents by their links on an origin the deployment moved from", async () => {
+		let context = setup();
+		context.auth.config = {
+			...context.auth.config,
+			origin: "https://chopin.example.com",
+			previousOrigins: ["https://chopin.test"],
+		};
+		let opened = await plan(context);
+		let child = await context.storage.channels.create({
+			id: crypto.randomUUID(),
+			repositoryId: "R_score",
+			repositoryOwner: "octo-org",
+			repositoryName: "score",
+			title: "Rollback research",
+			createdBy: "U_allowed",
+			parentChannelId: opened.channel.id,
+			now: context.now,
+		});
+		let adapter = hosted(context.auth);
+		let caller = await adapter.caller(request("Bearer allowed"));
+		if (!caller) throw new Error("test caller was not authenticated");
+		let url = "/documents/octo-org/score/release-readiness";
+		let childUrl = `${url}/children/rollback-research`;
+
+		try {
+			for (let origin of ["https://chopin.example.com", "https://chopin.test"]) {
+				expect(await adapter.documents.read(caller, `${origin}${url}`))
+					.toMatchObject({ id: opened.channel.id, url });
+				expect(await adapter.documents.read(caller, `${origin}${childUrl}`))
+					.toMatchObject({ id: child.id, url: childUrl });
+				expect(await adapter.documents.read(caller, `${origin}/channels/${opened.channel.id}`))
+					.toMatchObject({ id: opened.channel.id, url });
+			}
+			expect(await adapter.documents.read(caller, `https://other.example.com${url}`))
+				.toBeUndefined();
+		} finally {
 			await Service.close(opened.plan);
 		}
 	});

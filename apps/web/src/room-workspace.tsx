@@ -112,6 +112,7 @@ import { motionContract } from "./motion-contract";
 import { motionImmediately } from "./motion-input";
 import { useNavigationDocument } from "./navigation-shell";
 import { titleEdits } from "./title-edit";
+import { useTitlingReport } from "./title-presence";
 import { peopleHere } from "./presence";
 import {
 	discardDecision,
@@ -1253,6 +1254,12 @@ export function RoomWorkspace(
 
 	let workspaceArchivedAt = archivedAt ?? metadata.archivedAt;
 	let workspaceCanEdit = effectiveCanEdit && !workspaceArchivedAt;
+	useTitlingReport({
+		wire: workspaceCanEdit ? wire : undefined,
+		room,
+		open: !!titleEdit && effectiveCanManage && !workspaceArchivedAt,
+		area: documentArea,
+	});
 	let editMode = documentEditMode({
 		canEdit: !!workspaceCanEdit && !implementation.locked,
 		editing,

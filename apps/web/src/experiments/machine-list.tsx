@@ -12,6 +12,7 @@ import {
 	PlayIcon,
 	SearchIcon,
 	StarIcon,
+	UsersIcon,
 } from "@chopin/icons";
 import {
 	Badge,
@@ -149,6 +150,49 @@ function Dash({ label }: { label: string }) {
 			<span className="sr-only">{label}</span>
 		</span>
 	);
+}
+
+/** What sharing a machine with teammates does, as the switch's tooltip and the phone row say. */
+export const SHARE_DETAIL =
+	"A teammate's document with no machine of its own can run its Planner here, as you, "
+	+ "in repositories you can push to. Builds stay yours. Turned off, a teammate's Planner "
+	+ "finishes the reply, question or run it is on first.";
+
+/**
+ * Whether teammates' documents may plan on a machine: a switch, named for the machine, that
+ * changes at once and settles as the server says.
+ */
+function ShareSwitch(
+	{ machine, onChange }: { machine: Machine; onChange: (shared: boolean) => void },
+) {
+	let finishingId = useId();
+	let finishing = !machine.shared && finishingWords(machine);
+	return (
+		<span className="machines-stack">
+			<button
+				aria-checked={machine.shared}
+				aria-describedby={finishing ? finishingId : undefined}
+				aria-label={`Share ${machine.label} with teammates`}
+				className="machines-switch"
+				data-tooltip={machine.shared ? "Shared with teammates" : "Share with teammates"}
+				onClick={() => onChange(!machine.shared)}
+				role="switch"
+				type="button"
+			>
+				<span aria-hidden="true" className="machines-switch-thumb" />
+			</button>
+			{finishing && <span className="machines-secondary" id={finishingId}>{finishing}</span>}
+		</span>
+	);
+}
+
+/**
+ * What a machine that stopped being shared still does for teammates: their Planners keep going
+ * until their current work finishes. Undefined once none does.
+ */
+export function finishingWords(machine: Pick<Machine, "finishing">): string | undefined {
+	let count = machine.finishing ?? 0;
+	return count ? `Finishing ${count} teammate document${count === 1 ? "" : "s"}` : undefined;
 }
 
 function copiesFor(machine: Machine, recommended: string | null): CopyItem[] {
@@ -325,6 +369,9 @@ function MachineTable(
 					<TableHead>Host</TableHead>
 					<TableHead>Version</TableHead>
 					<TableHead>Agent</TableHead>
+					<TableHead className="machines-share-column">
+						<span data-tooltip={SHARE_DETAIL} tabIndex={0}>Shared</span>
+					</TableHead>
 					<TableHead className="machines-status-column">Last seen</TableHead>
 					<TableHead className="machines-actions-column">
 						<span className="sr-only">Actions</span>
@@ -334,14 +381,14 @@ function MachineTable(
 			{!list.length && (
 				<TableBody>
 					<TableRow>
-						<TableCell className="machines-empty" colSpan={7}>No machines match.</TableCell>
+						<TableCell className="machines-empty" colSpan={8}>No machines match.</TableCell>
 					</TableRow>
 				</TableBody>
 			)}
 			{groupMachines(list).map(group => (
 				<TableBody key={group.kind}>
 					<TableRow>
-						<TableHead className="machines-group-head" colSpan={7} scope="rowgroup">
+						<TableHead className="machines-group-head" colSpan={8} scope="rowgroup">
 							<span className="machines-group-title">
 								<GroupIcon kind={group.kind} />
 								{GROUP_LABEL[group.kind]}
@@ -412,6 +459,12 @@ function MachineTable(
 											: <Dash label="Agent unknown" />}
 										{machine.planner && <span className="machines-secondary">Planner</span>}
 									</span>
+								</TableCell>
+								<TableCell className="machines-share-column">
+									<ShareSwitch
+										machine={machine}
+										onChange={shared => void machines.share(machine.id, shared)}
+									/>
 								</TableCell>
 								<TableCell className="machines-status-column">
 									<Status machine={machine} now={now} />
@@ -640,10 +693,11 @@ export function MachineDetail(
 		],
 		[
 			"Runs",
-			[machine.service && "stays connected", machine.autoRun && "builds automatically"].filter(
-				Boolean,
-			)
-				.join(", "),
+			[
+				machine.service && "stays connected",
+				machine.autoRun && "builds automatically",
+				machine.shared && "plans teammates' documents",
+			].filter(Boolean).join(", "),
 		],
 	];
 	return (
@@ -672,6 +726,24 @@ export function MachineDetail(
 					>
 						<StarIcon aria-hidden="true" filled={machine.favorite} size={16} />
 						{machine.favorite ? "Remove favorite" : "Set as favorite"}
+					</button>
+				</li>
+				<li>
+					<button
+						aria-pressed={machine.shared}
+						className="machines-row"
+						onClick={() => void machines.share(machine.id, !machine.shared)}
+						type="button"
+					>
+						<UsersIcon aria-hidden="true" size={16} />
+						<span className="machines-row-text">
+							{machine.shared ? "Stop sharing with teammates" : "Share with teammates"}
+							<span className="machines-secondary">
+								{!machine.shared && finishingWords(machine)
+									? `${finishingWords(machine)}. Each stops when its current work finishes.`
+									: SHARE_DETAIL}
+							</span>
+						</span>
 					</button>
 				</li>
 				{copiesFor(machine, machines.recommended).map(item => (

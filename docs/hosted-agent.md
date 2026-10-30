@@ -71,8 +71,8 @@ conversation-analysis flags. It uses the complete saved answers affecting that p
 updates only its explicit target. Applied answer generations commit with the source, so an
 interrupted retry cannot write them twice. Lost or ambiguous targets refuse safely. Work waits
 for an existing authorized Planner owner; it never claims ownership from a viewer or saver.
-The same Save also starts one Planner turn carrying the answer, so the Planner acts on what was
-decided rather than only rewriting the passage.
+The same Save also hands the answer to a Planner turn, so the Planner acts on what was decided
+rather than only rewriting the passage; answers saved close together share one turn.
 See [Decisions](decisions.md) for the shared answer lifecycle.
 
 This does not start background research without an explicit request. Blocking `ask` remains
@@ -112,7 +112,14 @@ existing body prose. When the topic changes it may refine a blank title, the
 generated name of a document created without one, or the title a Planner last
 drafted (kept in the sidecar as `plannerTitle`). A title a person set, at
 creation, by renaming or by editing the heading, is never replaced; the job may
-still seed a goal beneath it.
+still seed a goal beneath it. Once a person renames the document or edits its
+heading, the sidecar records `titleChosen` and no later draft replaces their title,
+even a blank, a generated-looking name or the Planner's own earlier draft.
+A drafted title also waits for a person who is renaming: while anyone has the
+header's title field open or the caret in the heading (`plan:titling`), while
+anyone still connected has typed in either, and for a minute after the last of
+them lets go, the job keeps the current title. The drafted title is not offered
+elsewhere; the next saved message drafts again.
 Missing credentials, an absent remote attachment and an implementation lock keep
 new work pending. Closing or detaching interrupts live work; reconnecting never
 replays an interrupted job. Under `remote`, title work uses only the attached owner
@@ -134,9 +141,9 @@ Under `HARNESS=remote` only attaching claims ownership. An `@chopin` message or
 owner. Other Planner requests, such as sending a comment to the Planner or a
 Build draft, claim nothing either: with a client attached they run on it, and
 without one they fail as any request without a usable owner does, not with
-`planner-not-attached`. Model-backed research is unavailable, because the remote
-Planner requires `BACKGROUND_JOBS=off`; a research request claims no ownership
-and is refused as not ready.
+`planner-not-attached`. A research request claims no ownership either: its
+workers run on the attached client as [isolated sessions](#remote-planner), and
+without one the request waits until a client attaches.
 
 An attachment lasts only as long as its owner. Signing that browser login out,
 its expiry, or a repository writer's reset of the document's Planner closes the
@@ -496,7 +503,12 @@ them with `tools` before calling any, may not reuse a host tool's name, and
 reports them as provider-executed `tool-call` and `tool-result` parts. An
 undeclared tool fails the turn as a tool boundary failure. Background job
 sessions start in `isolated` mode, where the client may offer no tools of its own
-and ask nothing. A turn ends with `turn-end`. An abort waits briefly for the
+and ask nothing. That includes every background worker: the research, research
+brief, document description, and History summary workers each open an isolated
+session on the client attached to their document, may call only the host tools
+their stage offers (the research evidence worker's `web_search`), and return
+their structured result as the turn's JSON. The job runner starts no worker for
+a document with no attached client; its job stays pending until one attaches. A turn ends with `turn-end`. An abort waits briefly for the
 client's `turn-end`, then ends the turn anyway. A turn that ends while one of
 its host tools still runs, such as an `ask` waiting on Decisions, stops that tool
 and withdraws the cards it opened. A connection that closes mid-turn ends the turn
@@ -533,7 +545,9 @@ GitHub App token, limited to the document's repository, which its own account
 can already read. The attached client decides what the Planner writes to the
 document during turns writers start, which is why attaching requires the push
 or administration access every Planner owner needs. Summary and research workers
-have no model in the server, so `HARNESS=remote` requires `BACKGROUND_JOBS=off`.
+have no model in the server either; they run as isolated sessions on the same
+client, so attaching also lends that client's model to the document's
+background work.
 
 ## Permission checks
 
@@ -621,7 +635,9 @@ launched it, and its runs belong to that session, so Chopin keeps the session
 and its owner binding, and keeps the document loaded, until every run has
 finished. The next turn reuses that session, so the Planner can still see and
 steer its runs over Intercom; people steer through Chat and Decisions, never a
-stage directly. **Stop Planner** also pauses the session's live runs, resumably,
+stage directly. Since Atomic 0.9.44 such a message reaches a busy stage after
+its current tool calls finish rather than cancelling them, unless the Planner
+sends it as an `interrupt`. **Stop Planner** also pauses the session's live runs, resumably,
 through Atomic's session run control, and **Resume Planner** resumes the runs it
 paused. A run waiting on a question pauses too: Atomic withdraws the question
 from Decisions while the run is paused and presents it again on Resume, and an
@@ -631,7 +647,9 @@ is between turns starts a Planner turn about it, on the kept session, so the
 Planner reports what happened and what the team needs to do; Chat records the
 run's end as that turn's reason, and the session is let go after the turn. The
 adapter stops any turn Atomic starts on its own, such as for its lifecycle
-notices, because Chopin would neither show nor record it.
+notices or, since Atomic 0.9.41, for a message queued while the session is
+idle, because Chopin would neither show nor record it. The Planner's next turn
+still starts normally.
 Chat shows the session's runs as one stack, one row
 per run: its name, status (running, waiting on Decisions, paused, or ended), and
 elapsed time. Several runs can be live at once. Runs waiting on Decisions come
@@ -657,7 +675,11 @@ document. When a run ends, Chat also records a line saying how it ended and how
 long it took. The session is let go when its runs finish, when its owner
 binding ends, or when the document closes; run state is durable in Atomic's
 workflow journal, so runs interrupted that way can be resumed from a later
-session. Chopin keeps that journal at
+session. Before disposing the session, the adapter waits, for at most 10
+seconds, on Atomic's `session.workflows.waitForSettled()` for each run that
+finished, failed or was stopped, so a session let go right after a run ends
+never leaves that run `running` in the journal; a run whose ending could not be
+recorded is logged by its ID. Chopin keeps that journal at
 `$XDG_STATE_HOME/chopin/atomic/workflows.sqlite` under the same per-user state
 directory as the documents' own directories, because a run resumes only with
 the journal and working directory it started in. Each Planner session is
@@ -665,7 +687,12 @@ given that file through Atomic's `createAgentSession({ journal })`, so the
 server's process environment is left unchanged. An operator's non-empty
 `ATOMIC_WORKFLOW_JOURNAL_PATH` names another file instead; Atomic's
 `workflows.journal` setting and its `ATOMIC_WORKFLOWS_JOURNAL` and
-`ATOMIC_STORAGE` selections do not move a Planner session's journal. Atomic
+`ATOMIC_STORAGE` selections do not move a Planner session's journal, and
+neither does the shared top-level `storage` setting, including an adapter named
+by package such as the libSQL selection `atomic storage join` writes. That
+setting does reach the Planner's Intercom: its sessions use the machine's
+Intercom broker, which keeps its routing in the selected database and so can
+reach sessions on every machine that selects the same one. Atomic
 still checks every set `ATOMIC_STORAGE`, `ATOMIC_SESSIONS_STORAGE`, and
 `ATOMIC_WORKFLOWS_JOURNAL` when it creates a session, so an invalid value fails
 every Atomic turn with a `StorageConfigError` naming the variable. A Build is not a workflow run and has no card in Chat: its tasks, their

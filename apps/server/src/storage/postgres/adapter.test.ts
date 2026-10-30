@@ -1013,20 +1013,22 @@ if (url) {
 				"024_document_versions",
 				"025_document_version_summaries",
 				"026_workflow_run_stages",
+				"027_decision_answers",
+				"028_machine_sharing",
 				"mantl_document_provenance",
 				"mantl_user_preferences",
 			]);
-			expect(await sql<{ table: string | null }[]>`SELECT to_regclass('channel_slugs') AS table`)
-				.toEqual([
-					{ table: "channel_slugs" },
-				]);
-			expect(await sql<{ table: string | null }[]>`SELECT to_regclass('user_navigation') AS table`)
-				.toEqual([
-					{ table: "user_navigation" },
-				]);
-			expect(
-				await sql<{ table: string | null }[]>`SELECT to_regclass('research_workspaces') AS table`,
-			).toEqual([{ table: "research_workspaces" }]);
+			expect([
+				...await sql<{ table: string | null }[]>`SELECT to_regclass('channel_slugs') AS table`,
+			]).toEqual([{ table: "channel_slugs" }]);
+			expect([
+				...await sql<{ table: string | null }[]>`SELECT to_regclass('user_navigation') AS table`,
+			]).toEqual([{ table: "user_navigation" }]);
+			expect([
+				...await sql<
+					{ table: string | null }[]
+				>`SELECT to_regclass('research_workspaces') AS table`,
+			]).toEqual([{ table: "research_workspaces" }]);
 		} finally {
 			await sql.unsafe(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).simple();
 			await sql.close();
