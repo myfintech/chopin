@@ -18,6 +18,7 @@ import {
 } from "../../testing/agent-link";
 import { createHumanInput } from "../atomic/human-input";
 import { hostInputRoom } from "../../testing/decisions";
+import { startingMessage } from "./attachments";
 import { MachinePlanners } from "./machine-planners";
 
 import type { RemotePlanner } from "./registry";
@@ -183,6 +184,17 @@ async function dispatchServer() {
 			raw.send({ type: "attach", version: AGENT_VERSION, document: channel.id });
 			return raw;
 		}
+		/** What the connector tells Chopin about its Planner backend's failing to start. */
+		async function report(body: unknown) {
+			return send("/api/connector/planner/failure", {
+				bearer: token,
+				headers: {
+					[CONNECTOR_VERSION_HEADER]: "dev",
+					[CONNECTOR_PROTOCOL_HEADER]: String(protocol),
+				},
+				body,
+			});
+		}
 		let disconnect = () =>
 			send("/connector/mcp", {
 				bearer: connection,
@@ -208,6 +220,7 @@ async function dispatchServer() {
 			poll,
 			credential,
 			backend,
+			report,
 			disconnect,
 			reconnect,
 		};
@@ -265,6 +278,158 @@ async function upgrade(url: string, credential: string) {
 	let response = await upgradeRequest(url, { authorization: `Bearer ${credential}` });
 	return response.status;
 }
+
+/** What a connector says when its backend exited before attaching `attempts` times in a row. */
+function failing(document: string, attempts: number, reason = "unsafe-checkout: refused") {
+	return { document, failure: { attempts, how: "exit 1", reason, at: Date.now() } };
+}
+
+describe("a Planner backend that keeps failing to start", () => {
+	it("is told to the document's people from the second launch in a row, and goes once the Planner attaches", async () => {
+		let { machine, choose, runtime, channel, server } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		await choose("member", laptop.id);
+		await laptop.poll([]);
+		expect(await runtime.plannerStarting(channel.id)).toEqual({
+			login: "member",
+			machineId: laptop.id,
+		});
+
+		// One launch that exited is a transient failure: the document still just says starting.
+		expect((await laptop.report(failing(channel.id, 1))).status).toBe(200);
+		expect(await runtime.plannerStarting(channel.id)).toEqual({
+			login: "member",
+			machineId: laptop.id,
+		});
+
+		// The second in a row is not.
+		let reason = "unsafe-checkout: ~/src/score's own git configuration sets a credential helper";
+		let before = Date.now();
+		expect(await (await laptop.report(failing(channel.id, 2, reason))).json())
+			.toEqual({ recorded: true });
+		expect(await runtime.plannerStarting(channel.id)).toEqual({
+			login: "member",
+			machineId: laptop.id,
+			failure: {
+				attempts: 2,
+				reason,
+				at: expect.any(String),
+			},
+		});
+		let { failure } = (await runtime.plannerStarting(channel.id))!;
+		// The time is the server's own, so a connector's clock cannot skew what people read.
+		expect(Date.parse(failure!.at)).toBeGreaterThanOrEqual(before);
+
+		// It attaches at last; once it lets go and the grace period ends, nothing old is told.
+		let link = await laptop.backend();
+		await link.next("attached");
+		link.send({ type: "detach" });
+		for (let deadline = Date.now() + 4_000; server.attachments.holding(channel.id);) {
+			if (Date.now() > deadline) throw new Error("the Planner was never released");
+			await Bun.sleep(50);
+		}
+		expect(await runtime.plannerStarting(channel.id)).toEqual({
+			login: "member",
+			machineId: laptop.id,
+		});
+	});
+
+	it("goes when the connector says its backend stays up, or the machine stops being asked for the document", async () => {
+		let { machine, choose, runtime, channel } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		let desk = await machine("member", "U_member", "desk");
+		await choose("member", laptop.id);
+		await laptop.poll([]);
+		await laptop.report(failing(channel.id, 3));
+		expect((await runtime.plannerStarting(channel.id))?.failure?.attempts).toBe(3);
+		// A launch that stays up: no failure to report any more.
+		expect(await (await laptop.report({ document: channel.id })).json())
+			.toEqual({ recorded: true });
+		expect((await runtime.plannerStarting(channel.id))?.failure).toBeUndefined();
+
+		// A failure of the laptop does not follow the document to the desk, or back again.
+		await laptop.report(failing(channel.id, 2));
+		await choose("member", desk.id);
+		expect((await runtime.plannerStarting(channel.id))?.failure).toBeUndefined();
+		await choose("member", laptop.id);
+		await laptop.poll([]);
+		expect(await runtime.plannerStarting(channel.id)).toEqual({
+			login: "member",
+			machineId: laptop.id,
+		});
+	});
+
+	it("is taken only from a machine Chopin asked to run the document's Planner, for its people to read", async () => {
+		let { machine, choose, runtime, channel, send } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		let desk = await machine("member", "U_member", "desk");
+		let rival = await machine("rival", "U_rival", "rival-box");
+		await choose("member", laptop.id);
+		await laptop.poll([]);
+
+		// Not asked: the desk was never chosen, and the rival's machine cannot touch the document.
+		for (let other of [desk, rival]) {
+			let answer = await other.report(failing(channel.id, 4, "not for you"));
+			expect(answer.status).toBe(200);
+			expect(await answer.json()).toEqual({ recorded: false });
+		}
+		expect((await runtime.plannerStarting(channel.id))?.failure).toBeUndefined();
+
+		// Nor anyone who is not a paired machine.
+		let stranger = await send("/api/connector/planner/failure", {
+			bearer: `chopin_m_${"x".repeat(43)}`,
+			headers: { [CONNECTOR_VERSION_HEADER]: "dev", [CONNECTOR_PROTOCOL_HEADER]: "4" },
+			body: failing(channel.id, 2),
+		});
+		expect(stranger.status).toBe(401);
+		expect((await runtime.plannerStarting(channel.id))?.failure).toBeUndefined();
+	});
+
+	it("is what an @chopin request is told while the Planner cannot start, instead of to try again in a moment", () => {
+		expect(startingMessage("mona")).toBe(
+			"This document's Planner is still starting on @mona's machine. Try again in a moment.",
+		);
+		expect(
+			startingMessage("mona", {
+				attempts: 3,
+				reason: "unsafe-checkout: refused",
+				at: "2026-11-04T02:00:00.000Z",
+			}),
+		).toBe(
+			"This document's Planner can't start on @mona's machine: unsafe-checkout: refused "
+				+ "(3 attempts in a row). It keeps trying; try again once that is fixed.",
+		);
+	});
+
+	it("keeps what is told short and plain", async () => {
+		let { machine, choose, runtime, channel } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		await choose("member", laptop.id);
+		await laptop.poll([]);
+		await laptop.report(failing(channel.id, 2, `\u001b[31m${"x".repeat(1_500)}\u0007\r\nend`));
+		let reason = (await runtime.plannerStarting(channel.id))!.failure!.reason;
+		expect(reason).toHaveLength(300);
+		expect([...reason].some(character => character.charCodeAt(0) < 32)).toBe(false);
+		// A report that says nothing about why still says how it ended.
+		await laptop.report({
+			document: channel.id,
+			failure: { attempts: 2, how: "signal SIGKILL", at: Date.now() },
+		});
+		expect((await runtime.plannerStarting(channel.id))!.failure).toEqual({
+			attempts: 2,
+			reason: "signal SIGKILL",
+			at: expect.any(String),
+		});
+		// Malformed ones are refused.
+		for (
+			let body of [{ document: channel.id, failure: { attempts: 0, how: "x", at: 1 } }, {
+				failure: {},
+			}]
+		) {
+			expect((await laptop.report(body)).status).toBe(409);
+		}
+	});
+});
 
 describe("choosing a machine for a document", () => {
 	it("tells that machine to run the document's Planner, and stops it when another is chosen", async () => {
@@ -364,6 +529,114 @@ describe("choosing a machine for a document", () => {
 			planners: [{ id: channel.id, url }],
 		});
 		expect((await choice("member")).planner.state).toBe("starting");
+	});
+
+	it("lets the creator's choice take the Planner from a machine another member chose", async () => {
+		let { machine, choose, choice, channel, server, url } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		let rivals = await machine("rival", "U_rival", "rival-box");
+		// The other member chose their machine first, and its Planner attached.
+		await choose("rival", rivals.id);
+		expect(await rivals.poll([])).toEqual({
+			kind: "planners",
+			planners: [{ id: channel.id, url }],
+		});
+		let theirs = await rivals.backend();
+		await theirs.next("attached");
+		expect(server.attachments.holding(channel.id)?.machineId).toBe(rivals.id);
+
+		// The creator chooses their own machine: the other member's Planner stops and their choice goes.
+		let chosen = await choose("member", laptop.id);
+		expect(chosen.planner).toEqual({ state: "starting", login: null, machine: laptop.id });
+		expect(await theirs.next("refused")).toMatchObject({ code: "access-revoked" });
+		expect(await rivals.poll([channel.id])).toEqual({
+			kind: "planners",
+			planners: [],
+			stopped: { [channel.id]: expect.stringContaining("member chose another machine") },
+		});
+		expect((await choice("rival")).choice).toBeNull();
+		expect(await laptop.poll([])).toEqual({
+			kind: "planners",
+			planners: [{ id: channel.id, url }],
+		});
+		let mine = await laptop.backend();
+		await mine.next("attached");
+		expect(server.attachments.holder(channel.id)).toBe("member");
+		expect((await choice("member")).planner)
+			.toEqual({ state: "attached", login: "member", machine: laptop.id });
+	});
+
+	it("never lets another member's choice keep the Planner from the creator's chosen machine", async () => {
+		let { machine, choose, choice, channel, server, url } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		let rivals = await machine("rival", "U_rival", "rival-box");
+		await choose("member", laptop.id);
+		expect(await laptop.poll([])).toEqual({
+			kind: "planners",
+			planners: [{ id: channel.id, url }],
+		});
+
+		// Chosen after the creator's, the other member's machine is never asked.
+		let theirs = await choose("rival", rivals.id);
+		expect(theirs.choice).toBe(rivals.id);
+		expect(theirs.planner).toEqual({ state: "none", login: null, machine: null });
+		expect(await rivals.poll([])).toEqual({ waiting: true });
+		let mine = await laptop.backend();
+		await mine.next("attached");
+		expect(server.attachments.holder(channel.id)).toBe("member");
+		expect((await choice("rival")).planner).toEqual({
+			state: "held",
+			login: "member",
+			machine: null,
+		});
+	});
+
+	it("lets the creator take the Planner back with Default machine from a member's choice", async () => {
+		let { machine, choose, choice, visit, channel, server, url } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		let rivals = await machine("rival", "U_rival", "rival-box");
+		await visit();
+		await choose("rival", rivals.id);
+		expect(await rivals.poll([])).toEqual({
+			kind: "planners",
+			planners: [{ id: channel.id, url }],
+		});
+		let theirs = await rivals.backend();
+		await theirs.next("attached");
+		expect(server.attachments.holding(channel.id)?.machineId).toBe(rivals.id);
+
+		// The creator has chosen no machine, yet asking for Default machine claims the document.
+		let back = await choose("member", null);
+		expect(back.planner).toEqual({ state: "starting", login: null, machine: laptop.id });
+		expect(await theirs.next("refused")).toMatchObject({ code: "access-revoked" });
+		expect((await choice("rival")).choice).toBeNull();
+		expect(await laptop.poll([])).toEqual({
+			kind: "planners",
+			planners: [{ id: channel.id, url }],
+		});
+		let mine = await laptop.backend();
+		await mine.next("attached");
+		expect(server.attachments.holder(channel.id)).toBe("member");
+	});
+
+	it("keeps the creator's Planner when they go back to Default machine after a member chose", async () => {
+		let { machine, choose, choice, visit, channel, server } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		let rivals = await machine("rival", "U_rival", "rival-box");
+		await visit();
+		await choose("member", laptop.id);
+		let mine = await laptop.backend();
+		await mine.next("attached");
+		// Inert while the creator's choice stands, and still stored for the member's own builds.
+		await choose("rival", rivals.id);
+		expect(await rivals.poll([], 300)).toEqual({ waiting: true });
+
+		// Default machine gives the Planner to the same machine, so it stays; the member's choice
+		// does not revive and take the document.
+		expect((await choose("member", null)).planner.state).toBe("attached");
+		expect(await rivals.poll([], 300)).toEqual({ waiting: true });
+		expect(server.attachments.holder(channel.id)).toBe("member");
+		expect((await choice("rival")).choice).toBe(rivals.id);
 	});
 
 	it("withdraws a machine's credential once it is no longer asked, so it never attaches after Automatic", async () => {
@@ -527,7 +800,10 @@ describe("a document on Default machine", () => {
 		expect(await laptop.poll([])).toEqual({ waiting: true });
 		expect((await choice("member")).planner)
 			.toEqual({ state: "starting", login: null, machine: desk.id });
-		expect(await runtime.plannerStarting(channel.id)).toEqual({ login: "member" });
+		expect(await runtime.plannerStarting(channel.id)).toEqual({
+			login: "member",
+			machineId: desk.id,
+		});
 
 		let link = await desk.backend();
 		await link.next("attached");
@@ -706,7 +982,7 @@ describe("a document on Default machine", () => {
 			let answer = await laptop.poll([channel.id]);
 			return "waiting" in answer;
 		};
-		return { ...dispatch, laptop, link, room, idle };
+		return { ...dispatch, laptop, link, room, session, idle };
 	}
 
 	it("keeps the Planner while it waits on a question, and stops it once that has been answered for a while", async () => {
@@ -724,6 +1000,26 @@ describe("a document on Default machine", () => {
 
 		await room.answer(card!.id, [0]);
 		expect(await link.next("input-result")).toMatchObject({ status: "answered", value: true });
+		expect(await idle(PLANNER_IDLE_MS - 1_000)).toBe(true);
+		expect(await idle(2_000)).toBe(false);
+		expect(await link.next("refused")).toMatchObject({ code: "access-revoked" });
+	});
+
+	it("keeps the Planner through a reply that runs past the idle threshold, and counts idle time only from its end", async () => {
+		let { link, session, idle } = await unwatched();
+		let turn = session.doPromptTurn({
+			prompt: "outline the plan",
+			skills: [],
+			tools: [],
+			emit: () => {},
+		});
+		let { turn: id } = await link.next("turn");
+		await turn;
+		expect(await idle(PLANNER_IDLE_MS + 60_000)).toBe(true);
+		expect(await idle(PLANNER_IDLE_MS * 4)).toBe(true);
+
+		link.send({ type: "turn-end", session: "planner-session", turn: id, status: "finished" });
+		await Bun.sleep(50);
 		expect(await idle(PLANNER_IDLE_MS - 1_000)).toBe(true);
 		expect(await idle(2_000)).toBe(false);
 		expect(await link.next("refused")).toMatchObject({ code: "access-revoked" });
@@ -760,7 +1056,10 @@ describe("a teammate's machine shared with teammates", () => {
 		expect(await box.poll([])).toEqual({ kind: "planners", planners: [{ id: channel.id, url }] });
 		expect((await choice("member")).planner)
 			.toEqual({ state: "starting", login: "rival", machine: box.id });
-		expect(await runtime.plannerStarting(channel.id)).toEqual({ login: "rival" });
+		expect(await runtime.plannerStarting(channel.id)).toEqual({
+			login: "rival",
+			machineId: box.id,
+		});
 
 		expect(await plain.poll([])).toEqual({ waiting: true });
 

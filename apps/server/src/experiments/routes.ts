@@ -24,6 +24,7 @@ import {
 	CONNECTOR_UPDATE_REQUIRED,
 	CONNECTOR_VERSION_HEADER,
 } from "@chopin/protocol/connector";
+import type { Session } from "@chopin/protocol";
 import type { PlannerAssignment, PlannerControl } from "@chopin/protocol/connector";
 import { documentsPath } from "@chopin/protocol/document-url";
 import { documentUrl } from "../channels/document-url";
@@ -185,6 +186,26 @@ function stoppedSharing(login: string) {
  * Protocol 6 keeps the claimed document ID on build renewals and reports after assignment cleanup.
  */
 export const CONNECTOR_PROTOCOLS: { min: number; max: number } = { min: 2, max: 6 };
+
+/** A document's people read why a Planner backend keeps failing from this launch in a row on. */
+export const PLANNER_FAILURE_SHOWN_AT = 2;
+/** The longest reason shown, in characters. */
+const START_REASON_CHARS = 300;
+
+/** What a machine's connector last said about its Planner backend failing to start. */
+type StartFailure = { attempts: number; reason: string; at: number };
+
+/** Text from a connector, safe to show: no control characters, one line, short. */
+function plainText(text: string): string {
+	let line = text
+		// oxlint-disable-next-line no-control-regex
+		.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+		// oxlint-disable-next-line no-control-regex
+		.replace(/[\u0000-\u001f\u007f]+/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	return line.length > START_REASON_CHARS ? `${line.slice(0, START_REASON_CHARS - 1)}…` : line;
+}
 
 /** The chopin release a connector says it runs; a script or source run has none. */
 function releaseVersion(request: Request): string | undefined {
@@ -438,6 +459,21 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 	 */
 	let defaults = new Map<string, string>();
 	/**
+	 * Why each machine's Planner backend keeps failing to start, as its connector last said, by
+	 * document id and then machine id. A document's people read it from the second launch in a
+	 * row, while the connector is still trying; the backend attaching, the connector saying it
+	 * stays up, or the machine no longer being asked for the document forgets it. Forgotten with a
+	 * restart.
+	 */
+	let startFailures = new Map<string, Map<string, StartFailure>>();
+	function forgetStartFailure(documentId: string, machineId?: string) {
+		let failures = startFailures.get(documentId);
+		if (!failures) return;
+		if (machineId === undefined) failures.clear();
+		else failures.delete(machineId);
+		if (!failures.size) startFailures.delete(documentId);
+	}
+	/**
 	 * Whether each shared machine's owner can push to a repository, by machine and repository id,
 	 * as GitHub last said with the machine's own token; a machine shared with teammates runs only
 	 * the Planners of documents its owner could work on themselves.
@@ -550,8 +586,22 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		}
 		return changed;
 	}
+	/**
+	 * Whether a member's own choice places a document's Planner. A document has one Planner, so its
+	 * creator's choice decides where it runs: another member's choice counts only while the creator
+	 * chose no machine, and never keeps the Planner from a machine its creator chose.
+	 */
+	function placesPlanner(channel: ChannelRecord, userId: string) {
+		return userId === channel.createdBy || !connections.chosen(channel.id, channel.createdBy);
+	}
+	/** The machines whose choice places a document's Planner: its creator's, else any member's. */
+	function plannerChoices(channel: ChannelRecord) {
+		let creators = connections.chosen(channel.id, channel.createdBy);
+		return creators ? [creators] : connections.chosenFor(channel.id);
+	}
 	/** The machine that runs a document's Planner for `userId`: the one they chose, else Default's. */
 	function plannerMachine(channel: ChannelRecord, userId: string) {
+		if (!placesPlanner(channel, userId)) return undefined;
 		return connections.chosen(channel.id, userId)
 			?? (userId === channel.createdBy ? defaultMachine(channel) : undefined);
 	}
@@ -575,6 +625,8 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 			if (owner !== connection.owner) continue;
 			let channel = await auth.storage.channels.get(documentId);
 			if (!channel || channel.archivedAt || !serves(connection, channel.repositoryId)) continue;
+			// A member's choice yields to the creator's, which keeps its own machine asked instead.
+			if (!placesPlanner(channel, owner)) continue;
 			let holder = options.attachments?.()?.holding(documentId);
 			if (holder && holder.userId !== connection.owner) continue;
 			await add(channel);
@@ -600,6 +652,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 			if (!serves(connection, repositoryId) || wanted.has(documentId)) continue;
 			// No longer asked, as another account now holds it: a credential it got stops working.
 			options.planners?.withdraw(connection.machineId, documentId);
+			forgetStartFailure(documentId, connection.machineId);
 			told.delete(documentId);
 		}
 		for (let document of documents) told.set(document.id, document.repositoryId);
@@ -630,32 +683,56 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 	}
 	/**
 	 * Whose machine is about to run a document's Planner, when nothing holds it yet: one chosen for
-	 * it, or Default machine's, that can run Planners now. Undefined when no machine will.
+	 * it, or Default machine's, that can run Planners now, and why its backend keeps failing to
+	 * start once it has more than once in a row. Undefined when no machine will.
 	 */
-	async function plannerStarting(documentId: string): Promise<{ login: string } | undefined> {
+	async function plannerStarting(
+		documentId: string,
+	): Promise<
+		{ login: string; machineId: string; failure?: Session.PlannerStartFailure } | undefined
+	> {
 		if (!options.planners || !auth.machines.durable) return undefined;
 		if (options.attachments?.()?.holding(documentId)) return undefined;
 		let channel = await auth.storage.channels.get(documentId);
 		if (!channel || channel.archivedAt) return undefined;
 		await readChoices().catch(() => {});
 		let fallback = defaultMachine(channel);
-		for (let machineId of [...connections.chosenFor(documentId), ...fallback ? [fallback] : []]) {
+		for (let machineId of [...plannerChoices(channel), ...fallback ? [fallback] : []]) {
 			let live = connections.machine(machineId).find(value =>
 				serves(value, channel.repositoryId) && runsPlanners(value)
 			);
-			if (live) return { login: live.login };
+			if (!live) continue;
+			let failure = startFailures.get(documentId)?.get(machineId);
+			return {
+				login: live.login,
+				machineId,
+				...(failure && failure.attempts >= PLANNER_FAILURE_SHOWN_AT
+					? {
+						failure: {
+							attempts: failure.attempts,
+							reason: failure.reason,
+							at: new Date(failure.at).toISOString(),
+						},
+					}
+					: {}),
+			};
 		}
 		return undefined;
 	}
 	/**
-	 * A document stops being used once nobody has had it open, and its Planner has waited on no
-	 * question or workflow run, for PLANNER_IDLE_MS: the machine Default machine gave its Planner
-	 * stops running it. A question never times out by this route while its Planner waits on it.
+	 * A document stops being used once nobody has had it open, and its Planner has been replying
+	 * to nobody and waiting on no question or workflow run, for PLANNER_IDLE_MS: the machine
+	 * Default machine gave its Planner stops running it. Work under way and a question never
+	 * time out by this route, however long they take.
 	 */
 	async function plannersIdle() {
 		let now = auth.clock().getTime();
 		for (let [documentId, seen] of inUse) {
-			if (options.documentOpen?.(documentId) || options.attachments?.()?.waiting(documentId)) {
+			let attached = options.attachments?.();
+			if (
+				options.documentOpen?.(documentId) || attached?.waiting(documentId)
+				|| attached?.busy(documentId)
+			) {
 				inUse.set(documentId, now);
 				continue;
 			}
@@ -710,13 +787,17 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		keep: (documentId: string, repositoryId: string) => boolean = () => false,
 		documentId?: string,
 	) {
-		if (documentId) options.planners?.withdraw(machineId, documentId);
+		if (documentId) {
+			options.planners?.withdraw(machineId, documentId);
+			forgetStartFailure(documentId, machineId);
+		}
 		let told = dispatched.get(machineId);
 		if (!told) return;
 		let label = (await auth.storage.machines.get(machineId))?.label ?? "The machine";
 		for (let [documentId, repositoryId] of told) {
 			if (keep(documentId, repositoryId)) continue;
 			options.planners?.withdraw(machineId, documentId);
+			forgetStartFailure(documentId, machineId);
 			told.delete(documentId);
 			let reason = message(label);
 			let reasons = stopReasons.get(machineId) ?? new Map<string, string>();
@@ -1124,6 +1205,48 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		});
 	});
 	/**
+	 * A machine's connector says why its Planner backend for a document keeps exiting before it
+	 * attaches, or, without `failure`, that it no longer does. Only a Planner Chopin asked the
+	 * machine to run counts, since what is said here is shown to the document's people.
+	 */
+	route("POST", "/api/connector/planner/failure", async request => {
+		let planners = options.planners;
+		if (!planners || !auth.machines.durable) fail("not-found");
+		compatible(request, auth.config.origin, options.connectorVersion);
+		let machine = await machineRefusal(() => auth.machines.authenticate(bearer(request)));
+		let { document, failure } = z.object({
+			document: z.string().min(1).max(2048),
+			failure: z.object({
+				attempts: z.number().int().min(1).max(1_000_000),
+				how: z.string().max(2000),
+				reason: z.string().max(2000).optional(),
+				at: z.number().int().positive(),
+			}).strict().optional(),
+		}).strict().parse(await body(request));
+		let told = dispatched.get(machine.id);
+		// The connector names the document by id once Chopin issued it a credential; an address
+		// is read with the machine's own token, as that credential is.
+		let documentId: string | undefined;
+		if (told?.has(document)) documentId = document;
+		else if (told?.size) {
+			let located = await machineRefusal(() => planners.locate(machine, document))
+				.catch(() => undefined);
+			if (located && located !== "forbidden") documentId = located.channel.id;
+		}
+		if (!documentId || !told?.has(documentId)) return json({ recorded: false });
+		if (!failure) forgetStartFailure(documentId, machine.id);
+		else {
+			let now = auth.clock().getTime();
+			let reason = plainText(failure.reason ?? "") || plainText(failure.how);
+			let known = startFailures.get(documentId) ?? new Map<string, StartFailure>();
+			// The time is the server's own: a connector's clock is its own.
+			known.set(machine.id, { attempts: failure.attempts, reason, at: now });
+			startFailures.set(documentId, known);
+		}
+		options.plannerStatus?.(documentId);
+		return json({ recorded: true });
+	});
+	/**
 	 * A paired machine's own GitHub token, for its Planner commands and runs to push to
 	 * `repository` and open draft pull requests as its owner (see `machineGitHubToken`). Under
 	 * AUTH_MODE=local machines hold no GitHub token, so there is none to give.
@@ -1410,10 +1533,34 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		// Default machine picks again for its creator, as for any change of choice.
 		if (userId === channel.createdBy) defaults.delete(channel.id);
 		let next = plannerMachine(channel, userId);
-		// The machine that ran it stops, unless it is the one that runs it now; the new one starts.
-		if (previous && previous !== next) {
+		// The machines that stop: the one that ran it, unless it is the one that runs it now. The
+		// creator's choice also ends a Planner another member's machine runs or was asked to run,
+		// and that member's choice with it, so it does not take the document back.
+		let stops = new Set(previous && previous !== next ? [previous] : []);
+		if (userId === channel.createdBy) {
+			let holder = options.attachments?.()?.holding(channel.id);
+			let theirs = [
+				...dispatched.entries().filter(([, told]) => told.has(channel.id)).map(([id]) => id),
+				...holder?.machineId ? [holder.machineId] : [],
+			];
+			for (let machineId of theirs) {
+				if (machineId === next || machineId === previous) continue;
+				stops.add(machineId);
+				for (let chooser of connections.choosing(machineId)) {
+					if (chooser.documentId !== channel.id || chooser.owner === userId) continue;
+					await auth.storage.machines.choose(
+						{ channelId: channel.id, userId: chooser.owner },
+						auth.clock(),
+					);
+					connections.choose(channel.id, chooser.owner, undefined);
+					options.chosen?.(channel.id, chooser.owner);
+				}
+			}
+		}
+		// The new machine starts.
+		for (let machineId of stops) {
 			await stopPlanners(
-				previous,
+				machineId,
 				label =>
 					`${session.user.login} chose ${
 						machine ? "another machine" : "Default machine"
@@ -2117,6 +2264,8 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 	}
 	/** A document's Planner attached, detached or was released: its chosen machines are asked again. */
 	function plannerChanged(channelId: string) {
+		// It attached, so whatever kept it from starting is over.
+		if (options.attachments?.()?.attached(channelId)) forgetStartFailure(channelId);
 		void auth.storage.channels.get(channelId).then(
 			channel => channel && connections.wake(channel.repositoryId),
 			() => {},

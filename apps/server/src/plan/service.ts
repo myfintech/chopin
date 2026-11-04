@@ -1489,6 +1489,7 @@ export async function readStored(
 	graph?: Graph;
 	execution?: Run;
 	lifecycle?: Lifecycle;
+	records?: Questions.Record[];
 }> {
 	let restored = await restoreHosted(loaded.channel.id, loaded);
 	try {
@@ -1496,6 +1497,7 @@ export async function readStored(
 		return {
 			source: room.project(restored.document),
 			revision: restored.sidecar.revision,
+			...(restored.sidecar.questions.length > 0 ? { records: restored.sidecar.questions } : {}),
 			...(restored.sidecar.creation ? { creation: restored.sidecar.creation } : {}),
 			...(restored.sidecar.graph ? { graph: restored.sidecar.graph } : {}),
 			...(restored.sidecar.builds ? { builds: restored.sidecar.builds } : {}),

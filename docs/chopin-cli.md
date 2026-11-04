@@ -418,6 +418,18 @@ Connector:  running (pid 4242, chopin 0.0.11, the service)
 A Planner that Chopin refused for good, such as one for a deleted document,
 shows `stopped:` and the reason instead of `failing`.
 
+The people in the document can read why too, not only whoever runs the
+machine. After each launch of a Planner Chopin asked this machine to run that
+exits before staying up, the connector tells Chopin how many launches in a row
+have, how the last one ended and the last line it printed to stderr that says
+why (a closing "Exiting with code 1" notice does not count), with tokens and
+`--env` values masked, your home directory shown as `~` and the line cut at 300
+characters. From the second launch in a row, Chat says **Planner can't start on
+studio:** and the reason, instead of **Planner: starting on studio…**, while the
+connector keeps retrying. Once the Planner attaches, or a launch stays up, it
+goes. A Chopin from before this does not know the report; the connector asks it
+once and carries on.
+
 A connector started with `--planner-command` says it can run Planners, and
 lists each Planner it runs because Chopin asked this machine for it
 beside the `--planner` ones (`canRunPlanners` and `chosenPlanners` in
@@ -467,8 +479,9 @@ the person who created it, picked as for builds: their default machine when it
 is connected and can run Planners, else the machine that last worked on the
 document, else any of theirs that can. Chopin asks for it while someone has the
 document open, and stops it once nobody has used the document for 30 minutes.
-A Planner waiting on a question or on a live or paused workflow run counts as
-use, so its questions stay open however long nobody views the document.
+A Planner that is replying, or waiting on a question or on a live or paused
+workflow run, counts as use, so its work and its questions are never cut short
+however long nobody views the document.
 A Planner stays on its machine while that machine is connected, even when
 another comes online; it moves when the machine disconnects or the creator
 changes the document's machine or their default. Chat says
@@ -553,6 +566,21 @@ The machine uses your own `gh` and Git login instead when:
 ```text
 The GitHub App can't push to octo-org/score (it needs Contents and Pull requests write), so this machine uses its own GitHub login for it.
 ```
+
+### Your Git configuration
+
+Where Chopin gives the machine a token, the connector's Git commands for that
+repository, and those of the Planner and agent it starts, use the repository's
+`https://github.com/` address and the token, whatever your own Git
+configuration says. A `url.<base>.insteadOf` or `pushInsteadOf` rule that sends
+GitHub to SSH, which a background service has no agent or key for, doesn't
+reach them, and a checkout whose `origin` is an SSH address is fetched and
+pushed over https. The rest of your configuration (identity, signing, other
+rules and repositories) applies as it is, and nothing is written to your global
+configuration or the checkout's own.
+
+If a Git command still reaches GitHub over SSH and fails, the error names the
+rule that rewrites the address.
 
 ## Update
 

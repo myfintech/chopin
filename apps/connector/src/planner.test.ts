@@ -1,10 +1,16 @@
 import { afterAll, expect, mock, test } from "bun:test";
 import { mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { machineFile } from "./machine";
 import { createOutput } from "./output";
-import { commandWords, dispatchedPlanners, servePlanners, stopBackend } from "./planner";
+import {
+	commandWords,
+	dispatchedPlanners,
+	servePlanners,
+	startFailureReason,
+	stopBackend,
+} from "./planner";
 import type { ServiceHost } from "./service";
 import { collectStatus, formatStatus } from "./status";
 import { git, lockWorkspace, startFailures } from "./workspace";
@@ -656,6 +662,159 @@ test.skipIf(process.platform === "win32")(
 			expect(report.connectors[0]!.failures![0]!.stderr).toBe(marker);
 		} finally {
 			process.stderr.write = stderr;
+			abort.abort();
+			await serving;
+			await release();
+			await chopin.stop(true);
+		}
+	},
+	30_000,
+);
+
+/**
+ * A backend that exits early on its first two launches, as one refusing its checkout does: it says
+ * why, then prints a notice that it is exiting, which is not the reason. The third stays up.
+ */
+const REFUSING_BACKEND = `
+import { appendFileSync, readFileSync } from "node:fs";
+let [log, home] = process.argv.slice(2);
+let launches = 0;
+try { launches = readFileSync(log, "utf8").split("\\n").filter(Boolean).length; } catch {}
+appendFileSync(log, process.pid + "\\n");
+if (launches < 2) {
+	process.stderr.write("2026-11-04T02:05:16.714Z Attaching the document.\\n");
+	process.stderr.write("2026-11-04T02:05:16.715Z Stopped attaching: unsafe-checkout: " + home + "/src/score has a credential helper (ghp_${
+	"A".repeat(20)
+})\\n");
+	process.stderr.write("2026-11-04T02:05:16.716Z Exiting with code 1; starting again with a fresh credential.\\n\\n");
+	process.exit(1);
+}
+process.on("SIGTERM", () => process.exit(0));
+setInterval(() => {}, 1000);
+`;
+
+test.skipIf(process.platform === "win32")(
+	"a Planner backend that keeps exiting early reports to Chopin why, without credentials or the home directory, and clears it once one stays up",
+	async () => {
+		let reports: Array<{ authorization: string | null; body: any }> = [];
+		let chopin = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request): Promise<Response> {
+				if (new URL(request.url).pathname === "/api/connector/planner/failure") {
+					reports.push({
+						authorization: request.headers.get("authorization"),
+						body: await request.json(),
+					});
+					return Response.json({ recorded: true });
+				}
+				return Response.json({
+					token: `chopin_p_${"P".repeat(43)}`,
+					expiresAt: Date.now() + 15 * 60_000,
+					document: { id: "D_1", repository: "octo-org/score", url: "http://x" },
+				});
+			},
+		});
+		let directory = await mkdtemp(join(scratch, "reported-"));
+		let script = join(directory, "backend.ts");
+		await writeFile(script, REFUSING_BACKEND);
+		let release = await lockWorkspace(directory, directory, { planners: ["D_1"] });
+		let abort = new AbortController();
+		let quiet = { write: () => true };
+		let serving = servePlanners({
+			url: `http://127.0.0.1:${chopin.port}`,
+			machine: MACHINE,
+			// Started by its address, as Chopin tells a connector; its reports name it by id.
+			documents: ["https://chopin.example/octo-org/score/plan"],
+			command: [process.execPath, script, join(directory, "launches.log"), homedir()],
+			checkouts: checkouts({ directory, registered: { "octo-org/score": directory } }),
+			directory,
+			output: createOutput(quiet, quiet, {}),
+			signal: abort.signal,
+			healthyMs: 1000,
+		});
+		try {
+			await until(async () => reports.length >= 3, 15_000);
+			let [first, second, cleared] = reports;
+			let failure = (attempts: number) => ({
+				attempts,
+				how: "exit 1",
+				reason:
+					"Stopped attaching: unsafe-checkout: ~/src/score has a credential helper ([redacted])",
+				at: expect.any(Number),
+			});
+			expect(first!.authorization).toBe(`Bearer ${MACHINE}`);
+			expect(first!.body).toEqual({ document: "D_1", failure: failure(1) });
+			expect(second!.body).toEqual({ document: "D_1", failure: failure(2) });
+			// The third launch stays up, so what was reported goes.
+			expect(cleared!.body).toEqual({ document: "D_1" });
+			expect(JSON.stringify(reports)).not.toContain("ghp_");
+		} finally {
+			abort.abort();
+			await serving;
+			await release();
+			await chopin.stop(true);
+		}
+	},
+	30_000,
+);
+
+test("the reason a backend exited is its last stderr line that says why, not that it is exiting", () => {
+	// The reason comes before the notice that it is leaving, and loses its colors and its time.
+	expect(startFailureReason([
+		"2026-11-04T02:05:16.714Z Attaching the document.",
+		"\u001b[31m2026-11-04T02:05:16.715Z error: no access to octo-org/score\u001b[0m",
+		"2026-11-04T02:05:16.716Z Exiting with code 1; starting again.",
+	])).toBe("error: no access to octo-org/score");
+	// With nothing but a notice, the notice is all there is.
+	expect(startFailureReason(["exited with code 3"])).toBe("exited with code 3");
+	expect(startFailureReason([])).toBeUndefined();
+	expect(startFailureReason(["  ", "\u001b[0m"])).toBeUndefined();
+});
+
+test.skipIf(process.platform === "win32")(
+	"a server that does not know the failure report is told once, not on every launch",
+	async () => {
+		let reports = 0;
+		let credentials = 0;
+		let chopin = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request): Response {
+				if (new URL(request.url).pathname === "/api/connector/planner/failure") {
+					reports++;
+					return Response.json({ error: "not-found" }, { status: 404 });
+				}
+				if (new URL(request.url).pathname === "/api/connector/planner") credentials++;
+				return Response.json({
+					token: `chopin_p_${"P".repeat(43)}`,
+					expiresAt: Date.now() + 15 * 60_000,
+					document: { id: "D_1", repository: "octo-org/score", url: "http://x" },
+				});
+			},
+		});
+		let directory = await mkdtemp(join(scratch, "unknown-report-"));
+		let script = join(directory, "backend.ts");
+		await writeFile(script, "process.exit(1);\n");
+		let release = await lockWorkspace(directory, directory, { planners: ["D_1"] });
+		let abort = new AbortController();
+		let quiet = { write: () => true };
+		let serving = servePlanners({
+			url: `http://127.0.0.1:${chopin.port}`,
+			machine: MACHINE,
+			documents: ["D_1"],
+			command: [process.execPath, script],
+			checkouts: checkouts({ directory, registered: { "octo-org/score": directory } }),
+			directory,
+			output: createOutput(quiet, quiet, {}),
+			signal: abort.signal,
+			healthyMs: 1000,
+		});
+		try {
+			// A third launch means two failures went by after the first one was reported.
+			await until(async () => credentials >= 3, 15_000);
+			expect(reports).toBe(1);
+		} finally {
 			abort.abort();
 			await serving;
 			await release();
@@ -1484,14 +1643,18 @@ test.skipIf(process.platform === "win32")(
 
 /** A Planner backend that records what it was given for GitHub, then reads its token file again. */
 const GITHUB_BACKEND = `
+import { spawnSync } from "node:child_process";
 import { appendFileSync, readFileSync, statSync } from "node:fs";
 let log = process.argv[2];
+// Where git, under this environment, would fetch or push the repository's https address.
+let url = spawnSync("git", ["ls-remote", "--get-url", "https://github.com/octo-org/score.git"], { encoding: "utf8" }).stdout.trim();
 let file = process.env.CHOPIN_GITHUB_TOKEN_FILE;
 let seen = () => file ? { content: readFileSync(file, "utf8"), mode: (statSync(file).mode & 0o777).toString(8) } : null;
 appendFileSync(log, JSON.stringify({
 	token: process.env.CHOPIN_GITHUB_TOKEN ?? null,
 	expiresAt: process.env.CHOPIN_GITHUB_TOKEN_EXPIRES_AT ?? null,
 	file: file ?? null,
+	url,
 	argv: process.argv,
 	seen: seen(),
 }) + "\\n");
@@ -1540,6 +1703,11 @@ test.skipIf(process.platform === "win32")(
 		let script = join(directory, "backend.ts");
 		let log = join(directory, "launches.jsonl");
 		await writeFile(script, GITHUB_BACKEND);
+		// The person's own Git configuration sends GitHub over SSH, which a service can't use.
+		let global = join(directory, "gitconfig");
+		await writeFile(global, '[url "git@github.com:"]\n\tinsteadOf = https://github.com/\n');
+		let saved = process.env.GIT_CONFIG_GLOBAL;
+		process.env.GIT_CONFIG_GLOBAL = global;
 		let written = "";
 		let capture = {
 			write: (chunk: string | Uint8Array) => {
@@ -1568,6 +1736,8 @@ test.skipIf(process.platform === "win32")(
 				expiresAt: new Date(expiries[0]!).toISOString(),
 				file,
 				seen: { content: `${tokens[0]}\n`, mode: "600" },
+				// Its own git and its agent's keep to https for this repository, rewrite or not.
+				url: "https://github.com/octo-org/score.git",
 			});
 			// Never in its arguments.
 			expect(JSON.stringify(first.argv)).not.toContain("ghu_");
@@ -1583,6 +1753,8 @@ test.skipIf(process.platform === "win32")(
 			expect(await stat(file).catch(() => "missing")).toBe("missing");
 			for (let token of tokens) expect(written).not.toContain(token);
 		} finally {
+			if (saved === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+			else process.env.GIT_CONFIG_GLOBAL = saved;
 			abort.abort();
 			await chopin.stop();
 		}

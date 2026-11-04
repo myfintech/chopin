@@ -46,10 +46,11 @@ import { JOB_TOOLS } from "../agent/job-scope";
 import type { Job, JobOutcome } from "../conversation-plan/jobs";
 export type { Announcer, NoticeInput } from "./notices";
 import { isChannelId } from "../channels/id";
+import { holdsQuestion } from "../questions/records";
 import { broadcast, fail, reply, tell } from "../wire";
 import { MAX_MESSAGE_BYTES } from "./limits";
 import { contributed } from "./initiative";
-import { checkPlannerReply, publishPlannerReplies } from "./reply-policy";
+import { checkPlannerReply, PlannerReplyError, publishPlannerReplies } from "./reply-policy";
 import { runDuration } from "./run-duration";
 import type { InitiativeSchedule } from "./initiative-schedule";
 
@@ -318,6 +319,8 @@ export type Chat = {
 	owner?: { sessionId: string; generation: number; revision: number };
 	/** User-facing reason an in-flight turn was interrupted. */
 	interruption?: string;
+	/** Decisions the running turn opened or repeated through `open_decisions`, new or not. */
+	captured?: Set<string>;
 	/** Backscroll entries already represented by an opening session's bootstrap. */
 	bootstrapEntries?: Set<string>;
 	/** References available to `read_reference` in the active SDK session. */
@@ -1341,7 +1344,19 @@ export async function abort(context: Room, ws: Socket): Promise<void> {
 		await stopping.pause;
 		return;
 	}
-	if (!turn && !live) return;
+	if (!turn && !live) {
+		// A Planner that only waits on a question it asked has nothing to pause; Stop withdraws it.
+		if (chat.retained && chat.retained.session.inputs?.open()) {
+			await chat.retained.release();
+			say(chat, server, room, {
+				id: ulid(),
+				author: { kind: "system" },
+				text: `@${ws.data.handle} stopped the Planner and withdrew its open question.`,
+				ts: now(),
+			});
+		}
+		return;
+	}
 	if (live && session?.pauseRuns) {
 		let pauseRuns = session.pauseRuns;
 		let stopping: StoppingRuns = {
@@ -1662,10 +1677,11 @@ function followUpEndedRun(context: Room, run: Wire.Run, said: string): Promise<v
 }
 
 /**
- * Keep a Planner session that still owns workflow runs instead of destroying
- * it with its turn: the runs belong to the session, and the next turn reuses
- * it so the Planner can still see and steer them. It is let go once every run
- * has finished, when its owner binding ends, or when the chat closes.
+ * Keep a Planner session that still owns workflow runs, or waits on a question
+ * it asked, instead of destroying it with its turn: the runs and the question
+ * belong to the session, and the next turn reuses it so the Planner can still
+ * see and steer them. It is let go once every run has finished and no question
+ * is open, when its owner binding ends, or when the chat closes.
  */
 function retain(
 	context: Room,
@@ -1673,32 +1689,41 @@ function retain(
 ): boolean {
 	let { chat } = context;
 	let runs = opened.session.runs?.();
+	let live = !!runs && (runs.active.length > 0 || runs.paused.length > 0);
+	// A question no member has answered is open work: its request ends with the session.
+	let asking = (opened.session.inputs?.open() ?? 0) > 0;
 	if (chat.retained && chat.retained.session !== opened.session) return false;
-	if (!runs || opened.binding.signal.aborted) return false;
-	if (!runs.active.length && !runs.paused.length) {
-		void publishRuns(context, opened.session, runs);
+	if (opened.binding.signal.aborted) return false;
+	if (!live && !asking) {
+		if (runs) void publishRuns(context, opened.session, runs);
 		return false;
 	}
-	let report = (next: typeof runs) => publishRuns(context, opened.session, next);
+	let report = (next: NonNullable<typeof runs>) => publishRuns(context, opened.session, next);
 	if (!chat.retained) {
 		let unhold = context.hold?.();
+		let releaseWhenIdle = async () => {
+			await publishing.get(chat);
+			if (chat.busy) await chat.running;
+			if (chat.busy || chat.retained?.session !== opened.session) return;
+			let current = opened.session.runs?.();
+			if (current && (current.active.length || current.paused.length)) return;
+			if (opened.session.inputs?.open()) return;
+			await chat.retained.release();
+		};
+		let release = () =>
+			void releaseWhenIdle().catch(err =>
+				console.error("[chat] releasing completed workflow session failed:", err)
+			);
 		let stopWatching = opened.session.watchRuns?.(next => {
 			if (chat.retained?.session !== opened.session) return;
 			let planning = chat.busy && !chat.job && chat.agent === opened.session;
 			let followUp = !planning && opened.session.followsUpRuns !== false;
 			void publishRuns(context, opened.session, next, false, followUp);
 			if (next.active.length || next.paused.length) return;
-			let releaseWhenIdle = async () => {
-				await publishing.get(chat);
-				if (chat.busy) await chat.running;
-				if (chat.busy || chat.retained?.session !== opened.session) return;
-				let current = opened.session.runs?.();
-				if (!current || current.active.length || current.paused.length) return;
-				await chat.retained.release();
-			};
-			void releaseWhenIdle().catch(err =>
-				console.error("[chat] releasing completed workflow session failed:", err)
-			);
+			release();
+		});
+		let stopInputs = opened.session.inputs?.watch(() => {
+			if (chat.retained?.session === opened.session) release();
 		});
 		let released: Promise<void> | undefined;
 		let retained: Retained = {
@@ -1707,6 +1732,7 @@ function retain(
 				released ??= (async () => {
 					if (chat.retained === retained) chat.retained = undefined;
 					stopWatching?.();
+					stopInputs?.();
 					opened.binding.signal.removeEventListener("abort", ended);
 					try {
 						await opened.session.destroy();
@@ -1727,7 +1753,7 @@ function retain(
 		opened.binding.signal.addEventListener("abort", ended, { once: true });
 		chat.retained = retained;
 	}
-	void report(runs);
+	if (runs) void report(runs);
 	return true;
 }
 
@@ -2219,6 +2245,7 @@ async function run(
 	// Where this turn's own messages begin, so its last word can be found again.
 	let firstEntry = chat.entries.length;
 	let failed = false;
+	let replyOnly = false;
 
 	if (!reserved) {
 		chat.busy = true;
@@ -2258,6 +2285,7 @@ async function run(
 		}
 		: undefined;
 	chat.messageIds = new Map();
+	if (!jobTurn) chat.captured = new Set();
 	if (jobTurn) {
 		chat.job = jobTurn.job;
 		chat.jobOutput = undefined;
@@ -2328,9 +2356,17 @@ async function run(
 				prompt,
 				signal,
 				decide: context.decide,
+				// Only a card still holding its question counts: one a person discarded, or that
+				// was cancelled, leaves nothing for the people in the room to decide.
 				capturedDecisions: () =>
 					[...plan.records.values()].filter(record =>
 						!existingDecisions.has(record.id) && record.origin === "planner" && !!record.followUp
+						&& holdsQuestion(record.status)
+					).length,
+				keptDecisions: () =>
+					[...plan.records.values()].filter(record =>
+						existingDecisions.has(record.id) && chat.captured?.has(record.id)
+						&& record.origin === "planner" && !!record.followUp && holdsQuestion(record.status)
 					).length,
 				publish: part => translate(context, part),
 			});
@@ -2351,6 +2387,8 @@ async function run(
 		console.error("[chat] turn failed:", err);
 		// A stop the room asked for is not a failure; an interruption is.
 		failed = !turnController.signal.aborted || !!chat.interruption;
+		// A reply the check refused ended no workflow run and answered no question.
+		replyOnly = err instanceof PlannerReplyError && !chat.interruption;
 		turnController.abort();
 		if (jobTurn) {
 			outcome = chat.closed
@@ -2380,11 +2418,14 @@ async function run(
 		chat.focus = undefined;
 		chat.readiness = undefined;
 		chat.turnController = undefined;
+		chat.captured = undefined;
 		chat.toolFinished = undefined;
 		chat.toolProgress = undefined;
 		let kept = false;
 		try {
-			if (opened && !chat.closed && !jobTurn && !failed) kept = retain(context, opened);
+			if (opened && !chat.closed && !jobTurn && (!failed || replyOnly)) {
+				kept = retain(context, opened);
+			}
 			if (!kept) {
 				if (!jobTurn && chat.retained?.session === opened?.session) await chat.retained?.release();
 				else await opened?.session.destroy();

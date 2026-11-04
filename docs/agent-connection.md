@@ -270,13 +270,13 @@ rests on ends or the document's Planner is reset. The server then sends
 `refused` and closes an attached connection at once, and any eligible account,
 including the same one, can attach again immediately:
 
-| Cause                                                                                                                                                                                                                                              | Refusal code       | Close code |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ---------- |
-| The owner's browser sign-in signs out or expires                                                                                                                                                                                                   | `sign-in-required` | 4401       |
-| The machine whose credential attached it is disconnected, or GitHub refuses its authorization                                                                                                                                                      | `access-revoked`   | 4403       |
-| Chopin started it on a machine and moved it to another, or stopped it: a new machine choice or favorite, the document unused for 30 minutes (a Planner waiting on a question or a live or paused run is using it), or the machine lost push access | `access-revoked`   | 4403       |
-| A repository writer resets the document's Planner                                                                                                                                                                                                  | `access-revoked`   | 4403       |
-| The stored ownership no longer names this attachment's sign-in                                                                                                                                                                                     | `access-revoked`   | 4403       |
+| Cause                                                                                                                                                                                                                                                            | Refusal code       | Close code |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ---------- |
+| The owner's browser sign-in signs out or expires                                                                                                                                                                                                                 | `sign-in-required` | 4401       |
+| The machine whose credential attached it is disconnected, or GitHub refuses its authorization                                                                                                                                                                    | `access-revoked`   | 4403       |
+| Chopin started it on a machine and moved it to another, or stopped it: a new machine choice or favorite, the document unused for 30 minutes (a Planner replying, or waiting on a question or a live or paused run, is using it), or the machine lost push access | `access-revoked`   | 4403       |
+| A repository writer resets the document's Planner                                                                                                                                                                                                                | `access-revoked`   | 4403       |
+| The stored ownership no longer names this attachment's sign-in                                                                                                                                                                                                   | `access-revoked`   | 4403       |
 
 The same checks before every `start` and `turn`, and the periodic one, also
 find an expired sign-in or a released ownership that nothing reported; an
@@ -321,6 +321,14 @@ waits up to 30 seconds for it to attach, and is refused only if it has not:
 
 ```text
 This document's Planner is still starting on @<login>'s machine. Try again in a moment.
+```
+
+Once the machine's backend has exited before attaching more than once in a row,
+the refusal says why, from what its connector reported (see
+[Hosted agent](hosted-agent.md#remote-planner)), and still only names the login:
+
+```text
+This document's Planner can't start on @<login>'s machine: <reason> (3 attempts in a row). It keeps trying; try again once that is fixed.
 ```
 
 If no machine is starting one, the message says how to get one. Where Chopin

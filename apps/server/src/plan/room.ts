@@ -75,7 +75,7 @@ import type { Root, RootContent } from "mdast";
 import type { Decision, Questionnaire, Registry } from "@chopin/dialect";
 import type { Plan } from "@chopin/protocol";
 
-type Anchor = Plan.Anchor;
+export type Anchor = Plan.Anchor;
 type Passage = Plan.Passage;
 
 /** Awareness is relayed, never interpreted here, so a no-op provider suffices. */
@@ -1006,6 +1006,34 @@ export function anchorAt(target: Document, index: number, hash: string): Anchor 
 	return anchorForKey(target, key, hash);
 }
 
+/** An anchor for every addressable block, in order, with none where a block has no collaborative identity. */
+export function anchorsOfBlocks(target: Document): Array<Anchor | undefined> {
+	let hashes = digests(target);
+	let keys: string[] = [];
+	target.editor.getEditorState().read(() => {
+		keys = addressable().map(node => node.getKey());
+	});
+	return hashes.map((hash, index) => {
+		try {
+			return anchorForKey(target, keys[index], hash);
+		} catch {
+			return undefined;
+		}
+	});
+}
+
+/** The index of the block an anchor still names, whatever that block now says. */
+export function blockNamedBy(target: Document, anchor: Anchor): number | undefined {
+	let key = resolveAnchor(target, anchor);
+	if (!key) return undefined;
+	let keys: string[] = [];
+	target.editor.getEditorState().read(() => {
+		keys = addressable().map(node => node.getKey());
+	});
+	let index = keys.indexOf(key);
+	return index < 0 ? undefined : index;
+}
+
 /** A questionnaire's index in the canonical block address space. */
 export function questionnaireIndex(target: Document, id: string): number | undefined {
 	let found: number | undefined;
@@ -1439,6 +1467,16 @@ export function resolveBlock(
 	let hashes = digests(target);
 	if (hashes[at.index] === at.digest) return at.index;
 	let matches = hashes.flatMap((hash, index) => hash === at.digest ? [index] : []);
+	return matches.length === 1 ? matches[0] : undefined;
+}
+
+/**
+ * The block carrying `at.digest` when exactly one does, wherever it now stands. Unlike
+ * `resolveBlock`, a repeated digest never resolves, even where the addressed index still
+ * matches: identical paragraphs give no way to tell which one was meant.
+ */
+export function uniqueBlock(target: Document, at: { digest: string }): number | undefined {
+	let matches = digests(target).flatMap((hash, index) => hash === at.digest ? [index] : []);
 	return matches.length === 1 ? matches[0] : undefined;
 }
 

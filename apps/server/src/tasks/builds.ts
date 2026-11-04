@@ -2,6 +2,7 @@ import { z } from "zod";
 import { activityText } from "@chopin/protocol/activity";
 import { changedBlocks } from "./changes";
 import { approveGraph, validate } from "./graphs";
+import { unapprovedContext } from "./open-decisions";
 import { planningReadiness } from "./plan-graphs";
 import {
 	claimEligibility,
@@ -271,7 +272,7 @@ export type RebuildResult =
 	| { kind: "busy" }
 	| { kind: "unchanged" }
 	| { kind: "unavailable" }
-	/** A person's Build waits, like Build plan, for open decisions and accepted comments. */
+	/** A person's Build waits, like Build plan, for accepted comments and required investigations. */
 	| { kind: "blocked"; blockers: string[] };
 
 /** Whether any build or claim is in flight, including rebuilds that leave editing open. */
@@ -846,6 +847,7 @@ export function readRebuild(plan: Plan, buildId: string) {
 			})),
 			tasks,
 			...(outstanding.length ? { outstanding } : {}),
+			...unapprovedContext(plan.records.values()),
 		};
 	});
 }
