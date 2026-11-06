@@ -5,7 +5,8 @@ to an external coding agent. It persists a versioned dependency graph, lets a
 coding agent claim an approved version, records task and pull-request progress,
 and requires graph-wide verification before releasing a successful run. The
 ordinary MCP read-before-claim path accepts MCP-created documents. Browser plans
-run on the clicker's own ACP connector, which serves every repository they can push to, and its run-scoped
+run on the ACP connector of the machine the clicker chose, their own (which serves every repository they can
+push to) or a teammate's shared machine, and its run-scoped
 bridge; see the
 [local implementation tracer](local-launcher.md).
 
@@ -20,7 +21,8 @@ implementation, automatic restart and an installer remain future work.
   `read_implementation_graph` and `edit_implementation_graph`.
 - A **person** is the only actor allowed by the domain model to approve a draft.
   The header's **Build plan** press approves the exact drafted
-  graph and queues it, with the clicker's own connection and checkout, in one
+  graph and queues it, with the connection and checkout of the machine the clicker
+  chose (their own, or a teammate's shared one, recorded as `machineOwner`), in one
   durable commit.
 - The **local connector** creates an exact-commit worktree and ACP session, then
   claims a browser-approved graph before prompting the orchestrator. Its scoped
@@ -57,7 +59,9 @@ A browser build that delivers records its built source even without
 `LIVE_BUILD`. Later edits then read as **N changes to build**, and the
 capsule's **Build** sends them to `POST /api/channels/:id/implementation/rebuild`.
 That route queues one rebuild of the edits onto the existing pull requests, on
-the presser's own connected agent, and persists it before answering. Like
+the presser's own connected agent, or the teammate's shared machine they chose
+for the document or, choosing none, made their default (which comes before the
+connection of the build before it), and persists it before answering. Like
 Build plan, it is refused while accepted comments await plan changes or
 required investigations are open, and the capsule's Build is inert with that
 reason. Open decisions never refuse it. The press is the approval: the

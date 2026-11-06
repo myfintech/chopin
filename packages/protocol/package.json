@@ -37,6 +37,14 @@
 			"types": "./agents.ts",
 			"default": "./agents.ts"
 		},
+		"./pending-work": {
+			"types": "./pending-work.ts",
+			"default": "./pending-work.ts"
+		},
+		"./restart": {
+			"types": "./restart.ts",
+			"default": "./restart.ts"
+		},
 		"./run-stages": {
 			"types": "./run-stages.ts",
 			"default": "./run-stages.ts"

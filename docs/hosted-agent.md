@@ -174,6 +174,12 @@ disposable session receives its owner's token when created and has no
 client-level service token or logged-in-user fallback. That detail is specific to
 the Copilot SDK adapter, not a property every harness in `HARNESS` shares.
 
+The CLI process does not inherit the server's environment. It receives the
+proxy variables (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, lowercase forms) and the
+certificate variables (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`) the
+server has set, so a server behind a proxy reaches GitHub through it, and nothing
+else; see [Self-hosting](self-hosting.md).
+
 The two pull-request tool names and input schemas are available when a Planner
 session opens. GitHub MCP discovery runs on the first pull-request tool call,
 using the owner's current credential. An unavailable server or missing required
@@ -193,7 +199,8 @@ Chopin's tools available to the Planner under every harness are:
   current plan-oriented tool names);
 - Chopin's child document tools (`list_children`, `read_child`, `edit_child`,
   `anchor_child`), bound to the root document's own children and rechecked on
-  every call (owner access, parentage, repository, and archive state). They are
+  every call (owner access, parentage, repository, and archive state); `read_child`
+  [pages like `read_plan`](#reading-a-large-document). They are
   never offered to background jobs, and unexpected storage errors reach the
   model only as a generic message;
 - bounded file and tree reads plus commit history using the session's default
@@ -373,10 +380,21 @@ extension dialogs, and workflow-stage input become ordinary shared Decisions:
   given in that batch. Late submissions cannot approve withdrawn input.
 - A request has no time limit. It waits until members answer it or it is
   withdrawn: the Planner stops, its run is cancelled, the document is archived
-  or deleted, or the asker's link closes. A document on **Default machine**
+  or deleted, or the asker's link closes for good, which includes its owner's
+  sign-in ending. A lost connection is never such an end. A link that dropped
+  unexpectedly and offered `resumable-sessions` keeps its open questions and live
+  runs for its account to [resume](agent-connection.md#resuming-after-a-dropped-link)
+  however long it stays away: no timer, including `PLANNER_ATTACH_GRACE_MS`, ends
+  them. While it is away Chat shows the runs with their last status, marked
+  disconnected rather than stopped, says once that the Planner disconnected and once
+  that it came back, and the Decisions stay open and answerable, their answers kept
+  for the client. A Stop pressed meanwhile, or sent and still unanswered when the link
+  dropped, is held for the client's return (Chat says so) rather than lost; Stop on
+  a Planner that only waits on a question withdraws it, and Chat says that. A
+  document on **Default machine**
   keeps its Planner running while that Planner is replying or waits on a question
-  or a live or paused workflow run, so nobody viewing the document does not
-  withdraw it or cut its work short.
+  or a live or paused workflow run, a disconnected Planner's kept work included, so
+  nobody viewing the document does not withdraw it or cut its work short.
 - Cards an earlier Chopin closed unanswered after a fixed time stay in the
   document and in Decisions, among the resolved cards, marked
   `status="expired"`; each reads "Nobody answered this question, so the Planner
@@ -450,7 +468,11 @@ Planner backend command it starts per document
 access is checked with the machine's own GitHub authorization, and it owns the
 document through a delegated login of the machine's owner that no browser holds
 (`apps/server/src/harness/remote/machine-planners.ts`), so no browser sign-in is
-needed and signing out does not release it. Revoking the machine, or GitHub
+needed and signing out does not release it. A machine its owner shares with
+teammates does the same for a teammate's document as its owner, where they chose it or made it their favorite; the same sharing
+is the owner's consent for that teammate's builds and runs to run on the machine
+too, as the owner (see
+[Share a machine with teammates](chopin-cli.md#share-a-machine-with-teammates)). Revoking the machine, or GitHub
 refusing its authorization, ends that login and closes its connections with
 `access-revoked`.
 
@@ -469,28 +491,76 @@ produce, is cleared under its generation and the document is claimed again.
 
 One client holds a document's Planner. While it is attached, every other
 `attach` for that document is refused with `planner-attached` (4409) and a
-message naming its GitHub login. A connection that detaches or drops keeps the
-ownership for `PLANNER_ATTACH_GRACE_MS` (2 minutes by default). A connection that
+message naming its GitHub login. A connection that detaches, or drops with no
+workflow run or open question to keep, keeps the ownership for
+`PLANNER_ATTACH_GRACE_MS` (2 minutes by default). A connection that
 answers none of the server's [protocol pings](agent-connection.md#pings) for
 `AGENT_CONNECTION_TIMEOUT_MS` (2 minutes by default) is closed as dropped, so a
 client whose network silently went away does not keep the document attached.
 Within the grace period the same account can attach again and keeps the same
-ownership generation, and anyone
-else is refused. When it ends, the ownership is cleared under its generation, so
-a newer owner is never released by an old timer. An attach, including a grace
+ownership generation; anyone else is refused. A link that offered
+`resumable-sessions` and dropped unexpectedly while it had runs or open questions
+instead keeps the ownership with no deadline, as the document's **disconnected**
+Planner: the same account takes back the sessions, runs and questions whenever its
+client returns, however long that takes, and nobody else can attach meanwhile.
+Nothing but an explicit act ends that hold: a sign-out or expiry of the owner's
+login, a Planner reset, revoking or unpairing the machine, the owner choosing
+another machine for the document, the document being archived, a Stop that
+withdraws the last thing it kept (which then runs the grace period as a detach
+does), or the same account attaching with a client that holds nothing to resume.
+A machine that only went quiet, or a Default machine idle period, never
+does. The grace period is an ownership lease on a connection that is no longer
+there, not a timeout on active work: it never runs while a client is attached or
+disconnected with work kept. When it ends, the ownership is cleared under its
+generation, so a newer owner is never released by an old timer. An attach, including a grace
 reattach, binds only if no sign-out, expiry, or Planner reset of its ownership
 landed while it was checking, including the eligibility checks of the sign-in
 it is about to claim with; otherwise it is refused like an attached connection would
 be closed. Attachments live in the server process; startup already clears
-every owner reference, which releases every attachment.
+every owner reference, which releases every attachment, so a server restart ends
+what a disconnected link kept, and a graceful shutdown ends it as a crash does: the
+server tells every link it is going down first, so none withdraws a question on the way
+out, and posts no Chat line about the links or the runs. Its run cards come back stopped,
+as any live card does after a restart, since Chopin no longer tracks the workflows, and
+stay so, because the client's later `runs` for a session the server no longer has are ignored; its open Decisions stay open and answerable (nobody waits
+on them any more, so an answer starts a Planner turn once one is attached); and the
+client's `resume` finds nothing, so it settles its questions as cancelled.
 
 **Who is attached.** Each room socket hears `session:planner` after
 `session:hello`, and the whole room hears it again whenever an attachment
-changes: an attach, a detach into the grace period with the time it ends, the
-grace period ending, a sign-out, a Planner reset, or the server closing a connection
+changes: an attach, a detach into the grace period with the time it ends, a drop
+that keeps work (`disconnected`, with no deadline), the grace period ending, a sign-out, a Planner reset, or the server closing a connection
 whose ownership was released. It names only the holder's GitHub login and
-state, never a machine, checkout, or token. Chat shows it as one line under the
-composer. Other harnesses never send it, and Chat then shows nothing.
+state, never a machine, checkout, or token. A healthy, attached Planner shows
+nothing. Otherwise the document's machine button carries it (a thin spinner while
+the machine is connecting, a warning dot where it cannot connect, a muted grey dot
+while the Planner is away, and no dot at all where no machine is connected, the same
+bare icon as a button with no machine, never the machine's own green) with its words in
+the button's name and at the top of its menu, and the composer's top edge warns when the machine cannot be connected to. A
+person with no machine button (no machine paired or shared, a title bar that does not
+show one, a phone whose top bar an open child has taken) has nowhere else to see the
+state, so for them the composer's top edge says every state, and, for a machine that
+cannot be connected to, draws the reason exactly as the machine reported it. One
+decision, `plannerPlacement`, chooses this for the button, its menu and the strip, so
+they cannot disagree. A screen reader hears each problem state once as it begins, from
+a live region of the page, and nothing when it clears. Other harnesses never send it,
+and Chat then shows nothing.
+
+These words are plain and name none of Chopin's own terms: _Connecting to studio_,
+_Can't connect to studio_, _studio is offline. Your work is kept._, _studio stepped away.
+Your work is kept until 10:31 AM._ for a detached holder with its deadline, and _No machine is
+connected._ where none is attached, naming the machine when it is the viewer's own and
+otherwise only its owner's login (_@mona's machine_). A `disconnected` Planner's work is
+kept with no deadline. Its live
+run cards carry `disconnected` beside the status they last reported: each reads
+**disconnected**, not running or stopped, with a still ring instead of the pulse and
+its clock held at the last report; an open card says what it last reported and what
+happens when the Planner returns. A card offers Pause, named as waiting for the Planner
+to reconnect, because Chopin holds it, and no Resume, which it cannot hold. Decisions
+stay where they were and stay answerable. **Build plan** says to reconnect the machine
+(_Reconnect the machine to build_), and a new comment is not sent to Chopin by default, until
+it does. With no machine connected at all it says _Connect a machine to this document to
+build_ and offers how to connect one.
 
 While a paired machine is starting the Planner, the state is `starting`. Its
 connector reports each launch of the backend that exits before staying up to
@@ -498,8 +568,8 @@ connector reports each launch of the backend that exits before staying up to
 last stderr line that says why (colors and credentials removed, the home
 directory shown as `~`, at most 300 characters). From the second in a row, the
 `starting` state also carries `failure` with the count, the reason and when
-the last launch exited, so everyone in the document reads why the Planner has
-not attached; the time is the server's own, not the connector's clock. The report
+the last launch exited, so everyone in the document reads why it cannot connect to
+the machine; the time is the server's own, not the connector's clock. The report
 counts only for a document Chopin asked that machine to run, and is forgotten
 when the Planner attaches, when the connector says a launch stayed up, when the
 machine is no longer asked for the document, and with a restart. It is a new
@@ -509,8 +579,10 @@ which it takes to mean no.
 
 **Unattached documents.** Members, MCP callers, and research requests never claim
 ownership under `HARNESS=remote`. An `@chopin` message or `invoke_planner` call
-for a document with no attached client, including one within its grace period,
-is refused with `planner-not-attached` before anything is posted or queued.
+for a document with no attached client, including one within its grace period or
+disconnected with its work kept (the message says its machine is offline and that the work
+is kept and picks up when it is back), is refused with `planner-not-attached` before
+anything is posted or queued.
 Before accepting either, the server rechecks an attached connection as its periodic
 recheck would: if the owner's browser sign-in has ended or storage no longer
 assigns that owner, it closes the connection, releases the ownership, and refuses the
@@ -617,24 +689,36 @@ every turn.
   descriptions and legacy summaries under durable `document-summary@1` are
   separate and are not bootstrap context.
 - The Planner reads the current document through the plan-named `read_plan` tool
-  instead of receiving a stale embedded copy. That result, and every structured
-  `edit_plan` result (success, or a locked, stale, or invalid refusal), carry
-  `document: { id, url }`: the room's own document id and the canonical URL MCP
-  `read_document` returns for it, nested under the parent for a child document. A
-  renamed top-level document adds `earlier_urls`, the links it had before, which
-  still open it, so the Planner can tell its current link from an old one by data.
-  Argument and storage errors return plain error text without it. Code running
-  inside the session, such as an Atomic extension, can use either to address
-  that document over MCP.
+  instead of receiving a stale embedded copy. The tool's own result is still that
+  structured view as JSON, and the model is shown it as
+  [text it can page through](#reading-a-large-document). A short header names the
+  `document` id, the canonical `url` MCP `read_document` returns for it (nested
+  under the parent for a child document), the `revision` and the size. A renamed
+  top-level document adds `earlier urls`, the links it had before, which still
+  open it, so the Planner can tell its current link from an old one by data.
+  Every structured `edit_plan` result (success, or a locked, stale, or invalid
+  refusal) still carries `document: { id, url }`, and `earlier_urls` after a
+  rename. Argument and storage errors return plain error text without it. Code
+  running inside the session, such as an Atomic extension, can use either to
+  address that document over MCP.
 
 After an `ask` questionnaire has a saved answer, its result may include
 `current_plan` with the same document, revision, source, block outline, comments,
-and question records as `read_plan`. The Planner can edit from that revision and
+and question records as the structured view `read_plan` is built from. The
+Planner can edit from that revision and
 still uses `anchor_plan` to relate the answer to prose. The optional snapshot
 has a 50 ms budget for document lookup, owner revalidation, and room access;
 if it cannot finish, the saved answer returns without waiting and the Planner
 can call `read_plan`. When none of a batch's questions were answered, or lookup
-or revalidation fails, the result contains only the outcomes.
+or revalidation fails, the result contains only the outcomes. `open_decisions`
+returns `current_plan` the same way. Once that view, as JSON, would take more
+than half of one read's 16,000 bytes (8,000 bytes), `current_plan` keeps
+`document`, `revision`, and the newest `questions` and `comments` that fit, with
+`questions_omitted` and `comments_omitted` counting any left out, and replaces
+`source` and `blocks` with `source_omitted`, which gives the source's size, the
+block count and the call that reads them. A result that carries the plan stays
+within one read's bytes. Edit from that revision only after `read_plan` has
+returned the blocks.
 
 Chat references are typed server-side resources, not URLs the model can
 follow. `#` selects another ordinary document in the current repository.
@@ -648,6 +732,97 @@ room-fixed target of `read_plan` or editing tools.
 
 Messages from people retain their GitHub handles so disagreement is not merged
 into one anonymous user voice.
+
+### Reading a large document
+
+A host tool result reaches the model as one string, and a harness may keep only
+the head and tail of a long one: Atomic's MCP adapter keeps the first and last
+10 KiB of a result over 20 KiB of UTF-8 and drops the middle without a word.
+`read_plan`, `read_child` and MCP `read_document` therefore return Markdown with
+real newlines, and one result never carries more than **16,000 UTF-8 bytes in
+all** (`READ_BYTES` in `apps/server/src/document-reading.ts`). The budget covers
+the header, the outline, the lists, the block listing, the source and the lines
+that say how to continue; nothing sits outside it. It is well under the 20 KiB
+Atomic keeps and the 50,000 characters a harness reads at once.
+
+`read_plan` and `read_child` still return their structured view as JSON, so a
+caller that runs the tool itself, or reads the result of a tool-run in the
+server, sees the whole document unchanged. The Copilot SDK, Atomic and the
+attached client show their model whatever a host tool returned, and the agent
+harness applies a tool's `toModelOutput` only to the messages it returns when a
+turn ends. `withModelOutput` (`apps/server/src/harness/model-output.ts`) wraps
+each real harness, so the result it hands the runtime for these two tools is the
+text below, made from the same view. The harness the end-to-end suite fakes, and
+`HARNESS` values added later, see the JSON until they are wrapped. The `remote`
+harness sends the attached client the same text as `host-tool-result.output`.
+
+```text
+document: <id>
+url: /documents/<owner>/<repository>/<slug>
+revision: 7
+size: 168421 characters, 5566 lines, 2214 blocks
+lines: 1-120 of 5566
+next: read_plan {"offset":121}
+This document is larger than one result holds (16000 bytes), so this is its outline and first part. ...
+
+Outline (line, heading):
+L1 # Quarterly field notes
+L3 ## Site 1: harbour survey
+
+Decisions (their text, options and answers are in the source):
+- <id>: open: Which quay?
+
+Blocks starting on lines 1-120 (index type lines digest):
+0 heading L1-1 sha256:...
+
+--- source lines 1-120 of 5566 ---
+# Quarterly field notes
+...
+```
+
+- The source is last, after a `--- source lines A-B of N ---` line, and is
+  verbatim: the source sections of the results `next:` leads through, joined,
+  are the document exactly, with its final newline, CRLF and blank lines. Lines
+  are separated by `\n`; a final newline does not start another line, so `lines`
+  is the count of lines, not of newlines.
+- Without arguments, a document whose whole text fits in 16,000 bytes is
+  returned whole (`lines: all N`). A larger one returns its outline (shallow
+  headings first, with the line each starts on, in at most 2,500 bytes and with
+  a count of any left out) and its first part, and says `next:` with the exact
+  call that continues. That is the threshold: `read_document` returns a document of
+  up to about 15,000 characters whole, and `read_plan`, whose block listing takes
+  about 90 bytes a block, about 6,000 characters of short blocks or more of long
+  ones.
+- `offset` (a 1-based line) and `limit` (lines) return that slice and the total
+  line count. Where the slice fits in the budget it is exact. **`limit` is a
+  maximum:** a result that would pass 16,000 bytes stops sooner, and its header
+  says so (`limit: asked for 4000 lines from line 1, but one result holds at
+  most 16000 bytes, so this one stops at line 521`) with a `next:` for the rest.
+  The cap is what keeps a harness from silently cutting the middle of a result,
+  so it wins over an exact slice. An `offset` outside the document is an error
+  that names the line count.
+- A line too long for one result is read in pieces. `column` is a 1-based
+  position in line `offset`, counted in Unicode code points (a line's characters
+  and then its newline, if it has one), so a piece never splits an emoji or a CJK
+  character. A result that ends inside a line says `ends mid-line: line 3 after
+  character 30703 of 50001` and its `next:` names `offset` and `column`; the
+  result that continues says `starts mid-line`. A `column` needs its `offset`
+  and must lie inside that line. Following `next:` covers every character
+  exactly once.
+- Lists that come with the first part are trimmed to their own budgets, and the
+  last line of each says what was left out: the decisions (1,500 bytes; every
+  decision, with its options and answers, is in the source), the accepted
+  comments (1,500 bytes) and, for MCP, the brief (2,000 bytes; the whole brief is
+  in `structuredContent.brief`). A header value is one line of at most 300
+  characters.
+- A part lists the top-level blocks that start on its lines, with their index,
+  type, line range and digest, so a Planner can aim `edit_plan` and `anchor_plan`
+  at a block it has read. `read_plan` on a small document lists every block.
+- `read_child` has the same text, with `child` and `title` in the header, the
+  same `offset`, `limit` and `column`, and a `next:` that names the child. MCP
+  `read_document` has the same shape with the document's `id`, `title` and `url`,
+  and no blocks. Its `structuredContent` is the whole document as before,
+  whatever slice the text carries.
 
 ## Session lifecycle
 
@@ -705,7 +880,8 @@ until a member answers it or it is withdrawn. A turn whose Chat reply could not
 be verified, or moved into inline decisions, fails without letting go a session
 that still owns runs or waits on a question, so that failure ends no run and
 withdraws no question. An explicit Stop still lets go a session that only waits on
-a question. The
+a question, but changes nothing for one whose workflows are paused: they and the
+question they hold open wait for Resume. The
 "was stopped after N min" line records how long the run had lasted when its
 session was let go, not a limit; run state is durable in Atomic's
 workflow journal, so runs interrupted that way can be resumed from a later

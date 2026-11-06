@@ -18,16 +18,18 @@ import {
 } from "react";
 
 import {
-	CONNECTION_GRACE,
+	connectionGrace,
 	isDemoHandle,
 	MAX_RESEARCH_BRIEF,
 	useConnectionNotice,
+	usePendingWork,
 	usePopoverDismissal,
 } from "@chopin/editor";
 import { chatDraftKey } from "../demo-actor";
+import { WireLost } from "../wire";
 import { canWithdraw } from "./withdraw";
 import type { DraftInputHandle } from "./draft-input";
-import { PlannerAttachment } from "./planner-attachment";
+import type { PlannerNotice } from "./planner-status";
 import { TypingReporter } from "./typing";
 import { ChatComposer } from "./composer";
 
@@ -74,17 +76,22 @@ import {
 	reviseComposerDraft,
 	withNoticesAfter,
 } from "./references";
-import { RunStack } from "./run-card";
+import { runCounts, RunStack } from "./run-card";
 import { runStages } from "../api";
 import { Transcript } from "./transcript";
-import { initialTranscript, transcriptReducer } from "./transcript-state";
+import {
+	initialTranscript,
+	progressOf,
+	silentRestart,
+	transcriptReducer,
+} from "./transcript-state";
 import type { TranscriptDecisions } from "./transcript";
 import type { CardLink } from "../conversation-plan/links";
 import type { ExcerptCorrectionAction } from "../conversation-plan/analysis-overview";
 import type { ChatDestination } from "../conversation-plan/source";
 import type { ResearchOfferControls } from "./research-offer";
 
-import type { Chat as Wire, ConversationPlan, Session } from "@chopin/protocol";
+import type { Chat as Wire, ConversationPlan } from "@chopin/protocol";
 import type { Repository } from "../api";
 import type { ResearchLaunchBlock, ResearchLaunchResult } from "@chopin/editor";
 import type { ChatCommand } from "./commands";
@@ -139,20 +146,14 @@ export type ChatProps = {
 	notice?: string;
 	/** One calm line shown while the transcript has loaded and is still empty. */
 	emptyNotice?: string;
-	/** Who holds the document's remote Planner; absent under every other harness. */
-	planner?: Session.PlannerAttachment;
-	/** The viewer's own machine that is starting the Planner, by name, when one is. */
-	plannerMachine?: string;
+	/**
+	 * The strip for the composer's top edge about the document's remote Planner, when its state
+	 * needs one: a machine that cannot be connected to, or, for a viewer with no machine button to
+	 * say it, any state that is not healthy (`plannerPlacement` decides). Absent while it is
+	 * attached, and under every other harness.
+	 */
+	plannerStrip?: PlannerNotice;
 };
-
-/** How many runs are still live, and how many are paused and resumable. */
-export function runCounts(runs: Wire.Runs | undefined): { active: number; paused: number } {
-	let list = runs ?? [];
-	return {
-		active: list.filter(run => run.status === "running" || run.status === "waiting").length,
-		paused: list.filter(run => run.status === "paused").length,
-	};
-}
 
 function draftKey(room: string, handle: string): string {
 	return chatDraftKey(room, isDemoHandle(handle) ? handle : undefined);
@@ -221,8 +222,7 @@ export function Chat(
 		people = [],
 		notice,
 		emptyNotice,
-		planner,
-		plannerMachine,
+		plannerStrip,
 		onShowDecisions,
 		onResearch,
 		onShowResearch,
@@ -274,10 +274,10 @@ export function Chat(
 	let submission = useRef<object | undefined>(undefined);
 	let draftRef = useRef(draft);
 	draftRef.current = draft;
-	// A reload, including the header's fallback when reconnecting keeps
-	// failing, must not take an unsent message with it. Kept as it changes
+	// A reload must not take an unsent message with it. Kept as it changes
 	// rather than on unload, which a browser does not promise to announce.
 	useEffect(() => keepDraft(room, handle, draft), [room, handle, draft]);
+	usePendingWork(!!draft.text.trim());
 	let pickerId = useId();
 	let mentionPickerId = useId();
 	let commandPickerId = useId();
@@ -297,25 +297,22 @@ export function Chat(
 	let typingEnabled = composerReady && active && agent && !!participationState?.enabled;
 	// A draft never waits on the connection; only sending does.
 	let draftable = !readonly && !archived;
-	let connectionNotice = useConnectionNotice(!connected);
-	let connectionLabel = connectionNotice === "none"
-		? undefined
-		: connectionNotice === "offline" || wire?.status === "closed" || wire?.status === "denied"
-		? "Offline"
-		: wire?.status === "connecting"
-		? "Connecting…"
-		: "Reconnecting…";
+	// The document says when the connection is lost; Chat only holds back what it cannot send.
+	let connectionNotice = useConnectionNotice(!connected, wire?.restarting);
 	let effectiveMode = !!agent && (mode || draft.submission?.to === "planner"
 		|| addressedOutsideReferences(draft.text, draft.references));
-	let workingTurn = transcriptReady ? turn : undefined;
-	let suspendedWork = !transcriptReady && turn && transcript.activeAnchorId
-		? {
-			turnId: turn.id,
-			entryOffset: turn.entryOffset,
-			endOffset: entries.length,
-			anchorId: transcript.activeAnchorId,
-		}
-		: undefined;
+	let quietRestart = useRef(false);
+	quietRestart.current = silentRestart(
+		quietRestart.current,
+		!!wire?.restarting,
+		transcriptReady,
+		connectionNotice !== "none",
+	);
+	let { working: workingTurn, suspended: suspendedWork } = progressOf(
+		transcript,
+		transcriptReady,
+		quietRestart.current,
+	);
 	let detected = referencesEnabled && composerReady && !submitting
 		? referenceTrigger(draft.text, selection.start, selection.end)
 		: undefined;
@@ -559,7 +556,10 @@ export function Chat(
 		void wire.ask<Wire.Sent>("chat:send", payload).then(() => {
 			clearSubmittedDraft(submitted);
 		}, error => {
-			setSendError(boundedChatError(error));
+			// A restart cut the send off. The draft keeps its request id, so it is made again once
+			// the server is back, and the server answers one it already holds with that message.
+			if (error instanceof WireLost && error.restarting) setHeld(true);
+			else setSendError(boundedChatError(error));
 		}).finally(() => {
 			if (submission.current !== token) return;
 			submission.current = undefined;
@@ -585,7 +585,7 @@ export function Chat(
 	// Never held longer than the grace period, however the wait ends.
 	useEffect(() => {
 		if (!held) return;
-		let timer = setTimeout(() => setHeld(false), CONNECTION_GRACE);
+		let timer = setTimeout(() => setHeld(false), connectionGrace(wire?.restarting));
 		return () => clearTimeout(timer);
 	}, [held]);
 	useEffect(() => {
@@ -728,7 +728,6 @@ export function Chat(
 				{transcriptView}
 				<div className="chat-composer shrink-0 px-2.5 pb-2.5">
 					<p className="px-4 py-3 text-sm text-text-tertiary">{notice}</p>
-					<PlannerAttachment machine={plannerMachine} planner={planner} />
 				</div>
 			</div>
 		);
@@ -781,7 +780,7 @@ export function Chat(
 					? { tone: "info", text: "Research isn’t available in this document" }
 					: !agent
 					? { tone: "info", text: "Chopin unavailable" }
-					: undefined}
+					: plannerStrip}
 				unavailable={archived ? "archived" : readonly ? "readonly" : undefined}
 				references={referencesEnabled
 					? {
@@ -803,8 +802,6 @@ export function Chat(
 					|| blockedCommand
 					|| (connectionNotice !== "none" && !draftCommand(draft.text))}
 				onSubmit={submit}
-				connectionLabel={connectionLabel}
-				onReconnect={connectionNotice === "offline" && wire ? () => wire.reconnect() : undefined}
 				run={agent && (busy || counts.active > 0)
 					? {
 						action: "stop",
@@ -851,7 +848,6 @@ export function Chat(
 						)}
 					</>
 				}
-				attachment={<PlannerAttachment machine={plannerMachine} planner={planner} />}
 				input={{
 					"aria-activedescendant": commandOpen
 						? referenceOptionId(commandPickerId, commandActive)

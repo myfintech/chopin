@@ -164,13 +164,13 @@ export const AUDIT_INVENTORY: readonly AuditGroup[] = [
 				id: "chat",
 				label: "Conversation",
 				source: "apps/web/src/chat/chat.tsx",
-				states: ["member", "planner", "tool", "busy", "error"],
+				states: ["member", "planner", "tool", "busy", "error", "planner-status"],
 			},
 			{
 				id: "workflow-runs",
 				label: "Workflow runs",
 				source: "apps/web/src/chat/run-card.tsx",
-				states: ["running", "concurrent", "ended"],
+				states: ["running", "concurrent", "disconnected", "ended"],
 			},
 			{
 				id: "identity",

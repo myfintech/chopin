@@ -1,3 +1,4 @@
+import { usePendingWork } from "@chopin/editor";
 import { Face } from "@chopin/editor/face";
 import {
 	CheckIcon,
@@ -75,7 +76,11 @@ function MachineLabel({ machine }: { machine: BuildMachine }) {
 	return (
 		<span
 			className="build-card-machine"
-			title={machine.connected === false ? `${machine.label} is offline` : undefined}
+			title={machine.connected === false
+				? `${machine.label} is offline`
+				: machine.owner
+				? `${machine.label}, ${machine.owner}'s machine`
+				: undefined}
 		>
 			{machine.connected === undefined
 				? (
@@ -128,6 +133,7 @@ export function BuildView(
 	let [stopping, setStopping] = useState(false);
 	let [returning, setReturning] = useState(false);
 	let [reason, setReason] = useState("");
+	usePendingWork(returning && reason.trim() !== "");
 	let [open, setOpen] = useState<Record<string, boolean>>({});
 	let [linked, setLinked] = useState<string>();
 	let [now, setNow] = useState(() => Date.now());

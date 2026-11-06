@@ -117,6 +117,8 @@ export interface MachineStore {
 	byToken(tokenHash: Uint8Array): Promise<StoredMachine | undefined>;
 	/** An owner's unrevoked machines, most recently paired first. */
 	list(userId: string): Promise<StoredMachine[]>;
+	/** Every unrevoked machine its owner shares with teammates, most recently paired first. */
+	shared(): Promise<StoredMachine[]>;
 	seen(id: string, now: Date): Promise<void>;
 	rotate(id: string, expectedRevision: number, credentials: MachineCredentials): Promise<boolean>;
 	/** Drop credentials GitHub refused at `expectedRevision`; the owner must pair again. */
@@ -136,9 +138,15 @@ export interface MachineStore {
 		choice: Omit<MachineChoice, "machineId"> & { machineId?: string },
 		now: Date,
 	): Promise<void>;
-	/** Every person's favorite unrevoked machine. Revoking a machine forgets it as a favorite. */
+	/**
+	 * Every person's favorite unrevoked machine. Revoking a machine forgets it as a favorite, and
+	 * its owner no longer sharing it forgets teammates' (not its owner's own).
+	 */
 	favorites(): Promise<MachineFavorite[]>;
-	/** Set a person's favorite to one of their own machines, or without `machineId` clear it. */
+	/**
+	 * Set a person's favorite to one of their own machines or a teammate's that its owner shares,
+	 * or without `machineId` clear it.
+	 */
 	favor(
 		favorite: Omit<MachineFavorite, "machineId"> & { machineId?: string },
 		now: Date,

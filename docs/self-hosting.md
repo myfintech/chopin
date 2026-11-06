@@ -75,6 +75,20 @@ each owner's GitHub App user token and does not consume `HARNESS_AUTH`;
 setting `auto` on loopback passes the startup guard but does not enable host
 login in that adapter.
 
+Under `HARNESS=copilot-sdk` the Copilot CLI runs with a minimal environment of
+its own, not the server's. Behind an HTTP or HTTPS proxy, set these on the
+server process and the CLI receives them unchanged: `HTTPS_PROXY`,
+`HTTP_PROXY`, `NO_PROXY` and their lowercase forms, and the certificate
+variables a proxy that re-signs TLS needs, `NODE_EXTRA_CA_CERTS`,
+`SSL_CERT_FILE` and `SSL_CERT_DIR`. A variable the server has not set is not
+passed, and one set to an empty string is passed as empty. The CLI also gets
+`COPILOT_PLUGIN_DIR_ONLY=true` and the variables the Copilot SDK itself sets;
+nothing else from the server's environment reaches it, including tokens and
+`COPILOT_ENABLE_BUILTIN_GITHUB_MCP`. If the host reaches GitHub only through a
+proxy that the server learns some other way, such as a system setting, set
+these variables on the server process too: otherwise the CLI connects directly,
+and a Planner turn fails with "The Planner stream failed."
+
 `HARNESS=atomic` runs Atomic 0.9.71 in the Chopin server process through its
 headless SDK (`createAgentSession()`). It does not spawn the `atomic` CLI or use
 RPC mode.
@@ -265,8 +279,10 @@ GitHub token bearer, checked like hosted MCP, and needs push or administration
 access to the document's repository, rechecked before every session and turn and
 every 5 minutes while it stays attached. The same account must have signed in to
 this server in a browser: attaching makes that login the document's Planner
-owner, one client per document, and a detached or dropped connection keeps it for
-`PLANNER_ATTACH_GRACE_MS` so the same account can reattach. The server pings
+owner, one client per document, and a detached connection, or one that dropped with
+nothing to keep, holds it for `PLANNER_ATTACH_GRACE_MS` so the same account can
+reattach. A dropped `resumable-sessions` connection with runs or open questions
+holds it, and them, until it returns or something explicit ends them. The server pings
 every connection and counts one that answers nothing for `AGENT_CONNECTION_TIMEOUT_MS` as
 dropped, so a client whose network silently went away does not stay attached.
 A queue of frames draining toward the client puts that off, but never past
@@ -312,6 +328,10 @@ headers.
 - For `copilot-sdk`, an active Copilot entitlement for each user who may own a
   hosted agent session. For `atomic`, model credentials for the chosen
   `HARNESS_AUTH` mode instead.
+- For public web research (`/research` with `WEB_RESEARCH` on), GitHub's Copilot
+  MCP endpoint must offer its `web_search` tool to each user's App user access
+  token. GitHub does not document that tool's requirements, so verify it on your
+  deployment; see [Troubleshooting](#troubleshooting).
 
 ## Register the GitHub App
 
@@ -373,7 +393,7 @@ the image.
 | `MODEL`                           | `gpt-6.1-sol`           | Model requested for hosted agent sessions. Required under `HARNESS=atomic`, where it must be `provider/model` from Atomic's catalog. Optional under `HARNESS=remote`, where the attached client chooses its model and a set value is only passed along as the turn's request.                                                                                                                                                                                                                                                                                                                                                                                     |
 | `HISTORY_MODEL`                   | `MODEL`                 | Model for History's one-line summaries of editing sessions, written when someone opens History on a document with a Planner owner. A small, fast model suits it. Resolved like `MODEL` by the configured harness.                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `HARNESS`                         | `copilot-sdk`           | Adapter name selected from Chopin's harness map (`copilot-sdk`, `atomic`, or `remote`). An unknown name refuses at startup. `remote` runs Planner turns in a client attached at `/api/v1/agent`; see [The remote Planner](#the-remote-planner). `atomic` gives every Planner session shell and filesystem access as the server process's user, hosted instances included; see [Choose and trust a harness](#choose-and-trust-a-harness).                                                                                                                                                                                                                          |
-| `PLANNER_ATTACH_GRACE_MS`         | `120000`                | Under `HARNESS=remote`, how long a detached or dropped agent connection keeps the document's Planner ownership so the same account can reattach, in milliseconds, an integer between 0 and 3600000.                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `PLANNER_ATTACH_GRACE_MS`         | `120000`                | Under `HARNESS=remote`, how long a detached agent connection, or one that dropped with nothing to keep, holds the document's Planner ownership so the same account can reattach, in milliseconds, an integer between 0 and 3600000. It is an ownership lease, not a timeout on active work: a dropped `resumable-sessions` connection with runs or open questions keeps them with no deadline until it returns or something explicit ends them.                                                                                                                                                                                                                   |
 | `AGENT_CONNECTION_PING_MS`        | `15000`                 | Under `HARNESS=remote`, how often the server sends each agent connection a WebSocket protocol ping, in milliseconds, an integer between 1000 and 600000.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `AGENT_CONNECTION_TIMEOUT_MS`     | `120000`                | Under `HARNESS=remote`, how long an agent connection may send nothing, not even a pong, before the server closes it as dropped, in milliseconds, an integer between 1000 and 600000 and longer than `AGENT_CONNECTION_PING_MS`. A whole frame must arrive within it: 2 MiB in 120 seconds is about 17 KiB/s of client upload.                                                                                                                                                                                                                                                                                                                                     |
 | `AGENT_CONNECTION_MAX_SILENCE_MS` | `900000`                | Under `HARNESS=remote`, how long an agent connection may send nothing at all, not even a pong, before the server closes it as dropped, however much of what the server queued for it drains meanwhile, in milliseconds, an integer between 1000 and 3600000 and at least `AGENT_CONNECTION_TIMEOUT_MS`. A draining queue defers the timeout only up to this, since a proxy can drain it while the client reads nothing. The 15-minute default lets a client reading at about 19 KiB/s drain the full 16 MiB the server may queue for it and answer a ping; lower it to release a client that stopped reading behind a proxy sooner, or raise it for slower links. |
@@ -561,6 +581,9 @@ The proxy must:
 - proxy WebSocket upgrades on `/ws`, and on `/api/v1/agent` under `HARNESS=remote`;
 - proxy `/mcp` and the `/api/v1/agent` upgrade without removing their
   `Authorization` header, nor the upgrade's `Sec-WebSocket-Protocol` header;
+- pass Chopin's response headers through unchanged, so a browser can tell Chopin's
+  refusal of a WebSocket handshake (`x-chopin-refusal: 1`) from the proxy's own
+  4xx while no upstream answers;
 - serve Chopin at `/`, not below a path prefix; and
 - redirect alternate hosts to the canonical origin before application traffic,
   except the paths a [moved deployment](#moving-to-a-new-origin) keeps serving.
@@ -670,12 +693,29 @@ After the first deployment:
    entitlement for `copilot-sdk`, or the `HARNESS_AUTH` credentials for
    `atomic`)
    and the hosted agent runtime.
-8. Connect a local coding agent and call `list_documents` if MCP is part of the
+8. Run `/research` with a short brief to verify public web search. It reaches
+   GitHub's Copilot MCP endpoint with the signed-in user's App user access
+   token, a separate check from step 7.
+9. Connect a local coding agent and call `list_documents` if MCP is part of the
    deployment's intended surface.
 
 The image health check calls `/api/session`. It confirms HTTP liveness but does
 not prove that a browser bundle is present, a new database transaction can
 complete, GitHub is reachable, or the Planner can start.
+
+Two unauthenticated endpoints answer with a status word and nothing else, for a
+proxy or platform that routes on them:
+
+- `GET /api/health/live` answers `200 live` while the process runs.
+- `GET /api/health/ready` answers `200 ready` once the process holds the writer
+  lease and has finished startup recovery. It answers `503 starting` before
+  that, and `503 draining` from the moment a shutdown begins.
+
+Send new connections only to a ready process. Readiness does not check that
+GitHub is reachable or that a model answers. Both endpoints answer `HEAD` the
+same way.
+They are the first step of Stage 1 of the zero-downtime upgrades design,
+invisible restarts on one server.
 
 ## Operations
 
@@ -697,6 +737,43 @@ Browser sessions and Planner ownership are cleared at startup.
 3. Start the new image against the same database; its entrypoint applies pending
    migrations before serving.
 4. Repeat the first-start checks after migrations or authentication changes.
+
+A stop signal makes Chopin close every WebSocket with code 1012 (service
+restart) before it exits, rather than the 1001 that stopping the listener
+sends. An open browser tab takes that as a restart: it reconnects after a
+random moment of up to a second and goes on retrying about once a second, says
+nothing about it for the first 5 seconds, and keeps its unacknowledged edits,
+drafts and answers to send once connected. In those 5 seconds the connection
+reports no outage, so the notice for a lost connection does not wait on a
+shorter count, and the attempts that fail meanwhile are not counted towards
+the backoff or towards offering Retry. A restart that lasts longer is then
+treated as any other lost connection, with the same moment of grace before
+the notice. A refusal Chopin makes of a handshake carries
+`x-chopin-refusal: 1`, and a tab stops retrying on a 4xx only when it does (a
+401 still asks for a sign-in). Without it the 4xx is a proxy's and the tab keeps
+retrying. This is the client half of Stage 1 of the zero-downtime upgrades
+design, invisible restarts on one server; it does not make the gap between the
+old process stopping and the new one listening any shorter. Two things differ
+from that design's current revision, which adds no restart jitter and keeps the
+existing 1.5 seconds of silence for a restart: the random moment before the first
+attempt is added so that tabs do not all return together, and the silence is 5
+seconds, because a restart that stops the old process before it starts the new
+one takes longer than 1.5 seconds. The design's 1.5 seconds assumes a second
+process already waiting to take over.
+
+A tab opened before an upgrade asks for the hashed `/assets/*` files of its own
+build, which the new image does not carry, since a build here has only its own
+files. Chopin answers a missing file under `/assets/` with 404 and never with the
+app's HTML. When a part of the page fails to load for that reason (Vite's
+`vite:preloadError`), the tab reloads to fetch the new build, but only while the
+server answers with a page of another build than the one running (it asks for the
+page and compares the entry script, so a failure with the server away, or with no
+upgrade behind it, is left to the page's own recovery) and it holds nothing the
+server has not taken: no unacknowledged edit, unsent message, answer or draft.
+Otherwise it leaves the failure as it was and a later one reloads it, and a reload
+that did not cure the failure is not repeated within ten seconds. Keeping the previous build's assets in the new image would let such a tab
+carry on without reloading, but it needs the previous image, which nothing in this
+repository's build has.
 
 Migration files are checksummed once applied. Never edit an applied migration.
 Because migrations are forward-only, returning to an older application image
@@ -770,6 +847,45 @@ process to loopback for local-only use. See [Choose and trust a harness](#choose
 entitlement, the model, App permissions, repository write access, and Copilot
 CLI startup logs. Planner and research request execution validate these
 dependencies lazily.
+
+**Public web research fails before it searches.** `/research` finds public sources through
+the `web_search` tool of GitHub's Copilot MCP endpoint (`https://api.githubcopilot.com/mcp/`).
+It authorizes with the signed-in user's App user access token (`ghu_`), the same credential the
+Planner's pull request tools send to that endpoint. When setup fails, the research card says
+which of three things happened and the server log names the step and the cause:
+
+- `web-search-credential-rejected`: "GitHub refused the credential from this sign-in for public
+  web search." The endpoint answered HTTP 401 or 403 while connecting or listing tools.
+- `web-search-not-offered`: "GitHub did not offer public web search to this sign-in." The endpoint
+  accepted the connection, but its tool list had no `web_search`.
+- `web-search-unavailable`: "The public web-search service was unavailable." Any other setup
+  failure, such as a network error, an HTTP 5xx, or a JSON-RPC error.
+
+The log line names the step (`connect` or `tools`), a classification with any HTTP status and
+JSON-RPC code, how long setup ran, the type of credential Chopin sent, and the client's error
+with tokens and `Bearer` values masked and clipped to one short line. It never contains the token
+or the `Authorization` header:
+
+```text
+chopin: web_search unavailable at connect - local:connect:mcp-client:http:401 in 180ms; credential: GitHub App user access token (ghu_); MCPClientError: ...
+```
+
+The `elapsedMs` on the `connecting-web` progress line records when that phase began, not when it
+failed; read the duration from the failure line.
+
+Chopin cannot tell from these responses why the endpoint refused the credential or withheld the
+tool. GitHub's Copilot SDK documentation lists GitHub App user access tokens (`ghu_`) as supported
+for Copilot requests, but GitHub documents no token requirement for this endpoint's `web_search`
+tool, and the tool is not part of GitHub's open-source MCP server. A deployment that signs in
+through its own GitHub App reported this step failing while a classic OAuth token (`gho_`) for the
+same account was accepted by the endpoint's `initialize` request. Whether the endpoint refuses
+App user access tokens for `web_search` is unconfirmed.
+
+Check the log line first, then the account's Copilot entitlement and the settings that gate web
+search and MCP servers for the user and, in an organization, its Copilot policies. No Chopin
+setting sends a different credential to this endpoint. If setup keeps failing, set
+`WEB_RESEARCH=off` to stop offering public web research until you have verified it, and report
+the log line, which holds no token.
 
 **MCP returns 401 or 403.** A 401 indicates an invalid or expired bearer. A 403
 indicates failed instance admission or a supplied Origin that differs from
