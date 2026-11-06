@@ -13,7 +13,7 @@ import { MemoryStorage } from "../storage/memory/adapter";
 import type { AgentClient, AgentHandlers, TurnContext } from "@chopin/agent-link/client";
 import type { AddressInfo, Socket } from "node:net";
 import type { ServerWebSocket } from "bun";
-import type { Repository } from "../github/client";
+import type { Repository, RepositoryPage } from "../github/client";
 import type { AttachmentAuth } from "../harness/remote/attachments";
 import type { AgentAuth, AgentSocketData } from "../harness/remote/endpoint";
 import type { AgentLink } from "../harness/remote/link";
@@ -139,6 +139,47 @@ export async function linkAuth(channelId?: string) {
 				let account = Object.values(ACCOUNTS).find(value => loginToken(value.login) === token)
 					?? machineAccount(token);
 				return account ? scoreRepository(owner, name, account.push) : undefined;
+			},
+			/** The head of octo-org/score's default branch, which a machine with no checkout clones. */
+			async branchHead() {
+				return "b".repeat(40);
+			},
+			/** The App is installed on octo-org for every account that has a browser login or a machine. */
+			async installations(token: string) {
+				let account = Object.values(ACCOUNTS).find(value => loginToken(value.login) === token)
+					?? machineAccount(token);
+				return {
+					installations: account
+						? [{
+							id: "1",
+							account: { login: "octo-org", avatarUrl: "", type: "organization" },
+							repositorySelection: "all",
+							configureUrl: "https://github.test/octo-org",
+							suspended: false,
+							permissions: {
+								contents: true,
+								pullRequests: true,
+								checks: false,
+								statuses: false,
+								issues: false,
+							},
+						}]
+						: [],
+					nextPage: undefined,
+				};
+			},
+			/** octo-org/score, with the role the account has there. */
+			async installationRepositories(
+				token: string,
+				_installation?: string,
+				_page?: number,
+			): Promise<RepositoryPage> {
+				let account = Object.values(ACCOUNTS).find(value => loginToken(value.login) === token)
+					?? machineAccount(token);
+				return {
+					repositories: account ? [scoreRepository("octo-org", "score", account.push)] : [],
+					nextPage: undefined,
+				};
 			},
 		},
 	};
@@ -461,6 +502,40 @@ export async function slowUplink(url: string, bytes: number, everyMs: number) {
 }
 
 /**
+ * A TCP proxy in front of a link server whose client side can be cut while its server side stays
+ * open and silent, as a client's network going away looks to a server that has not noticed yet.
+ */
+export async function cuttableProxy(url: string) {
+	let target = new URL(url);
+	let pairs: Array<{ client: Socket; upstream: Socket }> = [];
+	let proxy = createServer(client => {
+		let upstream = createConnection(Number(target.port), target.hostname);
+		pairs.push({ client, upstream });
+		client.on("data", chunk => upstream.write(chunk));
+		upstream.on("data", chunk => {
+			if (!client.destroyed) client.write(chunk);
+		});
+		client.on("error", () => {});
+		upstream.on("error", () => {});
+	});
+	await new Promise<void>(resolve => proxy.listen(0, "127.0.0.1", resolve));
+	return {
+		url: `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`,
+		/** The client's side ends; the server's side stays open and hears nothing more. */
+		cut() {
+			for (let { client } of pairs) client.destroy();
+		},
+		stop() {
+			for (let { client, upstream } of pairs) {
+				client.destroy();
+				upstream.destroy();
+			}
+			proxy.close();
+		},
+	};
+}
+
+/**
  * A TCP proxy to `url` that forwards both ways until `hold()`, then keeps reading
  * what the server sends, one read every `everyMs`, and forwards none of it, as a
  * buffering proxy in front of a client that went quiet. The server's queue keeps
@@ -469,12 +544,14 @@ export async function slowUplink(url: string, bytes: number, everyMs: number) {
 export async function holdingProxy(url: string, everyMs: number) {
 	let target = new URL(url);
 	let sockets: Socket[] = [];
+	let clients: Socket[] = [];
 	let timers: ReturnType<typeof setInterval>[] = [];
 	let held = false;
 	let swallowed = 0;
 	let proxy = createServer(client => {
 		let upstream = createConnection(Number(target.port), target.hostname);
 		sockets.push(client, upstream);
+		clients.push(client);
 		client.on("data", chunk => upstream.write(chunk));
 		upstream.on("data", (chunk: Buffer) => {
 			if (!held) return void client.write(chunk);
@@ -496,6 +573,10 @@ export async function holdingProxy(url: string, everyMs: number) {
 		hold() {
 			held = true;
 			for (let socket of sockets) socket.pause();
+		},
+		/** From now on what the client sends reaches the server again, though the server's bytes still do not. */
+		hearClient() {
+			for (let socket of clients) socket.resume();
 		},
 		/** Server bytes read and dropped since `hold()`. */
 		get swallowed() {
@@ -560,7 +641,8 @@ export function attach(
 	handlers: AgentHandlers,
 	token = MEMBER_TOKEN,
 ): Promise<AgentClient> {
-	return connectAgent({ url, token, document, handlers });
+	// Tests of a drop that ends everything need a client that does not ask to be resumed.
+	return connectAgent({ url, token, document, handlers, resumable: false });
 }
 
 /**

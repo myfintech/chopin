@@ -37,12 +37,14 @@ import {
 	Face,
 	firstOpenDecision,
 	GitHubReferencesProvider,
+	isOffline,
 	openCommentList,
 	opensEditing,
 	personName,
 	PlanEditor,
 	PlanStatus,
 	QuestionnaireStore,
+	RepositoryLinksProvider,
 	ResearchLauncher,
 	revealDeckItem,
 	selectDecisionView,
@@ -54,14 +56,17 @@ import {
 } from "@chopin/editor";
 
 import { BuildGlyph, BuildPlanButton, useBuildPlan } from "./build-plan-button";
+import { OfflineAnnouncement, OfflineNotice, useOfflineNotice } from "./offline-notice";
 import { buildBlockers } from "./build-blockers";
 import type { BuildBlocker } from "./build-blockers";
 import {
 	offlineChoice,
-	plannerStartingOn,
+	plannerRunsOn,
 	showsMachineChoice,
 	useMachineChoice,
 } from "./machine-choice";
+import { plannerPlacement, plannerStatus } from "./chat/planner-status";
+import { PlannerAnnouncement } from "./chat/planner-announcement";
 import { MachineButton } from "./machine-button";
 import { machines as machineStore, summarizeMachines, useLiveMachines } from "./machine-summary";
 import { useLiveBuild } from "./live-build";
@@ -112,6 +117,7 @@ import { motionContract } from "./motion-contract";
 import { motionImmediately } from "./motion-input";
 import { useNavigationDocument } from "./navigation-shell";
 import { titleEdits } from "./title-edit";
+import { useTitlingReport } from "./title-presence";
 import { peopleHere } from "./presence";
 import {
 	discardDecision,
@@ -147,7 +153,7 @@ import type { TitleEdit } from "./title-edit";
 import type { HostedWorkspaceProps } from "./hosted";
 import type { ReactNode } from "react";
 import type { QuestionPageRoot } from "./question-page";
-import type { Status } from "./wire";
+import type { Outage, Status } from "./wire";
 import type { ChatDestination } from "./conversation-plan/source";
 import type { SourceDestination } from "./conversation-plan/card-parts";
 import type { WorkspaceDocumentView } from "./workspace-model";
@@ -458,9 +464,6 @@ export function Header(
 	);
 }
 
-/** Reconnect attempts a person can make in one outage before Reload is offered. */
-const RECONNECTS_BEFORE_RELOAD = 3;
-
 export function RoomWorkspace(
 	{
 		agent = true,
@@ -507,6 +510,7 @@ export function RoomWorkspace(
 		if (!archivedAt) rememberOpened(browserStorage(), userId, repository.id, room);
 	}, [archivedAt, repository.id, room, userId]);
 	let [status, setStatus] = useState<Status>("connecting");
+	let [outage, setOutage] = useState<Outage>();
 	let [planState, setPlanState] = useState<PlanState>({ synced: false });
 	// Contents ticks sit in the document's margin. History slides over the views bar and document,
 	// and an earlier session it names replaces the live document in place.
@@ -564,13 +568,13 @@ export function RoomWorkspace(
 		return () => removeEventListener("title-edit", listen);
 	}, [room]);
 	// Controls dim only once a loss outlasts a blip; actions still read `status`.
-	let treatAsConnected = useConnectionNotice(status !== "connected") === "none";
-	// Reconnecting in place keeps unsent work, so it is offered first. A reload
-	// is the fallback once it has failed this often in one outage.
-	let [reconnects, setReconnects] = useState(0);
+	let treatAsConnected = useConnectionNotice(status !== "connected", wire?.restarting) === "none";
+	// A lost connection is said once, at the top of the page: decided here, above wherever the
+	// notice is drawn, so a person switching between Chat and the document neither waits out the
+	// grace period again nor hears of it twice.
+	let offline = useOfflineNotice(isOffline(status, !!outage), outage?.failures ?? 0);
 	// The last loss of unsent edits this person has dismissed.
 	let [lostSeen, setLostSeen] = useState(0);
-	if (status === "connected" && reconnects) setReconnects(0);
 	let [members, setMembers] = useState<Session.Member[]>([]);
 	let [effectiveCanEdit, setEffectiveCanEdit] = useState(canEdit && !archivedAt);
 	let [effectiveCanManage, setEffectiveCanManage] = useState(canManage);
@@ -659,6 +663,15 @@ export function RoomWorkspace(
 		[onResearchChildOpen, onResearchChildPublished, room],
 	);
 	let githubReferences = useMemo(() => new GitHubReferenceCache({ channelId: room }), [room]);
+	let links = useMemo(
+		() => ({ owner: repository.owner, name: repository.name, ref: repository.defaultBranch }),
+		[repository.defaultBranch, repository.name, repository.owner],
+	);
+	// Wherever this room draws a link (the document, an earlier version, Chat, a decision card), a
+	// path in the repository means a file there.
+	let linked = (children: ReactNode) => (
+		<RepositoryLinksProvider value={links}>{children}</RepositoryLinksProvider>
+	);
 	let researchLinks = useResearchOfferLinks(
 		wire,
 		status === "connected",
@@ -704,16 +717,25 @@ export function RoomWorkspace(
 		};
 	});
 	let typing = useDocumentEditing(room);
+	// A disconnected Planner is as unable to take a message or draft tasks as a detached one.
 	let plannerDetached = plannerAttachment.wire === wire && !!plannerAttachment.planner
 		&& plannerAttachment.planner.state !== "attached";
+	let plannerDisconnected = plannerDetached && plannerAttachment.planner?.state === "disconnected";
 	// The machine button beside Build plan chooses where work runs; Build plan says when it is offline.
 	let machineChoice = useMachineChoice(
 		room,
 		profile.implementation && !!effectiveCanEdit && !(archivedAt ?? metadata.archivedAt),
 	);
-	// The choice shows only while the person has a paired machine, live: it appears with their
-	// first and goes with their last.
-	let ownsMachine = showsMachineChoice(useLiveMachines(true).machines);
+	// What is not well with the Planner. Where it is told, the machine button, the composer's top
+	// edge, or both, is decided once for every place that tells it (`plannerPlacement`).
+	let attachment = plannerAttachment.wire === wire ? plannerAttachment.planner : undefined;
+	let plannerNote = useMemo(
+		() => plannerStatus(attachment, plannerRunsOn(machineChoice.state)),
+		[attachment, machineChoice.state],
+	);
+	// The choice shows only while the person has a paired machine, live, or the document lists a
+	// teammate's shared one: it appears with their first and goes with their last.
+	let ownsMachine = showsMachineChoice(useLiveMachines(true).machines, machineChoice.state);
 	// Refresh the machine choice when the Planner moves to another machine.
 	let refreshMachine = machineChoice.refresh;
 	useEffect(() => {
@@ -727,16 +749,12 @@ export function RoomWorkspace(
 		live: liveBuild,
 		planner: agent,
 		plannerDetached,
+		plannerDisconnected,
 		room,
-		unanswered,
 		userId,
 		wire,
 	});
-	let namedBuildBlockers = useMemo(() => buildBlockers(build.snapshot, entries, cardMetadata), [
-		build.snapshot,
-		entries,
-		cardMetadata,
-	]);
+	let namedBuildBlockers = useMemo(() => buildBlockers(build.snapshot), [build.snapshot]);
 	// Touch has no tooltips, so a phone tap on Build, or on the build slot, says why it can't open.
 	let buildUnavailable = build.look.kind === "plan" && build.look.blocked
 		? build.look.blocked
@@ -1092,18 +1110,8 @@ export function RoomWorkspace(
 			card.focus({ preventScroll: true });
 		});
 	};
-	let showNamedBuildBlocker = (item: BuildBlocker) => {
-		if (item.kind === "decision") showPlan(item.id, item.question);
-		else showInvestigation(item.id);
-	};
+	let showNamedBuildBlocker = (item: BuildBlocker) => showInvestigation(item.id);
 	let showBuildBlocker = (reason: string) => {
-		let entry = firstOpenDecision(entries, cardMetadata);
-		let question = entry?.value.questions.find(value => value.answer === undefined)?.id
-			?? entry?.value.questions[0]?.id;
-		if (build.snapshot?.blockers.includes("unanswered questionnaires") && entry && question) {
-			showPlan(entry.id, question);
-			return;
-		}
 		let investigation = build.snapshot?.buildInvestigations?.[0];
 		if (investigation) {
 			showInvestigation(investigation.id);
@@ -1166,9 +1174,11 @@ export function RoomWorkspace(
 
 	useEffect(() => {
 		cardMeta.listen(undefined);
+		setOutage(undefined);
 		let socket = new Wire({
 			channelId: room,
 			onAuthenticationRequired: () => location.reload(),
+			onOutage: setOutage,
 			onDeleted: () => {
 				setDeleted(true);
 				onDocumentDeleted(room);
@@ -1253,6 +1263,29 @@ export function RoomWorkspace(
 
 	let workspaceArchivedAt = archivedAt ?? metadata.archivedAt;
 	let workspaceCanEdit = effectiveCanEdit && !workspaceArchivedAt;
+	// The machine button is drawn in the title bar beside Build plan, and in a phone's top bar
+	// unless an open child has taken that bar over; only a person with a machine choice has one.
+	// A lost connection hides the button without changing where the Planner's state is told:
+	// the offline notice speaks for the connection meanwhile.
+	let machineSlot = ownsMachine && machineChoice.state && workspaceCanEdit
+		? machineChoice
+		: undefined;
+	let titleBuildShown = profile.implementation
+		&& (presentation.type !== "parent-with-child" || phone);
+	let hasMachineButton = !!machineSlot
+		&& (phone
+			? !(presentation.type === "parent-with-child" && planVisible)
+			: titleBuildShown);
+	let plannerWhere = useMemo(
+		() => plannerPlacement(plannerNote, hasMachineButton),
+		[plannerNote, hasMachineButton],
+	);
+	useTitlingReport({
+		wire: workspaceCanEdit ? wire : undefined,
+		room,
+		open: !!titleEdit && effectiveCanManage && !workspaceArchivedAt,
+		area: documentArea,
+	});
 	let editMode = documentEditMode({
 		canEdit: !!workspaceCanEdit && !implementation.locked,
 		editing,
@@ -1529,6 +1562,10 @@ export function RoomWorkspace(
 			item.thread.status === "open" && !item.orphaned && !item.drifted
 		).length;
 
+	// A connection that outlasts a blip is said once, at the top of the document's content.
+	let offlineNotice = (
+		<OfflineNotice onRetry={() => wire?.reconnect()} open={offline.open} retry={offline.retry} />
+	);
 	let statusNotices = (
 		<>
 			{!!planState.lost && planState.lost !== lostSeen && (
@@ -1542,12 +1579,6 @@ export function RoomWorkspace(
 			<PlanStatus
 				connection={status === "deleted" ? "closed" : treatAsConnected ? undefined : status}
 				failed={planState.failed}
-				onReconnect={wire && reconnects < RECONNECTS_BEFORE_RELOAD
-					? () => {
-						setReconnects(count => count + 1);
-						wire.reconnect();
-					}
-					: undefined}
 				synced={planState.synced}
 			/>
 		</>
@@ -1658,9 +1689,10 @@ export function RoomWorkspace(
 			)}
 		</div>
 	);
-	let machinePicker = ownsMachine && machineChoice.state && workspaceCanEdit
-			&& status === "connected"
-		? machineChoice
+	// It goes with a lost connection, but not while a restart is quiet: the page says nothing then,
+	// and a button that came and went would be something.
+	let machinePicker = status === "connected" || (!!wire?.restarting && treatAsConnected)
+		? machineSlot
 		: undefined;
 	let titleProps: TitleProps = {
 		archivedAt: workspaceArchivedAt,
@@ -1697,7 +1729,7 @@ export function RoomWorkspace(
 			: childTitle?.actions && !childTitle.phone
 			? "parent"
 			: undefined;
-		return (
+		return linked(
 			<div
 				className="child-document flex h-full min-h-0 flex-col bg-page"
 				data-workspace-room={room}
@@ -1707,6 +1739,7 @@ export function RoomWorkspace(
 				<p aria-live="polite" className="sr-only" role="status">
 					<span key={announcement.sequence}>{announcement.text}</span>
 				</p>
+				<OfflineAnnouncement spoken={offline.spoken} />
 				{childTitle?.slot && (childTitle.phone
 					? createPortal(
 						<PhoneHeaderContent
@@ -1769,6 +1802,7 @@ export function RoomWorkspace(
 					</div>
 				)}
 				<div className="child-document-status">{statusNotices}</div>
+				{offlineNotice}
 				<section
 					aria-label="Document"
 					className="child-document-scroll min-h-0 flex-1"
@@ -1777,7 +1811,7 @@ export function RoomWorkspace(
 					{/* With no Decisions pane, a phone saves the child's cards from a bar of its own. */}
 					<DecisionSaveHost phone={phone}>{plan}</DecisionSaveHost>
 				</section>
-			</div>
+			</div>,
 		);
 	}
 
@@ -1812,7 +1846,7 @@ export function RoomWorkspace(
 		: undefined;
 	// Build plan or the build capsule sits beside the people here; a child open beside its parent
 	// has no build of its own. A phone shows this room's bar only off Document, so it keeps it.
-	let buildSlot = profile.implementation && (presentation.type !== "parent-with-child" || phone)
+	let buildSlot = titleBuildShown
 		&& (
 			<BuildPlanButton
 				blockers={namedBuildBlockers}
@@ -1835,7 +1869,9 @@ export function RoomWorkspace(
 	// phone's is in its top bar instead.
 	let titleBuild = buildSlot && (
 		<>
-			{!phone && machinePicker && <MachineButton choice={machinePicker} />}
+			{!phone && machinePicker && (
+				<MachineButton choice={machinePicker} planner={plannerWhere.button} />
+			)}
 			{buildSlot}
 		</>
 	);
@@ -1845,13 +1881,15 @@ export function RoomWorkspace(
 		? childEdit && { ...childEdit, toggle: () => childToggle.current?.() }
 		: editMode && { docked, editing: editMode === "editing", toggle: toggleEditing };
 
-	return (
+	return linked(
 		<DecisionContexts document={room} page={questionPageRoot}>
 			<ChildPhoneChromeContext.Provider value={childChromeValue}>
 				<ChildTitleContext.Provider value={childTitleValue}>
 					<p aria-live="polite" className="sr-only" role="status">
 						<span key={announcement.sequence}>{announcement.text}</span>
 					</p>
+					<OfflineAnnouncement spoken={offline.spoken} />
+					{profile.chat && <PlannerAnnouncement status={plannerNote} />}
 					<Workspace
 						available={available}
 						buildEnabled={build.tabReady}
@@ -1924,8 +1962,7 @@ export function RoomWorkspace(
 								repository={repository}
 								room={room}
 								sendAcknowledgements={chatSendAcks.wire === wire && chatSendAcks.enabled}
-								planner={plannerAttachment.wire === wire ? plannerAttachment.planner : undefined}
-								plannerMachine={plannerStartingOn(machineChoice.state)}
+								plannerStrip={plannerWhere.strip}
 								wire={wire}
 							/>
 						}
@@ -1950,6 +1987,7 @@ export function RoomWorkspace(
 										editingDocument={!childOpen && !!barEdit?.editing}
 										label={metadata.title}
 										machine={machinePicker}
+										planner={plannerWhere.button}
 										members={members}
 										onAction={action => onDocumentAction(room, action)}
 										onComments={() => {
@@ -2044,6 +2082,7 @@ export function RoomWorkspace(
 							</>
 						}
 						ids={workspaceIds}
+						notice={offlineNotice}
 						phoneAction={barEdit && (
 							<button
 								aria-label={barEdit.editing ? "Done editing" : "Edit document"}
@@ -2077,10 +2116,8 @@ export function RoomWorkspace(
 								build={build}
 								canEdit={!!workspaceCanEdit && status === "connected"}
 								comments={acceptedComments}
-								onShowDecisions={() => selectDestination("decisions")}
 								onShowDocument={() => selectDestination("plan")}
 								room={room}
-								unanswered={unanswered}
 								userId={userId}
 							/>
 						)}
@@ -2120,7 +2157,7 @@ export function RoomWorkspace(
 					/>
 				</ChildTitleContext.Provider>
 			</ChildPhoneChromeContext.Provider>
-		</DecisionContexts>
+		</DecisionContexts>,
 	);
 }
 

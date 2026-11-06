@@ -5,7 +5,7 @@ import { serialize } from "@chopin/dialect/serialize";
 import { assert } from "@chopin/dialect/validate";
 
 import { summaryAgent } from "../harness/agents";
-import { openWorkerSession } from "./worker-session";
+import { openWorkerSession, workerModel } from "./worker-session";
 import type { Config } from "../config";
 import type { DocumentTarget } from "../plan/service";
 import type { JsonValue } from "../storage/model";
@@ -230,6 +230,7 @@ class HarnessSummaryEngine {
 			else abortSignal.addEventListener("abort", stop, { once: true });
 		});
 		let worker = await openWorkerSession(summaryAgent, {
+			channelId: execution.job.channelId,
 			token: () => credential.token,
 			maxAiCredits: MAX_AI_CREDITS,
 			aborted,
@@ -294,7 +295,7 @@ class HarnessSummaryEngine {
 				}
 				partials = reduced;
 			}
-			return { description: partials[0]!, model: this.#config.model };
+			return { description: partials[0]!, model: workerModel(this.#config.model) };
 		} finally {
 			await worker.close();
 		}
@@ -338,7 +339,7 @@ export function documentSummaryDefinition(options: DocumentSummaryOptions): JobD
 			if (serialize(tree) !== target.source) throw new Error("Document source is not canonical.");
 			let result = target.source.trim()
 				? await engine(execution, target.source)
-				: { description: "Empty document", model: options.config.model };
+				: { description: "Empty document", model: workerModel(options.config.model) };
 			return {
 				revision: execution.input.revision,
 				sourceHash: execution.input.sourceHash,

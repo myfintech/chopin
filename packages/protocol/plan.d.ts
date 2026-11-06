@@ -14,7 +14,7 @@ type KIND<K extends string> = Frame & { kind: K };
  * text frame is legible in a network inspector when something goes wrong.
  */
 export declare namespace Plan {
-	export type Incoming = Request<Open.Ask> | Request<Submit> | Awareness | Close;
+	export type Incoming = Request<Open.Ask> | Request<Submit> | Awareness | Titling | Close;
 
 	export type Outgoing =
 		| Open.Reply
@@ -49,6 +49,12 @@ export declare namespace Plan {
 		orphaned?: true;
 		/** A unique disappeared prose block may recover on the next document edit only. */
 		recoverOnNextEdit?: true;
+		/**
+		 * A decision's anchor that was found again by its digest after its position was lost, and
+		 * since re-expressed as a position on what it found, which may be an identical copy of the
+		 * block it was made for. It stays until the anchor is replaced.
+		 */
+		byDigest?: true;
 	};
 
 	/** The editable paragraph a decided card became, kept even when its block is lost. */
@@ -295,6 +301,13 @@ export declare namespace Plan {
 		/** base64 y-protocols awareness update */
 		update: string;
 	};
+
+	/**
+	 * This person has the document's title open for editing, in its header field or the
+	 * document's own heading, and whether they have typed in it on this connection. A drafted
+	 * title is not applied while anyone is renaming, nor for a short while after. Ephemeral.
+	 */
+	export type Titling = KIND<"plan:titling"> & { active: boolean; edited?: true };
 
 	/** Leave the document. Presence is dropped; the room stays open. */
 	export type Close = KIND<"plan:close">;

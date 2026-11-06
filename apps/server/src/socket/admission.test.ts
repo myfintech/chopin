@@ -1,3 +1,4 @@
+import { REFUSAL_HEADER } from "@chopin/protocol/restart";
 import { Machines } from "../auth/machines";
 import { describe, expect, it } from "bun:test";
 
@@ -5,7 +6,7 @@ import { Sessions } from "../auth/session";
 import { Admission } from "../auth/admission";
 import { GitHubError } from "../github/client";
 import { MemoryStorage } from "../storage/memory/adapter";
-import { admit } from "./admission";
+import { admit, refused } from "./admission";
 
 import type { HostedAuth } from "../auth/routes";
 import type {
@@ -107,6 +108,7 @@ describe("socket admission", () => {
 			clientId: "client",
 			clientSecret: "secret",
 			encryptionKey: new Uint8Array(32).fill(2),
+			previousOrigins: ["https://old.example.com"],
 		};
 		let auth: HostedAuth = {
 			config,
@@ -128,6 +130,22 @@ describe("socket admission", () => {
 			auth,
 		);
 		expect(wrongOrigin).toEqual({ status: 403, reason: "origin is not allowed" });
+		if (!("status" in wrongOrigin)) throw new Error("expected a refusal");
+		let answer = refused(wrongOrigin);
+		expect([answer.status, await answer.text(), answer.headers.get(REFUSAL_HEADER)]).toEqual([
+			403,
+			"origin is not allowed",
+			"1",
+		]);
+		// A page still open on the name the deployment moved from keeps its socket.
+		let previousOrigin = await admit(
+			new Request(url, {
+				headers: { cookie: pair(issued.cookie), origin: "https://old.example.com" },
+			}),
+			url,
+			auth,
+		);
+		expect("data" in previousOrigin).toBe(true);
 		let request = new Request(url, {
 			headers: { cookie: pair(issued.cookie), origin: "https://chopin.test" },
 		});

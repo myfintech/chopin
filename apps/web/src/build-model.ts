@@ -10,7 +10,7 @@ export type BuildPhase =
 	/** Tasks are missing, out of date or were returned; `draft` is the Planner request to send. */
 	| { kind: "drafting"; draft: "prepare" | "revise" | "returned" }
 	/** `stale` when there are no tasks for the current revision to show beneath the blockers. */
-	| { kind: "blocked"; decisions: boolean; comments: boolean; stale: boolean }
+	| { kind: "blocked"; comments: boolean; stale: boolean }
 	| { kind: "review" }
 	| { kind: "building" }
 	/** The build ended before it claimed the tasks; a retry is safe. */
@@ -303,7 +303,6 @@ export function buildPhase(snapshot: Snapshot | undefined): BuildPhase {
 	if (snapshot.blockers.length > 0) {
 		return {
 			kind: "blocked",
-			decisions: snapshot.blockers.includes("unanswered questionnaires"),
 			comments: snapshot.blockers.includes("accepted comments awaiting plan changes"),
 			stale: !snapshot.graph || snapshot.graph.planRevision !== snapshot.planRevision,
 		};
@@ -344,6 +343,17 @@ export function taskStateLabel(state: TaskState, noChange: boolean): string {
 	return state === "completed" && noChange ? "done, no change needed" : TASK_STATE_LABEL[state];
 }
 
+/**
+ * A task row's accessible name: the title as shown (`inlineText`), then its state. Given as a
+ * label, since a name read from the row's content gains a space before the comma: browsers set
+ * a visually hidden, absolutely positioned state apart from the title with one.
+ */
+export function taskRowName(title: string, state: TaskState, noChange: boolean): string {
+	let text = title.replace(/\s+/g, " ").trim();
+	let label = taskStateLabel(state, noChange);
+	return text ? `${text}, ${label}` : label;
+}
+
 /** Active and blocked rows start open; so does a linked task. */
 export function taskStartsOpen(state: TaskState, linked: boolean): boolean {
 	return linked || state === "in_progress" || state === "blocked";
@@ -361,14 +371,21 @@ export function startedBy(snapshot: Snapshot | undefined, userId: string): strin
 }
 
 /**
+ * Why Build plan waits when no machine can draft the tasks, in words that speak of a machine as
+ * the machine button does. The first one also opens how to connect one, so the button keys on it.
+ */
+export const CONNECT_MACHINE_TO_BUILD = "Connect a machine to this document to build";
+const RECONNECT_MACHINE_TO_BUILD = "Reconnect the machine to build";
+
+/**
  * Plain copy for a refusal the server explains, or `undefined` for one it does
  * not, which reads as Chopin failing to draft.
  */
 export function draftRefusalCopy(message: string, code?: string): string | undefined {
-	if (code === "planner-not-attached" || /No Planner is attached/.test(message)) {
-		return "Connect a Planner to this document to build.";
+	if (/ is offline, so it can't reply now/.test(message)) return `${RECONNECT_MACHINE_TO_BUILD}.`;
+	if (code === "planner-not-attached" || /Connect a machine to get a reply/.test(message)) {
+		return `${CONNECT_MACHINE_TO_BUILD}.`;
 	}
-	if (/unanswered questionnaires/.test(message)) return "Answer the open decisions first.";
 	if (/accepted comments/.test(message)) {
 		return "Update the document for accepted comments first.";
 	}
@@ -506,7 +523,7 @@ export function advanceFirstBuild(state: FirstBuild, event: FirstBuildEvent): Fi
  *
  * Once pressed it reads as `working` until the build runs or the attempt ends;
  * `reset` hands any later state back to the snapshot. A draft that raises a
- * decision does not drop the press: it reads `waiting` until the blockers
+ * blocker does not drop the press: it reads `waiting` until the blockers
  * clear, then drafts again if the tasks are stale and starts them. The server
  * keeps the press (`buildRequested`), so a reload `resume`s it. A build that
  * failed before it claimed its tasks starts again from the same tasks.
@@ -585,8 +602,9 @@ export type BuildContext = {
 	 * drafting needs one: starting drafted tasks, Retry and rebuilds do not.
 	 */
 	plannerDetached?: boolean;
+	/** The Planner is attached to this document but its connection dropped; it must reconnect. */
+	plannerDisconnected?: boolean;
 	hasContent: boolean;
-	unanswered: number;
 };
 
 /** Tasks of the current build that have a pull request, out of all of them. */
@@ -596,18 +614,11 @@ function progressCount(snapshot: Snapshot): { done: number; total: number } {
 	return { done: tasks.filter(task => task.state === "completed").length, total };
 }
 
-/** The open decisions or accepted comments that hold any build, or nothing. */
-function blockerReason(snapshot: Snapshot, unanswered: number): string | undefined {
+/** The required investigations or accepted comments that hold any build, or nothing. */
+function blockerReason(snapshot: Snapshot): string | undefined {
 	let investigations = snapshot.buildInvestigations?.length ?? 0;
-	let decisions = snapshot.blockers.includes("unanswered questionnaires")
-		? Math.max(1, unanswered)
-		: 0;
-	if (decisions || investigations) {
-		let waiting = [
-			decisions && plural(decisions, "decision", "decisions"),
-			investigations && plural(investigations, "investigation", "investigations"),
-		].filter(Boolean);
-		return `Waiting on ${waiting.join(" and ")}`;
+	if (investigations) {
+		return `Waiting on ${plural(investigations, "investigation", "investigations")}`;
 	}
 	if (snapshot.blockers.includes("accepted comments awaiting plan changes")) {
 		return "Update the document for accepted comments first";
@@ -619,14 +630,14 @@ function planBlocker(snapshot: Snapshot | undefined, context: BuildContext): str
 	if (!context.hasContent) return "Write the document first";
 	if (!context.connected || !snapshot) return "Chopin isn’t connected";
 	let phase = buildPhase(snapshot);
-	let reason = blockerReason(snapshot, context.unanswered);
+	let reason = blockerReason(snapshot);
 	if (reason) return reason;
 	if (phase.kind === "blocked") return "This document can’t be built yet";
 	if (phase.kind === "drafting" && !context.planner) {
 		return "Chopin isn’t running for this document";
 	}
 	if (phase.kind === "drafting" && context.plannerDetached) {
-		return "Connect a Planner to this document to build";
+		return context.plannerDisconnected ? RECONNECT_MACHINE_TO_BUILD : CONNECT_MACHINE_TO_BUILD;
 	}
 }
 
@@ -669,7 +680,7 @@ export function buildLook(snapshot: Snapshot | undefined, context: BuildContext)
 			};
 		}
 		let act = context.canEdit && context.connected;
-		let blocked = act ? blockerReason(snapshot, context.unanswered) : undefined;
+		let blocked = act ? blockerReason(snapshot) : undefined;
 		if (sync.reason === "failed") {
 			return {
 				kind: "failed",
@@ -738,7 +749,7 @@ export function buildLook(snapshot: Snapshot | undefined, context: BuildContext)
 	}
 	if (step.view === "working") return { kind: "tasks", tip: "Breaking the document into tasks" };
 	if (step.view === "waiting") {
-		return { kind: "plan", blocked: blockerReason(snapshot, context.unanswered) };
+		return { kind: "plan", blocked: blockerReason(snapshot) };
 	}
 	let retry = context.canEdit && context.connected;
 	if (context.state.stage === "failed" && context.state.agent) {

@@ -65,6 +65,23 @@ export type PutRunStages = {
 	replace?: boolean;
 };
 
+/** A saved answer to a decision the Planner left open, waiting for a Planner turn to act on it. */
+export type DecisionAnswer = {
+	decisionId: string;
+	/** The decision's saved generation; a reopened and saved again decision has a newer one. */
+	generation: number;
+	savedAt: Date;
+	/** The turn claimed to carry it, whose notice id it is; absent while it waits for one. */
+	turnId?: string;
+};
+
+export type SaveDecisionAnswer = {
+	channelId: string;
+	decisionId: string;
+	generation: number;
+	savedAt: Date;
+};
+
 /**
  * One editing session in a document's history and the source it left behind.
  * Consecutive edits by the same author within the idle gap extend one session.
@@ -187,6 +204,12 @@ export type StoredMachine = {
 	label: string;
 	repositories: MachineRepository[];
 	autoRun: boolean;
+	/**
+	 * The owner lets teammates choose this machine for a document: its Planner, builds and runs
+	 * then run here as the owner, and Default machine may run the Planner of a teammate's document
+	 * whose creator has no machine of their own that can. Off unless the owner turns it on.
+	 */
+	shared?: boolean;
 	tokenHash: Uint8Array;
 	credentials?: MachineCredentials;
 	createdAt: Date;

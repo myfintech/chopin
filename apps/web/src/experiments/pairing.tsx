@@ -2,6 +2,7 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { useTransitionPresence } from "@chopin/editor/transition-presence";
 import { ArrowLeftIcon, CheckIcon, MachineIcon, RestartIcon } from "@chopin/icons";
 import { InlineNotice } from "@chopin/visuals/inline-notice";
+import { allMachines } from "../machine-summary";
 import { motionImmediately } from "../motion-input";
 import { AddServerPage } from "./add-server";
 import { experimentRequest } from "./api";
@@ -179,7 +180,7 @@ function MachinesPage() {
 function MachinePage({ id }: { id: string }) {
 	let machines = useMachines();
 	let owner = useOwner();
-	let machine = machines.machines?.find(value => value.id === id);
+	let machine = allMachines(machines)?.find(value => value.id === id);
 	return (
 		<MachinesFrame
 			lead={
@@ -256,7 +257,10 @@ export default function PairingPage() {
 	// Off by default: without it, work reaches this machine only when its owner presses Build or
 	// Run (apps/server/src/experiments/routes.ts runs pressed work on the presser's own connection).
 	let [autoRun, setAutoRun] = useState(false);
+	// Off by default too: shared, teammates may choose this machine and their work runs here as its owner.
+	let [shared, setShared] = useState(false);
 	let helpId = useId();
+	let shareHelpId = useId();
 	useEffect(() => {
 		let abort = new AbortController();
 		// Without a pairing, /machines lists the person's machines.
@@ -281,7 +285,7 @@ export default function PairingPage() {
 		try {
 			let result = await experimentRequest<{ url?: string; authorize?: string }>(
 				`/api/connector/pairings/${encodeURIComponent(id!)}/approve`,
-				{ autoRun },
+				{ autoRun, shared },
 			);
 			// GitHub authorizes the machine on its own, then returns to this page.
 			if (result.authorize) {
@@ -387,7 +391,26 @@ export default function PairingPage() {
 									<p className="machines-detail machines-auto-help" id={helpId}>
 										Off: work runs here only when you press Build or Run. On: Chopin can also
 										rebuild what you built when its document changes, and prototype passages you
-										write. Nobody else's work runs here.
+										write.
+									</p>
+								</div>
+								<div className="machines-auto">
+									<label className="machines-auto-label">
+										<input
+											aria-describedby={shareHelpId}
+											checked={shared}
+											className="choice-control size-4 shrink-0"
+											disabled={busy}
+											onChange={event => setShared(event.target.checked)}
+											type="checkbox"
+										/>
+										<span>Let teammates run their work on this machine</span>
+									</label>
+									<p className="machines-detail machines-auto-help" id={shareHelpId}>
+										Off: nobody else's work runs here. On: teammates see this machine and can choose
+										it for a document, and that document's Planner, builds and runs then run here as
+										you, with your GitHub account, in repositories you can push to. Rebuilds and
+										prototypes Chopin starts by itself stay yours. Change it any time on Machines.
 									</p>
 								</div>
 								<div className="machines-pairing-actions">

@@ -60,7 +60,12 @@ approve it.
 
 Chopin uses no App ID, private key, JWT, installation access token, or webhook
 secret. It acts as each signed-in user, with their App user access token,
-so repository-role checks and Copilot entitlement stay theirs.
+so repository-role checks and Copilot entitlement stay theirs. That token is also
+what Chopin sends to GitHub's Copilot MCP endpoint for the Planner's pull request
+tools and for public web search in `/research`. GitHub does not document which tokens
+that endpoint accepts for `web_search`; see
+[Troubleshooting](self-hosting.md#troubleshooting) if `/research` reports a refused
+credential or no web search.
 
 Configure Chopin with the App's slug and OAuth client credentials. A minimal
 production environment contains:
@@ -87,6 +92,13 @@ database and source control. Replacing it invalidates existing hosted logins.
 fragment, or trailing slash. HTTPS is required except for loopback development,
 such as `http://127.0.0.1:8787`. Callback URLs are built only from this value,
 never from incoming Host or forwarded headers.
+
+`PREVIOUS_ORIGINS` optionally lists origins the deployment moved from. Hosted
+session and machine credentials are encrypted with the origin as additional
+data; one that only decrypts under a listed previous origin is re-encrypted
+under `APP_ORIGIN` as its next credential revision, so later restarts no longer
+need the old origin. See
+[Moving to a new origin](self-hosting.md#moving-to-a-new-origin).
 
 [Self-hosting](self-hosting.md) lists every variable and how to deploy.
 
@@ -418,7 +430,8 @@ does not revoke the GitHub App authorization.
 
 OAuth state, the PKCE verifier, and the validated browser return path are held in
 a separate encrypted, ten-minute HttpOnly cookie. Browser state-changing routes
-and WebSocket upgrades require an Origin header exactly equal to `APP_ORIGIN`.
+and WebSocket upgrades require an Origin header exactly equal to `APP_ORIGIN` or
+one of `PREVIOUS_ORIGINS`.
 The bearer-authenticated MCP route accepts a missing Origin, as non-browser
 clients normally omit it, but rejects a present mismatched Origin. Open sockets
 periodically recheck the process-local session, instance admission, and

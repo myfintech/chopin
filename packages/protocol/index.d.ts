@@ -106,20 +106,37 @@ export declare namespace Session {
 	};
 
 	/**
-	 * Who holds this document's remote Planner. `held` is a client that detached or
-	 * dropped and keeps the document until `until` (ISO 8601) unless it reattaches.
-	 * `starting` is a paired machine of `login`'s asked to start it, which has yet to
-	 * attach. Only the GitHub login is named, never its machine or checkout.
+	 * Who holds this document's remote Planner. `held` is a client that detached and
+	 * keeps the document until `until` (ISO 8601) unless it reattaches. `disconnected`
+	 * is a client whose connection dropped while it had workflow runs or open questions
+	 * Chopin keeps for it: there is no deadline, and it resumes them when it reconnects
+	 * (see docs/agent-connection.md). `starting` is a paired machine of `login`'s asked to start it, which has yet to
+	 * attach; with `failure`, its backend has exited before attaching more than once in a
+	 * row. Only the GitHub login is named, never its machine or checkout.
 	 */
 	export type PlannerAttachment =
 		| { state: "attached"; login: string }
 		| { state: "held"; login: string; until: string }
-		| { state: "starting"; login: string }
+		| { state: "disconnected"; login: string }
+		| { state: "starting"; login: string; failure?: PlannerStartFailure }
 		| { state: "none" };
 
 	/**
+	 * Why a machine's Planner backend keeps failing to start, as its connector last said.
+	 * `reason` is the last line the backend wrote to stderr that says why, else how it ended,
+	 * with credentials masked and the home directory as `~`. `attempts` counts the launches
+	 * in a row that exited before staying up and `at` is when the last one did (ISO 8601).
+	 * The connector is retrying until the Planner attaches, which clears it.
+	 */
+	export type PlannerStartFailure = {
+		attempts: number;
+		reason: string;
+		at: string;
+	};
+
+	/**
 	 * Sent only under `HARNESS=remote`: once after `Hello`, then to the whole room
-	 * whenever a client attaches, detaches, its grace period ends, or its ownership
+	 * whenever a client attaches, detaches or disconnects, its grace period ends, or its ownership
 	 * is released by a sign-out, a Planner reset or the server closing its link, and
 	 * whenever a machine is asked to start it or stops being asked.
 	 * Other harnesses never send it.
@@ -149,14 +166,31 @@ export declare namespace Session {
 /**
  * The Projects sidebar's own socket at `/ws/sidebar`, which carries unanswered
  * decision counts for every repository the sidebar shows whether or not a
- * document is open. Admission authenticates the browser session only; each
+ * document is open, and says when a repository's documents change. Admission authenticates the browser session only; each
  * repository is authorized when it is watched. Room sockets carry none of these
  * frames. Requests fail with `Session.Failure`, and `Session.Ping` works here too.
  */
 export declare namespace Sidebar {
 	export type Incoming = Request<Session.Ping> | Request<Watch> | Request<Unwatch>;
 
-	export type Outgoing = Decisions | Watched | Snapshot | Session.Failure | Session.Ping;
+	export type Outgoing =
+		| Decisions
+		| Catalogue
+		| Watched
+		| Snapshot
+		| Session.Failure
+		| Session.Ping;
+
+	/**
+	 * A document in a watched repository joined, changed in or left its catalogue: someone
+	 * created, renamed, archived, restored or deleted it. Sent to every socket watching the
+	 * repository, the change's author's included. It names no title: read the repository's
+	 * documents again, through the same access check as any read.
+	 */
+	export type Catalogue = KIND<"sidebar:catalogue"> & {
+		repositoryId: string;
+		channelId: string;
+	};
 
 	/**
 	 * Unanswered decision counts read from authoritative question records after they

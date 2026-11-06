@@ -42,6 +42,11 @@ async function emptyCatalogues(page: Page) {
 	});
 }
 
+// A document another test creates rereads the catalogue, which can still be routed at teardown.
+test.afterEach(async ({ page }) => {
+	await page.unrouteAll({ behavior: "ignoreErrors" });
+});
+
 async function start(page: Page, baseURL: string, names = ["score"]) {
 	await emptyCatalogues(page);
 	await authenticate(page, `document-creator-${crypto.randomUUID()}`, baseURL);

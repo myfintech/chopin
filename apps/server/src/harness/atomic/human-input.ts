@@ -18,6 +18,71 @@ export type HumanInputStatus = "answered" | "cancelled";
  */
 export type HumanInputOptions = HostInputOptions & { block?: { index: number; digest: string } };
 
+/**
+ * The requests a Planner session has made that are still waiting on the document's members,
+ * and the requests whose result its client has not received. A session that has either must
+ * outlive the turn that ended while it waited: letting it go would withdraw a question nobody
+ * has answered, or take an answer away from the client that asked for it.
+ */
+export class PendingInputs {
+	#open = 0;
+	#held = 0;
+	#listeners = new Set<() => void>();
+
+	/** How many requests are waiting on a member's answer. */
+	open(): number {
+		return this.#open;
+	}
+
+	/** How many requests have not yet given their client a result, answered or not. */
+	held(): number {
+		return this.#held;
+	}
+
+	/** Calls `listener` whenever a request ends or its result is delivered; returns the unsubscribe function. */
+	watch(listener: () => void): () => void {
+		this.#listeners.add(listener);
+		return () => this.#listeners.delete(listener);
+	}
+
+	/** Counts one request from now until `work` settles. */
+	async track<T>(work: Promise<T>): Promise<T> {
+		this.#open++;
+		try {
+			return await work;
+		} finally {
+			this.#open--;
+			this.#notify();
+		}
+	}
+
+	/**
+	 * Counts one request from now until the returned function is called: when its result has
+	 * reached the client, or never can. A request that settles is no longer waiting, but its
+	 * session still owes the client that result. Calling it again does nothing.
+	 */
+	hold(): () => void {
+		this.#held++;
+		let held = true;
+		return () => {
+			if (!held) return;
+			held = false;
+			this.#held--;
+			this.#notify();
+		};
+	}
+
+	#notify(): void {
+		for (let listener of this.#listeners) {
+			try {
+				listener();
+			} catch (error) {
+				console.error("[agent] a pending input watcher failed:", error);
+			}
+		}
+	}
+}
+
 /** Chopin's HostInput, whose methods also take the block a request concerns. */
 export type HumanInput = {
 	[Method in keyof HostInput]: HostInput[Method] extends (...args: infer A) => infer R
@@ -39,8 +104,11 @@ export function createHumanInput(
 	room: DocumentRoom,
 	hold?: (workflowRunId: string, signal: AbortSignal) => Promise<void>,
 	report?: (status: HumanInputStatus) => void,
+	pending?: PendingInputs,
 ): HumanInput {
-	async function questionnaire(
+	const questionnaire = (params: QuestionParams, options: HumanInputOptions) =>
+		pending ? pending.track(asking(params, options)) : asking(params, options);
+	async function asking(
 		params: QuestionParams,
 		options: HumanInputOptions,
 	): Promise<QuestionnaireResult> {
@@ -54,11 +122,10 @@ export function createHumanInput(
 				question: question.question,
 				options: question.options.map(option => ({
 					label: option.label,
-					// Decisions shows no preview pane, so the mockup or code a member
-					// needs to see before choosing travels in the description.
-					description: [option.description, option.preview]
-						.filter(value => value !== undefined)
-						.join("\n\n"),
+					description: option.description,
+					// The option's own visual (a diagram, a table, an image of this document's)
+					// is its own field: every card surface frames it under the option.
+					...(option.preview ? { preview: option.preview } : {}),
 				})),
 				multiple: question.multiSelect ?? false,
 			})),

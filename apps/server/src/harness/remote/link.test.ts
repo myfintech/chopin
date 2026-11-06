@@ -16,7 +16,13 @@ import * as Store from "../../questions/store";
 import * as Plan from "../../plan/service";
 import * as Edit from "../../plan/edit";
 import * as Room from "../../plan/room";
-import { createPlannerAgent } from "../agents";
+import { documentTools } from "../../agent/tools";
+import { readingOutput } from "../../agent/reading-output";
+import { fieldNotes, reading } from "../../document-reading.test-fixtures";
+import { openPlan } from "../../testing/plan";
+import { createPlannerAgent, createResearchAgent } from "../agents";
+import { withModelOutput } from "../model-output";
+import { openWorkerSession } from "../../jobs/worker-session";
 import { createHumanInput } from "../atomic/human-input";
 import { openPlannerSession } from "../session";
 import { untilUnpaused } from "../atomic/full";
@@ -43,7 +49,7 @@ import { createRemoteAdapter } from "./adapter";
 import { admitAgent } from "./endpoint";
 import { remotePlanner } from "./registry";
 
-import type { AgentClient, AgentHandlers } from "@chopin/agent-link/client";
+import type { AgentClient, AgentHandlers, TurnContext } from "@chopin/agent-link/client";
 import type { ActiveOwnerBinding } from "../../agent/active-owner";
 import type { RemotePlanner } from "./registry";
 
@@ -948,9 +954,50 @@ describe("Agent connection protocol", () => {
 		}
 	});
 
+	it("offers upload_plan_image only to a client that asked for decision-option-previews", async () => {
+		let { server, channel } = await setup();
+		let both = new HarnessAgent({
+			harness: adapterFor(server, { channelId: channel.id, isolated: false }),
+			tools: {
+				read_plan: tool({ inputSchema: z.object({}), execute: async () => "the plan" }),
+				upload_plan_image: tool({ inputSchema: z.object({}), execute: async () => "stored" }),
+			},
+			activeTools: ["read_plan", "upload_plan_image"],
+			permissionMode: "allow-reads",
+		});
+		for (
+			let [header, offered] of [
+				[undefined, ["read_plan"]],
+				["run-stage-deltas", ["read_plan"]],
+				["decision-option-previews", ["read_plan", "upload_plan_image"]],
+				["run-stage-deltas, decision-option-previews", ["read_plan", "upload_plan_image"]],
+			] as const
+		) {
+			let raw = await rawLink(server.url, undefined, header);
+			raw.send({ type: "attach", version: 1, document: channel.id });
+			await raw.next("attached");
+			let started = raw.next("start").then(start => {
+				raw.send({ type: "started", session: start.session });
+				return raw.next("turn");
+			});
+			let session = await both.createSession({ sandboxSession });
+			cleanups.push(() => session.destroy());
+			let outcome = (async () => {
+				let result = await both.stream({ session, prompt: "look" });
+				for await (let _part of result.fullStream);
+			})();
+			let turn = await started;
+			expect(turn.tools.map((item: { name: string }) => item.name)).toEqual(offered);
+			raw.send({ type: "turn-end", session: turn.session, turn: turn.turn, status: "finished" });
+			await outcome;
+			raw.send({ type: "detach" });
+			await raw.closed;
+		}
+	});
+
 	it("merges stage deltas into a run's stages, and a full card replaces them", async () => {
 		let { server, channel, client } = await setup({});
-		expect(client.features).toEqual(["run-stage-deltas"]);
+		expect(client.features).toEqual(["run-stage-deltas", "decision-option-previews"]);
 		let planner: RemotePlanner = { channelId: channel.id, isolated: false };
 		let session = await adapterFor(server, planner).doStart({
 			sessionId: "deltas",
@@ -1107,6 +1154,52 @@ describe("Agent connection protocol", () => {
 		expect(isolated.errors.join("\n")).toContain("An isolated Planner turn cannot offer bash");
 	});
 
+	it("sends the attached client read_plan as paged text, the way its model is to read it", async () => {
+		let seen: Array<{ output: unknown; isError: boolean }> = [];
+		let { server, channel } = await setup({
+			async turn(context) {
+				seen.push(await context.callHostTool("read_plan", { offset: 1 }));
+				finishTurn(context);
+			},
+		});
+		let fixture = await openPlan(fieldNotes(60_000));
+		cleanups.push(() => Plan.close(fixture.plan));
+		let agent = new HarnessAgent({
+			harness: withModelOutput(
+				adapterFor(server, { channelId: channel.id, isolated: false }),
+				readingOutput,
+			),
+			tools: { read_plan: documentTools.read_plan },
+			activeTools: ["read_plan"],
+			toolsContext: {
+				read_plan: {
+					room: {
+						id: fixture.plan.id,
+						plan: fixture.plan,
+						server: fixture.server,
+						persist: () => Plan.persist(fixture.plan),
+						exclusive: action => Plan.exclusive(fixture.plan, action),
+						publish: async () => {},
+						anchors: () => {},
+						changes: () => {},
+					},
+				},
+			},
+			permissionMode: "allow-reads",
+		});
+		let session = await agent.createSession({ sandboxSession });
+		cleanups.push(() => session.destroy());
+		let outcome = await streamOn(agent as never, session as never, "read");
+		expect(outcome.errors).toEqual([]);
+		expect(seen).toHaveLength(1);
+		let text = seen[0]!.output as string;
+		expect(seen[0]!.isError).toBe(false);
+		expect(text).not.toStartWith("{");
+		expect(Buffer.byteLength(text)).toBeLessThanOrEqual(16_000);
+		expect(reading(text).fields.document).toBe(fixture.plan.id);
+		expect(reading(text).next).toBeDefined();
+	});
+
 	it("gives the server and the client the same error when a host result cannot cross the link", async () => {
 		let seen: unknown[] = [];
 		let { server, channel } = await setup({
@@ -1222,7 +1315,11 @@ describe("Agent connection protocol", () => {
 		});
 		cleanups.push(() => session.doDestroy());
 		await planner.control!("stop", "run-1");
-		await expect(planner.control!("resume")).rejects.toThrow("nothing to resume");
+		// Bun 1.4.4's pending `.rejects` matcher makes Bun.serve close a valid socket as
+		// fragmented (oven-sh/bun#45805), so the refusal is awaited before it is asserted.
+		let refusal = await planner.control!("resume").catch((error: unknown) => error);
+		expect(refusal).toBeInstanceOf(Error);
+		expect((refusal as Error).message).toContain("nothing to resume");
 		expect(controls).toEqual([{ type: "stop", run: "run-1" }, { type: "resume", run: undefined }]);
 		await session.doDestroy();
 		expect(planner.control).toBeUndefined();
@@ -1459,7 +1556,7 @@ describe("Agent connection questions", () => {
 			header: "Choice",
 			question: "  Which store?  ",
 			options: [
-				{ label: " Postgres ", description: "  durable  \n\ncreate table" },
+				{ label: " Postgres ", description: "  durable  ", preview: "create table" },
 				{ label: "Memory", description: "fast" },
 			],
 		});
@@ -1768,5 +1865,75 @@ describe("Agent connection questions", () => {
 	it("stops a host ask and withdraws its Decision when its turn ends before the tool does", async () => {
 		expect(await askingTurn("turn-end")).toEqual(["Error: The client gave up."]);
 		await askingTurn("destroy");
+	});
+});
+
+describe("Agent connection background workers", () => {
+	it("runs a document's research worker in its attached client as an isolated session", async () => {
+		let starts: string[] = [];
+		let turns: TurnContext["message"][] = [];
+		let searched: unknown[] = [];
+		let { channel } = await setup({
+			start: message => void starts.push(message.mode),
+			async turn(context) {
+				turns.push(context.message);
+				context.emit({ type: "stream-start", modelId: "scripted" });
+				let search = await context.callHostTool("web_search", { query: "axum rate limiting" });
+				let evidence = {
+					findings: [`Searched: ${String(search.output)}`],
+					sources: [{ title: "tower-governor", url: "https://docs.rs/tower_governor" }],
+				};
+				context.emit({ type: "text-start", id: "result" });
+				context.emit({ type: "text-delta", id: "result", delta: JSON.stringify(evidence) });
+				context.emit({ type: "text-end", id: "result" });
+				finishTurn(context);
+			},
+		});
+		let agent = createResearchAgent(createRemoteAdapter());
+		let worker = await openWorkerSession(agent, {
+			channelId: channel.id,
+			token: () => MEMBER_TOKEN,
+			maxAiCredits: 1,
+			aborted: new Promise<never>(() => {}),
+			openSandbox: async () => sandboxSession,
+		});
+		cleanups.push(() => worker.close());
+
+		let result = await agent.generate({
+			session: worker.session,
+			prompt: JSON.stringify({ material: { query: "axum rate limiting" } }),
+			options: {
+				model: "",
+				instructions: "Research only public web evidence.",
+				webSearch: tool({
+					inputSchema: z.object({ query: z.string() }),
+					execute: async input => {
+						searched.push(input);
+						return "results";
+					},
+				}),
+			},
+		});
+
+		expect(starts).toEqual(["isolated"]);
+		expect(turns.map(turn => turn.tools.map(spec => spec.name))).toEqual([["web_search"]]);
+		expect(turns[0]!.responseFormat?.type).toBe("json");
+		expect(searched).toEqual([{ query: "axum rate limiting" }]);
+		expect(result.output).toEqual({
+			findings: ["Searched: results"],
+			sources: [{ title: "tower-governor", url: "https://docs.rs/tower_governor" }],
+		});
+	});
+
+	it("refuses a worker for a document with no attached Planner", async () => {
+		let { channel } = await setup();
+		let agent = createResearchAgent(createRemoteAdapter());
+		await expect(openWorkerSession(agent, {
+			channelId: channel.id,
+			token: () => MEMBER_TOKEN,
+			maxAiCredits: 1,
+			aborted: new Promise<never>(() => {}),
+			openSandbox: async () => sandboxSession,
+		})).rejects.toThrow("No Planner is attached to this document.");
 	});
 });

@@ -12,7 +12,7 @@ import {
 	CONNECTOR_UPDATE_REQUIRED,
 } from "@chopin/protocol/connector";
 import { redacted } from "./connection";
-import { CONNECTOR_HEADERS, ConnectorError, refusal } from "./mcp";
+import { CONNECTOR_HEADERS, ConnectorError, jsonObject, refusal } from "./mcp";
 import type { Output } from "./output";
 
 /**
@@ -188,7 +188,7 @@ async function post(
 	});
 	let refused = await refusal(response);
 	if (refused) throw refused;
-	let value = await response.json().catch(() => ({})) as Record<string, unknown>;
+	let value = await jsonObject(response);
 	if (!response.ok) {
 		let code = typeof value.error === "string" ? value.error : `http-${response.status}`;
 		throw new ConnectorError(
@@ -360,6 +360,39 @@ export async function plannerCredential(
 			? { repository }
 			: {}),
 	};
+}
+
+/** Why a document's Planner backend keeps failing to start, as the connector tells Chopin. */
+export type PlannerStartFailure = {
+	/** How many launches in a row exited before staying up. */
+	attempts: number;
+	/** How the last one ended: `exit 1`, `signal SIGKILL`, or why it could not be started. */
+	how: string;
+	/** The last meaningful line it printed to stderr, with credentials masked. */
+	reason?: string;
+	/** When it exited (ms). */
+	at: number;
+};
+
+/**
+ * Tell Chopin why `document`'s Planner backend on this machine keeps failing to start, so the
+ * people in the document can read it; without `failure`, that it no longer does. Chopin shows it
+ * only for a Planner it asked this machine to run. A server that does not know the route answers
+ * 404, which the caller takes to mean it never will.
+ */
+export async function reportPlannerFailure(
+	url: string,
+	token: string,
+	document: string,
+	failure: PlannerStartFailure | undefined,
+	signal?: AbortSignal,
+) {
+	await post(
+		url + "/api/connector/planner/failure",
+		{ document, ...(failure ? { failure } : {}) },
+		token,
+		signal,
+	);
 }
 
 /**

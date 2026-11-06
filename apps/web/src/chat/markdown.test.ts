@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { RepositoryLinksProvider } from "@chopin/editor";
 
+import { inlineText } from "./inline-text";
 import { InlineMarkdown, MessageMarkdown } from "./markdown";
 import { referenceRenderModel } from "./references";
 
@@ -264,4 +266,59 @@ test("inline Markdown formats code, emphasis and links without blocks", () => {
 	expect(inline("    indented `code`")).toBe("indented <code>code</code>");
 	expect(inline("<b>raw</b> ![image](https://example.invalid/i.png)")).toBe("raw ");
 	expect(inline("one\n\ntwo")).toBe("one two");
+});
+
+test("the plain text of inline Markdown is the text it shows, with single spaces", () => {
+	let sources = [
+		"Rewire `login` to **call** _three_ [helpers](https://example.com)",
+		"Deploy on `main`",
+		"Read [the docs](https://example.com)",
+		"<b>raw</b> ![image](https://example.invalid/i.png)",
+		"> quote &amp; `a  b`",
+		"one\n\ntwo",
+	];
+	for (let source of sources) {
+		let shown = inline(source, false).replace(/<[^>]+>/g, "").replaceAll("&gt;", ">")
+			.replaceAll("&amp;", "&");
+		expect(inlineText(source)).toBe(shown.replace(/\s+/g, " ").trim());
+	}
+	expect(inlineText("Deploy on `main`")).toBe("Deploy on main");
+	expect(inlineText("<b>raw</b> ![image](https://example.invalid/i.png)")).toBe("raw");
+});
+
+const REPOSITORY = { owner: "octo-org", name: "score", ref: "main" };
+const BLOB = "https://github.com/octo-org/score/blob/main";
+
+function inRepository(element: ReturnType<typeof createElement>): string {
+	return renderToStaticMarkup(
+		createElement(RepositoryLinksProvider, { value: REPOSITORY }, element),
+	);
+}
+
+test("a repository path in Chat opens the file on GitHub, as it does in the document", () => {
+	let source = "See [the review](docs/review.md#L10-L20) and [the app](./src/app.ts).";
+	let markup = inRepository(createElement(MessageMarkdown, { source }));
+
+	expect(markup).toContain(
+		`<a href="${BLOB}/docs/review.md#L10-L20" rel="noopener noreferrer" target="_blank">the review</a>`,
+	);
+	expect(markup).toContain(`<a href="${BLOB}/src/app.ts"`);
+	expect(
+		inRepository(createElement(InlineMarkdown, { source: "Edit [the app](src/app.ts)" })),
+	).toContain(`<a href="${BLOB}/src/app.ts"`);
+});
+
+test("every other link in Chat is as written, with or without a repository", () => {
+	let source =
+		"[web](https://example.com/a) [mail](mailto:ana@example.com) [here](#here) [out](../secrets.md) [gone](//evil.example/a)";
+	let elsewhere = markdown(source);
+	let inside = inRepository(createElement(MessageMarkdown, { source }));
+
+	for (let href of ["https://example.com/a", "mailto:ana@example.com", "#here", "../secrets.md"]) {
+		expect(inside).toContain(`href="${href}"`);
+		expect(elsewhere).toContain(`href="${href}"`);
+	}
+	expect(inside).not.toContain("github.com");
+	// Without a repository to resolve against, a path stays the path it was.
+	expect(markdown("See [the review](docs/review.md)")).toContain('href="docs/review.md"');
 });

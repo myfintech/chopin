@@ -25,7 +25,7 @@ import {
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fullPlanner, workflowRuns } from "./full";
+import { fullPlanner, settleEndedRuns, workflowRuns } from "./full";
 
 import type {
 	HarnessV1,
@@ -161,6 +161,8 @@ export type AtomicSettings = {
 	 * `ATOMIC_WORKFLOW_JOURNAL_PATH`; the process environment is left unchanged.
 	 */
 	journal?: string;
+	/** The directory an isolated session's working directory is created in; the system's when absent. */
+	tempRoot?: string;
 };
 
 export class ToolBoundaryError extends Error {
@@ -618,7 +620,11 @@ export function createAtomicAdapter(
 				policy.hostNames = hostNames;
 				policy.structured = false;
 				if (!live) {
-					if (!full) directory ??= await mkdtemp(join(tmpdir(), "chopin-atomic-planner-"));
+					if (!full) {
+						directory ??= await mkdtemp(
+							join(settings.tempRoot ?? tmpdir(), "chopin-atomic-planner-"),
+						);
+					}
 					let cwd = full?.cwd ?? directory!;
 					let agentDir = full ? getAgentDir() : directory!;
 					if (full) settingsManager = await fullSettings(agentDir, cwd);
@@ -709,6 +715,12 @@ export function createAtomicAdapter(
 				try {
 					if (live) {
 						live.release();
+						if (full) {
+							await bounded(
+								settleEndedRuns(live.session.workflows, full.runs),
+								"Atomic workflow runs did not settle.",
+							).catch(error => console.error("[agent]", error));
+						}
 						await bounded(live.session.dispose(), "Atomic session disposal timed out.");
 					}
 				} finally {

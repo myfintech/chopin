@@ -20,7 +20,7 @@ import {
 	resumeOwnedRuns,
 	untilUnpaused,
 } from "./atomic/full";
-import { createHumanInput } from "./atomic/human-input";
+import { createHumanInput, PendingInputs } from "./atomic/human-input";
 import { type PlannerWorkspace, plannerWorkspace } from "./atomic/workspace";
 import { registerRemotePlanner, type RemotePlanner } from "./remote/registry";
 
@@ -62,16 +62,39 @@ export type PlannerSession = {
 	activeTools?: readonly string[];
 	stream: (prompt: string, abortSignal: AbortSignal) => ReturnType<PlannerAgent["stream"]>;
 	destroy: () => Promise<void>;
+	/**
+	 * The questions this session asked that no member has answered yet, and the requests whose
+	 * result its client has not received. A session with either is kept past a turn that ended
+	 * without it, as one that owns a workflow run is.
+	 */
+	inputs?: Pick<PendingInputs, "open" | "held" | "watch">;
 	/** Workflow runs this session owns; only atomic and remote Planner sessions report them. */
 	runs?: () => PlannerRuns | undefined;
 	/** Subscribes to run changes; returns the unsubscribe function. */
 	watchRuns?: (listener: (runs: PlannerRuns) => void) => () => void;
-	/** Pauses every workflow run this session owns, resumably. */
-	pauseRuns?: () => Promise<void>;
+	/**
+	 * Whether the client that runs this session lost its link unexpectedly and may still come
+	 * back: nothing it holds has ended, so the session is kept, however long that takes, until it
+	 * does or something explicit ends it.
+	 */
+	suspended?: () => boolean;
+	/** Whether the server is going down, so what its links close says nothing about the client. */
+	shuttingDown?: () => boolean;
+	/** Whether its link dropped with a Stop the client had not confirmed, kept for its return. */
+	keptStop?: () => boolean;
+	/** Takes the binding of the owner's renewed credential in place of one that ended. */
+	rebind?: (owner: ActiveOwnerBinding) => void;
+	/** Calls `listener` when `suspended` changes; returns the unsubscribe function. */
+	watchLink?: (listener: () => void) => () => void;
+	/**
+	 * Pauses every workflow run this session owns, resumably. Resolves `held` when it could not
+	 * reach the client that runs them and waits to tell it when it returns.
+	 */
+	pauseRuns?: () => Promise<void | "held" | "unconfirmed">;
 	/** Resumes the runs this session paused. */
 	resumeRuns?: () => Promise<void>;
-	/** Pauses one run this session owns. */
-	pauseRun?: (runId: string) => Promise<void>;
+	/** Pauses one run this session owns; `held` as for `pauseRuns`. */
+	pauseRun?: (runId: string) => Promise<void | "held" | "unconfirmed">;
 	/** Resumes one paused run this session owns. */
 	resumeRun?: (runId: string) => Promise<void>;
 	/**
@@ -98,9 +121,9 @@ function remoteRunControl(
 		runs: () => remote.runs,
 		watchRuns,
 		pauseRuns: async () => control()("stop"),
-		resumeRuns: async () => control()("resume"),
+		resumeRuns: async () => void await control()("resume"),
 		pauseRun: async runId => control()("stop", runId),
-		resumeRun: async runId => control()("resume", runId),
+		resumeRun: async runId => void await control()("resume", runId),
 		followsUpRuns: false,
 	};
 }
@@ -144,7 +167,8 @@ export async function openPlannerSession(
 	} catch (cause) {
 		return { ok: false, error: { kind: "Unavailable", cause } };
 	}
-	let tools = lazyGithubTools(owner, deps.githubTools ?? githubTools);
+	let current = owner;
+	let tools = lazyGithubTools(current, deps.githubTools ?? githubTools);
 	let extensions = await (deps.extensionTools ?? extensionTools)(channel.repository);
 	let sandbox: Sandbox;
 	try {
@@ -167,12 +191,16 @@ export async function openPlannerSession(
 			: undefined;
 		let planner: FullPlanner | undefined;
 		let listeners = new Set<(runs: PlannerRuns) => void>();
+		let linkListeners = new Set<() => void>();
+		let inputs = new PendingInputs();
 		if (workspace) {
 			planner = {
 				cwd: workspace.cwd,
 				humanInput: createHumanInput(
 					channel.room,
 					(runId, signal) => untilUnpaused(planner!, runId, signal),
+					undefined,
+					inputs,
 				),
 				onRuns: runs => {
 					for (let listener of listeners) listener(runs);
@@ -194,7 +222,12 @@ export async function openPlannerSession(
 						channel.room,
 						(runId, signal) => untilUnpaused(held, runId, signal),
 						report,
+						inputs,
 					);
+				held.holdInput = () => inputs.hold();
+				held.linkChanged = () => {
+					for (let listener of linkListeners) listener();
+				};
 				held.onRuns = runs => {
 					for (let listener of listeners) listener(runs);
 				};
@@ -236,7 +269,6 @@ export async function openPlannerSession(
 		}
 		if (owner.signal.aborted) throw new Error("Planner owner unavailable");
 		let active = session;
-		let release = unregister;
 		let stopped: Promise<void> | undefined;
 		let workflows = () => {
 			if (!planner?.workflows) {
@@ -274,6 +306,27 @@ export async function openPlannerSession(
 					return planner?.activeTools ?? remote?.activeTools ?? fixedTools;
 				},
 				...runControl,
+				...(planner || remote && !job ? { inputs } : {}),
+				...(remote && !job
+					? {
+						rebind: (renewed: ActiveOwnerBinding) => {
+							unregister?.();
+							current = renewed;
+							tools = lazyGithubTools(current, deps.githubTools ?? githubTools);
+							unregister = (deps.registerCredential ?? registerCredential)(
+								sessionId,
+								renewed.currentToken,
+							);
+						},
+						suspended: () => remote.suspended === true,
+						shuttingDown: () => remote.stopping === true,
+						keptStop: () => remote.keptStop === true,
+						watchLink: (listener: () => void) => {
+							linkListeners.add(listener);
+							return () => linkListeners.delete(listener);
+						},
+					}
+					: {}),
 				stream: (prompt, abortSignal) => {
 					// The remote turn aborts it when the turn ends or the link drops mid-tool.
 					let hostTools = remote ? new AbortController() : undefined;
@@ -285,7 +338,7 @@ export async function openPlannerSession(
 						options: {
 							...channel,
 							instructions,
-							owner,
+							owner: current,
 							githubTools: tools,
 							extensionTools: extensions,
 							...(hostTools ? { toolSignal: hostTools.signal } : {}),
@@ -300,7 +353,7 @@ export async function openPlannerSession(
 							try {
 								await sandbox.destroy();
 							} finally {
-								release();
+								unregister?.();
 								unregisterFull?.();
 								unregisterRemote?.();
 							}

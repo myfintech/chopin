@@ -22,6 +22,7 @@ import {
 } from "@chopin/agent-link";
 
 import { AdmissionDenied } from "../../auth/admission";
+import { ownOrigin } from "../../auth/config";
 import { documentUrl } from "../../channels/document-url";
 import { GitHubError } from "../../github/client";
 import {
@@ -150,7 +151,7 @@ export async function admitAgent(
 	if (!enabled) return refusal(404, "This Chopin does not accept agent connections.");
 	if (!offersSubprotocol(request)) return subprotocolRequired();
 	let origin = request.headers.get("origin");
-	if (origin !== null && origin !== auth.config.origin) {
+	if (origin !== null && !ownOrigin(auth.config, origin)) {
 		return refusal(403, "origin is not allowed");
 	}
 	let token = request.headers.get("authorization")?.match(BEARER)?.[1];
@@ -249,11 +250,33 @@ export function agentLink(
 				: {}),
 		}, link);
 		if (!granted.ok) return granted;
+		let document = { id: channel.id, title: channel.title, repository: fullName, url };
+		if (granted.takeover) {
+			let { takeover } = granted;
+			return {
+				ok: true,
+				document,
+				takeover: async names => {
+					let taken = await takeover(names);
+					if (!taken.ok) return taken;
+					channelId = channel.id;
+					return {
+						ok: true,
+						document,
+						detach: taken.detach,
+						claim: taken.claim,
+						lapse: taken.lapse,
+					};
+				},
+			};
+		}
 		channelId = channel.id;
 		return {
 			ok: true,
-			document: { id: channel.id, title: channel.title, repository: fullName, url },
+			document,
 			detach: granted.detach,
+			claim: granted.claim,
+			lapse: granted.lapse,
 		};
 	}
 	async function revalidate(): Promise<boolean> {

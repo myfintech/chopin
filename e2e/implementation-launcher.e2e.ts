@@ -694,7 +694,7 @@ test("the agent-offline notice folds to its glyph before the document's title gi
 });
 
 test(
-	"Build plan waits for unanswered decisions and says so",
+	"Build plan proceeds while decisions are open and leaves them to answer",
 	async ({ seed, join: enter }) => {
 		let widget = "01K0N4TR8K7JGM4R1J7PW4R8YJ";
 		let question = "01K0N4V4E7Y6P4MJ5WD8XZF3B2";
@@ -709,13 +709,12 @@ test(
 			}],
 		};
 		await seed(
-			`# Blocked build\n\nA decision is open.\n\n<Questionnaire id="${widget}" by="ana">
+			`# Open decision\n\nA decision is open.\n\n<Questionnaire id="${widget}" by="ana">
 <Question id="${question}" header="Rollout" prompt="How should we deploy?" multiple="false">
 <Option id="${option}" label="Canary" />
 </Question>
 </Questionnaire>\n`,
 			{
-				revision: 1,
 				graph: preparedGraph(),
 				questions: [{
 					id: widget,
@@ -736,27 +735,23 @@ test(
 			},
 		);
 		let page = await enter("ana");
-		let plan = page.getByRole("button", { name: "1 decision left. Show blockers", exact: true });
+		let plan = page.getByRole("button", { name: "Build plan", exact: true });
 		await expect(plan).toBeVisible();
-		await expect(page.getByRole("button", { name: "Build plan", exact: true })).toHaveCount(0);
+		// Nothing about the open decision holds Build back: no waiting capsule, no inert button.
+		await expect(page.getByRole("button", { name: /decisions? left/ })).toHaveCount(0);
+		await expect(plan).not.toHaveAttribute("aria-disabled", "true");
+		let shots = process.env.CHOPIN_SHOTS;
+		if (shots) await page.screenshot({ path: `${shots}/build-plan-with-open-decision.png` });
 		await plan.click();
-		let popup = page.getByRole("dialog", { name: "Build blockers", exact: true });
-		let item = popup.getByRole("button", { name: "Review: How should we deploy?", exact: true });
-		await expect(item).toBeVisible();
-		let screenshot = test.info().outputPath("decision-blocker-header.png");
-		await page.screenshot({ path: screenshot });
-		await test.info().attach("decision-blocker-header", {
-			path: screenshot,
-			contentType: "image/png",
-		});
-		await item.click();
-		await expect(page.locator(`article[data-plan-sidecar-questionnaire="${widget}"]`).first())
-			.toBeFocused();
-		await expect(page.getByRole("button", { name: "Preparing tasks", exact: true })).toHaveCount(0);
+		// The press went ahead; with no local agent connected it stops there, not at the decision.
+		await expect(page.getByRole("button", { name: "Agent offline", exact: true })).toBeVisible();
 		await expect(
 			page.getByRole("group", { name: "Document view" })
 				.getByRole("button", { name: "Build", exact: true }),
-		).toBeDisabled();
+		).toBeEnabled();
+		// The decision stays open on the page, still answerable once the build is done with it.
+		await expect(page.locator(`article[data-plan-sidecar-questionnaire="${widget}"]`).first())
+			.toBeVisible();
 	},
 );
 
@@ -839,9 +834,12 @@ test("a build that ran for an hour reads as built when it finished, not when it 
 
 test("a task that needed no change reads as done without a pull request, with its evidence", async ({ seed, join: enter }) => {
 	let now = Date.now();
+	let graph = preparedGraph();
+	// A title ending in inline code reads with its state straight after it, as any title does.
+	graph.versions[0]!.definition.tasks[0]!.title = "Connect the local agent on `main`";
 	await seed(
 		"# Checked build\n\nOne task was already satisfied.\n",
-		builtBuild(preparedGraph(), new Date(now - 10 * 60_000), new Date(now - 60_000), {
+		builtBuild(graph, new Date(now - 10 * 60_000), new Date(now - 60_000), {
 			connect: {
 				reason: "The connection already reports blockers on the base commit.",
 				evidence: "- Ran `bun test connector` in run 4821: **36 passed**, 0 failed.",
@@ -856,10 +854,12 @@ test("a task that needed no change reads as done without a pull request, with it
 	await expect(view.getByText("1 pull request, 1 task needed no change", { exact: true }))
 		.toBeVisible();
 	let tasks = view.getByRole("list", { name: "Tasks" });
-	let checked = tasks.getByRole("button", {
-		name: /^Connect the local agent\s*, done, no change needed$/,
-	});
-	await expect(checked).toBeVisible();
+	let checked = tasks.getByRole("button", { name: /^Connect the local agent/ });
+	await expect(checked).toHaveAccessibleName(
+		"Connect the local agent on main, done, no change needed",
+	);
+	await expect(tasks.getByRole("button", { name: /^Review the connection/ }))
+		.toHaveAccessibleName("Review the connection, done");
 	// The task that needed no change has no pull request link; the other task keeps its own.
 	await expect(tasks.getByRole("link", { name: /^Pull request/ })).toHaveCount(1);
 	await expect(tasks.getByText("No change needed", { exact: true })).toBeVisible();

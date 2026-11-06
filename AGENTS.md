@@ -47,7 +47,7 @@ bun run docker:up       # build and start app plus PostgreSQL locally
 bun run docker:down     # tear down the local Compose project
 ```
 
-The repository pins Bun 1.4.2. `mise.toml` selects that version automatically for
+The repository pins Bun 1.4.4. `mise.toml` selects that version automatically for
 contributors who use [mise](https://mise.jdx.dev); run `mise install` once. Keep
 the package metadata, `mise.toml`, Docker image, CI, and documentation
 synchronized when changing it.
@@ -100,7 +100,7 @@ harnesses as runtime package boundaries.
 The browser edits Lexical bound to Yjs. One WebSocket multiplexes session,
 document (`plan:*` on the wire), conversation, questions, comments, and
 implementation lifecycle messages; the Projects sidebar's own `/ws/sidebar`
-socket carries only decision counts. The server keeps each open channel as an
+socket carries decision counts and says when a repository's documents change. The server keeps each open channel as an
 authoritative Y.Doc with a headless Lexical mirror so it can validate and
 serialize the document without trusting a browser.
 
@@ -158,10 +158,26 @@ collaborative state and external implementation runs are durable.
   the account's live browser login the document's Planner owner, one client per
   document; nothing else claims ownership. `@chopin` and `invoke_planner` on a
   document without one fail with `planner-not-attached`. Signing out the
-  owner's login, its expiry, or a Planner reset closes the link. A paired
-  machine's Planner backend attaches with a document-scoped credential instead
-  and owns through a cookie-less login carrying the machine's own GitHub token,
-  which only revoking the machine or its authorization ends. See
+  owner's login, its expiry, or a Planner reset closes the link. A lost
+  connection never ends work by itself: a link that offered
+  `resumable-sessions` and then dropped unexpectedly keeps its sessions that hold
+  a live run or an open question, however long it stays away, and holds any Stop
+  pressed meanwhile or still unanswered when it dropped for its client's return.
+  Run cards say the Planner is disconnected, not stopped; Decisions stay open and
+  answerable; answers and cancellations made meanwhile are delivered when the
+  same account's client resumes. No timer ends that, and `PLANNER_ATTACH_GRACE_MS`
+  leases only a detached link's ownership. Only an explicit Stop, a sign-out or
+  expiry, a Planner reset, unpairing or revoking the machine, the owner choosing
+  another machine, archiving the document, or the same account attaching with a client that
+  does not resume (a browser sign-in over a machine's parked work included) ends it; no other
+  close keeps it.
+  A server restart, graceful or not, forgets the sessions (a client's `resume` finds
+  nothing) and leaves the Decisions open, and the cards come back stopped and stay so
+  until a session is started again; a graceful shutdown posts no Chat line about it. A same-account
+  client that returns before the server noticed its old link died takes that link's work
+  over with its first `resume`. A paired machine's Planner backend attaches with a document-scoped
+  credential instead and owns through a cookie-less login carrying the machine's
+  own GitHub token, which only revoking the machine or its authorization ends. See
   [Hosted agent](docs/hosted-agent.md#remote-planner).
 - **Repository node IDs are authoritative.** Owner and repository names resolve
   GitHub requests but never replace the stored node identity.
@@ -174,6 +190,31 @@ collaborative state and external implementation runs are durable.
   `LIVE_SPIKES` prototypes run only passages the consenting editor changed, on a
   push-refusing throwaway worktree, under hourly caps and a 20-minute deadline;
   see [Prototype spikes](docs/local-experiments.md#prototype-spikes-live_spikes).
+- **A shared machine runs teammates' work as its owner.** An owner who shares a machine
+  consents to the Planner, builds and runs of a document whose editor chose it, or made it
+  their favorite and chose none, in repositories the owner can push to (checked with the machine's
+  own token, as Default machine does). The
+  agent runs with the owner's GitHub account; the build records the editor as `user` and the
+  owner as `machineOwner`, and only the connection it was queued on may claim or report it.
+  Work Chopin starts by itself never leaves its builder's own machines. Where a document's Planner runs is
+  derived from stored choices (the creator's, else an editor's whose machine can run it now),
+  never from process memory, so a restart asks one machine; a choice that cannot run it yet
+  stops nothing and never interrupts an attached Planner. That check is held per machine and
+  repository (a pass 10 minutes, a refusal a minute, asked once however many listings ask
+  at once). The Machines page, polled every few seconds, lists a machine that serves every
+  repository from two held lists of what can be pushed to, not a check per repository: the
+  person's own (a minute) and its owner's, listed with the machine's token once per owner
+  for everyone (10 minutes, a failure a minute), so its cost to the owner's token does not
+  grow with teammates or polls. Only a repository the machine has a checkout of is asked
+  on its own. A person's one favorite may be a teammate's shared machine they could use (the
+  same eligibility as its listing); Automatic and Default machine prefer it where it serves the
+  repository, and fall back where it doesn't, for a pressed rebuild too, ahead of the machine its
+  first build ran on. A favorite is stored and published one change at a time per machine, with
+  unsharing and revoking, so memory never keeps one storage has cleared. Machines, a person's own
+  and teammates' shared ones, are listed together newest paired first. Unsharing clears
+  teammates' choices and favorites of the machine and hands a document to Default machine only where the machine ran its Planner,
+  had been asked to, was placing it, or someone uses the document; any other just loses
+  the choice.
 - **Persistence should precede publication.** Do not acknowledge or broadcast a
   domain mutation before its fenced durable commit.
 
@@ -293,12 +334,20 @@ plan can approve and dispatch a graph through the owner-paired ACP connector;
 its run-scoped bridge exposes the document and lifecycle reporting tools. The
 Planner cannot approve, lock, or start a graph. See docs/local-launcher.md.
 
+Open or reopened decisions never block a build. **Build plan**, **Build** and
+**Retry** go ahead: the coding agent builds on its best judgment, reads each
+unanswered decision as `unapprovedDecisions` (in `read_implementation` and
+`read_rebuild`), and is told to put that list in the body of every pull request
+it opens. The decisions stay open and answerable once the active build releases
+its lock; building never answers or closes one.
+
 A person's press is the approval. **Build plan** approves and starts the
 drafted graph. Once a build has delivered, with or without `LIVE_BUILD`, a
 rebuild appends its tasks as an approved, completed graph version from the
 coding agent's report, with no separate review: without `LIVE_BUILD` that
 approval is the person pressing **Build** (or **Retry**) on the changes, which
-the server refuses while decisions or accepted comments are open; under
+the server refuses while accepted comments await plan changes or required
+investigations are open, but never for an open decision; under
 `LIVE_BUILD` it is the Build plan press that made the document live.
 
 An approved graph binds one plan revision, graph version, and graph revision.
@@ -379,6 +428,16 @@ so merge ranges from all mounted editors before replacing a registry entry.
   after `send()` loses edits on disconnect.
 - Rebuilds and reconnects must replay unacknowledged updates only when the epoch
   is still compatible.
+- Shutdown closes every socket with 1012 (`OpenSockets.stopForRestart()`) before
+  `server.stop(true)`, whose own 1001 reads as a loss. The browser takes 1012 as a
+  quiet restart and a probe's 4xx as a refusal only with `x-chopin-refusal: 1`
+  (or a 401); answer any new refusal of `/ws` or `/ws/sidebar` through
+  `refused()` so a proxy's 4xx cannot be mistaken for it. A request waiting when
+  the 1012 arrives rejects as `WireLost` with `restarting` set; only a caller whose
+  request carries its own identity, as `chat:send` does, may send it again quietly.
+  For `RESTART_QUIET_MS` after a 1012 `Wire` raises no `onOutage`, so the document's one
+  offline notice stays away, and every other surface that speaks of a lost connection
+  waits `useConnectionNotice(lost, wire.restarting)`; a new one must honour both.
 - Room opening and closing share the document lifecycle lock. Opening waits for
   an active close; eviction forgets the room only after runtime shutdown and
   persistence complete. Preserve that ordering.
@@ -399,6 +458,13 @@ so merge ranges from all mounted editors before replacing a registry entry.
   reads raw Copilot SDK events and keeps its own live tool check against session
   metadata. Treat that as adapter-internal behavior, not a property every harness
   in `HARNESS` shares.
+- A host tool's return value is what its model reads: the Copilot SDK, Atomic and an
+  attached client show it as is, or as one line of JSON for an object, and `HarnessAgent`
+  applies a tool's `toModelOutput` only when a turn ends. `read_plan` and `read_child`
+  return their structured view, and each real harness in `harnesses.ts` is wrapped by
+  `withModelOutput` so its model reads them as text of at most `READ_BYTES` bytes, paged
+  with `next:`; Atomic's MCP adapter silently drops the middle of text over 20 KiB. A new
+  `HARNESS` must be wrapped too.
 - The GitHub MCP tools reached through `apps/server/src/harness/github-tools.ts`
   come from a remote server that can change its offered tool count. Diagnose by
   required names and denied capabilities, not literal counts.

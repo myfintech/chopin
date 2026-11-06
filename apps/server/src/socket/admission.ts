@@ -1,3 +1,6 @@
+import { REFUSAL_HEADER } from "@chopin/protocol/restart";
+
+import { ownOrigin } from "../auth/config";
 import { isChannelId } from "../channels/id";
 import { GitHubError } from "../github/client";
 import { uid } from "../ids";
@@ -12,6 +15,17 @@ export type Admission = { data: SocketData } | { status: number; reason: string 
 
 export type SidebarAdmission = { data: SidebarSocketData } | { status: number; reason: string };
 
+/**
+ * The HTTP answer to a socket handshake that admission refused, marked as Chopin's own so the
+ * client can tell it from a proxy's 4xx while Chopin is away.
+ */
+export function refused(outcome: { status: number; reason: string }): Response {
+	return new Response(outcome.reason, {
+		status: outcome.status,
+		headers: { [REFUSAL_HEADER]: "1" },
+	});
+}
+
 function probing(request: Request): boolean {
 	return request.headers.get("x-chopin-socket-probe") === "1"
 		&& request.headers.get("upgrade")?.toLowerCase() !== "websocket";
@@ -19,7 +33,7 @@ function probing(request: Request): boolean {
 
 export async function admitSidebar(request: Request, auth: HostedAuth): Promise<SidebarAdmission> {
 	try {
-		if (!probing(request) && request.headers.get("origin") !== auth.config.origin) {
+		if (!probing(request) && !ownOrigin(auth.config, request.headers.get("origin"))) {
 			return { status: 403, reason: "origin is not allowed" };
 		}
 		let session = await auth.sessions.authenticate(request);
@@ -54,7 +68,7 @@ export async function admit(
 	} = {},
 ): Promise<Admission> {
 	try {
-		if (!probing(request) && request.headers.get("origin") !== auth.config.origin) {
+		if (!probing(request) && !ownOrigin(auth.config, request.headers.get("origin"))) {
 			return { status: 403, reason: "origin is not allowed" };
 		}
 		let session = await auth.sessions.authenticate(request);

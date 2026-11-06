@@ -21,11 +21,13 @@ import { MAX_IMAGE_DATA_LENGTH, MAX_IMAGE_REQUEST_BYTES, prepareImage } from "./
 import { IMAGE_TYPES } from "./images/format";
 import { isLifecycleTool, LIFECYCLE_TOOLS, lifecycleCall } from "./mcp/lifecycle";
 import { normalizedTitle } from "./channels/title";
+import { documentText, NOTE_BYTES, READING_IN_PARTS, ReadRangeError } from "./document-reading";
 
 import type { Brief, CreateDocumentInput } from "./mcp/create";
 import type { UpdateDocument } from "./mcp/update";
 import type { UploadImageInput } from "./mcp/image";
 import type { Run, Version } from "./tasks/graphs";
+import type { unapprovedContext } from "./tasks/open-decisions";
 import type { LifecycleArguments } from "./mcp/lifecycle";
 import type { ImplementationLifecycle } from "./tasks/lifecycle";
 import type { Issue } from "@chopin/dialect";
@@ -65,6 +67,8 @@ export type Implementation = {
 	execution: { state: "idle" } | { state: "active"; run: Run };
 	activity?: ImplementationLifecycle["activity"];
 	history: ImplementationLifecycle["history"];
+	/** Decisions still open, for the agent to build on its best judgment; absent when none is. */
+	unapprovedDecisions?: NonNullable<ReturnType<typeof unapprovedContext>>["unapprovedDecisions"];
 };
 
 export type ImplementationInput = {
@@ -319,7 +323,10 @@ export const TOOLS: Tool[] = [
 	},
 	{
 		name: "read_document",
-		description: "Read a Chopin document by ID or canonical URL.",
+		description: "Read a Chopin document by ID or canonical URL. The text result is a short "
+			+ "header (id, title, revision, url, size), the brief when the document has one, and the "
+			+ "document's Markdown source with its real newlines, verbatim; `structuredContent` "
+			+ `carries the whole document as before. ${READING_IN_PARTS}`,
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -329,6 +336,9 @@ export const TOOLS: Tool[] = [
 					maxLength: MAX_DOCUMENT_LOCATOR_LENGTH,
 					pattern: "\\S",
 				},
+				offset: { type: "integer", minimum: 1 },
+				limit: { type: "integer", minimum: 1 },
+				column: { type: "integer", minimum: 1 },
 			},
 			required: ["id"],
 			additionalProperties: false,
@@ -724,6 +734,50 @@ function text(
 	};
 }
 
+function documentContent(
+	document: LinkedDocument,
+	range: { offset?: number; limit?: number; column?: number },
+): ReturnType<typeof text> {
+	let { id, title, description, archivedAt, revision, url, source, brief } = document;
+	let notes = brief
+		? [{
+			title: "Brief:",
+			items: [
+				`goal: ${brief.goal}`,
+				...[
+					["constraint", brief.constraints],
+					["settled decision", brief.settledDecisions],
+					["open question", brief.openQuestions],
+					["repository finding", brief.repositoryFindings],
+				].flatMap(([name, items]) => (items as string[]).map(item => `${name}: ${item}`)),
+			],
+			bytes: NOTE_BYTES.brief,
+			rest: (omitted: number) =>
+				`(${omitted} more brief lines are not shown; the whole brief is in structuredContent.brief.)`,
+		}]
+		: [];
+	return {
+		content: [{
+			type: "text",
+			text: documentText({
+				fields: [
+					["id", id],
+					["title", title],
+					...description ? [["description", description] as [string, string]] : [],
+					...archivedAt ? [["archived", archivedAt] as [string, string]] : [],
+					["revision", String(revision)],
+					["url", url],
+				],
+				notes,
+				source,
+				next: at => `read_document ${JSON.stringify({ id, ...at })}`,
+				range,
+			}),
+		}],
+		structuredContent: document,
+	};
+}
+
 function toolCall(
 	params: unknown,
 ): { name: string; arguments: Record<string, unknown> } | undefined {
@@ -999,13 +1053,33 @@ export function handler<Caller>(
 						: respond(text({ documents }));
 				}
 				if (tool.name === "read_document") {
-					if (Object.keys(tool.arguments).length !== 1 || !isLocator(tool.arguments.id)) {
+					let { id, offset, limit, column, ...extra } = tool.arguments;
+					if (Object.keys(extra).length || !isLocator(id)) {
 						return notification
 							? undefined
 							: error(call.id, -32602, "read_document requires an id or URL");
 					}
-					let document = await options.documents.read(caller, tool.arguments.id);
-					return document ? respond(text(document)) : respond({ content: [], isError: true });
+					for (let value of [offset, limit, column]) {
+						if (value !== undefined && (!Number.isSafeInteger(value) || (value as number) < 1)) {
+							return notification
+								? undefined
+								: error(call.id, -32602, "offset, limit and column must be integers of at least 1");
+						}
+					}
+					let document = await options.documents.read(caller, id);
+					if (!document) return respond({ content: [], isError: true });
+					try {
+						return respond(
+							documentContent(document, {
+								offset: offset as number | undefined,
+								limit: limit as number | undefined,
+								column: column as number | undefined,
+							}),
+						);
+					} catch (err) {
+						if (!(err instanceof ReadRangeError)) throw err;
+						return notification ? undefined : error(call.id, -32602, err.message);
+					}
 				}
 				if (tool.name === "create_document" && creation) {
 					let prepared = prepare(tool.arguments);

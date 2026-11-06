@@ -111,7 +111,7 @@ A server running `HARNESS=remote` claims no ownership here. Its Planner runs in
 a client attached to the document over the [agent connection](agent-connection.md), and
 only attaching makes an account the owner. With a client attached the turn goes
 to it and runs under its owner, whoever invoked it. Without one, including
-while a detached Planner's grace period runs and once the attached Planner's
+while a detached Planner's grace period runs, while a disconnected Planner's work is kept for it, and once the attached Planner's
 owner signs out of the browser, that sign-in expires, or its Planner is reset,
 the call is refused with
 `planner-not-attached` and a `message`, and nothing is posted or queued:
@@ -119,7 +119,7 @@ the call is refused with
 ```json
 {
 	"code": "planner-not-attached",
-	"message": "No Planner is attached to this document. To attach one, connect a Planner client to https://chopin.example/documents/octo-org/score/release-readiness over the agent connection from a session in a checkout of octo-org/score; that session becomes this document's Planner."
+	"message": "Connect a machine to get a reply. Connect an agent client to https://chopin.example/documents/octo-org/score/release-readiness over the agent connection from a session in a checkout of octo-org/score."
 }
 ```
 
@@ -213,6 +213,25 @@ returns `title-taken` when the repository already has a document with that title
 choose another title and retry under a new idempotency key. `idempotency-conflict`
 means the same key was reused with a different request, and validation failures
 return `issues`. Every one of these outcomes matches the tool's output schema.
+
+## Reading a large document
+
+`read_document` returns the document as Markdown text with real newlines after a
+short header (`id`, `title`, `revision`, `url`, size) and the brief when it has
+one, and the whole document, unchanged, in `structuredContent`. An agent harness
+may keep only the head and tail of a long text result (Atomic keeps the first
+and last 10 KiB of one over 20 KiB), so one result's text carries at most 16,000
+UTF-8 bytes in all, header and brief included. A document over that returns its
+outline (headings with line numbers), its first part and a `next:` call. Pass
+`offset` (a 1-based line) and optionally `limit` (most lines) to read any part:
+the text states the total line count, and where a slice fits it is exact. A
+`limit` is a maximum: a result the budget cuts says so and names `next:`. A line
+too long for one result continues with `column`, a 1-based character in line
+`offset`. The text after the `--- source ... ---` line is the source verbatim, so
+following `next:` returns every character exactly once. A long brief is trimmed
+in the text; `structuredContent.brief` has all of it. An `offset` or `column`
+outside the document is a JSON-RPC invalid-params error. See
+[Reading a large document](hosted-agent.md#reading-a-large-document).
 
 ## Document URLs and IDs
 

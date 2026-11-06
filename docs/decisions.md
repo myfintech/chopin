@@ -28,7 +28,35 @@ Planner first writes provisional prose, then supplies the current document revis
 key and related block addresses for each card. Written responses use `response: "text"`,
 `options: []`, and `multiple: false`; choices retain their existing form. Cards appear beside
 their primary passage and the tool returns immediately. Retrying a key reuses the same card,
-including after it has been saved or discarded. Stop Planner does not withdraw committed cards.
+including after it has been saved or discarded, but only when the retry describes that card: its
+question, response kind and choices (apart from options a person added since) and its passages
+must match. A key that already holds a different decision refuses the whole batch with a message
+naming the key, so a new question is never answered with an unrelated card; nothing is created
+or replaced. A discarded card is never recreated by its key. When the document changed after
+the Planner read it, each related block is matched against the revision the Planner read, not the
+document as it stands: the digest must have named exactly one block then, and that same block
+must still carry it, now alone, wherever it stands. A paragraph rewritten since, one an identical
+copy now repeats, one that was already repeated when it was read, and a read the server no longer
+retains each refuse the batch with a message saying the document changed and to read it again,
+rather than anchoring a card beside a twin. Nothing is created for a refused batch.
+Replaying a key whose card exists is judged against the same read. Where the server no longer
+holds it (after a restart, or once more than eight revisions have been read since), a replay is
+accepted only for a card standing beside the single passage it was opened on, and only if that
+card's anchor has never had to be found again by its digest. A card with several passages is
+refused until the Planner reads again, since a later passage cannot then be told from an
+identical copy. So is a card whose position in its paragraph was lost: after every edit the
+server re-expresses an anchor as a position, and when an edit removes it (the paragraph was
+rewritten or replaced, another block was moved across it, or the document was rebuilt under a
+new epoch) the anchor is matched to the one block carrying its digest. That block may be an
+identical copy of the paragraph, for instance one an edit left between the rewritten paragraph
+and the card, so the match is recorded on the anchor in the stored decision, survives later
+edits and restarts, and ends only when the Planner anchors the card again. The refusal says
+the card's paragraph can only be found again by its text; reading the document again gives the
+replay a read to be judged against. A card whose paragraph kept its place through insertions,
+deletions, edits and typing elsewhere is still accepted, with or without the read. A card
+recorded before the mark existed has none, and is judged by where it stands unless an edit
+since has taken its position.
+Stop Planner does not withdraw committed cards.
 
 Each Save queues an update to the related prose. Decisions sharing a passage share its write
 scope, so later answers preserve earlier saved answers. Source, updated anchors and receipts
@@ -38,14 +66,24 @@ authorized Planner owner after restart. Draft edits and research findings do not
 write-up. Child-focused Planner turns cannot create decisions in the root document.
 
 Saving a decision the Planner left open, whether captured with `open_decisions` or
-`open_decision` or asked with `ask` by a turn that has since ended, also starts one Planner turn
-that carries the saved answer, so the Planner acts on it: an answer that chose "start a new run"
-starts one. Chat shows a system notice naming who answered, and the turn leaves an anchored
-card's passage to its write-up. Like other turns nobody typed, it runs only under the existing
-Planner owner, and under `HARNESS=remote` only while a Planner is attached; it never claims
-ownership. An answer that found no Planner starts once an owner appears or a Planner attaches,
-unless the server restarts first. Reopening or saving again makes a waiting answer stale. An
-answer a blocking `ask` or a workflow's question is waiting for returns to it instead.
+`open_decision` or asked with `ask` by a turn that has since ended, also hands the saved answer to
+a Planner turn, so the Planner acts on it: an answer that chose "start a new run" starts one.
+Answers saved to one document close together share one turn that lists each question, answer,
+chosen option and who saved it. The turn starts once nobody has saved another answer for five
+seconds, or 30 seconds after the first, and never while a Planner turn runs or waits in that
+Chat, so answers saved meanwhile join the next turn. Chat shows one system notice naming who
+answered: the question for one answer, or a count such as "@ana answered 3 decisions". The turn
+leaves an anchored card's passage to its write-up. Like other turns nobody typed, it runs only
+under the existing Planner owner, and under `HARNESS=remote` only while a Planner is attached; it
+never claims ownership.
+
+Each answer waits in the `decision_answers` table, one row per document and decision, until a
+turn carries it, so an answer that found no Planner starts once an owner appears or a Planner
+attaches, after a restart too. Saving again replaces a waiting answer, and reopening makes it
+stale, so it is never handed over. A turn's answers are claimed under a fresh id before it starts
+and marked delivered once Chat accepts it. Its Chat notice takes that id, so answers claimed before
+a crash, but not yet marked, are recognized as already started and never run twice. An answer a
+blocking `ask` or a workflow's question is waiting for returns to it instead, and starts no turn.
 
 After a foreground rewrite, `anchor_plan` explicitly reviews the replacement passage and
 refreshes its saved write-up links and future write scope in the same durable commit.
@@ -78,6 +116,27 @@ linked to the nearest heading above it that survived, else the first section. It
 write-up, when the rewrite deleted that passage, is dropped instead of failing, and the answer
 still reaches the Planner as a turn of its own. Other cards keep owing a review as before, and a
 Planner `edit_plan` still reports `anchors_pending` for the Planner to re-anchor.
+
+## Options with their own visual
+
+People decide by looking, so each option of a choice question can carry a `preview`: Markdown that
+Chopin shows framed under the option's label and description. It can hold an image of the
+document's own, a Mermaid diagram, a small pipe table or a code sketch, at most 16,000
+characters. The Planner's `ask`, `open_decision` and `open_decisions` tools take it, and so does
+an input request from an attached Planner or from Atomic's `ask_user_question`.
+
+- The Planner makes an image, stores it with `upload_plan_image` (base64 bytes, a type and
+  required alternative text, at most 1 MiB) and puts the Markdown the tool returns in the
+  option's `preview` or in the card's body. Only people who can read the document load it.
+- Every card surface shows the previews: the Decisions tab, the inline card, the phone sheet,
+  an answered card, which keeps every option's visual, and the decision page. A picture is held
+  to the option's column and opens large from a click on it, which never chooses the option. A
+  decision with criteria shows a small thumbnail.
+- An option is still one radio button named by its label and description; its visual is a group
+  of its own, `Preview of <label>`, and an image keeps its alternative text.
+- A card saved before previews joined a sketch onto its description and looks the same.
+- A connected Planner learns whether the server does this from the `decision-option-previews`
+  [agent feature](agent-connection.md#option-previews).
 
 ## Collaboration and persistence
 
