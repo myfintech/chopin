@@ -11,7 +11,24 @@ import { renderToStaticMarkup as render } from "react-dom/server";
 
 import { buildLook, CONNECT_MACHINE_TO_BUILD, draftRefusalCopy } from "./build-model";
 import { BuildPlanButton } from "./build-plan-button";
+import { SETUP } from "./build-connection-popover";
+import { SHARE_DETAIL, YourMachines } from "./experiments/machine-list";
 import { ChatComposer } from "./chat/composer";
+import {
+	destinationCue,
+	PLANNER_UNAVAILABLE_NOTICE,
+	REPLIES_OFF,
+	repliesOffNotice,
+} from "./chat/references";
+import { disconnectedNote, RunStack, runStatusLabel } from "./chat/run-card";
+import { Transcript } from "./chat/transcript";
+import { destinationLabel } from "./workspace-navigation";
+import { documentActivityLabel } from "./document-activity";
+import { EvidencePopover } from "./conversation-plan/evidence-popover";
+import {
+	JOB_RETRY_FAILED,
+	PlannerJobDiagnostics,
+} from "./conversation-plan/planner-job-diagnostics";
 import {
 	plannerAnnouncement,
 	plannerButtonLabel,
@@ -22,18 +39,13 @@ import {
 } from "./chat/planner-status";
 import { MachineButton, MachineGlyph, PlannerNote } from "./machine-button";
 import { OFFLINE_MESSAGE, OfflineAnnouncement, OfflineNoticeBody } from "./offline-notice";
-import { offlineAnnouncement } from "@chopin/editor";
+import { AgentFace, offlineAnnouncement, PlanStatus } from "@chopin/editor";
+import { INTERNAL, INTERNAL_IN_STATUS } from "@chopin/protocol/plain-words";
 
-import type { Session } from "@chopin/protocol";
+import type { Chat, ConversationPlan, Session } from "@chopin/protocol";
 import type { ImplementationSnapshot } from "@chopin/protocol/implementation";
 import type { PlannerGlyph, PlannerStatus } from "./chat/planner-status";
 import type { MachineChoice } from "./machine-choice";
-
-/**
- * What an internal concept looks like to a person: any of these in a status is a leak. `detach` is
- * its own word (it contains `tach`, not `attach`), and `attach` takes every form of it.
- */
-const INTERNAL = /planner|detach|attach|\bheld\b|\bdecisions?\b|@chopin/i;
 
 const AT = "2026-11-04T18:29:00.000Z";
 
@@ -48,8 +60,8 @@ const STATES: Session.PlannerAttachment[] = [
 	{ state: "held", login: "mona", until: AT },
 ];
 
-/** The viewer's own machine, named, and someone else's, known only by its owner's login. */
-const MACHINES = ["Build box", undefined] as const;
+/** The viewer's own machine, named, someone else's, known only by its owner's login, and not known yet. */
+const MACHINES = ["Build box", undefined, null] as const;
 
 test("the leak check flags every banned term in any form, and none of the plain words", () => {
 	let leaks = [
@@ -74,7 +86,18 @@ test("the leak check flags every banned term in any form, and none of the plain 
 		"@chopin",
 		"Ask @Chopin",
 	];
-	for (let leak of leaks) expect(INTERNAL.test(leak), leak).toBe(true);
+	for (let leak of leaks) expect(INTERNAL_IN_STATUS.test(leak), leak).toBe(true);
+	// Decision and Decisions are the product's own word: only text about a machine and its connection
+	// must not use them, so the pattern for everything else flags the other terms alone.
+	let product = [
+		"Decision",
+		"decisions",
+		"Open Decisions stay answerable",
+		"Waiting on 2 Decisions",
+	];
+	for (let leak of leaks) {
+		expect(INTERNAL.test(leak), leak).toBe(!product.includes(leak));
+	}
 	let plain = [
 		"Connecting to Build box",
 		"Can't connect to Build box",
@@ -86,12 +109,16 @@ test("the leak check flags every banned term in any form, and none of the plain 
 		"The shelled output was upheld",
 		"Chopin",
 	];
-	for (let words of plain) expect(INTERNAL.test(words), words).toBe(false);
+	for (let words of [...plain, ...product]) {
+		expect(INTERNAL.test(words), words).toBe(false);
+	}
+	for (let words of plain) expect(INTERNAL_IN_STATUS.test(words), words).toBe(false);
 });
 
 function statuses(): PlannerStatus[] {
 	return STATES.flatMap(planner =>
-		MACHINES.map(machine => plannerStatus(planner, machine)).filter(Boolean) as PlannerStatus[]
+		MACHINES.flatMap(machine => [undefined, AT].map(seen => plannerStatus(planner, machine, seen)))
+			.filter(Boolean) as PlannerStatus[]
 	);
 }
 
@@ -116,6 +143,7 @@ function choice(): MachineChoice {
 				planner: false,
 			}],
 		},
+		read: 1,
 		saving: false,
 		choose: async () => {},
 		refresh: () => {},
@@ -135,7 +163,15 @@ function words(markup: string): string[] {
 	return [...attributes, ...text];
 }
 
+/** Text about a machine and its connection: none of Chopin's own terms, Decisions included. */
 function expectPlain(label: string, texts: readonly string[]): void {
+	for (let text of texts) {
+		expect(INTERNAL_IN_STATUS.test(text), `${label}: "${text}"`).toBe(false);
+	}
+}
+
+/** Any other words a person reads: none of the Planner, attaching, holding or `@chopin`. */
+function expectPlainWords(label: string, texts: readonly string[]): void {
 	for (let text of texts) {
 		expect(INTERNAL.test(text), `${label}: "${text}"`).toBe(false);
 	}
@@ -237,11 +273,178 @@ test("the words for the states the user named are exactly theirs, with plain apo
 	expect(say({ state: "disconnected", login: "mona" })).toBe(
 		"Build box is offline. Your work is kept.",
 	);
+	expect(plannerSentence(plannerStatus({ state: "disconnected", login: "mona" }, "Build box", AT)!))
+		.toMatch(/^Build box is offline\. Last seen .+\.$/);
 	expect(say({ state: "none" })).toBe("No machine is connected.");
 	expect(say({ state: "held", login: "mona", until: AT })).toMatch(
 		/^Build box stepped away\. Your work is kept until \d{1,2}:\d{2}/,
 	);
 	for (let status of statuses()) expect(plannerSentence(status)).not.toContain("\u2019");
+});
+
+test("a server whose agent is off says so in plain words, and says nothing of it while the page is offline", () => {
+	let strip = repliesOffNotice(false)!;
+	expect(strip.text).toBe(REPLIES_OFF);
+	expectPlain("the strip and the notice after a send", [strip.text, PLANNER_UNAVAILABLE_NOTICE]);
+	// And as the composer draws it, above the field.
+	let markup = render(createElement(ChatComposer, { ...COMPOSER, agent: false, notice: strip }));
+	let drawn = markup.slice(
+		markup.indexOf("composer-notice-slot"),
+		markup.indexOf("composer-surface"),
+	);
+	expect(drawn.length).toBeGreaterThan(0);
+	expectPlain("drawn", words(drawn));
+	// The page's offline notice is the one thing said about the connection.
+	expect(repliesOffNotice(true)).toBeUndefined();
+});
+
+test("the busy labels, the agent's face and the composer's picker hints are plain", () => {
+	let activities = [{ unread: 0, busy: false }, { unread: 3, busy: false }, {
+		unread: 0,
+		busy: true,
+	}, { unread: 3, busy: true }];
+	for (let destination of ["chat", "plan", "build"] as const) {
+		for (let activity of activities) {
+			for (let writing of [undefined, "writing", "unseen"] as const) {
+				expectPlainWords(
+					`the ${destination} tab`,
+					[destinationLabel(destination, 2, activity, writing)],
+				);
+			}
+		}
+	}
+	expectPlainWords(
+		"the document tab",
+		["writing", "unseen", undefined].map(state => documentActivityLabel(state as never)),
+	);
+	let working = render(createElement(PlanStatus, { busy: true, synced: true }));
+	expect(working).toContain("Chopin is working");
+	expectPlainWords("the document's status", words(working));
+	expectPlainWords("the agent's face", words(render(createElement(AgentFace, {}))));
+	for (let text of ["", "should we ask about auth first?", "@chopin draft the auth section"]) {
+		let cue = destinationCue(text, [], true);
+		if (cue) expectPlainWords("a picker hint", [cue.text]);
+	}
+	expect(destinationCue("should we ask about auth first?", [], true)?.text)
+		.toBe("Sent to people here. Type @ to ask Chopin");
+	let empty = render(createElement(Transcript, {
+		active: true,
+		emptyHint: { planner: true, references: true },
+		entries: [],
+		handle: "ana",
+		onWithdraw: () => {},
+		queued: [],
+	}));
+	expect(empty).toContain("to ask Chopin");
+	expectPlainWords("the empty Chat", words(empty));
+});
+
+test("a workflow run's status, notes and controls are plain, connected or away", () => {
+	let statuses = [
+		"running",
+		"waiting",
+		"paused",
+		"finished",
+		"blocked",
+		"failed",
+		"stopped",
+	] as const;
+	let run = (status: (typeof statuses)[number], away?: true): Chat.Run => ({
+		id: `run-${status}`,
+		name: `a-${status}-run`,
+		status,
+		started: 1,
+		updated: 2,
+		waiting: status === "waiting" ? 2 : 0,
+		stages: [],
+		...(away ? { disconnected: true } : {}),
+	} as Chat.Run);
+	for (let status of statuses) {
+		for (let away of [undefined, true] as const) {
+			let item = run(status, away);
+			expectPlainWords(`a ${status} run's label`, [runStatusLabel(item)]);
+			expectPlain(`a ${status} run's note about its machine`, [disconnectedNote(item)]);
+			for (let offline of [false, true]) {
+				let markup = render(createElement(RunStack, {
+					offline,
+					onPause: () => {},
+					onResume: () => {},
+					onShowDecisions: () => {},
+					runs: [item],
+				}));
+				expectPlainWords(`a ${status} run card`, words(markup));
+				// While the page's offline notice shows, nothing on a card is about the machine.
+				if (offline) {
+					expect(decode(markup), `a ${status} run card offline`).not.toMatch(
+						/disconnected|machine|reconnect|Last reported/i,
+					);
+				}
+			}
+		}
+	}
+	let away = render(createElement(RunStack, { onPause: () => {}, runs: [run("running", true)] }));
+	expect(decode(away)).toContain("Pause a-running-run when the machine reconnects");
+	expect(decode(away)).toContain("It carries on when the machine reconnects.");
+	let asking = render(
+		createElement(RunStack, { onShowDecisions: () => {}, runs: [run("waiting")] }),
+	);
+	expect(asking).toContain("Waiting on 2 Decisions");
+});
+
+test("what a message's analysis, its evidence and a failed background job say is plain", () => {
+	let rows = [{
+		optionId: "sso",
+		label: "Enterprise SSO",
+		origin: "planner",
+		supporters: [],
+		opposers: [],
+		items: [],
+		rationale: "Enterprise customers expect SAML.",
+		source: {
+			author: { kind: "agent" },
+			quote: "Enterprise customers expect SAML.",
+			messageId: "m",
+			start: 0,
+			end: 1,
+		},
+	}];
+	let evidence = render(createElement(EvidencePopover, { rows, onSource: () => {} } as never));
+	expect(evidence).toContain("Chopin suggested");
+	expectPlainWords("the evidence", words(evidence));
+	let jobs = render(createElement(PlannerJobDiagnostics, {
+		canEdit: true,
+		jobs: [{ id: "j", kind: "refine", status: "failed", reason: "x" }] as ConversationPlan.Job[],
+		onRetryJob: async () => {},
+	}));
+	expectPlainWords("the background jobs", [...words(jobs), JOB_RETRY_FAILED]);
+});
+
+test("the setup Build plan offers and the Machines page speak of machines, replies and teammates' work, not of Planners", () => {
+	expectPlain("the setup", [...Object.values(SETUP), SHARE_DETAIL]);
+	expect(SETUP.label).toBe("Connect a machine");
+	let machine = {
+		id: "m1",
+		label: "build-box",
+		autoRun: false,
+		createdAt: 1,
+		lastSeenAt: 2,
+		connected: true,
+		reauthorize: false,
+		version: "0.1.5",
+		hostname: "build-box.local",
+		platform: { os: "linux", arch: "x64" },
+		agent: { name: "GitHub Copilot CLI", version: "1.0.97" },
+		service: true,
+		planner: true,
+		favorite: false,
+		shared: true,
+	};
+	let table = render(createElement(YourMachines, {
+		owner: { login: "ada" },
+		machines: { machines: [machine], teammates: [], error: "", recommended: null } as never,
+	}));
+	expect(table).toContain("Can reply");
+	expectPlain("the Machines table", words(table));
 });
 
 /** A document with no tasks yet, so what is left to say about Build plan is why it must wait. */
@@ -289,7 +492,9 @@ test("every reason Build plan waits and every refusal Build shows is plain, mach
 		["accepted comments awaiting plan changes", undefined],
 		["implementation is already active", undefined],
 		["the queue is full", undefined],
+		["the reply queue is full", undefined],
 		["Planner is not running", undefined],
+		["Chopin is not running", undefined],
 		["write access is needed", undefined],
 		["this cannot be built", undefined],
 	] as const;
@@ -313,7 +518,7 @@ test("Build plan says it plainly and still opens how to connect a machine for th
 		);
 	// Needing a machine offers to connect one, in place of a button that cannot be pressed.
 	let connect = plan(CONNECT_MACHINE_TO_BUILD);
-	expect(connect).toContain("Connect Chopin");
+	expect(connect).toContain("Connect a machine");
 	expect(connect).not.toContain('aria-label="Build plan"');
 	// Any other reason leaves the inert button with the reason in its tooltip and description.
 	let reconnect = plan("Reconnect the machine to build");

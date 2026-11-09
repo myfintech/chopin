@@ -5,14 +5,35 @@ import {
 	machineButtonLabel,
 	machineRows,
 	offlineChoice,
+	plannerLastSeen,
+	plannerMachineName,
 	plannerRunsOn,
 	presence,
 	shownMachine,
 	showsMachineChoice,
 } from "./machine-choice";
 
+import { plannerShownAtOnce } from "./chat/planner-settle";
+import { plannerStatus, plannerWithheld } from "./chat/planner-status";
+
 import type { ChoosableMachine, MachineChoiceState } from "./machine-choice";
 import type { Machine, TeammateMachine } from "./machine-summary";
+
+/**
+ * What the status is told of the machine, with the list read after the socket's last word, as it is
+ * once the page has asked again, unless a case says the list is older.
+ */
+function told(
+	...[state, planner, viewer, loading, current = true]: [
+		MachineChoiceState | undefined,
+		Parameters<typeof plannerMachineName>[1],
+		string,
+		boolean,
+		boolean?,
+	]
+) {
+	return plannerMachineName(state, planner, viewer, loading, current);
+}
 
 const NOW = Date.UTC(2026, 9, 14, 12);
 
@@ -254,12 +275,43 @@ test("the choice is read again when a teammate's shared machine goes offline or 
 	expect(presence([box])).toBe(presence([box], []));
 });
 
-test("names the machine a Planner is starting on or dropped from, only when the person can see it", () => {
-	let runner = (planner: NonNullable<MachineChoiceState["planner"]>) => state({ planner });
+test("names the machine a Planner is starting on or dropped from only when it is the one the document runs on", () => {
+	let both = [machine(), machine({ id: "M_laptop", label: "laptop" }), teammateMachine()];
+	let runner = (
+		planner: NonNullable<MachineChoiceState["planner"]>,
+		base = state({ choice: "M_box" }),
+	) => ({
+		...base,
+		machines: both,
+		planner,
+	});
 	let on = { login: "mona", machine: "M_box" };
 	expect(plannerRunsOn(runner({ state: "starting", ...on }))).toBe("build-box");
 	expect(plannerRunsOn(runner({ state: "disconnected", ...on }))).toBe("build-box");
-	// A machine the person cannot list is not named, so the status names whose it is instead.
+	// With no choice, the machine Automatic uses now is the one the button names.
+	let automatic = state({ automatic: { id: "M_box", label: null } });
+	expect(plannerRunsOn(runner({ state: "starting", ...on }, automatic))).toBe("build-box");
+	// Another machine of the person's own than the one the document runs on is not named: a list
+	// read before the choice changed still describes it, and the status waits for the list to agree.
+	let laptop = { login: "mona", machine: "M_laptop" };
+	expect(plannerRunsOn(runner({ state: "starting", ...laptop }))).toBeUndefined();
+	expect(plannerRunsOn(runner({ state: "disconnected", ...laptop }))).toBeUndefined();
+	expect(plannerRunsOn(runner({ state: "starting", ...laptop }, automatic))).toBeUndefined();
+	expect(plannerRunsOn(runner({ state: "starting", ...laptop }, state()))).toBeUndefined();
+	// It is named once it is the document's own.
+	expect(plannerRunsOn(runner({ state: "starting", ...laptop }, state({ choice: "M_laptop" }))))
+		.toBe("laptop");
+	// A teammate's machine is named when it is the document's own, the one its button names.
+	let theirs = { state: "starting" as const, login: "casey", machine: "M_theirs" };
+	expect(plannerRunsOn(runner(theirs, state({ choice: "M_theirs" })))).toBe("desk");
+	expect(plannerRunsOn(runner(theirs, state({ automatic: { id: "M_theirs", label: null } }))))
+		.toBe("desk");
+	// Not when the document runs on another machine, or none is known yet: whose it is is said
+	// instead, never its name.
+	expect(plannerRunsOn(runner(theirs, state({ choice: "M_box" })))).toBeUndefined();
+	expect(plannerRunsOn(runner(theirs, state()))).toBeUndefined();
+	expect(plannerRunsOn(runner({ ...theirs, state: "disconnected" }))).toBeUndefined();
+	// A machine the person cannot list is not named either.
 	expect(plannerRunsOn(runner({ state: "starting", login: "mona", machine: "M_other" })))
 		.toBeUndefined();
 	// Attached is healthy, held is another account's, and none runs nowhere.
@@ -268,4 +320,212 @@ test("names the machine a Planner is starting on or dropped from, only when the 
 	expect(plannerRunsOn(runner({ state: "none", login: null, machine: null }))).toBeUndefined();
 	expect(plannerRunsOn(undefined)).toBeUndefined();
 	expect(plannerRunsOn(state())).toBeUndefined();
+});
+
+function starting(login: string) {
+	return { state: "starting" as const, login };
+}
+
+test("gives the time a machine of the person's own, or the document's, was last seen only while it is offline", () => {
+	let away = machine({ connected: false, lastSeenAt: NOW - 3_600_000 });
+	let dropped = (planner: NonNullable<MachineChoiceState["planner"]>, machines = [away]) =>
+		state({ choice: "M_box", machines, planner });
+	let on = { login: "mona", machine: "M_box" };
+	expect(plannerLastSeen(dropped({ state: "disconnected", ...on }))).toBe(
+		new Date(NOW - 3_600_000).toISOString(),
+	);
+	// Connected, it was seen just now, which is no news: the Planner alone is what dropped.
+	expect(plannerLastSeen(dropped({ state: "disconnected", ...on }, [machine()]))).toBeUndefined();
+	expect(plannerLastSeen(dropped({ state: "starting", ...on }))).toBeUndefined();
+	expect(plannerLastSeen(dropped({ state: "attached", ...on }))).toBeUndefined();
+	// Not one the status names, not a time it may borrow.
+	expect(plannerLastSeen(dropped({ state: "disconnected", login: "mona", machine: "M_x" })))
+		.toBeUndefined();
+	let other = machine({
+		id: "M_other",
+		label: "other",
+		connected: false,
+		lastSeenAt: NOW - 7_200_000,
+	});
+	expect(
+		plannerLastSeen(
+			dropped({ state: "disconnected", login: "mona", machine: "M_other" }, [away, other]),
+		),
+	).toBeUndefined();
+	expect(plannerLastSeen(undefined)).toBeUndefined();
+});
+
+test("names a machine only for the runner the socket describes: a poll of another account's Planner says nothing", () => {
+	let alice = { login: "alice", avatarUrl: "" };
+	let boxA = teammateMachine({ id: "M_a", label: "Box A", owner: alice });
+	let polled = state({
+		choice: "M_a",
+		machines: [machine(), boxA],
+		planner: { state: "starting", login: "alice", machine: "M_a" },
+	});
+	// The poll and the socket describe alice's Planner: the machine is named.
+	expect(told(polled, starting("alice"), "mona", true)).toBe("Box A");
+	// bob's Planner dropped after the poll was read: Box A is not his machine, nor said of him.
+	expect(told(polled, { state: "disconnected", login: "bob" }, "mona", true))
+		.toBeNull();
+	expect(told(polled, starting("bob"), "mona", true)).toBeNull();
+	let failing = { ...starting("bob"), failure: { attempts: 3, reason: "exit 1", at: "x" } };
+	expect(told(polled, failing, "mona", true)).toBeNull();
+	// A machine of the viewer's own is polled with no login, and is theirs: the socket must say
+	// their own account, whatever its case.
+	let own = state({
+		choice: "M_box",
+		planner: { state: "starting", login: null, machine: "M_box" },
+	});
+	expect(told(own, starting("Mona"), "mona", true)).toBe("build-box");
+	expect(told(own, starting("bob"), "mona", true)).toBeNull();
+	// Nothing is lent where nobody names a machine anyway.
+	expect(told(polled, { state: "held", login: "bob", until: "x" }, "mona", true))
+		.toBeUndefined();
+	expect(told(polled, { state: "none" }, "mona", true)).toBeUndefined();
+});
+
+test("waits for the list when it names a teammate's machine for the person's own Planner, and names a teammate's by its owner", () => {
+	let both = [machine(), teammateMachine()];
+	let listed = state({ machines: both });
+	// Their machines are loading: nothing yet, but only where they will load.
+	expect(told(undefined, starting("mona"), "mona", true)).toBeNull();
+	expect(told(undefined, starting("mona"), "mona", false)).toBeUndefined();
+	// Named when the list names it.
+	let named = {
+		...listed,
+		choice: "M_box",
+		planner: { state: "starting" as const, login: "mona", machine: "M_box" },
+	};
+	expect(told(named, starting("mona"), "mona", true)).toBe("build-box");
+	// The list names a teammate's machine, which the document does not run on, while the person's
+	// own account is the one starting it: that name is not lent to it, nor their own login said.
+	let theirs = {
+		...listed,
+		planner: { state: "starting" as const, login: "casey", machine: "M_theirs" },
+	};
+	expect(told(theirs, starting("mona"), "Mona", true)).toBeNull();
+	expect(told(theirs, { state: "disconnected", login: "mona" }, "mona", true))
+		.toBeNull();
+	// Someone else's machine is named by its owner's login, which the status writes.
+	expect(told(theirs, starting("casey"), "mona", true)).toBeUndefined();
+	// A Planner the list knows nothing of, such as an agent client of their own with no machine,
+	// is the status's to name by login.
+	let alone = { ...listed, planner: { state: "none" as const, login: null, machine: null } };
+	expect(told(alone, starting("mona"), "mona", true)).toBeUndefined();
+	expect(told(alone, { state: "disconnected", login: "mona" }, "mona", true))
+		.toBeUndefined();
+	// Nothing to name while it is attached or no machine is asked.
+	expect(told(alone, { state: "attached", login: "mona" }, "mona", true))
+		.toBeUndefined();
+	expect(told(alone, { state: "none" }, "mona", true)).toBeUndefined();
+});
+
+test("names a machine only when it is the one the document runs on, and says nothing while a list still describes another machine of the person's own", () => {
+	let boxA = machine({ id: "M_a", label: "Box A" });
+	let boxB = machine({ id: "M_b", label: "Box B" });
+	let listed = (
+		planner: NonNullable<MachineChoiceState["planner"]>,
+		base: Partial<MachineChoiceState> = { choice: "M_b" },
+	) => state({ machines: [boxA, boxB], planner, ...base });
+	let onA = { login: null, machine: "M_a" };
+	let onB = { login: null, machine: "M_b" };
+	let failure = { attempts: 3, reason: "exit 1", at: new Date(NOW).toISOString() };
+	let words = [
+		starting("mona"),
+		{ state: "disconnected" as const, login: "mona" },
+		{ ...starting("mona"), failure },
+	];
+	// The document was set to run on Box B after the list was read, and the list still says the
+	// Planner is on Box A, the person's own as well: Box A is not named, nor is anything said.
+	for (let word of words) {
+		for (let runner of ["starting", "disconnected"] as const) {
+			expect(told(listed({ state: runner, ...onA }), word, "mona", true)).toBeNull();
+		}
+	}
+	// With no choice, the machine Automatic uses now is the one the button names.
+	let automatic = { choice: null, automatic: { id: "M_b", label: "Box B" } };
+	for (let word of words) {
+		expect(told(listed({ state: "starting", ...onA }, automatic), word, "mona", true))
+			.toBeNull();
+	}
+	// The list catches up, and the document's own machine is named.
+	for (let word of words) {
+		expect(told(listed({ state: "starting", ...onB }), word, "mona", true))
+			.toBe("Box B");
+		expect(told(listed({ state: "disconnected", ...onB }), word, "mona", true))
+			.toBe("Box B");
+		expect(told(listed({ state: "starting", ...onB }, automatic), word, "mona", true))
+			.toBe("Box B");
+	}
+	// Another account's Planner on that machine is told by its login, as the status writes it.
+	expect(told(listed({ state: "starting", ...onA }), starting("casey"), "mona", true))
+		.toBeUndefined();
+});
+
+test("says nothing of a machine while the list was read before the socket's word, however well it agrees with itself", () => {
+	let boxB = machine({ id: "M_b", label: "Box B" });
+	let listed = state({
+		choice: "M_b",
+		machines: [machine({ id: "M_a", label: "Box A" }), boxB],
+		planner: { state: "starting", login: null, machine: "M_b" },
+	});
+	let failure = { attempts: 3, reason: "exit 1", at: new Date(NOW).toISOString() };
+	let words = [
+		starting("mona"),
+		{ state: "disconnected" as const, login: "mona" },
+		{ ...starting("mona"), failure },
+	];
+	for (let word of words) {
+		// It names Box B, which is the choice and where the Planner was: the Planner may have moved
+		// since, so it says nothing until a read that began after the word has answered.
+		expect(told(listed, word, "mona", true, false)).toBeNull();
+		expect(told(listed, word, "mona", true, true)).toBe("Box B");
+	}
+	// Whose machine it is by login waits as well: the list is how it is known not to be the person's own.
+	let mine = state({ machines: [] });
+	expect(told(mine, starting("casey"), "mona", true, false)).toBeNull();
+	expect(told(mine, starting("casey"), "mona", true, true)).toBeUndefined();
+	// A word that names no machine anyway, and a page with no list to be older, are unaffected.
+	for (let word of [{ state: "attached" as const, login: "mona" }, { state: "none" as const }]) {
+		expect(told(listed, word, "mona", true, false)).toBeUndefined();
+	}
+	expect(told(undefined, starting("mona"), "mona", false, false)).toBeUndefined();
+	expect(told(undefined, starting("mona"), "mona", true, false)).toBeNull();
+});
+
+test("a word that waits for a newer read of the list says nothing, never what the status said of an older word, and is drawn at once", () => {
+	let listed = state({
+		choice: "M_box",
+		planner: { state: "starting", login: null, machine: "M_box" },
+	});
+	let failure = { attempts: 3, reason: "exit 1", at: new Date(NOW).toISOString() };
+	// What the status said of the word before, from a list that named Box B.
+	let before = plannerStatus(starting("mona"), "Box B");
+	expect(before).toBeDefined();
+	for (
+		let word of [
+			starting("mona"),
+			{ state: "disconnected" as const, login: "mona" },
+			{ ...starting("mona"), failure },
+		]
+	) {
+		let name = told(listed, word, "mona", true, false);
+		expect(name).toBeNull();
+		expect(plannerWithheld(word, name)).toBe(true);
+		let status = plannerStatus(word, name);
+		// Nothing, not the earlier status, and not held for the list: it is drawn as nothing at once.
+		expect(status).toBeUndefined();
+		expect(plannerShownAtOnce(before, status)).toBe(true);
+		// A read that began after the word names it, and the word is no longer withheld.
+		let named = told(listed, word, "mona", true, true);
+		expect(named).toBe("build-box");
+		expect(plannerWithheld(word, named)).toBe(false);
+		expect(plannerStatus(word, named)).toBeDefined();
+	}
+	// What names no machine, and says a state clearing, goes at once and is not withheld.
+	for (let word of [{ state: "attached" as const, login: "mona" }, { state: "none" as const }]) {
+		let name = told(listed, word, "mona", true, false);
+		expect(plannerWithheld(word, name)).toBe(false);
+	}
 });

@@ -23,6 +23,7 @@ The most useful technical references are:
 - [Background jobs and workers](docs/background-jobs.md)
 - [Experimental implementation lifecycle](docs/implementation-lifecycle.md)
 - [Self-hosting](docs/self-hosting.md)
+- [Deploys nobody can see](docs/zero-downtime-deploys.md)
 
 ## Commands
 
@@ -116,10 +117,15 @@ MDAST object identity preserves existing Lexical nodes, selections, and undo
 history.
 
 PostgreSQL is the only runtime storage adapter. One renewable `chopin:writer`
-lease permits one application process per database. Hosted browser sessions use
-encrypted credentials in PostgreSQL and restore on presentation of the browser
-cookie. Startup clears Planner ownership and metadata-only local sessions;
-collaborative state and external implementation runs are durable.
+lease permits one application process per database. A second process started with
+`HANDOVER=wait` waits beside the holder in standby, reading the lease without a lock,
+and takes it when the holder's cut releases it; only the holder serves.
+[Deploys nobody can see](docs/zero-downtime-deploys.md) gives the order and the proxy
+it needs. Hosted browser sessions use encrypted credentials in PostgreSQL and restore
+on presentation of the browser cookie. Startup clears Planner ownership, except a
+remote Planner's persisted hand-over hold, and metadata-only local sessions;
+collaborative state, saved Planner requests and external implementation runs are
+durable.
 
 ## Authority and security
 
@@ -157,7 +163,8 @@ collaborative state and external implementation runs are durable.
   client sees what a turn sees and steers its document writes. Attaching makes
   the account's live browser login the document's Planner owner, one client per
   document; nothing else claims ownership. `@chopin` and `invoke_planner` on a
-  document without one fail with `planner-not-attached`. Signing out the
+  document without one are saved as durable rows, shown as sent and delivered
+  when a Planner takes them, also under `AUTH_MODE=local`. Signing out the
   owner's login, its expiry, or a Planner reset closes the link. A lost
   connection never ends work by itself: a link that offered
   `resumable-sessions` and then dropped unexpectedly keeps its sessions that hold
@@ -171,9 +178,21 @@ collaborative state and external implementation runs are durable.
   another machine, archiving the document, or the same account attaching with a client that
   does not resume (a browser sign-in over a machine's parked work included) ends it; no other
   close keeps it.
-  A server restart, graceful or not, forgets the sessions (a client's `resume` finds
-  nothing) and leaves the Decisions open, and the cards come back stopped and stay so
-  until a session is started again; a graceful shutdown posts no Chat line about it. A same-account
+  A restart keeps what the cut writes to `planner_link_holds`: the sessions a client holds,
+  the questions it waits on (with the decisions each asked, which the next process waits on
+  again so a member's answer reaches the client's own request), the answers it is owed and the
+  Stops it has not heard. Until its window (`HANDOVER_PLANNER_WINDOW_MS`, counted from the
+  release of the lease: the next process starts it as it rebuilds the hold, so no step between
+  the write and the release, however slow, and no late takeover takes anything from it; only a
+  row the cut wrote more than an hour before is no window's) ends, a hold whose link the cut
+  closed is shown as attached. A `resume` inside the window is never refused: before the owner's
+  browser sign-in is back it waits for it, with the link kept and the machine shown attached, and
+  takes the sessions back the moment it is; one still without it once the window is over is
+  refused `unavailable` with `retry`. Only that process is given the window: it rewrites the
+  row without it before it shows the hold, so a process that starts after it crashed, inside the
+  window or after it, finds the hold disconnected. A crash keeps only
+  the hold of a link that had already dropped. Without a `resume` the hold turns disconnected
+  when the window ends. A graceful shutdown posts no Chat line about it. A same-account
   client that returns before the server noticed its old link died takes that link's work
   over with its first `resume`. A paired machine's Planner backend attaches with a document-scoped
   credential instead and owns through a cookie-less login carrying the machine's
@@ -225,6 +244,30 @@ The web composer uses `packages/protocol/address.ts` to translate `@chopin` into
 destination is authoritative on the server. Do not describe `@chopin` as a server
 authorization boundary: a custom write-authorized client can send an explicit
 Planner destination without a mention.
+
+A message to the Planner leaves the composer at once. The browser shows it from
+its outbox (`apps/web/src/chat/delivery.ts`), marked as waiting to send, until
+the server's entry for the same request ID arrives; it then carries
+`Entry.deliveryState` (sent, delivered). Delivered means the prompt is on its way
+to the machine, after a session is open there; a request whose session cannot be
+opened stays sent and waits to be tried again. The outbox sends one message at a
+time, oldest first, once the current connection's transcript has arrived, and only
+to a server that acknowledges sends. A refused send or a `failed` entry says
+"Couldn't send" on the message with Try again and Delete, never in a strip above
+the composer, and not while the page's offline notice shows. A refusal with a passing reason is not a
+refusal of the message: a full queue behind a running turn (`planner-queue-full`, twenty requests; a
+machine that is away has no bound, and keeps every request until it is back, as a chat app keeps
+a message for someone offline) or a storage, room or authorization trouble that will pass
+(`temporarily-unavailable`). The browser keeps the message waiting to send and sends it
+again, in order and with the same request ID, once there may be room. Only a refusal with neither
+code is final.
+A message already put on the wire can still be deleted, whatever the server last answered it
+(an earlier attempt of one it turned down for a passing reason may have been kept): the server is
+told to drop it, and a late send cannot bring it back. One it kept, though the commit's answer
+was lost, is put back in the queue and the transcript, in its place, when the same request is sent
+again, when the queue next starts and when the document opens again, and is delivered once and in
+order; a person's request for a machine that is away is never turned away for how many are being
+saved at once, whether sent from Chat, by an MCP call or as a task draft.
 
 `instruction()` strips the mention before model input. Recent room messages that
 did not address the Planner still enter a bounded backscroll for the next turn.
@@ -437,7 +480,22 @@ so merge ranges from all mounted editors before replacing a registry entry.
   request carries its own identity, as `chat:send` does, may send it again quietly.
   For `RESTART_QUIET_MS` after a 1012 `Wire` raises no `onOutage`, so the document's one
   offline notice stays away, and every other surface that speaks of a lost connection
-  waits `useConnectionNotice(lost, wire.restarting)`; a new one must honour both.
+  waits `useConnectionNotice(lost, wire.restarting)`; a new one must honour both. What the
+  page draws holds through that quiet too (`readsConnected` for Build plan and the editors'
+  controls, `quietRestart` for Chat's hint and composer): a control that comes and goes with the
+  connection must not change for a restart, and `e2e/handover.e2e.ts` samples them.
+- The cut has a fixed order (`apps/server/src/handover/cut.ts`, held by its test): readiness
+  off for the whole unready window while everything is still served, then the listener stops,
+  in-flight requests finish, edits stop and commit, link state is persisted, the lease is
+  released, and only then do clients hear `session:restarting` and lose their sockets. A
+  process answers nothing after it releases the lease, and refuses nothing it was routed.
+  Before SIGTERM's cut it keeps serving and starts no new Planner turn. Do not move a step
+  across the release or the listener stop, and do not make readiness depend on a query.
+  `Chat.close` waits for every send already admitted before it marks the Chat closed, so a
+  message being saved at the cut is saved and answered; a `chat:send` that reaches a closed Chat
+  of a stopping process (`holdStarts`) is answered with nothing, never "chat is closed", because
+  its browser sends it again to the next process and must not show it as one that could not be
+  sent.
 - Room opening and closing share the document lifecycle lock. Opening waits for
   an active close; eviction forgets the room only after runtime shutdown and
   persistence complete. Preserve that ordering.
@@ -500,6 +558,13 @@ so merge ranges from all mounted editors before replacing a registry entry.
 - Coolify preview variables that must remain late-bound use direct `${NAME}`
   references. A `${NAME:-default}` can be resolved from production before the
   preview environment is attached.
+- The deploy that overlaps two processes needs a proxy that checks `/api/health/ready`
+  actively and holds requests; `deploy/overlap` is a local reference, not a production
+  file. A stopped Compose slot's name does not resolve, so a deploy script waits for the
+  proxy to see the new slot before it stops the old one (`scripts/overlap.ts` does).
+  `scripts/deploy-under-load.ts` is the many-client version, run by hand or from the
+  `deploy under load` workflow and never as part of `bun test`; strict invisibility is switched
+  on only after it passes on the built image.
 - The Docker image expects internal port 8787. Changing `PORT` alone breaks its
   health check and routing assumptions.
 - Bun wrapper processes can outlive a failed child. The development and E2E

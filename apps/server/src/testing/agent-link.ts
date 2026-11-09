@@ -1,7 +1,7 @@
 import { createConnection, createServer } from "node:net";
 
 import { AGENT_PATH, AGENT_SUBPROTOCOL } from "@chopin/agent-link";
-import { agentUrl, connectAgent } from "@chopin/agent-link/client";
+import { AgentRefused, agentUrl, connectAgent, WIRE } from "@chopin/agent-link/client";
 
 import { AdmissionDenied } from "../auth/admission";
 import { GitHubError } from "../github/client";
@@ -14,7 +14,7 @@ import type { AgentClient, AgentHandlers, TurnContext } from "@chopin/agent-link
 import type { AddressInfo, Socket } from "node:net";
 import type { ServerWebSocket } from "bun";
 import type { Repository, RepositoryPage } from "../github/client";
-import type { AttachmentAuth } from "../harness/remote/attachments";
+import type { AttachmentAuth, PlannerAttachmentOptions } from "../harness/remote/attachments";
 import type { AgentAuth, AgentSocketData } from "../harness/remote/endpoint";
 import type { AgentLink } from "../harness/remote/link";
 import type { MachinePlanners } from "../harness/remote/machine-planners";
@@ -67,7 +67,14 @@ function scoreRepository(owner: string, name: string, push: boolean): Repository
  * account without access, the denied account fails admission, and every other
  * token is rejected by GitHub.
  */
-export async function linkAuth(channelId?: string) {
+/** What a hosted process keeps a browser login with: the encrypted credentials a restart restores. */
+export const LINK_PERSISTENCE = {
+	key: new Uint8Array(32).fill(5),
+	origin: "https://chopin.test",
+	clientId: "link-test",
+};
+
+export async function linkAuth(channelId?: string, options: { persistent?: boolean } = {}) {
 	let storage = new MemoryStorage();
 	let now = new Date();
 	for (let account of Object.values(ACCOUNTS)) {
@@ -76,6 +83,7 @@ export async function linkAuth(channelId?: string) {
 	let clock = { skewMs: 0 };
 	let revocations = new Set<(sessionId: string) => Promise<void>>();
 	let sessions = new Sessions(storage, false, () => new Date(Date.now() + clock.skewMs), {
+		...(options.persistent ? { persistence: LINK_PERSISTENCE } : {}),
 		onRevoked: async id => {
 			for (let revoked of revocations) await revoked(id);
 		},
@@ -214,10 +222,11 @@ export function linkServer(
 	graceMs = 2_000,
 	liveness?: { pingEveryMs: number; pongTimeoutMs: number; maxSilenceMs?: number },
 	planners?: MachinePlanners,
+	holds: { attachments?: PlannerAttachments; options?: PlannerAttachmentOptions } = {},
 ) {
 	let links: AgentLink[] = [];
 	let sockets = new Set<ServerWebSocket<AgentSocketData>>();
-	let attachments = new PlannerAttachments(auth, graceMs);
+	let attachments = holds.attachments ?? new PlannerAttachments(auth, graceMs, holds.options);
 	let server = Bun.serve<AgentSocketData>({
 		hostname: "127.0.0.1",
 		port: 0,
@@ -643,6 +652,46 @@ export function attach(
 ): Promise<AgentClient> {
 	// Tests of a drop that ends everything need a client that does not ask to be resumed.
 	return connectAgent({ url, token, document, handlers, resumable: false });
+}
+
+/**
+ * What a backend does after its link was closed because the server is restarting, as
+ * docs/agent-connection.md states the `restart-notice` rule: connect again at once, and retry a
+ * `resume` the server refused with `retry` every 250 ms until the `reconnectWithinMs` the server
+ * announced has passed, then on the backend's own backoff (`fallbackMs`). Any other refusal is
+ * final and thrown. Resolves with the client that got its sessions back.
+ */
+export async function resumeAfterRestart(
+	previous: AgentClient,
+	options: {
+		url: string;
+		document: string;
+		handlers: AgentHandlers;
+		token?: string;
+		fallbackMs?: number;
+	},
+): Promise<{ client: AgentClient; attempts: number }> {
+	let closed = await previous.closed;
+	let resume = await previous.resumption;
+	if (!resume) throw new Error("The link held nothing to resume.");
+	let deadline = Date.now() + (closed.reconnectWithinMs ?? 0);
+	for (let attempts = 1;; attempts++) {
+		try {
+			let client = await connectAgent({
+				url: options.url,
+				token: options.token ?? MEMBER_TOKEN,
+				document: options.document,
+				handlers: options.handlers,
+				resume,
+			});
+			return { client, attempts };
+		} catch (error) {
+			if (error instanceof AgentRefused && !error.retry) throw error;
+			await Bun.sleep(
+				Date.now() < deadline ? WIRE.restartResumeRetryMs : options.fallbackMs ?? 1_000,
+			);
+		}
+	}
 }
 
 /**

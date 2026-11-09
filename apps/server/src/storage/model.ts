@@ -418,6 +418,11 @@ export type CommitChannel = {
 	researchProjections?: ResearchProjectionChange[];
 	/** Lifecycle and shutdown maintenance may persist after document archival. */
 	allowArchived?: boolean;
+	/**
+	 * Deferred Planner turns written or moved in this commit's transaction, so a request is
+	 * durable no later than the entry that acknowledges it. A repeated operation applies none.
+	 */
+	deferredTurns?: DeferredTurnChange[];
 	provenance?: ProvenanceChange;
 };
 
@@ -432,6 +437,8 @@ export class ResearchProjectionConflict extends StorageError {
 }
 
 export type CommitResult = {
+	/** What each of the commit's `deferredTurns` did, in the same order; absent for a repeat. */
+	deferredTurns?: DeferredTurnOutcome[];
 	sidecar?: JsonValue;
 	/** Present when the operation synchronizes an authored title. */
 	channel?: ChannelRecord;
@@ -940,3 +947,187 @@ export type Lease = {
 	fencing: number;
 	expiresAt: Date;
 };
+
+/**
+ * A lease as a plain read finds it, without taking it or queueing behind its holder. `free` is
+ * judged on the storage's own clock: the lease was released or its time ran out.
+ */
+export type LeasePeek = { lease: Lease; free: boolean };
+
+/**
+ * A question a remote Planner's client still waits on, as a restart keeps it: the kind of request
+ * and the decisions it asked, which is what its answer is built from in the process that takes over.
+ */
+export type PlannerAskedInput = {
+	request: string;
+	method: "questionnaire" | "confirm" | "select" | "input" | "editor";
+	decisions: string[];
+};
+
+/** What one session of a remote Planner's client keeps across a link that dropped. */
+export type PlannerHeldSession = {
+	id: string;
+	/** Request ids of the questions the client still waits on. */
+	waiting: string[];
+	/** What each of those whose decisions exist needs to be answered again after a restart. */
+	asked?: PlannerAskedInput[];
+	/** Answers the client has not acknowledged. */
+	owed: JsonValue[];
+	/** Stops pressed while the link was down, for the client to hear first. */
+	stops: JsonValue[];
+};
+
+/**
+ * A document's remote Planner as its link left it, for the process that takes over to rebuild.
+ * Holds nothing a person typed and no secret: the owner's login is a session id.
+ */
+export type PlannerLinkHold = {
+	channelId: string;
+	userId: string;
+	login: string;
+	/**
+	 * The browser login session that owns the document's Planner; the hold goes with it. Absent
+	 * for a paired machine's hold, whose delegated login lasts only as long as one process: the
+	 * machine's next attach makes a new one, and the hold goes with the machine.
+	 */
+	ownerSessionId?: string;
+	/** The stored Planner owner's generation the hold was made under. */
+	generation: number;
+	/** The paired machine whose delegated login owns the document, by id and label. */
+	machineId?: string;
+	machine?: string;
+	/** Empty for a link that was live with nothing to resume. */
+	sessions: PlannerHeldSession[];
+	suspendedAt: Date;
+	/** Set when a cut closed the link: until then a returning client is not shown as gone. */
+	handoverUntil?: Date;
+};
+
+export type StoredPlannerLinkHold = PlannerLinkHold & {
+	/** The writer lease the hold was last written under. */
+	fencing: number;
+};
+
+/** A paired machine's Planner credential, known by the digest of its token and never the token. */
+export type PlannerCredential = {
+	/** SHA-256 of the credential. */
+	digest: Uint8Array;
+	machineId: string;
+	channelId: string;
+	expiresAt: Date;
+};
+
+export type McpSession = {
+	id: string;
+	userId: string;
+	clientName: string;
+	clientVersion: string;
+	createdAt: Date;
+	lastSeenAt: Date;
+};
+
+export const DEFERRED_TURN_KINDS = [
+	"composer",
+	"invoke_planner",
+	"invoke_system",
+	"comment",
+	"draft",
+] as const;
+export type DeferredTurnKind = (typeof DEFERRED_TURN_KINDS)[number];
+
+export const DEFERRED_TURN_STATES = [
+	"waiting",
+	"started",
+	"ended",
+	"interrupted",
+	"cancelled",
+] as const;
+export type DeferredTurnState = (typeof DEFERRED_TURN_STATES)[number];
+
+/**
+ * Why Chopin cancelled a request it could not run, for what its sender is told: the agent was
+ * reset, the sender can no longer write, or the document is gone. A request its sender took back
+ * or a comment whose thread was resolved has none.
+ */
+export const DEFERRED_CANCEL_REASONS = ["agent", "access", "unavailable"] as const;
+export type DeferredCancelReason = (typeof DEFERRED_CANCEL_REASONS)[number];
+
+/** An acknowledged Planner request whose turn had not started, kept until it runs or is resolved. */
+export type DeferredTurn = {
+	id: string;
+	/** The root document whose Chat and Planner the request is for. */
+	documentId: string;
+	/** What the acknowledgement named; unique within the document. */
+	requestId: string;
+	kind: DeferredTurnKind;
+	handle: string;
+	userId: string;
+	/** Empty for a comment, whose prompt is built from its thread when it starts. */
+	text: string;
+	references: JsonValue[];
+	/** A composer message's destination and fingerprints, for recognising a retried send. */
+	delivery?: JsonValue;
+	focusChannelId?: string;
+	focusTitle?: string;
+	/** The comment thread, and the child holding it when it is not in the document. */
+	threadId?: string;
+	threadChannelId?: string;
+	/** The revision a task draft was asked for. */
+	planRevision?: number;
+	claimantSessionId?: string;
+	ownerSessionIdAtAccept?: string;
+	state: DeferredTurnState;
+	createdAt: Date;
+	/** The writer lease the latest transition was written under. */
+	fencing: number;
+	resolvedAt?: Date;
+	/** Set only on a cancelled turn, when Chopin cancelled it. */
+	cancelReason?: DeferredCancelReason;
+};
+
+export type NewDeferredTurn = Omit<
+	DeferredTurn,
+	"state" | "fencing" | "resolvedAt" | "cancelReason"
+>;
+
+/**
+ * Moves one turn from the state it is expected to be in. Only `waiting` to `started` or
+ * `cancelled`, and `started` to `ended` or `interrupted`, are legal; anything else changes nothing.
+ */
+export type DeferredTurnTransition = {
+	id: string;
+	from: DeferredTurnState;
+	to: DeferredTurnState;
+	at: Date;
+	/** Why Chopin cancelled it; kept only with a move to `cancelled`. */
+	reason?: DeferredCancelReason;
+};
+
+export type DeferredTurnChange =
+	| { action: "insert"; turn: NewDeferredTurn }
+	| ({ action: "transition" } & DeferredTurnTransition);
+
+export type DeferredTurnOutcome =
+	| {
+		action: "insert";
+		/**
+		 * `repeated`: the document already has this request, returned as it first was.
+		 * `thread-waiting`: a comment thread already has a waiting turn, returned, and nothing was
+		 * written.
+		 */
+		status: "inserted" | "repeated" | "thread-waiting";
+		turn: DeferredTurn;
+	}
+	| { action: "transition"; changed: true; turn: DeferredTurn }
+	| {
+		action: "transition";
+		changed: false;
+		/** No such row, a pair the states do not allow, or a row not in the state asked for. */
+		reason: "missing" | "illegal" | "state";
+		turn?: DeferredTurn;
+	};
+
+export function legalDeferredTransition(from: DeferredTurnState, to: DeferredTurnState): boolean {
+	return (from === "waiting" && (to === "started" || to === "cancelled"))
+		|| (from === "started" && (to === "ended" || to === "interrupted"));
+}

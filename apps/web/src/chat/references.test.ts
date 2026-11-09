@@ -14,12 +14,16 @@ import {
 	prepareDraftSubmission,
 	reconcileReferenceDrafts,
 	referenceTrigger,
+	REPLIES_OFF,
+	repliesOffNotice,
 	restoreDraftSubmission,
 	reviseComposerDraft,
 	selectedReplacement,
+	sendFailure,
+	shownSendFailure,
 	withNoticesAfter,
 } from "./references";
-import { WireRefusal } from "../wire";
+import { WireLost, WireRefusal } from "../wire";
 
 import type { ReferenceDraft, ReferenceTarget } from "./references";
 
@@ -199,15 +203,23 @@ describe("textarea replacement reconciliation", () => {
 	});
 });
 
+describe("the strip for a server whose agent is off", () => {
+	test("says so plainly while the page is online, and nothing while the page's offline notice is up", () => {
+		expect(repliesOffNotice(false)).toEqual({ tone: "info", text: REPLIES_OFF });
+		expect(REPLIES_OFF).toBe("Replies are off on this server.");
+		expect(repliesOffNotice(true)).toBeUndefined();
+	});
+});
+
 describe("composer destination cue", () => {
 	test("says a message without @chopin stays in the room, and one with it goes to the Planner", () => {
 		expect(destinationCue("should we ask about auth first?", [], true)).toEqual({
 			to: "room",
-			text: "Room only. Add @chopin to ask the Planner",
+			text: "Sent to people here. Type @ to ask Chopin",
 		});
 		expect(destinationCue("@chopin draft the auth section", [], true)).toEqual({
 			to: "planner",
-			text: "Sends to the Planner, which will reply",
+			text: "Sends to Chopin, which will reply",
 		});
 	});
 
@@ -459,6 +471,56 @@ describe("acknowledged composer drafts", () => {
 		expect(bounded.length).toBeLessThanOrEqual(138);
 		expect(bounded).toEndWith("...");
 		expect(boundedChatError(new Error("connection lost"))).toContain("Check the connection");
+	});
+
+	test("knows a send the connection cut off from a refusal, and says the same of it", () => {
+		let cut = [
+			new WireLost("connection lost"),
+			new WireLost("disposed"),
+			new Error("not connected"),
+		];
+		for (let error of cut) {
+			expect(sendFailure(error)).toEqual({ text: boundedChatError(error), lost: true });
+			expect(sendFailure(error).text).toContain("Check the connection");
+		}
+		let refused = [
+			new WireRefusal("Unavailable"),
+			new WireRefusal("x".repeat(500)),
+			new WireRefusal(
+				"Still connecting to @mona's machine. Try again in a moment.",
+				"planner-not-attached",
+			),
+			new WireLost("document deleted"),
+		];
+		for (let error of refused) {
+			expect(sendFailure(error)).toEqual({ text: boundedChatError(error), lost: false });
+		}
+	});
+
+	test("tells a send the connection cut off only while the connection is up, and no failure at all while the page's offline notice shows", () => {
+		let cut = sendFailure(new WireLost("connection lost"));
+		let refused = sendFailure(new WireRefusal("Unavailable"));
+		let machine = sendFailure(
+			new WireRefusal(
+				"Still connecting to @mona's machine. Try again in a moment.",
+				"planner-not-attached",
+			),
+		);
+		// The page's offline notice speaks for a lost connection, so a blip and an outage alike
+		// leave nothing about the connection beside the composer.
+		expect(shownSendFailure(cut, false, false)).toBeUndefined();
+		expect(shownSendFailure(cut, false, true)).toBeUndefined();
+		expect(shownSendFailure(cut, true, false)).toBe(cut);
+		// Nor does a refusal sit beside that notice: two alerts would say two things were wrong.
+		// It is told before the notice shows and as soon as the connection is back, as it was.
+		for (let failure of [refused, machine]) {
+			expect(shownSendFailure(failure, true, false)).toBe(failure);
+			expect(shownSendFailure(failure, false, false)).toBe(failure);
+			expect(shownSendFailure(failure, false, true)).toBeUndefined();
+			expect(shownSendFailure(failure, true, true)).toBeUndefined();
+		}
+		expect(shownSendFailure(undefined, false, false)).toBeUndefined();
+		expect(shownSendFailure(undefined, true, true)).toBeUndefined();
 	});
 
 	test("shows the instructions for a missing machine whole, however long", () => {

@@ -33,12 +33,16 @@ function serve(sockets: OpenSockets) {
 	return server;
 }
 
-async function connect(server: Server<undefined>): Promise<{ closed: Promise<CloseEvent> }> {
+async function connect(
+	server: Server<undefined>,
+): Promise<{ closed: Promise<CloseEvent>; frames: unknown[] }> {
 	let client = new WebSocket(`ws://127.0.0.1:${server.port}/`);
 	clients.push(client);
+	let frames: unknown[] = [];
+	client.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
 	let closed = new Promise<CloseEvent>(resolve => client.addEventListener("close", resolve));
 	await new Promise(resolve => client.addEventListener("open", resolve, { once: true }));
-	return { closed };
+	return { closed, frames };
 }
 
 test("every open socket is closed with 1012, where server.stop(true) alone says 1001", async () => {
@@ -71,4 +75,64 @@ test("a socket that closed on its own is forgotten, and the listener stops takin
 	await sockets.stopForRestart(server);
 	expect((await staying.closed).code).toBe(SERVICE_RESTART);
 	await expect(fetch(`http://127.0.0.1:${server.port}/`)).rejects.toThrow();
+});
+
+test("a restart is announced to every open socket, with when to come back, before it is closed", async () => {
+	let sockets = new OpenSockets();
+	let server = serve(sockets);
+	let open = await Promise.all([connect(server), connect(server)]);
+	sockets.announceRestart(10_000);
+	await sockets.stopForRestart(server);
+	for (let socket of open) {
+		expect((await socket.closed).code).toBe(SERVICE_RESTART);
+		expect(socket.frames).toHaveLength(1);
+		expect(socket.frames[0]).toMatchObject({
+			kind: "session:restarting",
+			reconnectWithinMs: 10_000,
+		});
+	}
+});
+
+test("an agent link is told through its own protocol, and is sent no browser frame", async () => {
+	let sockets = new OpenSockets();
+	let restarts: number[] = [];
+	let server = Bun.serve<{ agent: boolean }>({
+		port: 0,
+		hostname: "127.0.0.1",
+		fetch(request, self) {
+			let agent = new URL(request.url).searchParams.has("agent");
+			if (self.upgrade(request, { data: { agent } })) return undefined;
+			return new Response("plain");
+		},
+		websocket: {
+			open(ws) {
+				sockets.opened(ws);
+			},
+			close(ws) {
+				sockets.closed(ws);
+			},
+			message() {},
+		},
+	});
+	let connectTo = async (query: string) => {
+		let client = new WebSocket(`ws://127.0.0.1:${server.port}/${query}`);
+		clients.push(client);
+		let frames: unknown[] = [];
+		client.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		let closed = new Promise<CloseEvent>(resolve => client.addEventListener("close", resolve));
+		await new Promise(resolve => client.addEventListener("open", resolve, { once: true }));
+		return { closed, frames };
+	};
+	let browser = await connectTo("");
+	let agent = await connectTo("?agent");
+	sockets.announceRestart(
+		10_000,
+		ws => (ws.data as { agent: boolean }).agent ? { restart: ms => restarts.push(ms) } : undefined,
+	);
+	await sockets.stopForRestart(server);
+	expect((await agent.closed).code).toBe(SERVICE_RESTART);
+	expect((await browser.closed).code).toBe(SERVICE_RESTART);
+	expect(restarts).toEqual([10_000]);
+	expect(agent.frames).toEqual([]);
+	expect(browser.frames).toMatchObject([{ kind: "session:restarting", reconnectWithinMs: 10_000 }]);
 });

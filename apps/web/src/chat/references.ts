@@ -373,8 +373,20 @@ export function chatSendPayload(
 	};
 }
 
+/** What a server whose agent is off says to a person, in the composer's strip and after a send. */
+export const REPLIES_OFF = "Replies are off on this server.";
+
 export const PLANNER_UNAVAILABLE_NOTICE =
-	"Chopin is off on this server. Your message went to the room only.";
+	`${REPLIES_OFF} Your message went to the people here only.`;
+
+/**
+ * The composer's strip for a server whose agent is off. A lost connection is the page's one
+ * notice, so while that shows the composer says nothing of availability, and the strip returns by
+ * itself with the connection.
+ */
+export function repliesOffNotice(offline: boolean): { tone: "info"; text: string } | undefined {
+	return offline ? undefined : { tone: "info", text: REPLIES_OFF };
+}
 
 /** Whether a payload names the Planner, even though it was routed to the room. */
 export function addressesPlanner(payload: ChatSendPayload): boolean {
@@ -404,23 +416,47 @@ export function destinationCue(
 	let to = chatSendPayload(text, references, plannerEnabled, "", referencesEnabled)?.to;
 	if (!to) return undefined;
 	return to === "planner"
-		? { to, text: "Sends to the Planner, which will reply" }
-		: { to, text: `Room only. Add ${MENTION} to ask the Planner` };
+		? { to, text: "Sends to Chopin, which will reply" }
+		: { to, text: "Sent to people here. Type @ to ask Chopin" };
 }
 
 export function acknowledgeDraft(current: ComposerDraft, submitted: ComposerDraft): ComposerDraft {
 	return current === submitted ? { text: "", references: [] } : current;
 }
 
-export function boundedChatError(error: unknown): string {
+/** A send that failed as the composer tells it, and whether the connection is what failed it. */
+export type SendFailure = { text: string; lost: boolean };
+
+export function sendFailure(error: unknown): SendFailure {
 	let detail = error instanceof Error ? error.message.trim() : "";
-	if (detail && (error as { code?: unknown }).code === "planner-not-attached") return detail;
+	if (detail && (error as { code?: unknown }).code === "planner-not-attached") {
+		return { text: detail, lost: false };
+	}
 	if (!detail || /^(connection lost|disposed|not connected)$/i.test(detail)) {
-		return "Message not sent. Check the connection and try again.";
+		return { text: "Message not sent. Check the connection and try again.", lost: true };
 	}
 	let maximum = 120;
 	if (detail.length > maximum) detail = `${detail.slice(0, maximum - 3)}...`;
-	return `Message not sent: ${detail}`;
+	return { text: `Message not sent: ${detail}`, lost: false };
+}
+
+export function boundedChatError(error: unknown): string {
+	return sendFailure(error).text;
+}
+
+/**
+ * What the composer tells of a failed send. While the page's offline notice shows it tells none: a
+ * lost connection is that notice's to tell, and a strip beside it would be a second alert for a
+ * problem the person cannot act on. A failure the server refused is kept meanwhile, and told as it
+ * was once the connection is back. A send the connection cut off has no strip of its own while the
+ * connection is down, so a blip, which shows no notice, says nothing either.
+ */
+export function shownSendFailure(
+	failure: SendFailure | undefined,
+	connected: boolean,
+	offline: boolean,
+): SendFailure | undefined {
+	return offline || (failure?.lost && !connected) ? undefined : failure;
 }
 
 function validPersistedRange(source: string, reference: Chat.Reference): boolean {

@@ -109,11 +109,12 @@ that validates `attached` strictly and never asks never sees the field. A server
 from before features ignores the header and answers without `features`; a
 client must then use none of them.
 
-| Feature                    | What it allows                                                                                                  |
-| -------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `run-stage-deltas`         | [Delta run cards](#run-stage-deltas), with no stage count limit                                                 |
-| `decision-option-previews` | An option's [`preview`](#option-previews) as its own visual, and the `upload_plan_image` host tool              |
-| `resumable-sessions`       | [Resuming](#resuming-after-a-dropped-link) the sessions, runs and questions of a link that dropped unexpectedly |
+| Feature                    | What it allows                                                                                                                                                 |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `run-stage-deltas`         | [Delta run cards](#run-stage-deltas), with no stage count limit                                                                                                |
+| `decision-option-previews` | An option's [`preview`](#option-previews) as its own visual, and the `upload_plan_image` host tool                                                             |
+| `resumable-sessions`       | [Resuming](#resuming-after-a-dropped-link) the sessions, runs and questions of a link that dropped unexpectedly                                                |
+| `restart-notice`           | A [`restarting`](#server-to-client) message before the server closes the link with 1012, and the [client rule](#when-the-server-is-restarting) that follows it |
 
 ### Pings
 
@@ -242,7 +243,7 @@ time. While a client is attached, any other `attach` for that document is
 refused with `planner-attached`, and the `message` names the holder's GitHub login:
 
 ```text
-octocat is attached as this document's Planner. A document has one Planner at a time.
+octocat is connected to this document. A document has one agent connected at a time.
 ```
 
 One exception serves a client that left a connection that died unnoticed. A client
@@ -268,7 +269,7 @@ the ownership; another account is refused with `planner-attached`, and the
 `message` says until when the holder keeps it:
 
 ```text
-octocat detached from this document's Planner and holds it until 2026-10-10T19:42:00.000Z unless they reattach. A document has one Planner at a time.
+octocat disconnected from this document and keeps it until 2026-10-10T19:42:00.000Z unless they connect again. A document has one agent connected at a time.
 ```
 
 When the grace period ends the ownership is released and any eligible account
@@ -286,7 +287,7 @@ Another account is refused with `planner-attached` and a `message` that says the
 holder's connection dropped and its work is kept until it reconnects:
 
 ```text
-octocat is this document's Planner, and its connection dropped. Its work is kept until it reconnects. A document has one Planner at a time.
+octocat is connected to this document, and its connection dropped. Its work is kept until it reconnects. A document has one agent connected at a time.
 ```
 
 A server restart releases every attachment and ownership at once; reattach after
@@ -325,9 +326,9 @@ instead of attaching; a fresh attach whose sign-in ends while the server checks
 it is refused with `sign-in-required` (4401). The `message` says what happened:
 
 ```text
-The Chopin browser sign-in that made octocat this document's Planner ended, so the Planner was released. Sign in to Chopin at https://chopin.example in a browser as octocat, then attach again.
-A repository writer reset this document's Planner, so octocat is no longer attached. Attach again to resume.
-This document's Planner ownership was released, so octocat is no longer attached. Attach again to resume.
+The Chopin browser sign-in that connected octocat to this document ended, so the connection was released. Sign in to Chopin at https://chopin.example in a browser as octocat, then connect again.
+A repository writer reset this document's connection, so octocat is no longer connected. Connect again to resume.
+This document's connection was released, so octocat is no longer connected. Connect again to resume.
 ```
 
 | Refusal code           | Close code | Meaning                                                                |
@@ -351,8 +352,10 @@ resuming, except `unavailable`: Chopin could not decide, so the refusal carries
 ### Without an attached Planner
 
 On a server running `HARNESS=remote`, an `@chopin` message in the browser and
-an MCP `invoke_planner` call for a document with no attached client are refused
-with the code `planner-not-attached`, and nothing is posted or queued. A
+an MCP `invoke_planner` call for a document with no attached client are never refused
+for it: they are [saved](hosted-agent.md#saved-requests), appear in
+Chat as sent, and start once a client attaches, in hosted mode and under `AUTH_MODE=local`
+alike. A
 document whose Planner is within its grace period, or disconnected with its work kept
 (the message then says the machine is offline, that the work is kept and that it picks
 up when the machine is back), counts as
@@ -411,6 +414,7 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
 { "type": "stop", "request": "", "session": "", "run?": "" }
 { "type": "resume", "request": "", "session": "", "run?": "" }
 { "type": "destroy", "session": "" }
+{ "type": "restarting", "reconnectWithinMs": 0 }
 { "type": "error", "code": "malformed-message", "message": "" }
 ```
 
@@ -450,6 +454,10 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   has since ended, only has the refusal logged for a `stop` sent again.
 - `destroy` ends the session; abandon its turn, its waiting host calls, and its
   questions.
+- `restarting`, with `restart-notice`, precedes a close with 1012 when the server is
+  restarting. `reconnectWithinMs` is how long, in milliseconds, a new process is expected to
+  take to take over; see [When the server is restarting](#when-the-server-is-restarting). A
+  client that did not offer the feature never receives it.
 - `error` precedes a close for a protocol violation (see [Closing](#closing)).
 
 ## Client to server
@@ -913,7 +921,7 @@ needs no feature check: an older Chopin shows the same text unformatted.
 | 1008       | `error` with `malformed-message` or `protocol` | Unparseable, invalid, or out-of-order message   |
 | 1009       | `error` with `message-too-large`               | A frame over 2 MiB                              |
 | 1011       | `refused` with `unavailable`                   | The server could not check the document         |
-| 1012       | nothing                                        | The server is restarting                        |
+| 1012       | `restarting`, with `restart-notice`            | The server is restarting                        |
 | 4401       | `refused`                                      | `sign-in-required`                              |
 | 4403       | `refused`                                      | `repository-forbidden` or `access-revoked`      |
 | 4404       | `refused`                                      | `document-unavailable` or `document-archived`   |
@@ -946,7 +954,8 @@ not apply to it.
   cards keep the status last reported, not `stopped`, marked `disconnected` for the
   people reading them, its Decisions stay open in the document and can be answered,
   and an answer given meanwhile is held. Other sessions end as they always did.
-  Chat says once that the Planner disconnected, and once that it came back.
+  Chat says nothing of the connection itself: the machine button, its menu and
+  the run cards carry that state, and nothing confirms it came back.
   Nothing waits on the client in the meantime: `@chopin` and `invoke_planner` are
   refused as [without an attached Planner](#without-an-attached-planner), and no
   other account can attach. The document is not let go either: a Default machine's
@@ -963,14 +972,14 @@ not apply to it.
   treated the same way.
 - **Stop is held, not lost.** A Stop Planner, or one run's pause, that cannot
   reach the client is held for its return, and Chat says that the workflows will
-  pause when the Planner reconnects; the run cards keep their last reported status
+  pause when the machine reconnects; the run cards keep their last reported status
   until the client reports otherwise. That covers a Stop pressed while the link is
   down and one already sent whose `control-result` had not come when the link
   dropped. A `stop` the client did not answer within 10 seconds while the link was
-  still attached is kept too: Chat says the Planner has not confirmed it, never that
-  it stopped, and once the link is found dead (see [Pings](#pings)) says once that the
-  Stop is kept and will be delivered when the Planner reconnects. Chat says a Stop
-  stopped the Planner only when the client confirmed it, that it was asked to when
+  still attached is kept too: Chat says Chopin has not confirmed it, never that
+  it stopped, and that the workflows will pause when the machine reconnects, and
+  says nothing more when the link is found dead (see [Pings](#pings)). Chat says a Stop
+  stopped Chopin only when the client confirmed it, that it was asked to when
   its connection is known to be down, and that it was not confirmed otherwise. After `resumed`, before anything else,
   the server sends the client one `stop` for every run (or one per run named),
   however many times it was pressed, and the client answers `control-result` as
@@ -1021,27 +1030,106 @@ not apply to it.
 - **What still ends it for good.** Its own `detach`; any definitive `refused` (every
   one without `retry`) or protocol error; the owner's sign-out or its expiry; a Planner reset; revoking or unpairing
   the machine that attached it; the document's owner choosing another machine for it;
-  archiving or deleting the document; a Stop that withdraws its last question; the
+  archiving or deleting the document; a Stop that withdraws its last question; and the
   same account attaching with a client that does not resume, which includes a browser
   sign-in attaching over a paired machine's parked work, since that client cannot
-  resume it; and a server restart. Of these, all but a server restart withdraw the
-  questions and show the runs as `stopped`, and a later `resume` finds nothing (a
-  restart is described below). A person with write access can always end a disconnected
-  Planner by resetting it.
+  resume it. All of these withdraw the questions and show the runs as `stopped`, and a
+  later `resume` finds nothing. A server restart does not end it: see below. A person
+  with write access can always end a disconnected Planner by resetting it.
+
+#### When the server is restarting
+
+A server that is restarting closes every link with 1012. A link that offered
+`resumable-sessions` keeps what it held, as for any close it did not choose: 1012 is not
+one of the closes that ends the link for good, and, unlike 1001, it says the server will be
+back. A client that also offers `restart-notice` is told how soon, with `restarting` just
+before the close, and follows this rule:
+
+- On a 1012 close, connect again at once. Do not wait out the backoff: a proxy in front of
+  Chopin holds the upgrade until the new process answers.
+- Send `resume` as usual. The new process does not refuse it inside the window it announced:
+  before it has restored the owner's browser sign-in (see [Ownership](#ownership)) it holds the
+  `resume`, keeps the link, and answers when the sign-in is back. It may refuse it with
+  `unavailable` and `retry` once the window is over with the sign-in still not back, or when it
+  could not decide for another passing reason. Retry the same `resume` every 250 ms until
+  `reconnectWithinMs` has passed since the close, then go back to the client's own backoff.
+- Any other `refused`, and any `error`, is final, as for a resume at any other time.
+
+A client without the feature sees only the 1012 close and resumes on its own backoff. If
+that is longer than the server's hand-over window, the document shows its Planner as
+disconnected once the window ends, as it does for any dropped link. The package client
+offers the feature with `resumable-sessions` and reports `reconnectWithinMs` on the
+`LinkClosed` its `closed` promise settles with; it leaves connecting again to its caller, so
+the rule is for the backend to follow. The test client in `apps/server/src/testing/agent-link.ts`
+(`resumeAfterRestart`) implements it.
 
 #### After a server restart
 
-The server keeps sessions, holds and open requests in memory only, so a restart ends
-what a disconnected link kept, and a graceful one ends it exactly as a crash does. The
-server tells every link it is going down before it closes any socket, closes each with 1012,
-and no link withdraws a question on the way out, so the Decisions the Planner had asked stay open
-and answerable in the document, as after a crash. A returning client's `resume` finds
-nothing: `resumed` lists no sessions, the client calls its `destroy` handler for each
-session it held and settles every question it still waited on as `cancelled`. The run
-cards Chat stored come back `stopped`: Chopin no longer tracks those workflows and has
-nothing newer than the last report. The client's `runs` for a session the server no
-longer has are ignored, so those cards stay `stopped`, even if the machine is still
-running the workflows, until the Planner starts a session again and reports its runs.
+The server keeps links, sessions and open requests in memory, and writes what a restart
+must carry over to storage: when a link drops with work kept, and for every live link at
+its cut, one `planner_link_holds` row per document with each session's waiting request
+ids, for each question the decisions it asked and the kind of request it was, the answers the
+client has not acknowledged and the Stops it has not heard. The
+server tells every link it is going down before it closes any socket, closes each with 1012
+(with `restarting`, whose `reconnectWithinMs` is the hold's window, for a client that offered
+`restart-notice`), and no link withdraws a question on the way out, so the Decisions the
+Planner had asked stay open and answerable in the document.
+
+The next process rebuilds each hold as a suspended one. Until its **hand-over window**
+(`HANDOVER_PLANNER_WINDOW_MS`, 10 seconds by default, counted from the release of the lease: the
+next process starts it as it rebuilds the hold, after the release) ends, the
+document's members see the Planner attached, the run cards Chat stored stay as they were, and
+a `@chopin` message, comment note or task draft is saved and started when the client resumes.
+A returning client attaches, and sends `resume` as usual:
+
+- **Before the owner's browser sign-in is back,** which a browser's cookie restores, the
+  `resume` waits inside the window: nothing is refused, the link stays attached, the document
+  shows the machine attached, and the sessions come back the moment the sign-in does. A
+  `resume` still without it when the window is over, or sent after it, is refused with
+  `unavailable` and `retry`, and the hold stays. A client that offered `restart-notice` retries
+  every 250 ms until `reconnectWithinMs` has passed, then on its own backoff; there is no
+  deadline for the hold itself. A paired machine's backend has no
+  such wait: its login is made again from the machine's own authorization, and the
+  credential it was issued is accepted at once, so no HTTP 401 follows a restart.
+- **After it,** the sessions the client names come back, as after any dropped link, and
+  `resumed` lists the requests the server holds. An answer given while the link was down,
+  or sent and never acknowledged, is one: it is delivered once after `resumed`. A question the
+  client still waited on is listed in `requests`, and the client keeps waiting on it. The new
+  process asks the members of the document the same question again when the document opens: it
+  is the Decision the old process created, still open in the document, and its answer goes to
+  the client's own request, as an `input-result` with the result the old process would have
+  sent, once. An answer given before the client is back waits and is sent after `resumed`; one
+  given after goes straight to it. No turn of its own follows, because the question is waited
+  on. A question a client resumes without, because it no longer waits on it, is withdrawn, as
+  `input-cancel` withdraws it. Each Stop held for the client is sent first. The client's
+  `runs` for a resumed session update nothing Chat shows until a Planner turn starts a session
+  of its own.
+- **An answer its client is never given.** When the client that asked does not come back to
+  resume (it attaches with nothing to resume, or resumes without the session), an answer a
+  member had given meanwhile cannot reach its request. It reaches the Planner once, as a turn of
+  its own that names the question, the option chosen and who chose it, started when the Planner
+  is attached (see [Decisions](decisions.md)). A question of a request that was not kept, one
+  asked while the old process was stopping or after a crash, is not waited on at all, and its
+  answer is handled the same way. Exactly one of the two delivers an answer. What is not
+  carried over is a workflow run's pause: an answer to a question a workflow run asked is sent
+  when it is given, without the wait that keeps a paused run stopped.
+- **A client that sends anything else first,** or resumes with nothing, holds nothing to
+  resume: the kept sessions end and the run cards stop.
+
+When the window ends with no `resume`, the hold is disconnected, as a dropped link is
+today: the document's members are told, its run cards say the Planner is disconnected, and the
+hand-over logs a miss naming the cause, the owner's sign-in or the client not back. It stays
+for the client's return and nothing times it out. A hold that was already disconnected when the
+cut came keeps its state and gets no window, and one in its grace period is not kept. An
+explicit end (sign-out, a reset, revoking the machine, archiving the document) removes
+the hold and its row. Under `AUTH_MODE=local`, which is never handed over, holds stay in
+memory and a restart ends them as before.
+
+After a crash, only the hold of a link that had already dropped is stored, with no window, so
+its client's `resume` finds it disconnected; the live link's work is lost as it always was. A
+crash of the process a cut handed over to leaves the same: it rewrote the row without the window
+when it rebuilt the hold, so the process after it finds the hold disconnected and keeps the
+sessions for the client's `resume`.
 Neither the link closing nor the shutdown posts a Chat line: no "disconnected" notice
 and no "was stopped after" line, since nobody stopped anything and Chopin merely restarted. An answer given to a Decision nobody
 waits on any more reaches the Planner as a turn of its own once a Planner is attached
@@ -1140,8 +1228,12 @@ document's repository (otherwise 403 `repository-forbidden`; 404 `not-found`
 for no such document, 409 `document-archived` for an archived one). The
 credential can open connections to that one document for **15 minutes**. A connection it
 opened does not depend on it afterwards: the server rechecks the machine as it
-rechecks any owner. Chopin keeps only its hash, in memory, so a server restart
-forgets it as it releases every attachment.
+rechecks any owner. Chopin keeps only its SHA-256 digest, in `planner_credentials`,
+written before the credential is handed out. A process that starts after a restart
+therefore accepts an unexpired credential at once, and a backend that reconnects with it
+is not refused with 401 while it waits for the machine's connector to renew it. The rows
+go when the credential expires, when the document's Planner is stopped on the machine,
+when the machine is unpaired or loses its GitHub authorization, and with the document.
 
 Attached this way, the document's Planner owner is a login of the machine's
 owner that no browser holds, whose GitHub token is the machine's own; Chopin's

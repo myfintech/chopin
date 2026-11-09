@@ -925,7 +925,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		for (let [documentId, repositoryId] of told) {
 			if (!serves(connection, repositoryId) || wanted.has(documentId)) continue;
 			// No longer asked, as another account now holds it: a credential it got stops working.
-			options.planners?.withdraw(connection.machineId, documentId);
+			await options.planners?.withdraw(connection.machineId, documentId);
 			forgetStartFailure(documentId, connection.machineId);
 			told.delete(documentId);
 		}
@@ -1105,25 +1105,32 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		keep: (documentId: string, repositoryId: string) => boolean = () => false,
 		documentId?: string,
 	) {
-		if (documentId) {
-			options.planners?.withdraw(machineId, documentId);
-			forgetStartFailure(documentId, machineId);
-		}
 		let told = dispatched.get(machineId);
-		if (!told) return;
-		let label = (await auth.storage.machines.get(machineId))?.label ?? "The machine";
-		for (let [documentId, repositoryId] of told) {
-			if (keep(documentId, repositoryId)) continue;
-			options.planners?.withdraw(machineId, documentId);
-			forgetStartFailure(documentId, machineId);
-			told.delete(documentId);
-			let reason = message(label);
-			let reasons = stopReasons.get(machineId) ?? new Map<string, string>();
-			reasons.set(documentId, reason);
-			stopReasons.set(machineId, reasons);
-			await options.attachments?.()?.stopMachine(documentId, machineId, reason);
+		// Why each stopped is recorded before storage is waited on: a connector that asks while its
+		// credentials are being forgotten must already be told.
+		let stopping: Array<[string, string]> = [];
+		if (told) {
+			let label = (await auth.storage.machines.get(machineId))?.label ?? "The machine";
+			for (let [id, repositoryId] of told) {
+				if (keep(id, repositoryId)) continue;
+				told.delete(id);
+				let reason = message(label);
+				let reasons = stopReasons.get(machineId) ?? new Map<string, string>();
+				reasons.set(id, reason);
+				stopReasons.set(machineId, reasons);
+				stopping.push([id, reason]);
+			}
 		}
-		if (!told.size) dispatched.delete(machineId);
+		if (documentId) {
+			await options.planners?.withdraw(machineId, documentId);
+			forgetStartFailure(documentId, machineId);
+		}
+		for (let [id, reason] of stopping) {
+			await options.planners?.withdraw(machineId, id);
+			forgetStartFailure(id, machineId);
+			await options.attachments?.()?.stopMachine(id, machineId, reason);
+		}
+		if (told && !told.size) dispatched.delete(machineId);
 	}
 	/**
 	 * One of `owner`'s machines connected, disconnected, or was shared or no longer: the documents
@@ -1516,7 +1523,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		let url = new URL(await documentUrl(channel, auth.storage.channels), auth.config.origin).href;
 		// The repository says which of the machine's checkouts the Planner runs in.
 		return json({
-			...planners.issue(machine, channel.id),
+			...await planners.issue(machine, channel.id),
 			document: {
 				id: channel.id,
 				url,
@@ -1774,7 +1781,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 					finishing: finishing.get(machine.id)?.documents.size ?? 0,
 					createdAt: machine.createdAt.getTime(),
 					lastSeenAt: machine.lastSeenAt.getTime(),
-					connected: connections.machine(machine.id).length > 0,
+					connected: connections.machine(machine.id).length > 0 || backed(machine.id),
 					version: connections.machine(machine.id).find(value => value.version)?.version ?? null,
 					...described(connections.machine(machine.id)),
 					reauthorize: !!machine.reauthorizeAt,
@@ -1784,7 +1791,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 					repositories,
 					// Only the viewer's own favorite, never its owner's.
 					favorite: machine.id === favorite,
-					connected: connections.machine(machine.id).length > 0,
+					connected: connections.machine(machine.id).length > 0 || backed(machine.id),
 				}))),
 			],
 		});
@@ -1915,6 +1922,10 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		await disconnectMachine(params.id);
 		return json({ revoked: true });
 	});
+	/** Whether a Planner backend of the machine is attached, or was cut by a deploy and is expected back. */
+	function backed(machineId: string): boolean {
+		return !!options.attachments?.()?.machineBacked(machineId);
+	}
 	/**
 	 * The caller's own machines, whatever repositories they have checkouts of, and the machines
 	 * teammates share that serve the document's repository while their owners can push to it (for
@@ -1952,6 +1963,11 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 			}
 		}
 		automatic ??= live[0];
+		// With no connection of its own yet in this process (a deploy just replaced the last), a
+		// machine whose backend holds the document's Planner is still the machine it runs on.
+		let carried = options.attachments?.()?.holding(documentId);
+		let automaticId = automatic?.machineId
+			?? (carried?.attached && carried.userId === userId ? carried.machineId : undefined);
 		let label = (id: string) =>
 			serving.find(machine => machine.id === id)?.label
 				?? teammates.find(({ machine }) => machine.id === id)?.machine.label ?? null;
@@ -1967,12 +1983,8 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 			/** The caller's favorite machine, theirs or a teammate's, which Automatic prefers where it serves the repository. */
 			favorite: favorite ?? null,
 			planner: plannerState(userId, channel, serving),
-			automatic: automatic
-				? {
-					id: automatic.machineId,
-					label: label(automatic.machineId),
-					favorite: automatic.machineId === favorite,
-				}
+			automatic: automaticId
+				? { id: automaticId, label: label(automaticId), favorite: automaticId === favorite }
 				: null,
 			machines: [
 				...serving.map(machine => {
@@ -1981,7 +1993,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 						id: machine.id,
 						label: machine.label,
 						teammate: false,
-						connected: live.some(value => serves(value, repositoryId)),
+						connected: live.some(value => serves(value, repositoryId)) || backed(machine.id),
 						reauthorize: !!machine.reauthorizeAt,
 						createdAt: machine.createdAt.getTime(),
 						lastSeenAt: machine.lastSeenAt.getTime(),
@@ -1997,7 +2009,8 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 				}),
 				...await Promise.all(teammates.map(async ({ machine }) => ({
 					...await teammateFacts(machine),
-					connected: connections.machine(machine.id).some(value => serves(value, repositoryId)),
+					connected: connections.machine(machine.id).some(value => serves(value, repositoryId))
+						|| backed(machine.id),
 					runsPlanners: capable(machine.id),
 				}))),
 			],

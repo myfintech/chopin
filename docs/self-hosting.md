@@ -15,16 +15,21 @@ that origin.
 - The application, API, MCP endpoint, and WebSocket share one origin and one
   internal port.
 - One active Chopin process may write to a database. Horizontal application
-  scaling and zero-downtime rolling deployment are not supported.
+  scaling is not supported. A second process can start beside the holder and take
+  over when it stops, which is how a deploy can be invisible; see
+  [Deploys nobody can see](zero-downtime-deploys.md).
 - PostgreSQL 17 is the version used by the repository and browser tests. Other
   versions are not covered by the project test suite.
 - Database migrations are forward-only. There is no automated schema rollback.
-- Restarting the application signs every browser out and releases hosted agent
-  ownership. Documents, transcripts, decisions, background jobs and artifacts,
-  research request staging, child documents, and implementation state remain.
-  In local mode (see below), the returning browser can restore the same login
-  without repeating device-flow sign-in; it still gets a new session and does
-  not reclaim Planner ownership.
+- Restarting the application releases hosted agent ownership, except for a remote
+  Planner that was connected when the process stopped, which keeps its place for
+  a short window (see [Deploys nobody can see](zero-downtime-deploys.md#a-remote-planner-and-its-machine)).
+  Documents, transcripts, decisions, background jobs and artifacts, research
+  request staging, child documents, implementation state and Planner requests
+  that had not started remain. A hosted browser's login is restored when its
+  cookie reaches the new process. In local mode (see below), the returning
+  browser can restore the same login without repeating device-flow sign-in; it
+  still gets a new session and does not reclaim Planner ownership.
 
 ## Choose the access policy first
 
@@ -89,7 +94,7 @@ proxy that the server learns some other way, such as a system setting, set
 these variables on the server process too: otherwise the CLI connects directly,
 and a Planner turn fails with "The Planner stream failed."
 
-`HARNESS=atomic` runs Atomic 0.9.71 in the Chopin server process through its
+`HARNESS=atomic` runs Atomic 0.9.74 in the Chopin server process through its
 headless SDK (`createAgentSession()`). It does not spawn the `atomic` CLI or use
 RPC mode.
 
@@ -302,8 +307,8 @@ receives what a Planner turn sees, including repository reads made with that
 owner's token, and decides what the Planner writes during turns writers start;
 its run reports never start a turn. The server never runs the client's tools and
 gains no shell or filesystem access from this harness. Without an attached
-client, `@chopin` and `invoke_planner` are refused with `planner-not-attached`
-and instructions to attach one. See
+client, `@chopin` and `invoke_planner` are saved and wait for one, under
+`AUTH_MODE=local` as well. See
 [Remote Planner](hosted-agent.md#remote-planner) for the behaviour and
 [Agent connection](agent-connection.md) for the wire format. The connection shares the
 application's origin and port with `/ws` and `/mcp`, so a TLS-terminating proxy
@@ -397,6 +402,13 @@ the image.
 | `AGENT_CONNECTION_PING_MS`        | `15000`                 | Under `HARNESS=remote`, how often the server sends each agent connection a WebSocket protocol ping, in milliseconds, an integer between 1000 and 600000.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `AGENT_CONNECTION_TIMEOUT_MS`     | `120000`                | Under `HARNESS=remote`, how long an agent connection may send nothing, not even a pong, before the server closes it as dropped, in milliseconds, an integer between 1000 and 600000 and longer than `AGENT_CONNECTION_PING_MS`. A whole frame must arrive within it: 2 MiB in 120 seconds is about 17 KiB/s of client upload.                                                                                                                                                                                                                                                                                                                                     |
 | `AGENT_CONNECTION_MAX_SILENCE_MS` | `900000`                | Under `HARNESS=remote`, how long an agent connection may send nothing at all, not even a pong, before the server closes it as dropped, however much of what the server queued for it drains meanwhile, in milliseconds, an integer between 1000 and 3600000 and at least `AGENT_CONNECTION_TIMEOUT_MS`. A draining queue defers the timeout only up to this, since a proxy can drain it while the client reads nothing. The 15-minute default lets a client reading at about 19 KiB/s drain the full 16 MiB the server may queue for it and answer a ping; lower it to release a client that stopped reading behind a proxy sooner, or raise it for slower links. |
+| `HANDOVER`                        | unset                   | Set exactly `wait` to let this process start beside another one that holds the database's writer lease. It then listens at once in standby, answers `GET /api/health/live` with `200 standby` and `GET /api/health/ready` with `503 standby`, serves the built client's files, holds every other request and WebSocket upgrade for up to `HANDOVER_HOLD_MS`, and reads the lease every 100 ms until the holder releases it or it expires, then takes it. Unset or `off`, a process that finds the lease held exits 1. Any other value refuses at startup.                                                                                                         |
+| `HANDOVER_TURN_WAIT_MS`           | `10000`                 | When this process is stopped (SIGTERM or SIGINT), how long it keeps serving while Planner turns already running finish, in milliseconds, an integer between 0 and 600000. A turn still running then is cut off, with a notice in its Chat, and is never run again. The turn wait, the unready window, the request wait and about three seconds to commit must fit inside the platform's stop grace period.                                                                                                                                                                                                                                                        |
+| `HANDOVER_UNREADY_MS`             | `300`                   | How long `GET /api/health/ready` answers `503 draining` before the listener stops, in milliseconds, an integer between 0 and 60000. Set it to the proxy's active health-check interval plus a margin. The process serves every request through the window. It logs how many readiness checks it answered not ready in it, and a window in which none came as a risk to the hand-over.                                                                                                                                                                                                                                                                             |
+| `HANDOVER_REQUEST_WAIT_MS`        | `1000`                  | After the listener stops, how long requests already running may finish before their connections are closed without an answer, in milliseconds, an integer between 0 and 60000. Each request closed this way is logged.                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `HANDOVER_PLANNER_WINDOW_MS`      | `10000`                 | How long after the cut a remote Planner is expected to be back, in milliseconds, an integer between 0 and 600000. It is the `reconnectWithinMs` of the `restarting` notice and of `session:restarting`.                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `HANDOVER_HOLD_MS`                | `20000`                 | How long a process in standby holds a request or WebSocket upgrade that needs the writer lease before it answers `503` with `Retry-After: 1`, in milliseconds, an integer between 0 and 120000.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `CLIENT_DIR`                      | `apps/web/dist`         | Directory of the built web client. A process is ready only when `index.html` exists there, unless `DEV_CLIENT` is set.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `HARNESS_AUTH`                    | unset                   | Auth mode forwarded to the selected adapter. For `copilot-sdk`, `direct` and `ai-gateway` are allowed on any bind and `auto` requires a loopback-only `SERVER_HOST`; the adapter does not otherwise consume it. For `atomic`, it is required and must be `auto`, which requires a loopback-only `SERVER_HOST`, or `ai-gateway`; every other value is refused. For `remote`, any value is refused.                                                                                                                                                                                                                                                                 |
 | `HARNESS_EXTENSIONS`              | unset                   | Extension or package paths every atomic Planner session loads, as Atomic's `--extension` flag would, separated by the platform path delimiter (`:`, or `;` on Windows). A package's extensions, skills, and workflows all register. Each path must be absolute and exist; any other harness refuses the variable at startup. Background workers never load them. The code runs in the server process as its user.                                                                                                                                                                                                                                                 |
 | `AGENT`                           | on                      | Set exactly `off` to prevent hosted agent turns, disable the entire background-job runner, and avoid Copilot CLI startup.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -536,6 +548,19 @@ Build an image from a reviewed commit:
 ```bash
 docker build --tag chopin:local .
 ```
+
+A page left open across a deploy still asks for the files of the build it loaded. The
+image keeps the hashed files of the last two builds before it, for 30 days at most, in
+`apps/web/kept-assets`, and the server answers for them from there; a file it does not
+have is a 404, never the page. To keep them, give the build the image that runs now:
+
+```bash
+docker build --build-arg PREVIOUS_IMAGE="$(docker inspect --format '{{.Image}}' chopin)"   --tag chopin:next .
+```
+
+With `docker compose`, set `PREVIOUS_IMAGE` in the environment of the build. Without it
+the build keeps nothing and only its own files are served. The first build after this
+step lands keeps only the image before it, which kept nothing itself.
 
 Create an environment file such as `/etc/chopin/chopin.env`:
 
@@ -699,23 +724,31 @@ After the first deployment:
 9. Connect a local coding agent and call `list_documents` if MCP is part of the
    deployment's intended surface.
 
-The image health check calls `/api/session`. It confirms HTTP liveness but does
-not prove that a browser bundle is present, a new database transaction can
-complete, GitHub is reachable, or the Planner can start.
+The image health check calls `/api/health/live`. It confirms HTTP liveness, and
+passes for a process waiting in standby too, but does not prove that a browser
+bundle is present, a new database transaction can complete, GitHub is reachable,
+or the Planner can start; readiness (below) covers the first two.
 
 Two unauthenticated endpoints answer with a status word and nothing else, for a
 proxy or platform that routes on them:
 
-- `GET /api/health/live` answers `200 live` while the process runs.
+- `GET /api/health/live` answers `200 live` while the process runs, and
+  `200 standby` while a process started with `HANDOVER=wait` waits for the
+  writer lease.
 - `GET /api/health/ready` answers `200 ready` once the process holds the writer
-  lease and has finished startup recovery. It answers `503 starting` before
-  that, and `503 draining` from the moment a shutdown begins.
+  lease, has finished startup recovery, a database transaction has completed
+  and the built client's `index.html` exists. It answers `503 standby` while it
+  waits for the lease, `503 starting` before it is ready, and `503 draining`
+  from the start of a shutdown's cut, not from SIGTERM: a stopping process keeps
+  answering `200 ready` and keeps serving while running Planner turns finish
+  (`HANDOVER_TURN_WAIT_MS`). It decides this once, when it becomes ready, so a
+  check runs no query.
 
 Send new connections only to a ready process. Readiness does not check that
 GitHub is reachable or that a model answers. Both endpoints answer `HEAD` the
 same way.
-They are the first step of Stage 1 of the zero-downtime upgrades design,
-invisible restarts on one server.
+A proxy that routes on them, and the deploy that overlaps two processes, are described
+in [Deploys nobody can see](zero-downtime-deploys.md).
 
 ## Operations
 
@@ -738,6 +771,13 @@ Browser sessions and Planner ownership are cleared at startup.
    migrations before serving.
 4. Repeat the first-start checks after migrations or authentication changes.
 
+This stops the old process before it starts the new one, so there is a gap in which nothing
+listens, and a tab shows its notice if the gap outlasts its quiet period (below). To make a
+deploy invisible instead, start the new process beside the old one with `HANDOVER=wait`
+and stop the old one once the new one is waiting, behind a proxy that holds requests for
+that moment: see [Deploys nobody can see](zero-downtime-deploys.md). Migrations must then be
+expand-only.
+
 A stop signal makes Chopin close every WebSocket with code 1012 (service
 restart) before it exits, rather than the 1001 that stopping the listener
 sends. An open browser tab takes that as a restart: it reconnects after a
@@ -751,19 +791,16 @@ treated as any other lost connection, with the same moment of grace before
 the notice. A refusal Chopin makes of a handshake carries
 `x-chopin-refusal: 1`, and a tab stops retrying on a 4xx only when it does (a
 401 still asks for a sign-in). Without it the 4xx is a proxy's and the tab keeps
-retrying. This is the client half of Stage 1 of the zero-downtime upgrades
-design, invisible restarts on one server; it does not make the gap between the
-old process stopping and the new one listening any shorter. Two things differ
-from that design's current revision, which adds no restart jitter and keeps the
-existing 1.5 seconds of silence for a restart: the random moment before the first
-attempt is added so that tabs do not all return together, and the silence is 5
-seconds, because a restart that stops the old process before it starts the new
-one takes longer than 1.5 seconds. The design's 1.5 seconds assumes a second
-process already waiting to take over.
+retrying. This is the client half of a restart that stops the old process before it
+starts the new one, and it does not make the gap between them any shorter. It
+adds a random moment before the first attempt so that tabs do not all return
+together, and keeps a restart quiet for 5 seconds rather than 1.5, because that
+kind of restart takes longer than 1.5 seconds. A deploy that overlaps two
+processes behind a proxy that holds requests ends well inside 1.5 seconds; see
+[Deploys nobody can see](zero-downtime-deploys.md).
 
 A tab opened before an upgrade asks for the hashed `/assets/*` files of its own
-build, which the new image does not carry, since a build here has only its own
-files. Chopin answers a missing file under `/assets/` with 404 and never with the
+build, which the new image carries only if it was built with `PREVIOUS_IMAGE`. Chopin answers a missing file under `/assets/` with 404 and never with the
 app's HTML. When a part of the page fails to load for that reason (Vite's
 `vite:preloadError`), the tab reloads to fetch the new build, but only while the
 server answers with a page of another build than the one running (it asks for the
@@ -771,9 +808,9 @@ page and compares the entry script, so a failure with the server away, or with n
 upgrade behind it, is left to the page's own recovery) and it holds nothing the
 server has not taken: no unacknowledged edit, unsent message, answer or draft.
 Otherwise it leaves the failure as it was and a later one reloads it, and a reload
-that did not cure the failure is not repeated within ten seconds. Keeping the previous build's assets in the new image would let such a tab
-carry on without reloading, but it needs the previous image, which nothing in this
-repository's build has.
+that did not cure the failure is not repeated within ten seconds. A build given the
+image that runs now (`PREVIOUS_IMAGE`, above) keeps the previous builds' files, so
+such a tab usually carries on without reloading.
 
 Migration files are checksummed once applied. Never edit an applied migration.
 Because migrations are forward-only, returning to an older application image
@@ -812,10 +849,12 @@ Chopin's Origin checks.
 ### Writer lease
 
 The database holds one renewable `chopin:writer` lease. A second application
-process refuses startup. If the active process loses the lease, it drains and
-stops; fencing prevents an expired process from committing collaboration state.
-Allow the previous lease to expire before treating a failed host as safely
-replaced.
+process refuses startup, unless it was started with `HANDOVER=wait`, which makes it
+wait in standby until the holder releases the lease (see
+[Deploys nobody can see](zero-downtime-deploys.md)). If the active process loses the
+lease, it drains and stops; fencing prevents an expired process from committing
+collaboration state. Allow the previous lease to expire (30 seconds after its last
+renewal) before treating a failed host as safely replaced.
 
 ## Troubleshooting
 
@@ -832,7 +871,9 @@ Members read access, the organization approved it, and the user has active
 membership. GitHub outages and rate limits fail closed for new checks.
 
 **A second process refuses startup.** Another holder owns the database writer
-lease. Do not run two application instances against one database.
+lease. Do not run two application instances against one database. To start a
+process beside the holder on purpose, set `HANDOVER=wait`; it waits in standby and
+serves nothing until the holder stops.
 
 **The process refuses startup with an unknown-harness or auth-mode error.**
 `HARNESS` names an adapter that is not in Chopin's harness map, or

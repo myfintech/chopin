@@ -113,8 +113,11 @@ only attaching makes an account the owner. With a client attached the turn goes
 to it and runs under its owner, whoever invoked it. Without one, including
 while a detached Planner's grace period runs, while a disconnected Planner's work is kept for it, and once the attached Planner's
 owner signs out of the browser, that sign-in expires, or its Planner is reset,
-the call is refused with
-`planner-not-attached` and a `message`, and nothing is posted or queued:
+the instruction is [saved](hosted-agent.md#saved-requests) and waits for a Planner, in hosted
+mode and under `AUTH_MODE=local` alike; the call returns as usual and its message shows in Chat
+as sent. A call that finds the queue full behind a running turn is refused with `planner-queue-full`; a machine that is away never has a full queue, and every call is saved and kept for it, in the order the calls came, however many arrive together. The refusal below,
+`planner-not-attached`, is what an older Chopin answered, and what `invoke_planner` still declares
+for a document that has no way to save a request:
 
 ```json
 {
@@ -190,7 +193,7 @@ restarts. Chopin logs each one it accepts or refuses.
 Refusals return an object with `code`, and `planner-not-attached` also a
 `message`:
 
-- `planner-not-attached`: under `HARNESS=remote`, no client is attached as the
+- `planner-not-attached`: under `HARNESS=remote` and `AUTH_MODE=local`, no client is attached as the
   document's Planner. `message` names the document URL and says to connect a
   Planner client to it over the agent connection from a session in a checkout of
   the repository, which attaches that session as the Planner.
@@ -200,7 +203,8 @@ Refusals return an object with `code`, and `planner-not-attached` also a
 - `checkout-unverified`: under `atomic`, correct the supplied path or its
   repository origin.
 - `planner-unavailable`: the Planner is disabled or the room is closing.
-- `planner-queue-full`: wait for queued work to drain before invoking again.
+- `planner-queue-full`: twenty requests wait behind a running turn; wait for queued work to
+  drain before invoking again. Never answered for a machine that is away.
 - `system-turn-forbidden`: `as: "system"` came from someone other than the
   document's creator or the account holding its Planner.
 - `system-turn-limited`: the document has taken 10 automatic follow-ups in the
@@ -293,6 +297,12 @@ recorded with the update. Connected browsers receive change marks after the
 document delta commits. Their change list identifies the MCP client without
 displaying a Planner cursor. Calls without initialization are attributed to
 `unknown`.
+
+The session ID `initialize` returns (the `Mcp-Session-Id` header) is stored with the
+user, client name and version, and when it was last used, so it keeps working across a
+server restart or a deploy. A session nobody used for 30 days is forgotten, and an ID the
+server does not know is treated as no session: `start_implementation` and the lifecycle
+tools answer `session-required` until the client initializes again.
 
 An answered decision stays linked to its text when the update leaves every
 block it is linked to unchanged. Any other answered decision, including one whose

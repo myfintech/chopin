@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { machines as liveMachines, newestFirst, ownerHint } from "./machine-summary";
 
 import type { Machine, TeammateMachine } from "./machine-summary";
+import type { Session } from "@chopin/protocol";
 
 /**
  * A machine serving a document's repository, as the server lists it: one of the person's own, or
@@ -107,15 +108,70 @@ export function offlineChoice(state: MachineChoiceState | undefined): string | u
 }
 
 /**
- * The machine the document's Planner is starting on, or was running on when it dropped, by name,
- * when it is one the person can see. Another account's machine is not named here.
+ * The name the Planner's status gives the machine it is starting on, or was running on when it
+ * dropped: the document's own machine, the one its button names (the person's choice, else the one
+ * Automatic uses now), and no other. Not another machine of the person's own, which a list read
+ * before the choice changed may still describe; not a teammate's the document is not set to run
+ * on, which is named by its owner's login instead; nor one that is not in the person's list at all.
  */
 export function plannerRunsOn(state: MachineChoiceState | undefined): string | undefined {
+	return plannerMachine(state)?.label;
+}
+
+/** The machine the list says the Planner is starting on or dropped from, whose ever it is. */
+function plannerRunner(state: MachineChoiceState | undefined): ChoosableMachine | undefined {
 	let planner = state?.planner;
 	if (!planner?.machine || (planner.state !== "starting" && planner.state !== "disconnected")) {
 		return undefined;
 	}
-	return state?.machines.find(machine => machine.id === planner.machine)?.label;
+	return state?.machines.find(value => value.id === planner.machine);
+}
+
+function plannerMachine(state: MachineChoiceState | undefined): ChoosableMachine | undefined {
+	let machine = plannerRunner(state);
+	return machine && shownMachine(state)?.id === machine.id ? machine : undefined;
+}
+
+/**
+ * When the machine a disconnected Planner was on was last seen, as a contact's last seen is said,
+ * while it is away. Not for one that is connected: it was seen just now, and only the Planner
+ * dropped.
+ */
+export function plannerLastSeen(state: MachineChoiceState | undefined): string | undefined {
+	let machine = state?.planner?.state === "disconnected" ? plannerMachine(state) : undefined;
+	return machine && !machine.connected ? new Date(machine.lastSeenAt).toISOString() : undefined;
+}
+
+/**
+ * What `plannerStatus` is told of the machine the Planner is on. A name, where `plannerRunsOn` has
+ * one; undefined where the status says whose machine it is by login. `null` says nothing is said
+ * yet: while the person's machines are loading; while the list is older than the socket's word
+ * (`current` is false: it was read before the word came, so it describes the Planner as it was, and
+ * may name a machine it has since left, or one the document no longer runs on); while the list
+ * names a machine the document does not run on (a teammate's, or another of the person's own) for
+ * a Planner the person's own account is the one starting or dropping; and while the list describes
+ * another account's Planner than the page's socket does (its login, or the viewer's own where the
+ * machine is theirs). In each the two disagree, and the list is what is out of date.
+ */
+export function plannerMachineName(
+	state: MachineChoiceState | undefined,
+	planner: Session.PlannerAttachment | undefined,
+	viewer: string,
+	loading: boolean,
+	current: boolean,
+): string | null | undefined {
+	if (!state) return loading ? null : undefined;
+	if (planner?.state !== "starting" && planner?.state !== "disconnected") return undefined;
+	if (!current) return null;
+	let name = plannerRunsOn(state);
+	if (name !== undefined) {
+		return (state.planner?.login ?? viewer).toLowerCase() === planner.login.toLowerCase()
+			? name
+			: null;
+	}
+	return plannerRunner(state) && planner.login.toLowerCase() === viewer.toLowerCase()
+		? null
+		: undefined;
 }
 
 const STATE_WORDS: Record<MachineState, string> = {
@@ -188,8 +244,21 @@ export function presence(
 	].sort().join(" ");
 }
 
+let readings = 0;
+
+/**
+ * A place in the one order that the words the page's socket says of the Planner and the reads of
+ * the machine list share. A read that began before a word arrived describes the Planner as it was
+ * and cannot say which machine the word is of; one that began after can.
+ */
+export function nextReading(): number {
+	return ++readings;
+}
+
 export type MachineChoice = {
 	state?: MachineChoiceState;
+	/** Where the read that produced `state` began in the order of `nextReading`; 0 before any. */
+	read: number;
 	/** A choice is being saved. */
 	saving: boolean;
 	/** Why the last choice was refused. */
@@ -230,19 +299,26 @@ export async function setShared(machine: string, shared: boolean): Promise<boole
  */
 export function useMachineChoice(room: string, enabled: boolean): MachineChoice {
 	let [state, setState] = useState<MachineChoiceState>();
+	let [read, setRead] = useState(0);
 	let [saving, setSaving] = useState(false);
 	let [error, setError] = useState<string>();
 	let generation = useRef(0);
 	let refresh = useCallback(() => {
 		if (!enabled || document.visibilityState === "hidden") return;
 		let mine = ++generation.current;
+		let began = nextReading();
 		fetch(endpoint(room)).then(answer).then(
-			value => mine === generation.current && setState(value),
+			value => {
+				if (mine !== generation.current) return;
+				setState(value);
+				setRead(began);
+			},
 			() => {},
 		);
 	}, [room, enabled]);
 	useEffect(() => {
 		setState(undefined);
+		setRead(0);
 		if (!enabled) return;
 		refresh();
 		let timer = window.setInterval(refresh, REFRESH_MS);
@@ -275,6 +351,7 @@ export function useMachineChoice(room: string, enabled: boolean): MachineChoice 
 	}, [enabled, refresh]);
 	let choose = async (machine: string | null) => {
 		let mine = ++generation.current;
+		let began = nextReading();
 		setSaving(true);
 		setError(undefined);
 		// Shown at once; the server's answer replaces it.
@@ -287,7 +364,10 @@ export function useMachineChoice(room: string, enabled: boolean): MachineChoice 
 					body: JSON.stringify({ machine }),
 				}),
 			);
-			if (mine === generation.current) setState(value);
+			if (mine === generation.current) {
+				setState(value);
+				setRead(began);
+			}
 		} catch (failure) {
 			setError(failure instanceof Error ? failure.message : "Chopin couldn’t save that choice");
 			refresh();
@@ -295,5 +375,5 @@ export function useMachineChoice(room: string, enabled: boolean): MachineChoice 
 			setSaving(false);
 		}
 	};
-	return { state, saving, error, choose, refresh };
+	return { state, read, saving, error, choose, refresh };
 }

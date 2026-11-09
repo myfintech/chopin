@@ -48,6 +48,7 @@ export declare namespace Session {
 		| Channel
 		| Deleted
 		| Planner
+		| Restarting
 		| Failure
 		| Ping;
 
@@ -80,6 +81,12 @@ export declare namespace Session {
 		webResearch: boolean;
 		chatReferences: boolean;
 		chatSendAcks: boolean;
+		/**
+		 * The build of the client this server serves: the entry script its page names. A tab whose own
+		 * build, sent as the socket's `build` query parameter, differs knows a newer server answered.
+		 * Absent when the server serves no built client.
+		 */
+		build?: string;
 	};
 
 	/** Durable channel metadata changed while this room was open. */
@@ -143,6 +150,13 @@ export declare namespace Session {
 	 */
 	export type Planner = KIND<"session:planner"> & { planner: PlannerAttachment };
 
+	/**
+	 * The server is about to close this socket with 1012 because it is restarting, and a new process
+	 * is expected to take over within `reconnectWithinMs`. Sent just before the close, so a client
+	 * that sees the close as anything but 1012 still treats it as a restart. Older clients ignore it.
+	 */
+	export type Restarting = KIND<"session:restarting"> & { reconnectWithinMs: number };
+
 	/** Broadcast whenever the membership of the room changes. */
 	export type Presence = KIND<"session:presence"> & {
 		members: Member[];
@@ -155,8 +169,24 @@ export declare namespace Session {
 		 * Set for a refusal the client presents in full rather than as a generic
 		 * failure. `planner-not-attached`: a Planner request under `HARNESS=remote`
 		 * to a document no client is attached to; `message` says how to attach one.
+		 * `planner-queue-full`: too many requests wait behind the Planner's running turn right now
+		 * (never said of a machine that is away, which keeps every request). The request itself is
+		 * fine and is sent again, with the same request id, once some have been answered.
+		 * `temporarily-unavailable`: a refusal of a `chat:send` for a passing reason (storage busy,
+		 * the room changing, too many sends being handled for a machine that is there, a lookup of a
+		 * reference or of the open child that failed). The message is fine and is sent again, with
+		 * the same request id, and is kept once and delivered once even if an earlier attempt was
+		 * saved before its answer was lost. Any
+		 * refusal of a send without a code or with `planner-not-attached` is final.
+		 * `message-not-deletable`: the answer to a `chat:delete` that is final: the machine already
+		 * took the message, or it is not the sender's. Any other refusal of a delete is for a passing
+		 * reason, and the delete is asked again.
 		 */
-		code?: "planner-not-attached";
+		code?:
+			| "planner-not-attached"
+			| "planner-queue-full"
+			| "temporarily-unavailable"
+			| "message-not-deletable";
 	};
 
 	/** Liveness, and the smallest thing that proves request correlation works. */
@@ -178,6 +208,7 @@ export declare namespace Sidebar {
 		| Catalogue
 		| Watched
 		| Snapshot
+		| Session.Restarting
 		| Session.Failure
 		| Session.Ping;
 

@@ -1000,6 +1000,34 @@ describe("a document on Default machine", () => {
 		expect(await runtime.plannerStarting(channel.id)).toBeUndefined();
 	});
 
+	it("keeps naming the machine whose backend holds the Planner, and listing it connected, while a new process has yet to hear from its connector", async () => {
+		let dispatch = await dispatchServer();
+		let { machine, favor, visit, choice, channel, url, listing } = dispatch;
+		let desk = await machine("member", "U_member", "desk");
+		await favor("member", desk.id);
+		await visit();
+		expect(await desk.poll([])).toEqual({ kind: "planners", planners: [{ id: channel.id, url }] });
+		let first = await desk.backend();
+		await first.next("attached");
+		expect((await choice("member")).automatic).toMatchObject({ id: desk.id, label: "desk" });
+
+		// A deploy: every connection is forgotten, and the connector has not asked again.
+		await dispatch.restart();
+		expect((await choice("member")).machines[0]).toMatchObject({ id: desk.id, connected: false });
+		expect((await choice("member")).automatic).toBeNull();
+
+		// Its backend, with the credential it was given, is back first: the machine is running.
+		let second = await desk.backend();
+		await second.next("attached");
+		let after = await choice("member");
+		expect(after.planner).toEqual({ state: "attached", login: "member", machine: desk.id });
+		expect(after.automatic).toMatchObject({ id: desk.id, label: "desk" });
+		expect(after.machines[0]).toMatchObject({ id: desk.id, connected: true });
+		expect((await listing("member")).find(value => value.id === desk.id)).toMatchObject({
+			connected: true,
+		});
+	});
+
 	it("falls back to the machine last used for the document, then any machine that can run Planners", async () => {
 		let { machine, favor, visit, channel, runtime, url } = await dispatchServer();
 		let laptop = await machine("member", "U_member", "laptop");
@@ -2261,6 +2289,33 @@ describe("choosing a teammate's shared machine for a document", () => {
 			stopped: { [channel.id]: expect.stringContaining("member chose another machine") },
 		});
 		expect((await choice("rival")).choice).toBeNull();
+	});
+
+	it("says why a Planner stopped to a machine that asks while its credentials are still being forgotten", async () => {
+		let { choose, machine, box, channel, planners, url } = await chosen();
+		let laptop = await machine("member", "U_member", "laptop");
+		await choose("rival", box.id);
+		expect(await box.poll([])).toEqual({ kind: "planners", planners: [{ id: channel.id, url }] });
+
+		// Forgetting a credential waits on storage. The choice has taken effect by then, so the
+		// machine's next question already has to be answered with the reason.
+		let reached = Promise.withResolvers<void>();
+		let proceed = Promise.withResolvers<void>();
+		let withdraw = planners.withdraw.bind(planners);
+		planners.withdraw = async (machineId, channelId) => {
+			reached.resolve();
+			await proceed.promise;
+			return withdraw(machineId, channelId);
+		};
+		let picked = choose("member", laptop.id);
+		await reached.promise;
+		expect(await box.poll([channel.id], 500)).toEqual({
+			kind: "planners",
+			planners: [],
+			stopped: { [channel.id]: expect.stringContaining("member chose another machine") },
+		});
+		proceed.resolve();
+		await picked;
 	});
 
 	it("never asks it for an editor's choice while the creator chose another machine", async () => {

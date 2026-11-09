@@ -10,10 +10,17 @@
  * same build work on localhost, over a LAN address, and through a tunnel.
  */
 
-import { REFUSAL_HEADER } from "@chopin/protocol/restart";
+import { BUILD_PARAM, REFUSAL_HEADER } from "@chopin/protocol/restart";
 
 import { activeActor } from "./active-actor";
-import { lossOf, quietLeft, refusalOf, restartDelay, restartRetryDelay } from "./wire-loss";
+import {
+	lossOf,
+	quietLeft,
+	refusalOf,
+	restartDelay,
+	restartRetryDelay,
+	runningBuild,
+} from "./wire-loss";
 
 import type { Session } from "@chopin/protocol";
 
@@ -75,7 +82,8 @@ export type WireOptions = WireTarget & {
 	 * reconnect nor the network coming back resets the count: only a connection that opens does.
 	 * A loss the server announced as a restart (close code 1012) raises none for `RESTART_QUIET_MS`,
 	 * and the attempts that fail meanwhile are not counted: a restart that is over by then is never
-	 * reported, and one that is not is reported then, as any other loss.
+	 * reported, and one that is not is reported then, as any other loss. A refusal ends the quiet at
+	 * once and raises none: the server is not coming back for this connection.
 	 */
 	onOutage?: (outage: Outage | undefined) => void;
 	onAuthenticationRequired?: () => void;
@@ -111,6 +119,8 @@ function endpoint(options: WireOptions): string {
 		let actor = activeActor();
 		if (actor) url.searchParams.set("actor", actor.id);
 	}
+	let build = runningBuild(globalThis.document);
+	if (build) url.searchParams.set(BUILD_PARAM, build);
 	return url.href;
 }
 
@@ -150,6 +160,8 @@ export class Wire {
 	#everConnected = false;
 	/** Whether the current outage began with the server saying it is restarting. */
 	#restarting = false;
+	/** Whether the open socket was told by `session:restarting` that its close is a restart. */
+	#announced = false;
 	#disposed = false;
 	#terminal = false;
 	#connectionGeneration = 0;
@@ -199,7 +211,7 @@ export class Wire {
 	}
 
 	/**
-	 * Whether the connection was lost because the server is restarting, until it is back.
+	 * Whether the connection was lost because the server is restarting, until it is back or refuses it.
 	 *
 	 * A restart is expected to end on its own within moments, so what is shown about it may
 	 * wait longer than for any other loss. What has to act on the connection must not: read
@@ -255,6 +267,7 @@ export class Wire {
 
 		let socket = new WebSocket(endpoint(this.#options));
 		this.#socket = socket;
+		this.#announced = false;
 
 		let opened = false;
 		socket.addEventListener("open", () => {
@@ -283,7 +296,8 @@ export class Wire {
 			// A socket superseded by a reconnect must not drive status or retries.
 			if (this.#socket !== socket) return;
 			this.#socket = undefined;
-			let loss = lossOf(event.code);
+			let loss = lossOf(event.code, this.#announced);
+			this.#announced = false;
 			if (loss === "deleted") {
 				this.#deleted();
 				return;
@@ -379,6 +393,11 @@ export class Wire {
 		if (this.#disposed || this.#terminal || generation !== this.#connectionGeneration) return;
 		this.#probing = false;
 		if (refusal) {
+			// A refusal says the server is not about to return for this connection: the restart's
+			// quiet ends here, with no outage raised for it.
+			this.#restarting = false;
+			clearTimeout(this.#quietTimer);
+			this.#quietTimer = undefined;
 			if (refusal.authentication) this.#options.onAuthenticationRequired?.();
 			return this.#set("denied", refusal.reason);
 		}
@@ -437,6 +456,7 @@ export class Wire {
 			}
 		}
 		if (frame.kind === "session:deleted") this.#deleted();
+		if (frame.kind === "session:restarting") this.#announced = true;
 	}
 
 	#deleted(): void {

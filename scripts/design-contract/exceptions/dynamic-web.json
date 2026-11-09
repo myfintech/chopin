@@ -101,7 +101,7 @@
 				1
 			]
 		],
-		"sourceHash": "c80190bf6bb90dcfb5217bd6804039aa61d34bea5b7d418453706b3a63dce276"
+		"sourceHash": "301ab61a399443a68265de8f46613564cec63406da513aac168363293cb0d13c"
 	},
 	{
 		"file": "apps/web/src/account-menu.tsx",
@@ -129,7 +129,7 @@
 				1
 			]
 		],
-		"sourceHash": "20323e990ce66f93fdb5669370a4026349c21c235b8980ea2f50c9bd52d177ac"
+		"sourceHash": "f82a203bbaa9d77efafd088a783e8043630292d4fbf5f20a4b4833e9ba9e9e4c"
 	},
 	{
 		"file": "apps/web/src/design-audit/controls.tsx",
@@ -143,7 +143,7 @@
 				1
 			]
 		],
-		"sourceHash": "67417dc4f0e93a10f76583d07b30b2a4980e9018cbdb72d4627ae6b0f37170e7"
+		"sourceHash": "b1eac2a759867ebff7afc1082c41a10101ec8a747891361f2849447599ac5e10"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -193,6 +193,20 @@
 			]
 		],
 		"sourceHash": "0a11fe298d25f70f899ec376a04f2e128b8de45e763d36c377d15f55aa8e2f8b"
+	},
+	{
+		"file": "apps/web/src/chat/message-delivery.tsx",
+		"reason": "The message menu is placed from its button's measured rectangle, above or below as there is room, as the document actions menu is: measured popup coordinates and visibility, not design token values.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"position",
+				"unresolved style > MessageMenu > <div>",
+				1
+			]
+		],
+		"sourceHash": "efb8748486bb9224d9e51bfc18b5298365ca9eebad95ee8b7a0c727c98f5a7cb"
 	},
 	{
 		"file": "apps/web/src/terminal-alert.tsx",
@@ -276,7 +290,7 @@
 				1
 			]
 		],
-		"sourceHash": "2cbc38e53c5c5098f7aa3798539815c6ee2f2fb415fa19f468ba12d07598b5d4"
+		"sourceHash": "0d052d72de63390cf74f74a5e709e392c02b0efee8d03afed343375044f78bf2"
 	},
 	{
 		"file": "apps/web/src/navigation-dialog.tsx",
@@ -311,7 +325,7 @@
 				1
 			]
 		],
-		"sourceHash": "25d5641ba4757668917be319cb5452999354e3f730264d3b1ec8cde48f3c3f44"
+		"sourceHash": "ef95f80b0d05b634dfbc54c1cf26cf950bbae85a1052b2980054499a8065e351"
 	},
 	{
 		"file": "apps/web/src/machine-button.tsx",
@@ -381,7 +395,7 @@
 				1
 			]
 		],
-		"sourceHash": "121c27bb62c1ccbc0ff6f878c9a13dd240f54c067ab369940b7b0dc29f9ebb28"
+		"sourceHash": "15f197fd510d2907f0cc3a5262f33db257028c470474fbfb23cf76a519dadd43"
 	},
 	{
 		"file": "apps/web/src/offline-notice.tsx",

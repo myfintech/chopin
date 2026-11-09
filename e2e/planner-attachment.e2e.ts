@@ -15,6 +15,7 @@ import { height, inBetween } from "./motion";
 import {
 	address,
 	announced,
+	expectNoMachineWords,
 	expectNoPlanner,
 	expectPlannerAttached,
 	expectSaidOnce,
@@ -29,7 +30,7 @@ import { authenticate, content, expect, ready, roomPath, test } from "./room";
 import { expectInsideViewport, expectNoHorizontalOverflow } from "./responsive";
 import { HARNESS, HOST, ROOT } from "./servers";
 
-import type { BrowserContext, Locator, Page } from "@playwright/test";
+import type { BrowserContext, Locator, Page, WebSocketRoute } from "@playwright/test";
 import type { AgentClient, AgentHandlers } from "../packages/agent-link/src/client";
 
 const PORT = 8793;
@@ -248,9 +249,9 @@ test("with no machine button, the composer's top edge always says what is wrong 
 });
 
 /** Open a new comment on the document's first paragraph. */
-async function draft(page: Page) {
+async function draft(page: Page, paragraph = 0) {
 	await page.waitForFunction(() => document.getAnimations().every(a => a.playState !== "running"));
-	await content(page).locator("p").first().selectText();
+	await content(page).locator("p").nth(paragraph).selectText();
 	await page.getByRole("button", { name: "Comment on this passage", exact: true }).click();
 	return page.getByRole("dialog", { name: "New comment" });
 }
@@ -263,7 +264,11 @@ test("a new comment is sent to Chopin by default only while a Planner is attache
 	registerTestDatabase(PORT, database);
 	let room = crypto.randomUUID();
 	await createChannel(PORT, room);
-	await seedChannel(PORT, room, "# Remote comments\nThe harp needs new strings.\n");
+	await seedChannel(
+		PORT,
+		room,
+		"# Remote comments\nThe harp needs new strings.\n\nThe bridge needs a new pin.\n",
+	);
 
 	await authenticate(page, HANDLE, ORIGIN);
 	await page.goto(`${ORIGIN}${roomPath(room)}`);
@@ -274,15 +279,16 @@ test("a new comment is sent to Chopin by default only while a Planner is attache
 	let box = card.getByRole("checkbox", { name: "Send to Chopin" });
 	await expect(box).not.toBeChecked();
 
-	// Ticked anyway, the server refuses it, says how to attach one, and keeps the words.
+	// Ticked anyway, it is not refused for the machine being away: it is posted at once, the
+	// thread shows Chopin is on it, and it waits for the machine.
 	await box.check();
 	let field = card.getByRole("textbox", { name: "Comment" });
 	await field.fill("Can you shorten this?");
 	await card.getByRole("button", { name: "Post comment", exact: true }).click();
-	await expect(card.getByRole("alert")).toContainText("Connect a machine to get a reply.");
-	await expect(field).toHaveValue("Can you shorten this?");
-	await page.keyboard.press("Escape");
+	await expect(card.getByRole("alert")).toHaveCount(0);
 	await expect(card).toHaveCount(0);
+	await expect(page.getByText("Can you shorten this?").first()).toBeVisible();
+	await expect(page.getByText("Connect a machine to get a reply.")).toHaveCount(0);
 
 	let client = await connectAgent({
 		url: ORIGIN,
@@ -292,7 +298,7 @@ test("a new comment is sent to Chopin by default only while a Planner is attache
 	});
 	try {
 		await expectPlannerAttached(page);
-		await expect((await draft(page)).getByRole("checkbox", { name: "Send to Chopin" }))
+		await expect((await draft(page, 1)).getByRole("checkbox", { name: "Send to Chopin" }))
 			.toBeChecked();
 	} finally {
 		await client.detach();
@@ -675,7 +681,7 @@ test("a Planner whose connection drops is shown as disconnected for longer than 
 		await expect(decision).toBeVisible();
 		let runs = chatPane(page).getByRole("region", { name: "Workflow runs" });
 		await expect(runs.getByRole("button", { name: /^plan-review, running, \d+m$/ })).toBeVisible();
-		await expect(chatPane(page).getByText("The Planner disconnected.")).toHaveCount(0);
+		await expect(chatPane(page).getByText("The machine disconnected.")).toHaveCount(0);
 		await snap(page, "link-drop-connected-desktop");
 
 		sockets[0]!.close(3000, "network failed");
@@ -693,15 +699,11 @@ test("a Planner whose connection drops is shown as disconnected for longer than 
 		await expect(away).toBeVisible();
 		await expect(away).toContainText("disconnected");
 		await expect(runs.locator("[data-run-disconnected-note]")).toHaveText(
-			"Last reported running. It carries on when the Planner reconnects.",
+			"Last reported running. It carries on when the machine reconnects.",
 		);
 		await expect(runs).not.toContainText("stopped");
-		await expect(
-			chatPane(page).getByText(
-				"The Planner disconnected. Its workflows and open Decisions are kept",
-			),
-		)
-			.toBeVisible();
+		// The machine's state is told on the run card and the composer's top edge, not again in Chat.
+		await expect(chatPane(page).getByText(/The machine (disconnected|reconnected)/)).toHaveCount(0);
 		await expect(decision.getByRole("button", { name: "Save", exact: true })).toBeVisible();
 		await snap(page, "link-drop-disconnected-desktop");
 		await snap(chatPane(page), "link-drop-disconnected-chat-desktop");
@@ -748,7 +750,7 @@ test("a Planner whose connection drops is shown as disconnected for longer than 
 		await page.getByRole("button", { name: "Stop Chopin", exact: true }).click();
 		await expect(
 			chatPane(page).getByText(
-				"asked to stop the Planner. Its connection is down, so its workflows will pause when it reconnects.",
+				"asked Chopin to stop. Its machine is disconnected, so its workflows will pause when it reconnects.",
 			),
 		).toBeVisible();
 		await expect(away).toBeVisible();
@@ -756,7 +758,7 @@ test("a Planner whose connection drops is shown as disconnected for longer than 
 		await expect(runs).not.toContainText("paused");
 		// Pause is offered, said as pending, and Resume is not.
 		await expect(
-			runs.getByRole("button", { name: "Pause plan-review when the Planner reconnects" }),
+			runs.getByRole("button", { name: "Pause plan-review when the machine reconnects" }),
 		)
 			.toBeVisible();
 		expect(controls).toEqual([]);
@@ -774,7 +776,8 @@ test("a Planner whose connection drops is shown as disconnected for longer than 
 		await expect(runs.getByRole("button", { name: /^plan-review, paused, \d+m$/ })).toBeVisible();
 		await expect(runs).not.toContainText("disconnected");
 		await expect(runs.locator("[data-run-disconnected-note]")).toHaveCount(0);
-		await expect(chatPane(page).getByText("The Planner reconnected and carries on.")).toBeVisible();
+		// Nothing confirms it: the card's mark and the composer's strip going are all there is.
+		await expect(chatPane(page).getByText(/The machine (disconnected|reconnected)/)).toHaveCount(0);
 		await expect(runs.getByRole("button", { name: "Resume plan-review" })).toBeVisible();
 		// The answer given while it was away reached it.
 		expect(await asked).toMatchObject({ status: "answered", value: true });
@@ -793,6 +796,182 @@ test("a Planner whose connection drops is shown as disconnected for longer than 
 		await link?.detach();
 	}
 });
+
+const OFFLINE = "You're offline. Your changes are kept and will sync when you reconnect.";
+
+/** Proxies the page's document socket, so a test is what drops it and keeps it away until `back`. */
+async function losable(page: Page) {
+	let away = false;
+	let sockets: WebSocketRoute[] = [];
+	await page.routeWebSocket("**/ws?**", socket => {
+		if (away) return void socket.close();
+		socket.connectToServer();
+		sockets.push(socket);
+	});
+	return {
+		lose: async () => {
+			away = true;
+			await sockets.at(-1)!.close();
+		},
+		back: async () => {
+			away = false;
+			await page.evaluate(() => dispatchEvent(new Event("online")));
+		},
+	};
+}
+
+for (
+	let [shape, options] of [
+		["desktop", { viewport: { width: 1440, height: 1000 } }],
+		["phone", PHONE],
+	] as const
+) {
+	test(`a run whose machine dropped says nothing of the machine while the page's offline notice shows, and says it again when the connection returns, on a ${shape}`, async ({ browser }) => {
+		test.setTimeout(150_000);
+		let database = await freshDatabase();
+		await migrate(database);
+		await remoteServer(database);
+		registerTestDatabase(PORT, database);
+		let room = crypto.randomUUID();
+		await createChannel(PORT, room);
+		await seedChannel(PORT, room, "# Release\nShip when ready.\n");
+		let context = await browser.newContext(options);
+		let page = await context.newPage();
+		await authenticate(page, HANDLE, ORIGIN);
+		let wire = await losable(page);
+		await listenForAnnouncements(page);
+		await page.goto(`${ORIGIN}${roomPath(room)}`);
+		await ready(page);
+		if (shape === "phone") {
+			await page.getByRole("navigation", { name: "Workspace view" })
+				.getByRole("button", { name: /^Chat/ }).click();
+			await expect.poll(async () => (await chatPane(page).boundingBox())?.x).toBe(0);
+		}
+
+		let sockets: WebSocket[] = [];
+		let Native = globalThis.WebSocket;
+		globalThis.WebSocket = class extends Native {
+			constructor(...args: ConstructorParameters<typeof Native>) {
+				super(...args);
+				sockets.push(this);
+			}
+		} as typeof WebSocket;
+		let link: AgentClient | undefined;
+		let returning: AgentClient | undefined;
+		let started = Math.floor(Date.now() / 1000) - 300;
+		let handlers: AgentHandlers = {
+			turn(context) {
+				link!.reportRuns(context.message.session, {
+					active: ["run-1"],
+					paused: [],
+					cards: [{
+						id: "run-1",
+						name: "plan-review",
+						status: "running",
+						started,
+						updated: started + 240,
+						stages: [{ id: "run-1:review", name: "review-draft", status: "running", started }],
+						waiting: 0,
+					}],
+				});
+			},
+		};
+		try {
+			link = await connectAgent({
+				url: ORIGIN,
+				token: `ghu_e2e_${HANDLE}_1`,
+				document: room,
+				handlers,
+			});
+			let input = chatInput(page);
+			await fillChat(input, "@chopin review the release");
+			await input.press("Enter");
+			let runs = chatPane(page).getByRole("region", { name: "Workflow runs" });
+			await expect(runs.getByRole("button", { name: /^plan-review, running, \d+m$/ }))
+				.toBeVisible();
+
+			// Its machine drops: the card says so, as does the composer's top edge.
+			sockets[0]!.close(3000, "network failed");
+			let held = await link.resumption;
+			expect(held).toBeDefined();
+			let note = runs.locator("[data-run-disconnected-note]");
+			await expect(
+				runs.getByRole("button", { name: /^plan-review, disconnected, was running, \d+m$/ }),
+			)
+				.toBeVisible();
+			await expect(note).toHaveText(
+				"Last reported running. It carries on when the machine reconnects.",
+			);
+			await expect(strip(page)).toHaveText(`@${HANDLE}'s machine is offline. Your work is kept.`);
+			// A screen reader was told once, by the page's one live region.
+			await expect(announced(page)).toHaveText(
+				`@${HANDLE}'s machine is offline. Your work is kept.`,
+			);
+			let said = await heard(page);
+			expect(said).toEqual([`@${HANDLE}'s machine is offline. Your work is kept.`]);
+
+			// Then the page's own connection is lost. Its notice is the one thing said: the card is
+			// still the run, as last reported, with its controls, and says nothing of the machine
+			// anywhere on the page, to the eye or to a screen reader.
+			await wire.lose();
+			await expect(page.locator("[data-offline-notice]").getByRole("alert")).toHaveText(OFFLINE);
+			await expect(page.getByRole("alert")).toHaveCount(1);
+			await expect(runs.getByRole("button", { name: /^plan-review, running, \d+m$/ }))
+				.toBeVisible();
+			await expect(runs.getByRole("button", { name: "Pause plan-review", exact: true }))
+				.toBeVisible();
+			await expect(runs.locator("[data-run-disconnected-note], [data-run-disconnected]"))
+				.toHaveCount(0);
+			await expect(strip(page)).toHaveCount(0);
+			await expectNoMachineWords(page);
+			expect(await heard(page)).toEqual(said);
+			await expect(chatPane(page)).not.toContainText(/machine/i);
+			await expectNoHorizontalOverflow(page);
+			await snap(page, `run-card-offline-${shape}`);
+
+			// It returns, and the words return with it, as the state dictates: the machine is still away.
+			await wire.back();
+			await expect(page.locator("[data-offline-notice]")).toHaveCount(0);
+			await expect(
+				runs.getByRole("button", { name: /^plan-review, disconnected, was running, \d+m$/ }),
+			)
+				.toBeVisible();
+			await expect(note).toHaveText(
+				"Last reported running. It carries on when the machine reconnects.",
+			);
+			await expect(
+				runs.getByRole("button", { name: "Pause plan-review when the machine reconnects" }),
+			).toBeVisible();
+			await expect(strip(page)).toHaveText(`@${HANDLE}'s machine is offline. Your work is kept.`);
+			// The state carried on through the loss, so it is not said again.
+			await page.waitForTimeout(500);
+			await expect(announced(page)).toHaveText("");
+			expect(await heard(page)).toEqual(said);
+			await expectNoHorizontalOverflow(page);
+			await snap(page, `run-card-online-${shape}`);
+
+			// And the machine returns: nothing about it is left.
+			returning = await connectAgent({
+				url: ORIGIN,
+				token: `ghu_e2e_${HANDLE}_1`,
+				document: room,
+				handlers,
+				resume: held!,
+			});
+			await expect(strip(page)).toHaveCount(0);
+			await expect(runs.getByRole("button", { name: /^plan-review, running, \d+m$/ }))
+				.toBeVisible();
+			await expect(note).toHaveCount(0);
+			await expect(announced(page)).toHaveText("");
+			expect(await heard(page)).toEqual(said);
+		} finally {
+			globalThis.WebSocket = Native;
+			await context.close();
+			await returning?.detach();
+			await link?.detach();
+		}
+	});
+}
 
 /** A bare WebSocket upgrade request as the member, offering `subprotocol` when given. */
 function handshake(path: string, subprotocol?: string): Promise<Response> {

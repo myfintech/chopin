@@ -107,6 +107,21 @@ const MIGRATIONS = [{
 	id: "028_machine_sharing",
 	path: join(import.meta.dir, "migrations/028_machine_sharing.sql"),
 }, {
+	id: "029_planner_link_holds",
+	path: join(import.meta.dir, "migrations/029_planner_link_holds.sql"),
+}, {
+	id: "030_planner_credentials",
+	path: join(import.meta.dir, "migrations/030_planner_credentials.sql"),
+}, {
+	id: "031_planner_deferred_turns",
+	path: join(import.meta.dir, "migrations/031_planner_deferred_turns.sql"),
+}, {
+	id: "032_mcp_sessions",
+	path: join(import.meta.dir, "migrations/032_mcp_sessions.sql"),
+}, {
+	id: "033_planner_hold_machine_owner",
+	path: join(import.meta.dir, "migrations/033_planner_hold_machine_owner.sql"),
+}, {
 	id: "mantl_user_preferences",
 	path: join(import.meta.dir, "migrations/mantl_user_preferences.sql"),
 }, {

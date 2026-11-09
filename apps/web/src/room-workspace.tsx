@@ -60,13 +60,20 @@ import { OfflineAnnouncement, OfflineNotice, useOfflineNotice } from "./offline-
 import { buildBlockers } from "./build-blockers";
 import type { BuildBlocker } from "./build-blockers";
 import {
+	nextReading,
 	offlineChoice,
-	plannerRunsOn,
+	plannerLastSeen,
+	plannerMachineName,
 	showsMachineChoice,
 	useMachineChoice,
 } from "./machine-choice";
-import { plannerPlacement, plannerStatus } from "./chat/planner-status";
+import { plannerPlacement, plannerStatus, plannerWithheld } from "./chat/planner-status";
 import { PlannerAnnouncement } from "./chat/planner-announcement";
+import {
+	plannerConnectionLost,
+	plannerWordHeard,
+	useSettledPlannerStatus,
+} from "./chat/planner-settle";
 import { MachineButton } from "./machine-button";
 import { machines as machineStore, summarizeMachines, useLiveMachines } from "./machine-summary";
 import { useLiveBuild } from "./live-build";
@@ -76,6 +83,7 @@ import { ChildPhoneChromeContext, sameEditState } from "./child-phone-chrome";
 import { ChildProvenance } from "./child-provenance";
 import { ChildTitleContext } from "./child-title";
 import { shouldShowResearchActionError, useResearchOfferLinks } from "./chat/research-offer";
+import type { PlannerView } from "./chat/planner-settle";
 import type { ResearchDraftController } from "./chat/research-draft-controller";
 import { useDocumentEditing } from "./document-editing";
 import { advanceConversationAnnouncement } from "./conversation-plan/announcements";
@@ -83,6 +91,7 @@ import type { ConversationAnnouncementSummary } from "./conversation-plan/announ
 import { evidenceRows, hasEvidence } from "./conversation-plan/evidence";
 import { EvidencePopover } from "./conversation-plan/evidence-popover";
 import { threadForCard } from "./conversation-plan/links";
+import { JOB_RETRY_FAILED } from "./conversation-plan/planner-job-diagnostics";
 import type { CardLink } from "./conversation-plan/links";
 import type { ExcerptCorrectionAction } from "./conversation-plan/analysis-overview";
 import { ConversationPlanStore, useConversationPlan } from "./conversation-plan/store";
@@ -130,6 +139,7 @@ import {
 import { ResearchRequestStore } from "./research-requests";
 import { GitHubReferenceCache } from "./github-references";
 import { Wire } from "./wire";
+import { readsConnected } from "./wire-loss";
 import { ExperimentStore } from "./experiments/store";
 import { InvestigationReference, removableInvestigation } from "./experiments/card";
 import { EvidenceDecisions, ViewDecision } from "./experiments/evidence";
@@ -569,6 +579,8 @@ export function RoomWorkspace(
 	}, [room]);
 	// Controls dim only once a loss outlasts a blip; actions still read `status`.
 	let treatAsConnected = useConnectionNotice(status !== "connected", wire?.restarting) === "none";
+	// What the page draws holds through a restart it is waiting out in silence.
+	let shownConnected = readsConnected(status, !!wire?.restarting, treatAsConnected);
 	// A lost connection is said once, at the top of the page: decided here, above wherever the
 	// notice is drawn, so a person switching between Chat and the document neither waits out the
 	// grace period again nor hears of it twice.
@@ -586,6 +598,9 @@ export function RoomWorkspace(
 	let [plannerAttachment, setPlannerAttachment] = useState<{
 		wire?: Wire;
 		planner?: Session.PlannerAttachment;
+		placeholder?: boolean;
+		/** Where the word arrived in the order of `nextReading`. */
+		heard?: number;
 	}>({});
 	let [chatSendAcks, setChatSendAcks] = useState<{ wire?: Wire; enabled: boolean }>({
 		enabled: false,
@@ -722,16 +737,33 @@ export function RoomWorkspace(
 		&& plannerAttachment.planner.state !== "attached";
 	let plannerDisconnected = plannerDetached && plannerAttachment.planner?.state === "disconnected";
 	// The machine button beside Build plan chooses where work runs; Build plan says when it is offline.
-	let machineChoice = useMachineChoice(
-		room,
-		profile.implementation && !!effectiveCanEdit && !(archivedAt ?? metadata.archivedAt),
-	);
+	let machinesEnabled = profile.implementation && !!effectiveCanEdit
+		&& !(archivedAt ?? metadata.archivedAt);
+	let machineChoice = useMachineChoice(room, machinesEnabled);
 	// What is not well with the Planner. Where it is told, the machine button, the composer's top
-	// edge, or both, is decided once for every place that tells it (`plannerPlacement`).
+	// edge, or both, is decided once for every place that tells it (`plannerPlacement`). Which
+	// machine it is on is said only once the person's machines are in, and read after the socket's
+	// last word: null says nothing until then.
 	let attachment = plannerAttachment.wire === wire ? plannerAttachment.planner : undefined;
-	let plannerNote = useMemo(
-		() => plannerStatus(attachment, plannerRunsOn(machineChoice.state)),
-		[attachment, machineChoice.state],
+	let listCurrent = machineChoice.read
+		> (plannerAttachment.wire === wire ? plannerAttachment.heard ?? 0 : 0);
+	let machineName = plannerMachineName(
+		machineChoice.state,
+		attachment,
+		handle,
+		machinesEnabled,
+		listCurrent,
+	);
+	let lastSeen = plannerLastSeen(machineChoice.state);
+	let plannerNow = useMemo(
+		() => plannerStatus(attachment, machineName, lastSeen),
+		[attachment, machineName, lastSeen],
+	);
+	let plannerWithheldNow = plannerWithheld(attachment, machineName);
+	let plannerNote = useSettledPlannerStatus(
+		plannerNow,
+		plannerAttachment.placeholder,
+		plannerWithheldNow,
 	);
 	// The choice shows only while the person has a paired machine, live, or the document lists a
 	// teammate's shared one: it appears with their first and goes with their last.
@@ -742,8 +774,8 @@ export function RoomWorkspace(
 		refreshMachine();
 	}, [plannerAttachment.planner, refreshMachine]);
 	let build = useBuildPlan({
-		canEdit: effectiveCanEdit && !(archivedAt ?? metadata.archivedAt) && status === "connected",
-		connected: status === "connected",
+		canEdit: effectiveCanEdit && !(archivedAt ?? metadata.archivedAt) && shownConnected,
+		connected: shownConnected,
 		enabled: profile.implementation,
 		hasContent: hasPlanContent,
 		live: liveBuild,
@@ -1060,7 +1092,7 @@ export function RoomWorkspace(
 			);
 			if (!result.queued) throw new Error("job is no longer retryable");
 		} catch {
-			throw new Error("The Planner job could not be retried. Try again when connected.");
+			throw new Error(JOB_RETRY_FAILED);
 		}
 	};
 	let showCard = (link: CardLink) => {
@@ -1175,6 +1207,7 @@ export function RoomWorkspace(
 	useEffect(() => {
 		cardMeta.listen(undefined);
 		setOutage(undefined);
+		let plannerView: PlannerView = "unknown";
 		let socket = new Wire({
 			channelId: room,
 			onAuthenticationRequired: () => location.reload(),
@@ -1188,6 +1221,7 @@ export function RoomWorkspace(
 					conversationStore.reset();
 					cardMeta.listen(undefined);
 				}
+				if (next === "reconnecting") plannerView = plannerConnectionLost(plannerView);
 				setStatus(next);
 			},
 		});
@@ -1224,7 +1258,13 @@ export function RoomWorkspace(
 			}),
 			socket.on<Session.Presence>("session:presence", frame => setMembers(frame.members)),
 			socket.on<Session.Planner>("session:planner", frame => {
-				setPlannerAttachment({ wire: socket, planner: frame.planner });
+				plannerView = plannerWordHeard(plannerView, frame.planner);
+				setPlannerAttachment({
+					wire: socket,
+					planner: frame.planner,
+					placeholder: plannerView === "returning",
+					heard: nextReading(),
+				});
 			}),
 			socket.on<ManagedAccess>("session:access", frame => {
 				latestCanEdit.current = frame.canEdit;
@@ -1277,8 +1317,8 @@ export function RoomWorkspace(
 			? !(presentation.type === "parent-with-child" && planVisible)
 			: titleBuildShown);
 	let plannerWhere = useMemo(
-		() => plannerPlacement(plannerNote, hasMachineButton),
-		[plannerNote, hasMachineButton],
+		() => plannerPlacement(plannerNote, hasMachineButton, offline.open),
+		[plannerNote, hasMachineButton, offline.open],
 	);
 	useTitlingReport({
 		wire: workspaceCanEdit ? wire : undefined,
@@ -1372,7 +1412,7 @@ export function RoomWorkspace(
 		}),
 		[formatDock, planVisible, reportChildEdit],
 	);
-	let investigationsEditable = !!workspaceCanEdit && status === "connected";
+	let investigationsEditable = !!workspaceCanEdit && shownConnected;
 	// Read through a ref so the editor keeps one stable set of resources while people come and go.
 	let pageRequest = useRef(0);
 	let exploreState = useRef({ cardMetadata, handle, members, presentation, wire });
@@ -1855,7 +1895,7 @@ export function RoomWorkspace(
 				documentURL={new URL(documentPath(repository.owner, repository.name, slug), location.origin)
 					.href}
 				machineOffline={offlineChoice(machineChoice.state)}
-				canEdit={!!workspaceCanEdit && status === "connected"}
+				canEdit={!!workspaceCanEdit && shownConnected}
 				compact={mode !== "split"}
 				hot={buildHover === "tab"}
 				onExplain={showBuildBlocker}
@@ -1889,7 +1929,13 @@ export function RoomWorkspace(
 						<span key={announcement.sequence}>{announcement.text}</span>
 					</p>
 					<OfflineAnnouncement spoken={offline.spoken} />
-					{profile.chat && <PlannerAnnouncement status={plannerNote} />}
+					{profile.chat && (
+						<PlannerAnnouncement
+							offline={offline.open}
+							status={plannerNote}
+							withheld={plannerWithheldNow}
+						/>
+					)}
 					<Workspace
 						available={available}
 						buildEnabled={build.tabReady}
@@ -1904,6 +1950,7 @@ export function RoomWorkspace(
 							<Chat
 								active={chatActive}
 								agent={agent}
+								offline={offline.open}
 								focus={presentation.type === "parent-with-child" ? presentation.childId : undefined}
 								onOpenChild={presentation.onChildOpen}
 								connected={status === "connected"}
@@ -2114,7 +2161,7 @@ export function RoomWorkspace(
 							<BuildView
 								active={workspacePresentation.documentVisible && view === "build"}
 								build={build}
-								canEdit={!!workspaceCanEdit && status === "connected"}
+								canEdit={!!workspaceCanEdit && shownConnected}
 								comments={acceptedComments}
 								onShowDocument={() => selectDestination("plan")}
 								room={room}
@@ -2128,7 +2175,7 @@ export function RoomWorkspace(
 								additional={
 									<EvidenceDecisions
 										store={experiments}
-										canEdit={!!workspaceCanEdit && status === "connected"}
+										canEdit={!!workspaceCanEdit && shownConnected}
 									/>
 								}
 								hasAdditional={[...experiments.values.values()].some(item =>

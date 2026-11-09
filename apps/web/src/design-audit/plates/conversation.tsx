@@ -134,7 +134,7 @@ let PRESENCE = [
 export function ConversationPlate() {
 	return (
 		<AuditPlate
-			description="Member, Planner, tool activity, queued work, composer, and error states."
+			description="Member, Chopin, tool activity, queued work, composer, and error states."
 			item="chat"
 			title="Conversation"
 		>
@@ -177,10 +177,6 @@ export function ConversationPlate() {
 						}}
 						text="Can we tighten the header?"
 					/>
-				</div>
-				<div>
-					<StateLabel>Can't connect, with the machine button</StateLabel>
-					<ComposerSpecimen notice={plannerPlacement(status(FAILING), true).strip} />
 				</div>
 				{WITHOUT_BUTTON.map(({ label, planner }) => (
 					<div key={label}>
