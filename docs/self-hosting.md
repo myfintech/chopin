@@ -94,7 +94,7 @@ proxy that the server learns some other way, such as a system setting, set
 these variables on the server process too: otherwise the CLI connects directly,
 and a Planner turn fails with "The Planner stream failed."
 
-`HARNESS=atomic` runs Atomic 0.9.74 in the Chopin server process through its
+`HARNESS=atomic` runs Atomic 0.9.76 in the Chopin server process through its
 headless SDK (`createAgentSession()`). It does not spawn the `atomic` CLI or use
 RPC mode.
 
@@ -845,6 +845,27 @@ to start again.
 Remove `PREVIOUS_ORIGINS` once machines have reconnected and you stop serving
 the old name. Never list an origin you no longer control: its pages would pass
 Chopin's Origin checks.
+
+### Machines and the connector sandbox
+
+`chopin connect` runs agents and Planner commands in the operating system's
+process sandbox where the machine has one (see
+[Sandbox](chopin-cli.md#sandbox)). Nothing to configure here: the server only
+keeps what each connector says about its own sandbox, in three additive request
+headers (`chopin-connector-sandbox`, `-reason` and `-fix`), and the Machines page
+shows it as **Sandboxed** or **Not sandboxed**, with the reason and the one fix
+for a machine that has none. An older connector sends none, and an older server
+ignores them.
+
+The sandbox lets agents reach your instance's origin, GitHub, the model
+providers and the npm, PyPI and crates registries, and nothing else. A
+self-hosted deployment whose agents also need an internal registry, a Git mirror
+or another model endpoint adds each host on the machine, with
+`chopin connect --sandbox-host <host>`, and runs `chopin service install` again
+for a service. An instance behind another origin needs nothing: the connector
+allows the origin it connected to. `--require-sandbox` refuses runs on a machine
+with no sandbox, which an operator may want to ask of the people who share
+machines.
 
 ### Writer lease
 

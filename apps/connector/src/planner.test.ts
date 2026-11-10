@@ -12,6 +12,7 @@ import {
 	stopBackend,
 } from "./planner";
 import type { ServiceHost } from "./service";
+import { plainSpawn, type Sandbox } from "./sandbox";
 import { collectStatus, formatStatus } from "./status";
 import { git, lockWorkspace, startFailures } from "./workspace";
 import { checkouts } from "./checkouts";
@@ -122,6 +123,7 @@ test(
 			"--no-env-file",
 			join(import.meta.dir, "main.ts"),
 			"connect",
+			"--no-sandbox",
 			root,
 			"--planner",
 			document,
@@ -153,7 +155,7 @@ test(
 					CHOPIN_URL: origin,
 					CHOPIN_DOCUMENT: document,
 					CHOPIN_PLANNER_TOKEN: issued[0],
-					CHOPIN_PLANNER_TOKEN_FILE: `${worktree}.planner-token`,
+					CHOPIN_PLANNER_TOKEN_FILE: join(`${worktree}.tokens`, "planner"),
 					CHOPIN_CHECKOUT: checkoutRoot,
 					CHOPIN_WORKTREE: worktree,
 					SOME_FLAG: "1",
@@ -162,7 +164,7 @@ test(
 					CHOPIN_URL: origin,
 					CHOPIN_DOCUMENT: document,
 					CHOPIN_PLANNER_TOKEN: issued[1],
-					CHOPIN_PLANNER_TOKEN_FILE: `${worktree}.planner-token`,
+					CHOPIN_PLANNER_TOKEN_FILE: join(`${worktree}.tokens`, "planner"),
 					CHOPIN_CHECKOUT: checkoutRoot,
 					CHOPIN_WORKTREE: worktree,
 					SOME_FLAG: "1",
@@ -180,7 +182,7 @@ test(
 			]);
 
 			// The running backend can read its current credential, privately, whenever its link needs one.
-			let tokenFile = `${worktree}.planner-token`;
+			let tokenFile = join(`${worktree}.tokens`, "planner");
 			expect(((await stat(tokenFile)).mode & 0o777).toString(8)).toBe("600");
 			expect((await readFile(tokenFile, "utf8")).trim()).toBe(issued[1]);
 
@@ -272,6 +274,7 @@ test(
 			"--no-env-file",
 			join(import.meta.dir, "main.ts"),
 			"connect",
+			"--no-sandbox",
 			root,
 			"--planner",
 			document,
@@ -344,6 +347,79 @@ function alive(pid: number) {
 		return false;
 	}
 }
+
+test.skipIf(process.platform === "win32")(
+	"a backend that starts in the sandbox finds its own worktree of the checkout made, as a linked worktree, and one that starts without a sandbox finds none made",
+	async () => {
+		let chopin = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () =>
+				Response.json({
+					token: `chopin_p_${"P".repeat(43)}`,
+					expiresAt: Date.now() + 15 * 60_000,
+					document: { id: "D_1", repository: "octo-org/score", url: "http://x" },
+				}),
+		});
+		let ran = async (sandbox: Sandbox | undefined) => {
+			let state = await mkdtemp(join(scratch, "worktree-state-"));
+			let root = await checkout();
+			let script = join(state, "backend.ts");
+			let log = join(state, "launches.jsonl");
+			await writeFile(script, BACKEND);
+			let abort = new AbortController();
+			let quiet = { write: () => true };
+			let serving = servePlanners({
+				url: `http://127.0.0.1:${chopin.port}`,
+				machine: MACHINE,
+				documents: ["D_1"],
+				command: [process.execPath, script, log],
+				checkouts: checkouts({ directory: state, registered: { "octo-org/score": root } }),
+				directory: state,
+				output: createOutput(quiet, quiet, {}),
+				signal: abort.signal,
+				...(sandbox ? { sandbox } : {}),
+			});
+			try {
+				await until(async () => (await entries(log)).length >= 1, 20_000);
+				let [launched] = await entries(log);
+				let worktree = join(state, "planners", "octo-org", "score", "D_1");
+				expect(launched.env.CHOPIN_WORKTREE).toBe(worktree);
+				return {
+					exists: await stat(worktree).then(() => true, () => false),
+					listed: git(root, "worktree", "list", "--porcelain").split("\n")
+						.filter(line => line.startsWith("worktree ")).map(line =>
+							line.slice("worktree ".length)
+						),
+					worktree,
+					file: await readFile(join(worktree, "sample.txt"), "utf8").catch(() => undefined),
+				};
+			} finally {
+				abort.abort();
+				await serving;
+			}
+		};
+		let inSandbox = (engine: "bubblewrap" | "none"): Sandbox => ({
+			report: engine === "none" ? { engine, reason: "off" } : { engine },
+			spawn: plainSpawn,
+			close: async () => {},
+		});
+		try {
+			let made = await ran(inSandbox("bubblewrap"));
+			expect(made.exists).toBe(true);
+			expect(made.listed).toContain(made.worktree);
+			expect(made.file).toBe("sample");
+			for (let sandbox of [undefined, inSandbox("none")]) {
+				let kept = await ran(sandbox);
+				expect(kept.exists).toBe(false);
+				expect(kept.listed).toHaveLength(1);
+			}
+		} finally {
+			await chopin.stop(true);
+		}
+	},
+	60_000,
+);
 
 test.skipIf(process.platform === "win32")(
 	"a backend's own children are killed with it, whether it exits by itself or is stopped",
@@ -1022,6 +1098,7 @@ test.skipIf(process.platform === "win32")(
 			"--no-env-file",
 			join(import.meta.dir, "main.ts"),
 			"connect",
+			"--no-sandbox",
 			root,
 			"--planner-command",
 			`${process.execPath} ${script} ${log}`,
@@ -1195,6 +1272,7 @@ test.skipIf(process.platform === "win32")(
 			"--no-env-file",
 			join(import.meta.dir, "main.ts"),
 			"connect",
+			"--no-sandbox",
 			root,
 			"--planner-command",
 			`${process.execPath} ${script} ${log}`,
@@ -1575,6 +1653,7 @@ test.skipIf(process.platform === "win32")(
 			"--no-env-file",
 			join(import.meta.dir, "main.ts"),
 			"connect",
+			"--no-sandbox",
 			root,
 			"--planner",
 			own,
@@ -1738,7 +1817,7 @@ test.skipIf(process.platform === "win32")(
 		try {
 			await until(async () => (await entries(log)).some(entry => entry.token), 10_000);
 			let [first] = await entries(log);
-			let file = join(directory, "planners", "octo-org", "score", "D_1.github-token");
+			let file = join(directory, "planners", "octo-org", "score", "D_1.tokens", "github");
 			expect(first).toMatchObject({
 				token: tokens[0],
 				expiresAt: new Date(expiries[0]!).toISOString(),

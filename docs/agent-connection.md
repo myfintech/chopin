@@ -1165,7 +1165,8 @@ quotes; an unmatched quote is refused. `CHOPIN_PLANNER_COMMAND` may hold the
 command as a JSON array of words instead. The command runs in the checkout of
 the document's repository, in its own process group: the one `--checkout` named,
 else a clone in `<base dir>/repos/<owner>/<repo>` that the connector makes once
-and fetches again before each launch. Its standard output and error go
+and fetches again before each launch. In the [sandbox](chopin-cli.md#sandbox) that
+checkout is read-only. Its standard output and error go
 to the connector's a line at a time, with its credential, your `--env` values
 and anything that looks like a token replaced with `[redacted]`; a line too
 long to mask is left out, with a note in its place.
@@ -1187,12 +1188,31 @@ Each launch gets the connector's environment, your `--env` values, and these:
 | `CHOPIN_GITHUB_TOKEN_FILE`       | A file (mode `0600`) that always holds the current token.                                |
 
 `CHOPIN_WORKTREE` stays the same across launches. The connector makes its
-parent folders but never creates or removes the worktree itself. The command
-does, for example:
+parent folders but never removes the worktree itself. Whether the backend or the
+connector makes it depends on the [sandbox](chopin-cli.md#sandbox):
 
-```sh
-git -C "$CHOPIN_CHECKOUT" worktree add "$CHOPIN_WORKTREE" -b <branch>
-```
+- **Without a sandbox** (none works on the machine, or `--no-sandbox`), the folder is
+  not there on the first launch and the command makes the worktree, for example:
+
+  ```sh
+  git -C "$CHOPIN_CHECKOUT" worktree add "$CHOPIN_WORKTREE" -b <branch>
+  ```
+
+- **In the sandbox** the worktree already exists on every launch, the first too: the
+  connector makes it on the host before the backend starts, as a linked worktree of
+  `CHOPIN_CHECKOUT` detached at its `HEAD`, and leaves it as it finds it on later
+  launches. The backend must use it, as it must after its first launch anyway:
+  `git -C "$CHOPIN_WORKTREE" checkout -b <branch>` starts a branch, and it can commit
+  and push from there. `git worktree add` fails in the sandbox, because the sandbox
+  lets the backend write that one worktree's git directory and not the list of
+  worktrees in the checkout's. **`CHOPIN_CHECKOUT` is read-only**: it is the
+  person's own checkout, and the sandbox never lets an agent write its files, its
+  submodules, its `.git`, its index or `HEAD`, whether it is a regular checkout or a
+  linked worktree of theirs, and no path its owner adds with `--sandbox-write` changes
+  that. A backend reads it, and does its work and its edits in
+  `CHOPIN_WORKTREE`, from where its changes reach the person as commits and a
+  pushed branch. See [Git in the sandbox](chopin-cli.md#git-in-the-sandbox). A
+  folder at `CHOPIN_WORKTREE` that holds something and is no worktree is left as it is.
 
 The connector renews the Planner credential in `CHOPIN_PLANNER_TOKEN_FILE` 5 minutes
 before it expires, for as long as the backend runs and Chopin still lets the machine run

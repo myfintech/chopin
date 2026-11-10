@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 import { SQL } from "bun";
 
 import { RESTART_QUIET_MS } from "../packages/protocol/restart";
+import { RESTART_JITTER_MS } from "../apps/web/src/wire-loss";
 import { chatInput, expectChatValue } from "./chat-input";
 import {
 	createChannel,
@@ -17,13 +18,14 @@ import {
 	testChannelPath,
 } from "./database";
 import { authenticate, content, expect, ready, status, test } from "./room";
+import { e2eDatabaseName, e2ePort } from "./ports";
 import { HOST, ROOT } from "./servers";
 
 import type { Page } from "@playwright/test";
 
-const PORT = 8796;
+const PORT = e2ePort(8796);
 const ORIGIN = `http://${HOST}:${PORT}`;
-const DATABASE = "chopin_restart_quiet";
+const DATABASE = e2eDatabaseName("chopin_restart_quiet");
 
 function databaseUrls() {
 	let cluster = new URL(
@@ -67,7 +69,38 @@ const ENV = {
 	DEV_COMMENTS: "",
 };
 
-type Running = { child: ReturnType<typeof spawn>; log: { text: string } };
+/** `startedIn` is how long it took from spawning the process to its saying it is ready. */
+type Running = { child: ReturnType<typeof spawn>; log: { text: string }; startedIn: number };
+
+/**
+ * The longest a restart may leave the page without a server and still be found before the page's
+ * quiet period is over. That period runs from the 1012 the page sees, which the old process sends
+ * as it releases its lease and exits: until then it serves everything and the page has its socket,
+ * and the zero-downtime design's budget counts from the release too. The tests count the outage
+ * from that 1012, as the page does, not from the old process's exit, which the test may see
+ * later than the page saw the 1012. From the 1012 the page tries at once or within
+ * `RESTART_JITTER_MS` and again within a second of each failure, so a server that is back with
+ * that much of the period to spare is found while it is still running.
+ */
+const SILENT_OUTAGE_MS = RESTART_QUIET_MS - RESTART_JITTER_MS;
+/** A blip, which the page waits out in 1.5 s with no quiet period: a restart must outlast it. */
+const BLIP_MS = 1_500;
+/** What a restart is made to take, well inside both bounds whatever the runner's speed. */
+const AIMED_OUTAGE_MS = 2_500;
+
+/**
+ * How long to leave the server away once the old one has gone, as a platform leaves a gap between
+ * stopping one container and starting the next. The new process takes 1.4 s to start on a quick
+ * machine and 2.6 to 2.9 s on two cores shared with busy loops, which is where a CI runner measured
+ * 4.4 s with a fixed second of gap and the cut's 0.4 s counted in. The 1012 the outage is counted
+ * from comes as the old process exits, so the gap and the start are what the outage is made of.
+ * No fixed gap keeps a restart over `BLIP_MS` and under `SILENT_OUTAGE_MS` on both, so it is what
+ * makes up the difference between the aim and what the first server took to start, which the next
+ * takes too.
+ */
+function gapAfter(first: Running): number {
+	return Math.max(0, AIMED_OUTAGE_MS - first.startedIn);
+}
 
 let processes: Running[] = [];
 
@@ -103,7 +136,8 @@ async function server(database: string): Promise<Running> {
 	};
 	child.stdout?.on("data", read);
 	child.stderr?.on("data", read);
-	let running = { child, log };
+	let spawned = Date.now();
+	let running = { child, log, startedIn: 0 };
 	processes.push(running);
 	for (let index = 0; index < 300; index++) {
 		if (child.exitCode !== null) {
@@ -111,7 +145,10 @@ async function server(database: string): Promise<Running> {
 		}
 		try {
 			let [code, word] = await health("/api/health/ready");
-			if (code === 200 && word === "ready") return running;
+			if (code === 200 && word === "ready") {
+				running.startedIn = Date.now() - spawned;
+				return running;
+			}
 		} catch { /* Not bound yet. */ }
 		await new Promise(resolve => setTimeout(resolve, 50));
 	}
@@ -141,6 +178,8 @@ type Probe = {
 	allowOffline: boolean;
 	/** When, by `performance.now()`, the first 1012 arrived, the first thing said and the notice. */
 	lostAt?: number;
+	/** When the first 1012 arrived by `Date.now()`, a clock the test shares with the page. */
+	lostAtWall?: number;
 	saidAt?: number;
 	noticeAt?: number;
 };
@@ -169,7 +208,10 @@ async function watch(page: Page) {
 				this.addEventListener("close", event => {
 					probe.closes.push(event.code);
 					probe.timeline.push(`${at()} close ${event.code}`);
-					if (event.code === 1012) probe.lostAt ??= at();
+					if (event.code === 1012) {
+						probe.lostAt ??= at();
+						probe.lostAtWall ??= Date.now();
+					}
 				});
 			}
 		} as typeof WebSocket;
@@ -202,6 +244,16 @@ async function watch(page: Page) {
 
 function probe(page: Page) {
 	return page.evaluate(() => (window as unknown as { probe: Probe }).probe);
+}
+
+/**
+ * How long the page was without a server: from the 1012 it saw, its first sign of the loss, to
+ * `readyAt`, when the test saw the new server ready. Both are `Date.now()` of one machine.
+ */
+async function outageFrom1012(page: Page, readyAt: number): Promise<number> {
+	let { lostAtWall } = await probe(page);
+	expect(lostAtWall, "the page saw no 1012").toBeDefined();
+	return readyAt - lostAtWall!;
 }
 
 /** Every error the page raises, as it fills. */
@@ -278,19 +330,18 @@ test("a restart under an open tab shows nothing, loses no edit and keeps the dra
 		}
 	})();
 	await page.waitForTimeout(1_000);
-	let stopped = Date.now();
 	let code = await stop(first);
-	// The gap a platform leaves between stopping the old container and starting the new one.
-	await new Promise(resolve => setTimeout(resolve, 1_000));
+	await new Promise(resolve => setTimeout(resolve, gapAfter(first)));
 	let second = await server(database);
-	let outage = Date.now() - stopped;
+	let readyAt = Date.now();
 	await typing;
 
 	expect(code, first.log.text).toBe(0);
 	expect(await health("/api/health/ready")).toEqual([200, "ready"]);
+	let outage = await outageFrom1012(page, readyAt);
 	// Longer than a blip, which the page waits out in 1.5 s, and quicker than it waits for a restart.
-	expect(outage, second.log.text).toBeGreaterThan(1_500);
-	expect(outage, second.log.text).toBeLessThan(4_000);
+	expect(outage, second.log.text).toBeGreaterThan(BLIP_MS);
+	expect(outage, second.log.text).toBeLessThan(SILENT_OUTAGE_MS);
 
 	await expect(status(page)).toHaveAttribute("data-level", "hidden");
 	await expect(content(page)).toHaveAttribute("contenteditable", "true");
@@ -431,18 +482,17 @@ for (let reached of [true, false]) {
 		await expect.poll(() => reached ? lost : sent.length, { timeout: 10_000 }).toBe(1);
 		if (reached) expect(await stored(database, room, message)).toBe(1);
 
-		let stopped = Date.now();
 		let code = await stop(first);
 		cut.on = false;
-		await new Promise(resolve => setTimeout(resolve, 1_000));
+		await new Promise(resolve => setTimeout(resolve, gapAfter(first)));
 		let second = await server(database);
-		let outage = Date.now() - stopped;
+		let readyAt = Date.now();
 
 		// The message is sent again, under the same request, and the draft goes once it is taken.
 		await expectChatValue(chatInput(chat), "");
 		await expect(chat.getByText(message, { exact: true })).toHaveCount(1);
 		expect(code, first.log.text).toBe(0);
-		expect(outage, second.log.text).toBeLessThan(4_000);
+		expect(await outageFrom1012(page, readyAt), second.log.text).toBeLessThan(SILENT_OUTAGE_MS);
 		expect(sent).toHaveLength(2);
 		expect(sent[1]!.requestId).toBeTruthy();
 		expect(sent[1]!.requestId).toBe(sent[0]!.requestId);

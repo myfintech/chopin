@@ -1,13 +1,12 @@
 import { existsSync } from "node:fs";
 import { mkdir, readdir, realpath, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { execFile, spawnSync } from "node:child_process";
-import { promisify } from "node:util";
 import { redacted } from "./connection";
+import { removePlantedRedirects } from "./git-directories";
+import { gitAsync, gitSync } from "./git-host";
 import { gitCredentials, type GitHubToken } from "./github-token";
+import { CLONES } from "./sandbox-policy";
 import { segment, workspace } from "./workspace";
-
-const exec = promisify(execFile);
 
 /** What git says when it reached GitHub over SSH and had nothing to authenticate with. */
 const SSH_FAILURE =
@@ -22,10 +21,7 @@ const SSH_FAILURE =
 export function sshCause(detail: string, repository: string): string | undefined {
 	if (!SSH_FAILURE.test(detail)) return undefined;
 	let url = `https://github.com/${repository}.git`;
-	let asked = spawnSync("git", ["ls-remote", "--get-url", url], {
-		encoding: "utf8",
-		timeout: 10_000,
-	});
+	let asked = gitSync(["ls-remote", "--get-url", url], { timeout: 10_000 });
 	let effective = asked.status === 0 ? asked.stdout.trim() : "";
 	if (!effective || effective.startsWith("https://")) return undefined;
 	return `${detail} Git rewrites ${url} to ${effective} (a url.<base>.insteadOf rule in its configuration), `
@@ -68,7 +64,7 @@ export async function registerCheckouts(paths: string[]): Promise<Registered> {
 /** Where an on-demand clone of `repository` lives: `<base>/repos/<owner>/<repo>`, lowercase. */
 export function clonePath(directory: string, repository: string) {
 	let [owner = "", name = ""] = repository.toLowerCase().split("/");
-	return join(directory, "repos", segment(owner), segment(name));
+	return join(directory, CLONES, segment(owner), segment(name));
 }
 
 /** The clones in `<base>/repos/<owner>/<repo>`, with their repository as their folders name it. */
@@ -78,7 +74,7 @@ export async function clones(directory: string) {
 		(await readdir(path, { withFileTypes: true }).catch(() => []))
 			.filter(entry => entry.isDirectory() && !entry.name.endsWith(".tmp"))
 			.map(entry => entry.name).sort();
-	let base = join(directory, "repos");
+	let base = join(directory, CLONES);
 	for (let owner of await folders(base)) {
 		for (let name of await folders(join(base, owner))) {
 			let path = join(base, owner, name);
@@ -140,7 +136,7 @@ export function checkouts(options: { directory: string; registered: Registered }
 				let env = gitCredentials(github.file, repository);
 				let run = async (args: string[], cwd?: string) => {
 					try {
-						await exec("git", args, {
+						await gitAsync(args, {
 							...(cwd ? { cwd } : {}),
 							env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: "0" },
 							timeout: 30 * 60_000,
@@ -161,6 +157,8 @@ export function checkouts(options: { directory: string; registered: Registered }
 					}
 				};
 				if (existsSync(join(path, ".git"))) {
+					// Runs of this clone's worktrees ran agents that could write its git directory.
+					removePlantedRedirects(path);
 					await run(["fetch", "--quiet", "--prune", "origin"], path);
 				} else {
 					await mkdir(dirname(path), { recursive: true, mode: 0o700 });

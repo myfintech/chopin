@@ -33,6 +33,7 @@ import {
 } from "./planner-status";
 import { createChannel, registerTestDatabase, seedChannel } from "./database";
 import { authenticate, content, expect, ready, roomPath, test } from "./room";
+import { e2eDatabaseName, e2ePort } from "./ports";
 import { RELEASE } from "./release";
 import { HOST, ROOT } from "./servers";
 
@@ -40,9 +41,9 @@ import { expectInsideViewport, expectNoHorizontalOverflow } from "./responsive";
 
 import type { Browser, Page } from "@playwright/test";
 
-const PORT = 8794;
+const PORT = e2ePort(8794);
 const ORIGIN = `http://${HOST}:${PORT}`;
-const DATABASE = "chopin_planner_picker";
+const DATABASE = e2eDatabaseName("chopin_planner_picker");
 const DESKTOP = { viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2 };
 const PHONE = {
 	hasTouch: true,
@@ -1309,8 +1310,13 @@ for (let [shape, options] of SHAPES) {
 	test(`a machine that is offline says when it was last seen, on a ${shape}`, async ({ browser }) => {
 		test.setTimeout(120_000);
 		let room = await remoteServer();
-		let context = await browser.newContext(options);
+		// The page words a time seen today as the time of day and any other day with its date, in the
+		// browser's time zone. An hour before the real clock is yesterday for a run just after local
+		// midnight, so the page's clock and zone are fixed and the machine was seen an hour before.
+		let context = await browser.newContext({ ...options, timezoneId: "UTC" });
 		let page = await context.newPage();
+		let now = new Date("2026-06-15T12:00:00Z");
+		await page.clock.install({ time: now });
 		await authenticate(page, "mona", ORIGIN);
 		let { say } = await carried(page);
 		await page.goto(`${ORIGIN}${roomPath(room)}`);
@@ -1333,7 +1339,7 @@ for (let [shape, options] of SHAPES) {
 			choice: id,
 			machines: (state.machines as Array<Record<string, unknown>>).map(value =>
 				value.id === id
-					? { ...value, connected: false, lastSeenAt: Date.now() - 3_600_000 }
+					? { ...value, connected: false, lastSeenAt: now.getTime() - 3_600_000 }
 					: value
 			),
 			planner: { state: "disconnected", login: "mona", machine: id },

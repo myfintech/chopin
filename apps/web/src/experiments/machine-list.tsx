@@ -23,6 +23,7 @@ import {
 	TableHeader,
 	TableRow,
 } from "@chopin/visuals";
+import { sandboxSummary } from "@chopin/protocol/connector";
 import { ago } from "../build-model";
 import { FavoriteStar } from "../favorite-star";
 import { IconButton } from "../icon-button";
@@ -724,6 +725,17 @@ export function MachineDetail(
 		[
 			"Agent",
 			[agentName(own?.agent ?? null), own?.planner && "can reply"].filter(Boolean).join(", "),
+		],
+		[
+			"Sandbox",
+			own?.sandbox && (
+				<span key="sandbox">
+					{sandboxSummary(own.sandbox)}
+					{own.sandbox.engine === "none" && own.sandbox.fix && (
+						<code className="machines-secondary">{own.sandbox.fix}</code>
+					)}
+				</span>
+			),
 		],
 		[
 			"Runs",
