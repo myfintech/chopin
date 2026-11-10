@@ -35,6 +35,7 @@ export function AuthorshipToggle({ store }: { store: AuthorshipStore }) {
 }
 
 const REACHED = "data-authorship-reached";
+const STRIP = "data-authorship-strip";
 const REACHED_MS = 1200;
 let reached: HTMLElement | undefined;
 let reachedTimer: ReturnType<typeof setTimeout> | undefined;
@@ -76,6 +77,16 @@ function reach(element: HTMLElement): void {
 	reachedTimer = setTimeout(() => element.removeAttribute(REACHED), REACHED_MS);
 }
 
+/**
+ * Marks the document while the strip is in it, so its stylesheet gives the strip a row without
+ * asking the document, which holds every block, what it contains.
+ */
+function markDocument(strip: HTMLDivElement | null) {
+	let document = strip?.parentElement;
+	document?.setAttribute(STRIP, "");
+	return () => document?.removeAttribute(STRIP);
+}
+
 export function AuthorshipStrip({ store }: { store: AuthorshipStore }) {
 	let view = useSyncExternalStore(store.subscribe, store.snapshot);
 	// The block last stepped to, by digest; a new focus starts over.
@@ -110,7 +121,12 @@ export function AuthorshipStrip({ store }: { store: AuthorshipStore }) {
 	let named = people.filter(item => item.author.type !== "system");
 
 	return (
-		<div aria-label="Contributors" className="authorship-strip" role="toolbar">
+		<div
+			aria-label="Contributors"
+			className="authorship-strip"
+			ref={markDocument}
+			role="toolbar"
+		>
 			<span className="authorship-strip-label">Contributors</span>
 			{!data && <span className="authorship-strip-note">Loading…</span>}
 			{named.map(item => (
