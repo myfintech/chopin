@@ -23,6 +23,7 @@ import {
 import { createHumanInput, PendingInputs } from "./atomic/human-input";
 import { type PlannerWorkspace, plannerWorkspace } from "./atomic/workspace";
 import { registerRemotePlanner, type RemotePlanner } from "./remote/registry";
+import { startingTurn } from "./turn-level";
 
 import type { HarnessAgent } from "@ai-sdk/harness/agent";
 import type { ActiveOwnerBinding } from "../agent/active-owner";
@@ -57,10 +58,21 @@ function applied(outcome: { status: string; message: string }): void {
 	if (outcome.status === "noop" || outcome.status === "cancelled") throw new Error(outcome.message);
 }
 
+export type PlannerChoice = { model?: string; thinkingLevel?: string };
+
 export type PlannerSession = {
 	/** The tools this session offers; a full Atomic session reports the set of its running turn. */
 	activeTools?: readonly string[];
-	stream: (prompt: string, abortSignal: AbortSignal) => ReturnType<PlannerAgent["stream"]>;
+	/**
+	 * Runs one turn. `choice` is what a person chose for the document, already checked against the
+	 * harness's catalog: the model replaces the channel's, and the thinking level goes to the
+	 * harness that offers one. Background jobs never pass one.
+	 */
+	stream: (
+		prompt: string,
+		abortSignal: AbortSignal,
+		choice?: PlannerChoice,
+	) => ReturnType<PlannerAgent["stream"]>;
 	destroy: () => Promise<void>;
 	/**
 	 * The questions this session asked that no member has answered yet, and the requests whose
@@ -324,23 +336,26 @@ export async function openPlannerSession(
 						},
 					}
 					: {}),
-				stream: (prompt, abortSignal) => {
+				stream: (prompt, abortSignal, choice) => {
 					// The remote turn aborts it when the turn ends or the link drops mid-tool.
 					let hostTools = remote ? new AbortController() : undefined;
 					if (remote) remote.hostTools = hostTools;
-					return agent.stream({
-						session: active,
-						prompt,
-						abortSignal,
-						options: {
-							...channel,
-							instructions,
-							owner: current,
-							githubTools: tools,
-							extensionTools: extensions,
-							...(hostTools ? { toolSignal: hostTools.signal } : {}),
-						},
-					});
+					// The level is on this turn alone, as the model is: nothing is left for the next one.
+					return startingTurn(choice?.thinkingLevel, () =>
+						agent.stream({
+							session: active,
+							prompt,
+							abortSignal,
+							options: {
+								...channel,
+								...(choice?.model ? { model: choice.model } : {}),
+								instructions,
+								owner: current,
+								githubTools: tools,
+								extensionTools: extensions,
+								...(hostTools ? { toolSignal: hostTools.signal } : {}),
+							},
+						}));
 				},
 				destroy: () =>
 					stopped ??= (async () => {

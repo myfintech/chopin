@@ -27,6 +27,7 @@ import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fullPlanner, settleEndedRuns, workflowRuns } from "./full";
+import { atomicThinkingLevels } from "../catalog";
 
 import type {
 	HarnessV1,
@@ -39,6 +40,8 @@ import type {
 	HarnessV1StreamPart,
 	HarnessV1ToolSpec,
 } from "@ai-sdk/harness";
+import type { Chat as Wire } from "@chopin/protocol";
+import type { PlannerTurn } from "../turn-level";
 import type {
 	AgentSession,
 	AgentSessionEvent,
@@ -169,9 +172,69 @@ const ZERO_USAGE = {
 	outputTokens: { total: undefined, text: undefined, reasoning: undefined },
 };
 
+type Level = ReturnType<AgentSession["getAvailableThinkingLevels"]>[number];
+
+/**
+ * The level the session's current model runs when nobody has chosen one, as Atomic starts a
+ * session on a model: the level saved for that model in the operator's settings, else their
+ * default, else `medium` (Atomic's own default, which it does not export). A level the model does
+ * not support is clamped when it is set. It is the model's, not the level the session happened to
+ * hold when a person chose one, which belonged to whichever model the session started on.
+ */
+function ownLevel(session: AgentSession): Level {
+	let { model, settingsManager } = session;
+	return (model && settingsManager.getModelThinkingLevel(model.provider, model.id))
+		?? settingsManager.getDefaultThinkingLevel() ?? "medium";
+}
+
 type ProviderConfig = Parameters<ModelRuntime["registerProvider"]>[1];
 type Model = NonNullable<ReturnType<ModelRuntime["getModel"]>>;
 type ToolOutcome = { output: unknown; isError?: boolean };
+
+/**
+ * The models a person may choose for a document's Planner: every chat model the runtime has
+ * credentials for that `resolveModel` would run, as `provider/model`, with each model's thinking
+ * levels from the model itself. They are listed as the runtime reports them: in its order, which
+ * the picker groups by provider where each first appears, and an entry it reports twice stays
+ * twice, each with its own levels. A choice of that id runs the first, as `resolveModel` finds
+ * it, and the catalog's readers resolve it the same way. `defaultModel` is the deployment's,
+ * whose entry is always listed.
+ */
+export async function atomicCatalog(
+	runtime: Pick<ModelRuntime, "getAvailable" | "getModel" | "getProvider">,
+	settings: Pick<AtomicSettings, "auth" | "providers">,
+	defaultModel: string | undefined,
+): Promise<Wire.ModelCatalog> {
+	let listed: Array<[id: string, model: Model]> = [];
+	for (let model of await runtime.getAvailable()) {
+		if (!providerAllowed(settings, model.provider)) continue;
+		listed.push([`${model.provider}/${model.id}`, model]);
+	}
+	let fallback: Model | undefined;
+	if (defaultModel) {
+		try {
+			fallback = resolveModel(runtime, settings, defaultModel);
+		} catch {
+			// A default Atomic cannot run is not offered; its turns fail as they always did.
+		}
+		if (fallback && !listed.some(([id]) => id === defaultModel)) {
+			listed.push([defaultModel, fallback]);
+		}
+	}
+	return {
+		models: listed.map(([id, model]) => {
+			let levels = atomicThinkingLevels(model);
+			return {
+				id,
+				name: model.name,
+				provider: { id: model.provider, name: runtime.getProvider(model.provider)?.name },
+				description: contextLabel(model.contextWindow),
+				...(levels.length ? { thinkingLevels: levels } : {}),
+			};
+		}),
+		...(fallback ? { default: { model: defaultModel! } } : {}),
+	};
+}
 
 export type AtomicSettings = {
 	auth: AtomicAuthMode;
@@ -285,6 +348,20 @@ export function turnSystemPrompt(
 	return [instructions, result].filter(Boolean).join("\n\n") || ATOMIC_DEFAULT_SYSTEM_PROMPT;
 }
 
+/** Whether `HARNESS_AUTH` lets this provider's models run: the gateway's, and ones code registered. */
+function providerAllowed(
+	settings: Pick<AtomicSettings, "auth" | "providers">,
+	provider: string,
+): boolean {
+	return settings.auth !== "ai-gateway" || provider === GATEWAY_PROVIDER
+		|| Object.hasOwn(settings.providers ?? {}, provider);
+}
+
+function contextLabel(tokens: number): string {
+	if (tokens >= 1_000_000) return `${+(tokens / 1_000_000).toFixed(1)}M token context`;
+	return `${Math.round(tokens / 1_000)}K token context`;
+}
+
 /** Looks up `provider/model` without letting Atomic substitute a default. */
 export function resolveModel(
 	runtime: Pick<ModelRuntime, "getModel">,
@@ -296,10 +373,7 @@ export function resolveModel(
 	let provider = requested.slice(0, slash);
 	let model = slash > 0 ? runtime.getModel(provider, requested.slice(slash + 1)) : undefined;
 	if (!model) throw new Error(`Atomic does not recognize model ${requested}`);
-	if (
-		settings.auth === "ai-gateway" && provider !== GATEWAY_PROVIDER
-		&& !Object.hasOwn(settings.providers ?? {}, provider)
-	) {
+	if (!providerAllowed(settings, provider)) {
 		throw new Error(
 			`HARNESS_AUTH ai-gateway allows only ${GATEWAY_PROVIDER} models, not ${requested}`,
 		);
@@ -499,7 +573,11 @@ function listen(run: Run, signal: AbortSignal | undefined): void {
 /** Host-process `HarnessV1` implementation over `@bastani/atomic`. */
 export function createAtomicAdapter(
 	settings: AtomicSettings,
-): HarnessV1 & { shutdown(): Promise<void> } {
+): HarnessV1 & {
+	shutdown(): Promise<void>;
+	/** What a document's Planner can be set to run; see `atomicCatalog`. */
+	catalog(defaultModel: string | undefined): Promise<Wire.ModelCatalog>;
+} {
 	if (!ATOMIC_AUTH_MODES.includes(settings.auth)) {
 		throw new Error(`HARNESS_AUTH ${settings.auth} is not a supported atomic authentication mode`);
 	}
@@ -527,6 +605,8 @@ export function createAtomicAdapter(
 				systemPrompt: ATOMIC_DEFAULT_SYSTEM_PROMPT,
 			};
 			let live: { session: AgentSession; signature: string; release: () => void } | undefined;
+			/** Whether a person's level is applied to the session now. */
+			let levelChosen = false;
 			let current: Run | undefined;
 			let closed: Promise<void> | undefined;
 
@@ -634,7 +714,7 @@ export function createAtomicAdapter(
 
 			let plannerTools: ReadonlySet<string> = new Set();
 
-			async function prepare(turn: HarnessV1PromptTurnOptions): Promise<AgentSession> {
+			async function prepare(turn: PlannerTurn): Promise<AgentSession> {
 				if (turn.skills.length > 0) throw unsupported("skills");
 				let hostNames = turn.tools.map(spec => spec.name);
 				if (hostNames.includes(ATOMIC_RESULT_TOOL_NAME)) {
@@ -739,7 +819,23 @@ export function createAtomicAdapter(
 				) {
 					await live.session.setModel(model);
 				}
+				await applyLevel(live.session, turn.thinkingLevel);
 				return live.session;
+			}
+
+			/**
+			 * A person's thinking level for this turn, or the model's own again once nobody's is
+			 * chosen. Atomic clamps a level to what the model supports; the server only ever sends
+			 * one the catalog listed for it.
+			 */
+			async function applyLevel(session: AgentSession, level: string | undefined): Promise<void> {
+				if (level !== undefined) {
+					await session.setThinkingLevel(level as Level);
+					levelChosen = true;
+				} else if (levelChosen) {
+					await session.setThinkingLevel(ownLevel(session));
+					levelChosen = false;
+				}
 			}
 
 			async function close(): Promise<void> {
@@ -780,7 +876,7 @@ export function createAtomicAdapter(
 				sessionId: startOptions.sessionId,
 				isResume: false,
 
-				async doPromptTurn(turn: HarnessV1PromptTurnOptions): Promise<HarnessV1PromptControl> {
+				async doPromptTurn(turn: PlannerTurn): Promise<HarnessV1PromptControl> {
 					if (closed) throw new Error("Atomic session is closed.");
 					if (current) throw new Error("Atomic session already has an active turn.");
 					let text = promptText(turn.prompt);
@@ -885,6 +981,10 @@ export function createAtomicAdapter(
 			};
 			open.add(handle);
 			return handle;
+		},
+
+		async catalog(defaultModel) {
+			return atomicCatalog(await (runtime ??= createRuntime(settings)), settings, defaultModel);
 		},
 
 		async shutdown() {

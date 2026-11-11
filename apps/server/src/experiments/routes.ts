@@ -546,6 +546,29 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 	 */
 	let toldUrls = new Map<string, Map<string, string>>();
 	/**
+	 * The documents whose Planner a person asked a machine to start again now, by machine id, with
+	 * when. The next answer to that machine's Planner poll lists them, once, and one nobody polled
+	 * for within `RETRY_FRESH_MS` is forgotten: it was asked for then, not now. Forgotten with a
+	 * restart.
+	 */
+	let retryAsked = new Map<string, Map<string, number>>();
+	const RETRY_FRESH_MS = 60_000;
+	function takeRetries(machineId: string, listed: Set<string>) {
+		let asked = retryAsked.get(machineId);
+		if (!asked) return [];
+		let now = auth.clock().getTime();
+		let ids: string[] = [];
+		for (let [id, at] of asked) {
+			if (now - at > RETRY_FRESH_MS) asked.delete(id);
+			else if (listed.has(id)) {
+				ids.push(id);
+				asked.delete(id);
+			}
+		}
+		if (!asked.size) retryAsked.delete(machineId);
+		return ids;
+	}
+	/**
 	 * Whether a connection can run its owner's Planners on request: it has a Planner command, speaks
 	 * protocol 4, and this server runs the remote Planner with machines' own GitHub authorization.
 	 */
@@ -941,9 +964,10 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 	/**
 	 * Someone uses a document: they opened it, or asked its Planner for something. On Default
 	 * machine its creator's machine is asked to run its Planner, if none is yet. A child's Planner
-	 * is its root's.
+	 * is its root's. `ask` asks the machines again even if this document is already in use, which
+	 * is what a person pressing for a Planner that is not there is owed.
 	 */
-	async function plannerUsed(documentId: string) {
+	async function plannerUsed(documentId: string, ask = false) {
 		if (!options.planners || !auth.machines.durable) return;
 		let channel = await auth.storage.channels.get(documentId);
 		if (channel?.parentChannelId) {
@@ -955,19 +979,37 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		await readChoices().catch(() => {});
 		// A creator with no machine of their own may get a teammate's shared one, checked anew here.
 		let reached = await reachShared(channel);
-		if (!fresh && !reached) return;
+		if (!fresh && !reached && !ask) return;
+		if (ask) {
+			// Whoever asked is owed an attempt now: the machine that will start it hears so, and its
+			// connector cuts the wait of a backend that exited. Nothing is said for a Planner that is
+			// attached or held, which `plannerStarting` leaves out.
+			let starting = await plannerStarting(channel.id);
+			if (starting) {
+				let asked = retryAsked.get(starting.machineId) ?? new Map<string, number>();
+				asked.set(channel.id, auth.clock().getTime());
+				retryAsked.set(starting.machineId, asked);
+			}
+		}
 		connections.wake(channel.repositoryId);
 		options.plannerStatus?.(channel.id);
 	}
 	/**
 	 * Whose machine is about to run a document's Planner, when nothing holds it yet: one chosen for
-	 * it, or Default machine's, that can run Planners now, and why its backend keeps failing to
-	 * start once it has more than once in a row. Undefined when no machine will.
+	 * it, or Default machine's, that can run Planners now, which launch it waits on once one has
+	 * exited before attaching (`attempt`, one more than the launches in a row that did), and why its
+	 * backend keeps failing to start once it has more than once in a row. Undefined when no machine
+	 * will.
 	 */
 	async function plannerStarting(
 		documentId: string,
 	): Promise<
-		{ login: string; machineId: string; failure?: Session.PlannerStartFailure } | undefined
+		{
+			login: string;
+			machineId: string;
+			attempt?: number;
+			failure?: Session.PlannerStartFailure;
+		} | undefined
 	> {
 		if (!options.planners || !auth.machines.durable) return undefined;
 		if (options.attachments?.()?.holding(documentId)) return undefined;
@@ -985,6 +1027,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 			return {
 				login: live.login,
 				machineId,
+				...(failure ? { attempt: failure.attempts + 1 } : {}),
 				...(failure && failure.attempts >= PLANNER_FAILURE_SHOWN_AT
 					? {
 						failure: {
@@ -2521,11 +2564,13 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 						told.has(value.id) && told.get(value.id) !== value.url
 					);
 					for (let value of planners) if (!told.has(value.id)) told.set(value.id, value.url);
+					let asked = takeRetries(connection.machineId, new Set(planners.map(value => value.id)));
+					let retry = asked.length ? { retry: asked } : {};
 					if (
 						!moved && planners.length === running.size
 						&& planners.every(value => running.has(value.id))
 					) {
-						return undefined;
+						return asked.length ? { kind: "planners", planners, ...retry } : undefined;
 					}
 					toldUrls.set(connection.id, new Map(planners.map(value => [value.id, value.url])));
 					let listed = new Set(planners.map(value => value.id));
@@ -2538,8 +2583,8 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 						reasons!.delete(id);
 					}
 					return Object.keys(stopped).length
-						? { kind: "planners", planners, stopped }
-						: { kind: "planners", planners };
+						? { kind: "planners", planners, stopped, ...retry }
+						: { kind: "planners", planners, ...retry };
 				};
 				value = await changed();
 				if (!value) {

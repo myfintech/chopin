@@ -26,6 +26,67 @@ server process's user, on hosted instances as well as local ones.** No other fla
 turns this on or off. Operators who do not want it should use `copilot-sdk`. See [Self-hosting](self-hosting.md#choose-and-trust-a-harness) for
 `HARNESS`/`HARNESS_AUTH` selection and adapter trust.
 
+## Choosing the model and reasoning level
+
+A person with write access can choose the model and the level of reasoning (thinking) of a
+document's Planner from the Chat composer. The choice belongs to the document: everyone who opens
+it sees it, it survives a reload and a restart (`planner_model_choices`, see
+[Storage](storage.md)), and it applies from the next turn. Until somebody chooses, the harness
+runs what it always did, so nothing changes. Choosing a model records that model, the one marked
+_Default_ included, so the document keeps it if the harness's or the client's default later
+changes; the reasoning control's _Default_ returns the level to the model's own.
+
+The server owns what can be chosen, never the browser. It builds a catalog from the harness and
+sends it to the room in `chat:model` (with the stored choice) when somebody joins and when either
+changes:
+
+| Harness                     | Catalog                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Applied by                                                                                                                                                                                                                                                     |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `atomic`                    | The models of the Atomic model runtime the adapter builds: every chat model it has credentials for that `HARNESS_AUTH` would run, as `provider/model`, in the order the runtime reports them (the picker groups them by provider, in the order each first appears, and a model it reports twice is listed twice, a choice of that id being the first entry's), with each model's thinking levels as Atomic reads them (`xhigh` and `max` only where the model maps them) and its context size as the description. `MODEL` is the default. | The turn's `model` and `thinkingLevel`, set on the session; with no level chosen the model runs its own (the level saved for it in the operator's Atomic settings, else their default level, else `medium`), whichever model or level the session held before. |
+| `remote`                    | What the attached client reported in its [capability catalog](agent-connection.md#capability-catalog), with `MODEL` as the default when set. An older client, or one that reports no models, offers none.                                                                                                                                                                                                                                                                                                                                 | `model` and `thinkingLevel` in the `turn` message; the level only to a client that offered `capability-catalog`.                                                                                                                                               |
+| `copilot-sdk` and any other | None: the composer offers no control, because a choice nobody honors is not offered.                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Not applicable.                                                                                                                                                                                                                                                |
+
+The thinking level is a field of the turn the harness is given, beside `model` (`PlannerTurn` in
+`apps/server/src/harness/turn-level.ts`). `HarnessAgent` builds a turn from a fixed set of fields
+that has none for it, so the call that starts a Planner turn carries the level and the harness
+wrapper puts it on that turn; no turn can see another's, and a background job's turn has none.
+
+`chat:model` checks a choice against the catalog reported now, stores it under the writer lease
+and only then answers the sender and tells the room. It refuses a model or a level the catalog
+does not list (whatever its spelling or length: only the catalog decides, and what it lists is
+stored as written), a field that is not a string, a choice for a child document
+(which uses its root's), and every choice where no catalog is offered; choosing nothing goes back
+to the default. Every Planner turn a person started resolves the stored choice again. A model that
+has gone, or a level its model no longer lists, is not sent: the default runs, Chat says so once
+while the reason stands (and again if it changes, or comes back after the choice was honored), and
+the composer shows what will run. The stored choice is
+kept, so it returns to force if the model does. Background jobs never carry a choice.
+
+The composer says so even where nothing can be chosen any longer. When a client withdraws all its
+models, or an older client takes its place, there is no catalog and the picker is gone, but the
+stored choice is still sent in `chat:model` and the composer's notice still says that the model is no longer
+available and the default runs, before and after a turn, until somebody's client offers it again.
+A document nobody chose for says nothing. The choice is held back while what a remote Planner
+offers is unknown: with no client attached (a machine that is away, a server that has just restarted)
+or one that offered the catalog and has yet to report it. The choice is then neither gone nor
+honored, and the machine's own status speaks. It stops being unknown for a client that offered the
+catalog and never reports it once a turn has run for want of it and fallen back on the saved
+choice: that has happened, Chat says it, and the room is told the choice so every composer says it
+too, for as long as that client stays attached and reports nothing. A report that comes later, or
+another client, starts again from what it reports. A person who can only read the document sees
+none of it.
+
+A turn that cannot read the choice at all (the catalog or the stored choice fails to load) never
+runs the default silently. It runs the default, Chat says once, while that holds, that the
+document's model choice couldn't be read, and the server tells the room with `chat:model-unreadable`
+(`true`, and `false` when a later turn can read it again; a person who joins meanwhile is sent
+`true` after the Chat history), so every open composer shows the same words in its notice until a
+turn can read the choice again. Nothing stored is changed. These words are the composer's own
+notice, a cause of their own beside the page's connection banner: drawn beneath the machine's
+banner when that is drawn, and giving way, as the composer's other notices do, to the room's
+own connection banner, a refused send and a failed reply, then returning with the connection
+([design guide](../apps/web/DESIGN.md)).
+
 ## Coaching in an invoked turn
 
 The Planner is instructed to develop a small, provisional account of the problem
@@ -581,23 +642,20 @@ nothing. Otherwise the document's machine button carries it (a thin spinner whil
 the machine is connecting, a warning dot where it cannot connect, a muted grey dot
 while the Planner is away, and no dot at all where no machine is connected, the same
 bare icon as a button with no machine, never the machine's own green) with its words in
-the button's name and at the top of its menu, and nowhere else: the composer's top edge is left alone,
-as a chat's header, not its text field, carries a contact's state. A
-person with no machine button (no machine paired or shared, a title bar that does not
-show one, a phone whose top bar an open child has taken) has nowhere else to see the
-state, so for them the composer's top edge says every state, and, for a machine that
-cannot be connected to, draws the reason exactly as the machine reported it, except
-while the page's offline notice shows: the page cannot hear the machine then, and the
-notice is the one thing said about the connection, so the strip says nothing and returns
-by itself with the state then known. One
-decision, `plannerPlacement`, chooses this for the button, its menu and the strip, so
-they cannot disagree. A screen reader hears each problem state once as it begins, from
-a live region of the page, and nothing when it clears. While the page's offline notice
-shows, that live region is empty and says nothing new, whatever the state does meanwhile,
-so the notice is the only thing a screen reader hears of the connection; the region
-remembers what it last said, so a state that carried on through the loss is not said
-again when the connection returns, and a different one is said once. Other harnesses
-never send it, and Chat then shows nothing.
+the button's name and at the top of its menu, and as the connection banner at the Chat
+composer's top edge, once, as it changes: _reconnecting_ while a machine is being connected to,
+_dropped_ for a machine that cannot be connected to (with the reason exactly as the machine
+reported it, the attempts and _How to fix_, and a button that asks the machine to try again
+through `chat:wake`), that is offline or that has stepped away (no button: only that machine
+can come back), and, for a person with no machine button, _No machine is connected._ The
+page cannot hear the machine while the room's own connection is lost, so the banner then
+tells that connection alone and tells the machine again, with the state then known, once
+the connection is back. `plannerForBanner` and `connectionStep` decide this, so the button
+and the banner cannot disagree. A screen reader hears each phase once as it begins, from
+one live region of the page, and nothing when it clears; the region remembers the machine
+state it last said, so one that carried on through a loss is not said again when the
+connection returns, and a different one is said once. Other harnesses never send it, and
+Chat then shows nothing.
 
 These words are plain and name none of Chopin's own terms: _Connecting to studio_,
 _Can't connect to studio_, _studio is offline. Last seen 10:31 AM._ for a machine that is away (_Your work is kept._ where no time is known), _studio stepped away.
@@ -615,7 +673,7 @@ run cards carry `disconnected` beside the status they last reported: each reads
 its clock held at the last report; an open card says what it last reported and what
 happens when the Planner returns. A card offers Pause, named as waiting for the Planner
 to reconnect, because Chopin holds it, and no Resume, which it cannot hold. While the
-page's offline notice shows, the cards say nothing of the machine: no **disconnected**, no
+page's connection banner shows, the cards say nothing of the machine: no **disconnected**, no
 note, and a plain Pause, with the status as last reported, a still neutral ring and the
 clock held; the words come back with the connection, as the state then is. Decisions
 stay where they were and stay answerable. **Build plan** says to reconnect the machine
@@ -983,7 +1041,7 @@ refusal for a passing reason keeps the message hidden and is asked again after a
 lost connection is asked again on the next one. A message that can
 never be delivered as sent, or that the server turned down for good, says **Couldn't send** on
 itself, with the reason and **Try again** and **Delete**, and never in a strip above the composer. While the
-page's one offline notice shows, that line gives way to it and returns with the connection.
+page's connection banner shows, that line gives way to it and returns with the connection.
 A full queue is not that: the message stays marked as waiting to send. The outbox is used only
 with a server that acknowledges sends (`chatSendAcks`), and only for messages to the machine.
 

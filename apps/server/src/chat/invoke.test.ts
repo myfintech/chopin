@@ -10,6 +10,7 @@ import { decideReplying } from "../conversation-plan/decisions.test-fixtures";
 import { Admission } from "../auth/admission";
 import { Sessions } from "../auth/session";
 import { fullPlanner } from "../harness/atomic/full";
+import { ToolBoundaryError } from "../harness/remote/link";
 import { createHumanInput, PendingInputs } from "../harness/atomic/human-input";
 import { forgetWorkspaces } from "../harness/atomic/workspace";
 import { openPlannerSession } from "../harness/session";
@@ -445,6 +446,38 @@ test("an invoked instruction persists verbatim as a member message before public
 	} finally {
 		saved.resolve();
 		finished.resolve();
+	}
+});
+
+test("an invoking caller is introduced to the room with their picture before their message is posted", async () => {
+	let { context, events, user } = await setup();
+	let finished = Promise.withResolvers<void>();
+	context.openPlannerSession = async () => ({
+		ok: true,
+		value: {
+			async stream() {
+				return {
+					fullStream: (async function*() {
+						await finished.promise;
+						yield { type: "finish" };
+					})(),
+				} as never;
+			},
+			destroy: async () => {},
+		},
+	});
+	try {
+		let caller = { ...user, avatarUrl: "https://avatars.test/u/7" };
+		expect(await Chat.invoke(context, caller, "Plan this.")).toBeUndefined();
+		let kinds = events.map(event => event.kind);
+		expect(kinds.indexOf("session:people")).toBeGreaterThanOrEqual(0);
+		expect(kinds.indexOf("session:people")).toBeLessThan(kinds.indexOf("chat:message"));
+		expect(events.find(event => event.kind === "session:people")).toMatchObject({
+			people: [{ login: "ana", avatarUrl: "https://avatars.test/u/7" }],
+		});
+	} finally {
+		finished.resolve();
+		await context.chat.running;
 	}
 });
 
@@ -2099,4 +2132,168 @@ test("a focused message queued behind a busy turn still names the child when it 
 	let drained = prompts[1]!;
 	expect(drained.indexOf(`child id ${child}`)).toBeGreaterThanOrEqual(0);
 	expect(drained.indexOf(`child id ${child}`)).toBeLessThan(drained.indexOf("shorten the summary"));
+});
+
+function failingMemberTurn(
+	context: Chat.Room,
+	stream: (prompt: string) => Promise<never> | AsyncGenerator<unknown>,
+) {
+	let planner = runningSession();
+	planner.session.stream = (async (prompt: string) => {
+		let made = stream(prompt);
+		return made instanceof Promise ? made : { fullStream: made };
+	}) as never;
+	context.openPlannerSession = async () => ({ ok: true, value: planner.session });
+	return planner;
+}
+
+test("a failed turn's notice says why it ended, for the member message and child that began it, and keeps saying so after a restore", async () => {
+	let { context, backend } = await setup(configured(ATOMIC));
+	let child = "0f5b2c1e-8d3a-4b6f-9a21-7c4e5d6f7a8b";
+	context.children = {
+		list: async () => [],
+		resolve: async id => id === child ? { id, title: "Source review", createdAt: "" } : undefined,
+		open: async () => {
+			throw new Error("not used");
+		},
+	};
+	failingMemberTurn(context, async () => {
+		throw new Error("429 Too Many Requests");
+	});
+	let ws = { data: { handle: "ana", principalId: "U_ana" }, send() {} } as unknown as Socket;
+	let requestId = crypto.randomUUID();
+	await Chat.send(context, ws, {
+		kind: "chat:send",
+		rid: "send",
+		requestId,
+		to: "planner",
+		text: "@chopin shorten the summary",
+		focus: child,
+		ts: 0,
+	} as never);
+	await context.chat.running;
+	let notice = context.chat.entries.at(-1)!;
+	expect(notice.text).toBe("429 Too Many Requests");
+	expect(notice.turnFailure).toEqual({
+		kind: "error",
+		detail: "429 Too Many Requests",
+		request: requestId,
+		focus: child,
+	});
+
+	await context.persist();
+	let reopened = await Plan.open(context.room, backend, context.server);
+	try {
+		expect(reopened.chat.entries.at(-1)?.turnFailure).toEqual(notice.turnFailure);
+	} finally {
+		await Plan.close(reopened);
+	}
+});
+
+test("a turn the Planner's link dropped under says dropped, which a client leaves to the connection to tell", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	let planner = failingMemberTurn(context, async () => {
+		throw new Error("The machine disconnected during the turn.");
+	});
+	Object.assign(planner.session, { suspended: () => true });
+	await Chat.invoke(context, user, "Run the workflow");
+	await context.chat.running;
+	let notice = context.chat.entries.at(-1)!;
+	expect(notice.text).toContain("connection dropped during this reply");
+	expect(notice.turnFailure?.kind).toBe("dropped");
+});
+
+test("a tool that failed inside a turn that went on is no failure of the turn", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	failingMemberTurn(context, async function*() {
+		yield { type: "tool-call", toolCallId: "t1", toolName: "read_plan", input: {} };
+		yield { type: "tool-error", toolCallId: "t1", toolName: "read_plan", error: new Error("no") };
+		yield { type: "finish" };
+	} as never);
+	await Chat.invoke(context, user, "Read it");
+	await context.chat.running;
+	expect(context.chat.entries.filter(entry => entry.turnFailure)).toEqual([]);
+});
+
+test("a tool the turn was refused ends it as refused, once, whatever else ends with it", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	failingMemberTurn(context, async function*() {
+		yield { type: "tool-approval-request", approvalId: "a1", toolCall: { toolName: "bash" } };
+		await new Promise(resolve => setTimeout(resolve, 20));
+	} as never);
+	await Chat.invoke(context, user, "Run a command");
+	await context.chat.running;
+	let refused = context.chat.entries.filter(entry => entry.turnFailure);
+	expect(refused.map(entry => entry.turnFailure?.kind)).toEqual(["refused"]);
+	expect(refused[0]!.text).toBe("Chopin's tool approval was denied.");
+});
+
+test("a tool the remote Planner used without declaring it ends the turn as a tool failure, with no boundary words in what the room is told", async () => {
+	for (
+		let ending of [
+			async function*() {
+				yield {
+					type: "error",
+					error: new ToolBoundaryError("Chopin's tool boundary failure: bash"),
+				};
+			},
+			async () => {
+				throw new ToolBoundaryError("Chopin's tool boundary failure: bash");
+			},
+		]
+	) {
+		let { context, user } = await setup(configured(ATOMIC));
+		failingMemberTurn(context, ending as never);
+		await Chat.invoke(context, user, "Run a command");
+		await context.chat.running;
+		let failed = context.chat.entries.filter(entry => entry.turnFailure);
+		expect(failed.map(entry => entry.turnFailure?.kind)).toEqual(["tool"]);
+		expect(failed[0]!.turnFailure?.detail).toBeUndefined();
+		expect(failed[0]!.text).not.toMatch(/boundary|Chopin's tool/i);
+		expect(failed[0]!.text).toBe("The reply stopped: a tool it needed isn't available.");
+	}
+});
+
+test("an error the model's stream reports ends the turn with the words it gave, in one entry, not Chopin's own generic line", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	failingMemberTurn(context, async function*() {
+		yield { type: "text-delta", id: "m", text: "Which" };
+		yield { type: "error", error: new Error("429 Too Many Requests") };
+	} as never);
+	await Chat.invoke(context, user, "Shorten the summary");
+	await context.chat.running;
+	let failed = context.chat.entries.filter(entry => entry.turnFailure);
+	expect(failed).toHaveLength(1);
+	expect(failed[0]!.text).toBe("429 Too Many Requests");
+	expect(failed[0]!.turnFailure).toMatchObject({ kind: "error", detail: "429 Too Many Requests" });
+});
+
+test("a stream that timed out ends the turn as timed out, however the harness names it, with none of its words", async () => {
+	let timeout = new Error("The operation was aborted due to timeout");
+	timeout.name = "TimeoutError";
+	let { context, user } = await setup(configured(ATOMIC));
+	failingMemberTurn(context, async function*() {
+		yield { type: "error", error: timeout };
+	} as never);
+	await Chat.invoke(context, user, "Shorten the summary");
+	await context.chat.running;
+	let failed = context.chat.entries.filter(entry => entry.turnFailure);
+	expect(failed.map(entry => entry.turnFailure?.kind)).toEqual(["timed-out"]);
+	expect(failed[0]!.turnFailure?.detail).toBeUndefined();
+});
+
+test("a stream that stopped without saying why is a failed reply with no words repeating the banner's own", async () => {
+	for (let part of [{ type: "abort" }, { type: "error", error: undefined }]) {
+		let { context, user } = await setup(configured(ATOMIC));
+		failingMemberTurn(context, async function*() {
+			yield part;
+		} as never);
+		await Chat.invoke(context, user, "Shorten the summary");
+		await context.chat.running;
+		let failed = context.chat.entries.filter(entry => entry.turnFailure);
+		expect(failed).toHaveLength(1);
+		expect(failed[0]!.turnFailure?.kind).toBe("error");
+		expect(failed[0]!.turnFailure?.detail).toBeUndefined();
+		expect(failed[0]!.text).toBe("Chopin's reply failed. Try again.");
+	}
 });

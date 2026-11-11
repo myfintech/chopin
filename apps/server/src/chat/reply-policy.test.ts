@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { expectPlain } from "../testing/plain-words";
+import { ToolBoundaryError } from "../harness/remote/link";
 import { checkPlannerReply, PlannerReplyError, publishPlannerReplies } from "./reply-policy";
 
 import type { Decide } from "../conversation-plan/decisions";
@@ -156,7 +157,7 @@ test("a classifier failure still fails even after inline decisions were captured
 test("a stream failure after capture cannot become a success summary", async () => {
 	let f = fixture([[{ type: "error", error: new Error("Provider failed") }]]);
 	f.options.capturedDecisions = () => 4;
-	expect(await rejection(f.run())).toContain("reply failed");
+	expect(await rejection(f.run())).toContain("Provider failed");
 	expect(f.published).toEqual([]);
 });
 
@@ -228,7 +229,7 @@ test("an unterminated message is still checked before publication", async () => 
 test("a stream error discards partial text without starting a repair", async () => {
 	let failure: Part = { type: "error", error: new Error("Provider failed") };
 	let f = fixture([[{ type: "text-delta", id: "message", text: "Which" }, failure]], verdict(1));
-	expect(await rejection(f.run())).toContain("reply failed");
+	expect(await rejection(f.run())).toContain("Provider failed");
 	expect(f.published).toEqual([]);
 	expect(f.prompts).toHaveLength(1);
 });
@@ -330,3 +331,15 @@ test.each(["classifier", "oversize"])(
 		expect(f.published).toEqual([]);
 	},
 );
+
+test("a stream error from the tool boundary ends the turn as that error, so it is told as a tool failure and not a failed reply", async () => {
+	let boundary = new ToolBoundaryError("Chopin's tool boundary failure: bash");
+	let f = fixture([[{ type: "text-delta", id: "message", text: "Which" }, {
+		type: "error",
+		error: boundary,
+	}]], verdict(1));
+	let failure = await f.run().then(() => undefined, error => error);
+	expect(failure).toBe(boundary);
+	expect(f.published).toEqual([]);
+	expect(f.prompts).toHaveLength(1);
+});

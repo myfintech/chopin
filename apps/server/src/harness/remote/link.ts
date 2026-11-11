@@ -12,6 +12,7 @@ import {
 	encodeMessage,
 	LINK_CLOSE,
 	parseClientMessage,
+	usableCatalog,
 } from "@chopin/agent-link";
 
 import type {
@@ -22,6 +23,7 @@ import type {
 	HarnessV1StreamPart,
 } from "@ai-sdk/harness";
 import type {
+	CapabilityCatalog,
 	ClientMessage,
 	ClientMessageOf,
 	ProtocolErrorCode,
@@ -32,6 +34,7 @@ import type {
 import type { Chat as Wire } from "@chopin/protocol";
 import type { JsonValue, PlannerHeldSession } from "../../storage/model";
 import type { AskedInput, HumanInputStatus, InputMethod } from "../atomic/human-input";
+import type { PlannerTurn } from "../turn-level";
 import type { RemotePlanner } from "./registry";
 
 const OPERATION_TIMEOUT_MS = 10_000;
@@ -93,6 +96,8 @@ export type LinkOptions = {
 	revalidateEveryMs?: number;
 	/** The features `attached` names; absent when the client asked for none. */
 	features?: string[];
+	/** The client reported what it offers, which may be nothing now; read it from `catalog`. */
+	catalogChanged?(): void;
 };
 
 const REFUSAL_CLOSE: Record<RefusalCode, number> = {
@@ -778,7 +783,7 @@ class RemoteSession {
 		};
 	}
 
-	async #prompt(options: HarnessV1PromptTurnOptions): Promise<HarnessV1PromptControl> {
+	async #prompt(options: PlannerTurn): Promise<HarnessV1PromptControl> {
 		this.#ready();
 		if (options.skills.length > 0) throw unsupported("skills");
 		let prompt = promptText(options.prompt);
@@ -790,6 +795,10 @@ class RemoteSession {
 		let hostNames = offered.map(tool => tool.name);
 		let hostTools = this.planner.hostTools;
 		this.planner.hostTools = undefined;
+		// The level is only ever one the client's own catalog listed for the model.
+		let thinkingLevel = this.#port.features?.includes(AGENT_FEATURES.capabilityCatalog)
+			? options.thinkingLevel
+			: undefined;
 		let turn: Turn = {
 			id: crypto.randomUUID(),
 			emit: options.emit,
@@ -811,6 +820,7 @@ class RemoteSession {
 			prompt,
 			...(options.instructions === undefined ? {} : { instructions: options.instructions }),
 			...(options.model ? { model: options.model } : {}),
+			...(thinkingLevel ? { thinkingLevel } : {}),
 			tools: offered.map(tool => ({
 				name: tool.name,
 				...(tool.description === undefined ? {} : { description: tool.description }),
@@ -941,6 +951,9 @@ export class AgentLink {
 	#resumed = false;
 	/** Whether the server or the client chose to end this link, rather than the network failing. */
 	#planned = false;
+	#catalog: CapabilityCatalog | undefined;
+	/** Whether a turn has run without the catalog this client offered, so it is not waited for. */
+	#ranWithoutCatalog = false;
 	/** Set on a link rebuilt after a restart: told when its sessions are given back or end. */
 	#rebuilt: { ended(): void; resumed(): void } | undefined;
 
@@ -1111,6 +1124,34 @@ export class AgentLink {
 
 	get attached(): boolean {
 		return this.#state === "attached";
+	}
+
+	/**
+	 * What the client last reported with `capabilities`; absent until it does, and for a link whose
+	 * client offered no `capability-catalog`.
+	 */
+	get catalog(): CapabilityCatalog | undefined {
+		return this.#catalog;
+	}
+
+	/**
+	 * Whether what the client offers is yet to be told: it offered `capability-catalog` and has not
+	 * sent `capabilities`, and no turn has run without it (`settleWithoutCatalog`). A client from
+	 * before the catalog never will, so nothing is pending for it, and a report that withdraws
+	 * everything is still a report.
+	 */
+	get catalogPending(): boolean {
+		return this.#catalog === undefined && !this.#ranWithoutCatalog
+			&& this.#options.features?.includes(AGENT_FEATURES.capabilityCatalog) === true;
+	}
+
+	/**
+	 * A turn has run, and fallen back on a saved choice, for want of the catalog this client offered
+	 * and has not reported: what it offers is no longer waited for but taken as nothing, so that
+	 * what the turn did can be told to the room. A report that comes later replaces it as ever.
+	 */
+	settleWithoutCatalog(): void {
+		this.#ranWithoutCatalog = true;
 	}
 
 	/** Whether this link offered `resumable-sessions`. */
@@ -1581,6 +1622,23 @@ export class AgentLink {
 				if (this.#resumed) return this.#violate("protocol", "resume must come first, once.");
 				this.#resumed = true;
 				return this.#resume(message);
+			case "capabilities": {
+				if (!this.#options.features?.includes(AGENT_FEATURES.capabilityCatalog)) {
+					return this.#violate("protocol", "capabilities needs the capability-catalog feature.");
+				}
+				// What nobody can ask for (a model with no id, an empty level) is left out here, once,
+				// so every reader of the catalog sees only what can be chosen; the rest and the link stay.
+				let { catalog, skipped } = usableCatalog(message.catalog);
+				if (skipped.length > 0) {
+					console.warn(
+						`[agent] ${this.#channelId} reported catalog entries Chopin cannot offer; skipped:`,
+						skipped.join("; "),
+					);
+				}
+				this.#catalog = catalog;
+				this.#options.catalogChanged?.();
+				return;
+			}
 			case "attach":
 				return this.#violate("protocol", "This link is already attached.");
 			case "detach":

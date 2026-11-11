@@ -10,8 +10,11 @@ import { atomicProviders } from "../atomic-providers";
 import { announceAtomicPlanner } from "../isolated-planner";
 import { createRemoteAdapter } from "./remote/adapter";
 import { readingOutput } from "../agent/reading-output";
+import { remoteCatalog } from "./catalog";
+import { attachedLink } from "./remote/registry";
 
 import type { HarnessV1 } from "@ai-sdk/harness";
+import type { Chat as Wire } from "@chopin/protocol";
 import type { AtomicAuthMode } from "./atomic/adapter";
 
 const credentials = new Map<string, {
@@ -131,6 +134,48 @@ export function harnessFor(config: {
 		auth,
 		extensions,
 	});
+}
+
+/**
+ * The models a document's Planner can be set to run, or none where its harness cannot honor a
+ * choice: Atomic's runtime offers its models, a remote Planner offers what its attached client
+ * reported (an older client reported nothing), and every other harness offers nothing.
+ */
+export async function plannerCatalog(
+	harness: string,
+	channelId: string,
+	operatorModel: string | undefined,
+): Promise<Wire.ModelCatalog | undefined> {
+	if (harness === "remote") return remoteCatalog(attachedLink(channelId)?.catalog, operatorModel);
+	let atomic = selected as { catalog?: (model: string | undefined) => Promise<Wire.ModelCatalog> };
+	if (harness === "atomic" && atomic?.catalog) return atomic.catalog(operatorModel);
+	return undefined;
+}
+
+/**
+ * Whether what the document's Planner offers is known now, though it may be nothing. A remote
+ * Planner's is known only while a client is attached and has told it, or offered no catalog to tell
+ * it with: with nobody attached (a machine that is away, a server that has just restarted) there is
+ * nobody to honor or to refuse a saved choice, and nothing is said of it. Every other harness knows.
+ */
+export function plannerOfferKnown(harness: string, channelId: string): boolean {
+	if (harness !== "remote") return true;
+	let link = attachedLink(channelId);
+	return link !== undefined && !link.catalogPending;
+}
+
+/**
+ * A turn has fallen back on a saved choice for want of a catalog its remote Planner's client
+ * offered and never reported. The wait is over for that client (`plannerOfferKnown` is then true
+ * until it leaves), so what the turn did can be told. False where no client is attached, and for
+ * every other harness, which knows what it offers.
+ */
+export function plannerRanWithoutOffer(harness: string, channelId: string): boolean {
+	if (harness !== "remote") return false;
+	let link = attachedLink(channelId);
+	if (!link) return false;
+	link.settleWithoutCatalog();
+	return true;
 }
 
 export function registerCredential(

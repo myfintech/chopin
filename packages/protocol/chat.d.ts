@@ -20,7 +20,9 @@ export declare namespace Chat {
 		| Request<Unqueue>
 		| Request<Delete>
 		| Request<Retry>
+		| Request<Wake>
 		| Request<SetParticipation>
+		| Request<SetModel>
 		| Request<Typing>;
 
 	export type Outgoing =
@@ -33,8 +35,11 @@ export declare namespace Chat {
 		| Sent
 		| Deleted
 		| Retried
+		| Woke
 		| Removed
-		| ParticipationState;
+		| ParticipationState
+		| ModelState
+		| ModelUnreadable;
 
 	/** Who said something. The agent is not a member, so it is named apart. */
 	export type Author =
@@ -149,6 +154,27 @@ export declare namespace Chat {
 		deliveryState?: DeliveryState;
 		/** Why a `failed` message could not be delivered. */
 		deliveryFailure?: DeliveryFailure;
+		/**
+		 * On a system notice that says a Planner turn ended without finishing its reply: why, so a
+		 * client can offer the way back. Absent on any other entry and on one saved before this
+		 * existed, which is only its `text`.
+		 */
+		turnFailure?: TurnFailure;
+	};
+
+	/**
+	 * Why a Planner turn ended. `error` is the model's or harness's own failure, `detail` its words
+	 * as reported; `refused` a tool the turn was not allowed to run, `tool` one it needed that is
+	 * not offered, `timed-out` a turn that took too long, `unreachable` an agent that could not be
+	 * reached, and `dropped` the machine's connection going while it replied (the connection's to
+	 * tell, not a failure to retry). `request` is the member message that began the turn, and
+	 * `focus` the child document that was open when it was sent, so a retry is the same turn.
+	 */
+	export type TurnFailure = {
+		kind: "error" | "refused" | "tool" | "timed-out" | "unreachable" | "dropped";
+		detail?: string;
+		request?: string;
+		focus?: string;
 	};
 
 	export type DeliveryState = "sent" | "delivered" | "failed";
@@ -224,6 +250,62 @@ export declare namespace Chat {
 	export type Participation = { enabled: boolean; paused: boolean };
 	export type ParticipationState = KIND<"chat:participation"> & Participation;
 	export type SetParticipation = KIND<"chat:participation"> & { paused: boolean };
+
+	/**
+	 * A model the document's agent can run, as its harness (or the client attached to the document)
+	 * reports it. `id` is the exact string a turn names; `thinkingLevels` are the levels the model
+	 * supports in the order to show them, absent or empty for a model with no reasoning control.
+	 */
+	export type ModelOption = {
+		id: string;
+		name: string;
+		provider?: { id: string; name?: string };
+		description?: string;
+		thinkingLevels?: string[];
+	};
+
+	/** What a document's agent offers: absent entirely where its harness offers no choice. */
+	export type ModelCatalog = {
+		models: ModelOption[];
+		/** The model, and thinking level, the agent uses until somebody chooses. */
+		default?: { model: string; thinkingLevel?: string };
+	};
+
+	/**
+	 * The model and thinking level somebody chose for the document's agent. A field left out means
+	 * the agent's own default; an empty choice is the default of both.
+	 */
+	export type ModelChoice = { model?: string; thinkingLevel?: string };
+
+	/**
+	 * The document's model choice and what it can be chosen from, shared by everyone in the room:
+	 * sent on join, to everyone when the choice or the catalog changes, and to the sender as the
+	 * answer to `SetModel`. `catalog` is absent when nothing can be chosen, and the composer then
+	 * offers no control. `choice` is the stored choice, which can name a model the catalog no longer
+	 * offers, or one offered by no catalog at all (a client withdrew its models, an older one took
+	 * its place); the agent then runs its default and says so in Chat, and the composer says so
+	 * too. `choice` is left out, though one is stored, while what the harness offers is unknown (a
+	 * remote Planner with no client attached, or one yet to report): it is neither gone nor honored.
+	 * A turn that falls back for want of a catalog its client offered and never reported ends that
+	 * for the client, and `choice` is then sent.
+	 */
+	export type ModelState = KIND<"chat:model"> & { catalog?: ModelCatalog; choice?: ModelChoice };
+
+	/**
+	 * Sent to everyone in the room when a turn could not read the document's model choice, or the
+	 * catalog to check it against, and so ran the agent's default (`unreadable: true`), and again
+	 * when a later turn could read it (`false`). Only a change is sent; a person who joins while it
+	 * holds is sent it after `History`, which ends what an earlier connection was told. The composer
+	 * says so, in the words of `UNREADABLE_NOTICE`, until it ends.
+	 */
+	export type ModelUnreadable = KIND<"chat:model-unreadable"> & { unreadable: boolean };
+
+	/**
+	 * Choose the document's model and thinking level, from the next turn. Anyone who can write may.
+	 * The server checks the choice against the catalog it reports now, and refuses one the catalog
+	 * does not offer. Without a field the agent's own default applies.
+	 */
+	export type SetModel = KIND<"chat:model"> & ModelChoice;
 
 	/** Ephemeral composer activity, with no draft content. */
 	export type Typing = KIND<"chat:typing"> & { active: boolean };
@@ -327,4 +409,26 @@ export declare namespace Chat {
 
 	/** The message is waiting again. */
 	export type Retried = KIND<"chat:retry"> & { id: string };
+
+	/**
+	 * Ask a machine to start the document's Planner now, as sending it a message does, without
+	 * sending one. Authorized like `chat:send`: repository write access, and a document that is
+	 * not archived or deleted. It changes nothing about a Planner that is attached, or whose
+	 * connection dropped and whose work is kept for its return: the answer says so and the
+	 * machine's own client is what resumes. It never replays a turn. It is the root document's;
+	 * a child's Chat is its root's.
+	 */
+	export type Wake = KIND<"chat:wake">;
+
+	/**
+	 * `asked` is true when a machine that can run the Planner was asked to start it; its progress
+	 * arrives as `session:planner`. When false, `why` says so: `attached` (nothing to start),
+	 * `disconnected` (its machine's connection dropped; only that machine can resume it) or
+	 * `held` (another account holds it) leave it as it is; `no-machine` means no machine that can
+	 * run it is connected; `unavailable` means this server does not run Planners on machines.
+	 */
+	export type Woke = KIND<"chat:wake"> & {
+		asked: boolean;
+		why?: "attached" | "disconnected" | "held" | "no-machine" | "unavailable";
+	};
 }

@@ -3,6 +3,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { ChatComposer } from "./composer";
+import { composerModelNotice } from "./model-picker-state";
 
 import type { ChatComposerProps } from "./composer";
 
@@ -182,4 +183,47 @@ test("a read-only document replaces the strip, whatever it was saying", () => {
 	});
 	expect(markup).not.toContain("Can't connect");
 	expect(markup).not.toContain("composer-notice");
+});
+
+test("a banner and the composer's own notice are both drawn, and both describe the draft", () => {
+	let markup = render({
+		banner: {
+			id: "lead connection",
+			node: createElement("div", { id: "lead", "data-banner": "" }, "No machine is connected."),
+		},
+		notice: { tone: "info", text: "Research isn't available in this document" },
+	});
+	expect(markup).toContain("No machine is connected.");
+	expect(markup).toContain("Research isn't available in this document");
+	let cue = markup.match(/role="status" id="([^"]+)"/)![1]!;
+	expect(markup).toMatch(new RegExp(`aria-describedby="lead connection ${cue}"`));
+});
+
+test("a banner alone describes the draft by its ids, with no notice strip of its own", () => {
+	let alone = render({ banner: { id: "a b", node: createElement("div", { id: "a" }) } });
+	expect(alone).toContain('aria-describedby="a b"');
+	expect(alone).not.toContain("composer-notice");
+});
+
+test("a saved model's fallback notice is drawn beneath a banner as a status, and both describe the draft", () => {
+	let words = composerModelNotice(undefined, false, { model: "acme/large" })!;
+	expect(words.text).toBe("acme/large is no longer available, so Chopin used its default model.");
+	let banner = {
+		id: "lead",
+		node: createElement("div", { id: "lead", "data-banner": "" }, "No machine is connected."),
+	};
+	let markup = render({ banner, notice: words });
+	// The banner is a cause of its own, above the field; the notice is another, beneath it.
+	expect(markup.indexOf("No machine is connected.")).toBeLessThan(markup.indexOf(words.text));
+	expect(markup.indexOf(words.text)).toBeLessThan(markup.indexOf("composer-surface"));
+	expect(markup).toMatch(/<div class="composer-notice" role="status"/);
+	let cue = markup.match(/role="status" id="([^"]+)"/)![1]!;
+	expect(markup).toContain(`aria-describedby="lead ${cue}"`);
+	// A banner that is not a refused send leaves the field valid.
+	expect(markup).not.toContain("aria-invalid");
+	// One that is makes the field invalid but does not turn the notice into an alert.
+	let refused = render({ banner: { ...banner, invalid: true }, notice: words });
+	expect(refused).toContain('aria-invalid="true"');
+	expect(refused).toMatch(/<div class="composer-notice" role="status"/);
+	expect(refused).not.toContain('role="alert"');
 });

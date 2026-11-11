@@ -15,6 +15,7 @@ import {
 	parseServerMessage,
 	RESTART_RESUME_RETRY_MS,
 	toolErrorSchema,
+	usableCatalog,
 } from "./protocol";
 
 describe("Agent connection messages", () => {
@@ -322,6 +323,7 @@ describe("Agent connection messages", () => {
 			decisionOptionPreviews: AGENT_FEATURES.decisionOptionPreviews,
 			resumableSessions: AGENT_FEATURES.resumableSessions,
 			restartNotice: AGENT_FEATURES.restartNotice,
+			capabilityCatalog: AGENT_FEATURES.capabilityCatalog,
 			restartResumeRetryMs: RESTART_RESUME_RETRY_MS,
 		});
 		expect(AGENT_FEATURES.restartNotice).toBe("restart-notice");
@@ -396,5 +398,275 @@ describe("Agent connection messages", () => {
 		expect(agentUrl("http://127.0.0.1:8787").href).toBe("ws://127.0.0.1:8787/api/v1/agent");
 		expect(agentUrl("ws://127.0.0.1:1/custom").href).toBe("ws://127.0.0.1:1/custom");
 		expect(() => agentUrl("ftp://chopin.test")).toThrow("http(s) or ws(s)");
+	});
+});
+
+describe("The capability catalog", () => {
+	let catalog = {
+		models: {
+			available: [
+				{
+					id: "acme/large:preview",
+					name: "Large",
+					provider: { id: "acme", name: "Acme" },
+					description: "Slower and more careful.",
+					thinkingLevels: ["off", "low", "high", "xhigh"],
+				},
+				{ id: "acme/small", name: "Small" },
+			],
+			default: { id: "acme/small" },
+		},
+		commands: [{ name: "release-notes", kind: "skill", description: "Draft release notes." }],
+	};
+
+	it("is a feature a client asks for, named as the documentation names it", () => {
+		expect(AGENT_FEATURES.capabilityCatalog).toBe("capability-catalog");
+		expect(WIRE.capabilityCatalog).toBe(AGENT_FEATURES.capabilityCatalog);
+	});
+
+	it("round-trips models, thinking levels and commands exactly as reported", () => {
+		let message = { type: "capabilities" as const, catalog };
+		let parsed = parseClientMessage(JSON.stringify(message));
+		expect(parsed).toEqual({ ok: true, message });
+		expect(encodeMessage(message)).toBe(JSON.stringify(message));
+	});
+
+	it("accepts an empty report and keeps the order, duplicates and spelling of what it names", () => {
+		expect(parseClientMessage(JSON.stringify({ type: "capabilities", catalog: {} }))).toEqual({
+			ok: true,
+			message: { type: "capabilities", catalog: {} },
+		});
+		let odd = {
+			models: {
+				available: [
+					{ id: "Z/b", name: "B", thinkingLevels: ["high", "off", "high"] },
+					{ id: "Z/b", name: "B again" },
+					{ id: "a/c", name: "C" },
+				],
+			},
+		};
+		let parsed = parseClientMessage(JSON.stringify({ type: "capabilities", catalog: odd }));
+		expect(parsed).toEqual({ ok: true, message: { type: "capabilities", catalog: odd } });
+	});
+
+	it("accepts every string a client reports as it was written, however it is spelled or how long", () => {
+		// The protocol does not say how a model, a level or a command is spelled, so none is refused.
+		let odd = {
+			models: {
+				available: [
+					{
+						id: `acme/${"x".repeat(300)}`,
+						name: "n".repeat(129),
+						provider: { id: "p".repeat(200), name: "P".repeat(200) },
+						description: "d".repeat(4_001),
+						thinkingLevels: ["extra high", "deep thought", "\u4f4e", "x".repeat(300), "a:b=c", ""],
+					},
+					{ id: "", name: "" },
+					{ id: 'with space \n and "quotes"', name: "Line\nbreak", thinkingLevels: [] },
+				],
+				default: { id: "y".repeat(300), thinkingLevel: "extra high" },
+			},
+			commands: [
+				{ name: "n".repeat(200), description: "d".repeat(5_000), kind: "slash command" },
+				{ name: "", kind: "" },
+			],
+		};
+		let message = { type: "capabilities" as const, catalog: odd };
+		expect(parseClientMessage(JSON.stringify(message))).toEqual({ ok: true, message });
+	});
+
+	it("refuses only a value of the wrong type, which no client of this feature sends", () => {
+		let refused = (value: unknown) =>
+			parseClientMessage(JSON.stringify({ type: "capabilities", catalog: value })).ok;
+		expect(refused({ models: { available: [{ id: 3, name: "x" }] } })).toBe(false);
+		expect(refused({ models: { available: [{ id: "a" }] } })).toBe(false);
+		expect(refused({ models: { available: "none" } })).toBe(false);
+		expect(refused({ models: { available: [{ id: "a", name: "x", thinkingLevels: "high" }] } }))
+			.toBe(false);
+		expect(refused({ models: { available: [{ id: "a", name: "x", thinkingLevels: [3] }] } }))
+			.toBe(false);
+		expect(refused({ models: { available: [{ id: "a", name: "x", description: 3 }] } }))
+			.toBe(false);
+		expect(refused({ models: { available: [], default: { thinkingLevel: "low" } } })).toBe(false);
+		expect(refused({ commands: [{ name: "x", kind: 3 }] })).toBe(false);
+		expect(refused({ commands: [{ kind: "skill" }] })).toBe(false);
+	});
+
+	it("bounds a report only by the frame it travels in", () => {
+		let big = { models: { available: [{ id: "a".repeat(MAX_LINK_MESSAGE_BYTES), name: "x" }] } };
+		expect(parseClientMessage(JSON.stringify({ type: "capabilities", catalog: big })))
+			.toMatchObject({
+				ok: false,
+				code: "message-too-large",
+			});
+	});
+
+	it("takes as many models and commands as the frame holds, and a description as long as a skill's", () => {
+		// Atomic's own models number 1,774 and its skills describe themselves in up to 925 characters.
+		let large = {
+			models: {
+				available: Array.from({ length: 1_774 }, (_, index) => ({
+					id: `provider/model-${index}`,
+					name: `Model ${index}`,
+					provider: { id: `provider-${index % 40}` },
+					thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+				})),
+			},
+			commands: Array.from({ length: 600 }, (_, index) => ({
+				name: `skill-${index}`,
+				kind: "skill",
+				description: "d".repeat(925),
+			})),
+		};
+		let parsed = parseClientMessage(JSON.stringify({ type: "capabilities", catalog: large }));
+		expect(parsed).toEqual({ ok: true, message: { type: "capabilities", catalog: large } });
+		let described = {
+			models: { available: [{ id: "a", name: "x", description: "d".repeat(4_000) }] },
+		};
+		expect(parseClientMessage(JSON.stringify({ type: "capabilities", catalog: described })).ok)
+			.toBe(true);
+	});
+
+	it("ignores a field it has no use for and keeps it as written, so a report can grow", () => {
+		let grown = {
+			models: {
+				available: [{
+					id: "a",
+					name: "A",
+					provider: { id: "p", homepage: "https://example.test" },
+					price: { input: 1, output: 3 },
+					thinkingLevels: ["low"],
+				}],
+				default: { id: "a", why: "cheapest" },
+				recommended: ["a"],
+			},
+			commands: [{ name: "x", kind: "skill", aliases: ["y"] }],
+			attachments: { images: true },
+			mentions: [{ kind: "file" }],
+		};
+		let parsed = parseClientMessage(JSON.stringify({ type: "capabilities", catalog: grown }));
+		expect(parsed).toEqual({ ok: true, message: { type: "capabilities", catalog: grown } });
+		// Only the catalog is read this way: a message is still strict.
+		expect(
+			parseClientMessage(JSON.stringify({ type: "capabilities", catalog: {}, extra: 1 })).ok,
+		)
+			.toBe(false);
+	});
+
+	it("rides a turn as an optional thinking level beside the model, and old turns still parse", () => {
+		let turn = {
+			type: "turn" as const,
+			session: "s",
+			turn: "t",
+			prompt: "p",
+			tools: [],
+		};
+		expect(parseServerMessage(JSON.stringify(turn))).toEqual({ ok: true, message: turn });
+		let chosen = { ...turn, model: "acme/large:preview", thinkingLevel: "high" };
+		expect(parseServerMessage(JSON.stringify(chosen))).toEqual({ ok: true, message: chosen });
+		// What the client reported is what comes back, however it is spelled or how long.
+		let odd = { ...turn, model: `acme/${"m".repeat(5_000)}`, thinkingLevel: "very high" };
+		expect(parseServerMessage(JSON.stringify(odd))).toEqual({ ok: true, message: odd });
+		let long = {
+			type: "part" as const,
+			session: "s",
+			turn: "t",
+			part: {
+				type: "stream-start" as const,
+				modelId: odd.model,
+			},
+		};
+		expect(parseClientMessage(JSON.stringify(long))).toEqual({ ok: true, message: long });
+	});
+});
+
+describe("What Chopin can offer of a capability catalog", () => {
+	it("skips a model whose id is empty and keeps every other entry, in the order given", () => {
+		let reported = {
+			models: {
+				available: [
+					{ id: "a", name: "A" },
+					{ id: "", name: "Blank", thinkingLevels: ["low"] },
+					{ id: "b", name: "B", description: "Second." },
+					{ id: "a", name: "A again" },
+				],
+				default: { id: "b" },
+			},
+			commands: [{ name: "notes", kind: "skill" }],
+		};
+		let { catalog, skipped } = usableCatalog(reported);
+		expect(catalog).toEqual({
+			models: {
+				available: [
+					{ id: "a", name: "A" },
+					{ id: "b", name: "B", description: "Second." },
+					{ id: "a", name: "A again" },
+				],
+				default: { id: "b" },
+			},
+			commands: [{ name: "notes", kind: "skill" }],
+		});
+		expect(skipped).toEqual(['the model named "Blank" has no id']);
+	});
+
+	it("drops an empty level from a model's levels and keeps the others as written", () => {
+		let { catalog, skipped } = usableCatalog({
+			models: {
+				available: [
+					{ id: "a", name: "A", thinkingLevels: ["", "high", "extra high", "", "high"] },
+					{ id: "b", name: "B", thinkingLevels: [""] },
+					{ id: "c", name: "C", thinkingLevels: ["low"] },
+				],
+			},
+		});
+		// A model left with no level has no reasoning control, as one that listed none.
+		expect(catalog.models?.available).toEqual([
+			{ id: "a", name: "A", thinkingLevels: ["high", "extra high", "high"] },
+			{ id: "b", name: "B", thinkingLevels: [] },
+			{ id: "c", name: "C", thinkingLevels: ["low"] },
+		]);
+		expect(skipped).toEqual(["a lists an empty thinking level", "b lists an empty thinking level"]);
+	});
+
+	it("takes no default that names no model, and no empty level for a default", () => {
+		let models = [{ id: "a", name: "A", thinkingLevels: ["low"] }];
+		expect(usableCatalog({ models: { available: models, default: { id: "" } } })).toEqual({
+			catalog: { models: { available: models } },
+			skipped: ["the default model has no id"],
+		});
+		expect(
+			usableCatalog({
+				models: { available: models, default: { id: "a", thinkingLevel: "", why: "cheapest" } },
+			}),
+		).toEqual({
+			catalog: { models: { available: models, default: { id: "a", why: "cheapest" } } },
+			skipped: ["the default thinking level is empty"],
+		});
+	});
+
+	it("leaves a catalog with nothing to skip exactly as the client wrote it, fields it does not use included", () => {
+		let reported = {
+			models: {
+				available: [
+					{
+						id: "x".repeat(300),
+						name: "",
+						description: "",
+						thinkingLevels: ["extra high", "\u4f4e"],
+						price: { input: 1 },
+					},
+				],
+				default: { id: "x".repeat(300), thinkingLevel: "extra high" },
+				recommended: ["a"],
+			},
+			attachments: { images: true },
+		};
+		let { catalog, skipped } = usableCatalog(reported);
+		expect(catalog).toEqual(reported);
+		expect(skipped).toEqual([]);
+		expect(usableCatalog({})).toEqual({ catalog: {}, skipped: [] });
+		expect(usableCatalog({ commands: [{ name: "", kind: "" }] }).catalog).toEqual({
+			commands: [{ name: "", kind: "" }],
+		});
 	});
 });

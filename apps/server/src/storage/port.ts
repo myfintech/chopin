@@ -52,6 +52,7 @@ import type {
 	PauseBackgroundJob,
 	PlannerCredential,
 	PlannerLinkHold,
+	PlannerModelChoice,
 	PublishChannelDescription,
 	PublishChannelDescriptionResult,
 	PublishInitialResearchReport,
@@ -103,6 +104,12 @@ import type { ProvenanceStore } from "../document-provenance/model";
 export interface UserStore {
 	put(user: PutUser): Promise<UserRecord>;
 	get(id: string): Promise<UserRecord | undefined>;
+	/**
+	 * The user each login names, in one read, compared case-insensitively as GitHub's logins are;
+	 * a login nobody signed in under is left out. A login a person has given up stays on their row
+	 * until they sign in again, so where two rows carry it the one saved last owns it.
+	 */
+	byLogins(logins: readonly string[]): Promise<UserRecord[]>;
 }
 
 export interface SessionStore {
@@ -422,6 +429,16 @@ export interface PlannerLinkHoldStore {
 }
 
 /**
+ * The model and thinking level chosen for each document's Planner. Writes are fenced by the writer
+ * lease; a row goes with its document.
+ */
+export interface PlannerModelChoiceStore {
+	/** Replaces the document's choice whole. A choice with neither field removes the row. */
+	put(lease: Lease, choice: PlannerModelChoice): Promise<void>;
+	get(channelId: string): Promise<PlannerModelChoice | undefined>;
+}
+
+/**
  * Credentials a paired machine hands to a Planner backend, by digest. A row is written before
  * its credential is handed out, so a process that starts later accepts it while it lasts.
  */
@@ -495,6 +512,7 @@ export interface StorageAdapter {
 	readonly versions: DocumentVersionStore;
 	readonly machines: MachineStore;
 	readonly plannerHolds: PlannerLinkHoldStore;
+	readonly plannerModelChoices: PlannerModelChoiceStore;
 	readonly plannerCredentials: PlannerCredentialStore;
 	readonly mcpSessions: McpSessionStore;
 	readonly deferredTurns: DeferredTurnStore;

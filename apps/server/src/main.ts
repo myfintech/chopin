@@ -16,7 +16,15 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { displayTitle, parse, ulid } from "@chopin/dialect";
 
-import { harnessFor, shutdownHarnesses } from "./harness/harnesses";
+import {
+	harnessFor,
+	plannerCatalog,
+	plannerOfferKnown,
+	plannerRanWithoutOffer,
+	shutdownHarnesses,
+} from "./harness/harnesses";
+import { chooseModel, publishModelState, turnModel } from "./chat/model-choice";
+import type { ModelChoiceDeps } from "./chat/model-choice";
 import {
 	admitAgent,
 	AGENT_UPGRADE_HEADERS,
@@ -40,6 +48,8 @@ import type { ExperimentRuntime } from "./experiments/routes";
 import type { Instruction, ServerInstructionDeps } from "./chat/server-instruction";
 import { fingerprint } from "./experiments/service";
 import * as Chat from "./chat/service";
+import { answerWake } from "./chat/wake";
+import { plannerAttachment } from "./chat/planner-attachment";
 import * as Initiative from "./chat/initiative";
 import { deferralWiring, keepsRequests } from "./chat/deferred";
 import { createChildDocuments } from "./chat/children";
@@ -67,6 +77,7 @@ import { clientBuild, proxy, serve } from "./client";
 import { describe, load } from "./config";
 import { GitHubClient, GitHubError } from "./github/client";
 import { GitHubReferences } from "./github/references";
+import { builders, named, pictures, present } from "./people";
 import { registerConnectorScript } from "./http/connector-script";
 import { cut } from "./handover/cut";
 import { acquireWhenFree } from "./handover/lease-wait";
@@ -726,6 +737,7 @@ function conversation(
 					withChildPlan,
 				}),
 			}),
+		modelChoice: () => turnModel(modelChoices, room.id),
 		activeOwner: () => ownerBindings!.resolve(room.id),
 		ownerAvailable: () => ownerAvailable(room.id),
 		jobs: config.backgroundJobs ? jobService : undefined,
@@ -1181,14 +1193,37 @@ async function plannerStarting(channelId: string): Promise<void> {
 async function plannerStatus(channelId: string): Promise<PlannerAttachment> {
 	let status = plannerAttachments!.status(channelId);
 	if (status.state !== "none") return status;
-	let starting = await experiments?.plannerStarting(channelId);
-	return starting
-		? {
-			state: "starting",
-			login: starting.login,
-			...(starting.failure ? { failure: starting.failure } : {}),
-		}
-		: status;
+	return plannerAttachment(status, await experiments?.plannerStarting(channelId));
+}
+
+/**
+ * A document's Planner model choice: the catalog its harness reports (an attached client's own
+ * under `HARNESS=remote`) and the choice stored for it. Nothing is offered with `AGENT=off`.
+ */
+const modelChoices: ModelChoiceDeps = {
+	catalog: async channelId =>
+		config.agent ? plannerCatalog(config.harness, channelId, config.model || undefined) : undefined,
+	known: channelId => plannerOfferKnown(config.harness, channelId),
+	fellBack: channelId => {
+		if (plannerRanWithoutOffer(config.harness, channelId)) announceModel(channelId);
+	},
+	storage,
+	lease: () => {
+		if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+		return writerLease.held;
+	},
+};
+
+/**
+ * Tell everyone in the document what its Planner can be set to run and what it is set to. It goes
+ * through the same order as a choice, so it never tells the room an older choice after a newer one.
+ */
+function announceModel(channelId: string): void {
+	let room = Rooms.get(channelId);
+	if (!room || room.parentChannelId || cutting) return;
+	void publishModelState(modelChoices, channelId, state => {
+		if (server && !cutting) broadcast(server, channelId, state);
+	}).catch(err => console.error("chopin: could not announce a document's model choice -", err));
 }
 
 /** Each document's latest status announcement, so an earlier one that resolves later is dropped. */
@@ -1316,6 +1351,15 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 				if (currentChannel) applyChannelAccess(ws, currentChannel, ws.data.canManage);
 				implementations?.track(room.id);
 				let parent = room.parentChannelId;
+				// Who the document names but the room does not hold, ahead of the frames that name them.
+				let people = await pictures(storage.users, {
+					logins: named(opened),
+					ids: builders(opened),
+				}).catch(err => {
+					console.error("chopin: could not read the pictures of a document's people -", err);
+					return [];
+				});
+				if (!ws.data.closed && room.members.get(ws.data.client) === ws) present(ws, people);
 				await greetJoinedPlan(
 					opened,
 					ws,
@@ -1331,6 +1375,12 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 						? { working: thread => Chat.workingFor(Rooms.get(parent)?.plan?.chat, thread, room.id) }
 						: undefined,
 				);
+				// What the Planner can be set to run, and what it is set to, for the composer.
+				if (!parent) {
+					void publishModelState(modelChoices, room.id, state => {
+						if (!ws.data.closed && room.members.get(ws.data.client) === ws) tell(ws, state);
+					}).catch(err => console.error("chopin: could not send a model choice -", err));
+				}
 				// A reload while the room stays open settles a finding whose event was missed.
 				if (!parent) {
 					void Explore.sweep(opened, server, room.id, exploreDeps)
@@ -1376,6 +1426,17 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 			await Initiative.setParticipation(chat(room, ws), ws, frame);
 			return;
 
+		case "chat:model":
+			if (!await plannerWritable(room, ws, frame.rid)) return;
+			await chooseModel(modelChoices, {
+				server,
+				ws,
+				channelId: room.id,
+				userId: ws.data.principalId,
+				child: !!room.plan?.parentChannelId,
+			}, frame);
+			return;
+
 		case "chat:send":
 			try {
 				if (!await plannerWritable(room, ws, frame.rid)) return;
@@ -1389,6 +1450,16 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 					PASSING,
 				);
 			}
+			return;
+
+		case "chat:wake":
+			await answerWake(
+				ws,
+				frame.rid,
+				room.plan!,
+				() => plannerWritable(room, ws, frame.rid),
+				{ attachments: plannerAttachments, experiments },
+			);
 			return;
 
 		case "implementation:draft":
@@ -1940,13 +2011,7 @@ function openRoomSocket(ws: Socket): void {
 		...(ws.data.channelDescription
 			? { description: ws.data.channelDescription }
 			: {}),
-		you: {
-			handle: ws.data.handle,
-			client: ws.data.client,
-			...(ws.data.actor
-				? { actor: { name: ws.data.actor.name, avatar: ws.data.actor.avatar } }
-				: {}),
-		},
+		you: Rooms.member(ws),
 		members: Rooms.members(room),
 		canEdit: ws.data.canEdit,
 		canManage: ws.data.canManage,
@@ -2078,6 +2143,7 @@ function listen(): Server<SocketData> {
 						pingEveryMs: config.agentConnectionPingMs,
 						pongTimeoutMs: config.agentConnectionTimeoutMs,
 						maxSilenceMs: config.agentConnectionMaxSilenceMs,
+						catalogChanged: announceModel,
 					});
 					return;
 				}
@@ -3018,6 +3084,8 @@ if (config.agent && config.harness === "remote") {
 		// A machine chosen for the document may start its Planner, or stop waiting to.
 		experiments?.plannerChanged(channelId);
 		announcePlanner(channelId);
+		// A client that attaches or leaves brings or takes its models.
+		announceModel(channelId);
 		// Settlements that waited for a Planner can run now.
 		if (planner.state === "attached") {
 			void startDeferred(channelId).catch(err =>

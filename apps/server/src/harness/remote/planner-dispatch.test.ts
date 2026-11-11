@@ -446,11 +446,13 @@ describe("a Planner backend that keeps failing to start", () => {
 			machineId: laptop.id,
 		});
 
-		// One launch that exited is a transient failure: the document still just says starting.
+		// One launch that exited is a transient failure: the document still just says starting, and
+		// counts the launch it waits on, the second.
 		expect((await laptop.report(failing(channel.id, 1))).status).toBe(200);
 		expect(await runtime.plannerStarting(channel.id)).toEqual({
 			login: "member",
 			machineId: laptop.id,
+			attempt: 2,
 		});
 
 		// The second in a row is not.
@@ -461,6 +463,7 @@ describe("a Planner backend that keeps failing to start", () => {
 		expect(await runtime.plannerStarting(channel.id)).toEqual({
 			login: "member",
 			machineId: laptop.id,
+			attempt: 3,
 			failure: {
 				attempts: 2,
 				reason,
@@ -2914,5 +2917,61 @@ describe("a machine's GitHub token", () => {
 		});
 		expect((await ask(viewer.token, "octo-org/score")).status).toBe(403);
 		expect((await ask("chopin_m_unknown", "octo-org/score")).status).toBe(401);
+	});
+});
+
+describe("a person asking for a Planner that is not there", () => {
+	it("asks the machines again even though the document was already in use, which opening it again does not", async () => {
+		let { machine, choose, runtime, channel, visit } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		await choose("member", laptop.id);
+		expect((await laptop.poll([])).kind).toBe("planners");
+		await visit();
+		// How long a poll that has nothing new to hear waits, once `act` has happened to it.
+		let waited = async (act: () => Promise<unknown>) => {
+			let began = Date.now();
+			let polling = laptop.poll([channel.id], 1_500);
+			await Bun.sleep(150);
+			await act();
+			await polling;
+			return Date.now() - began;
+		};
+		expect(await waited(() => runtime.plannerUsed(channel.id))).toBeGreaterThan(1_200);
+		expect(await waited(() => runtime.plannerUsed(channel.id, true))).toBeLessThan(900);
+	});
+
+	it("tells the machine that will start it, once, in its next Planner poll, and tells a machine nobody asked nothing", async () => {
+		let { machine, choose, runtime, channel, visit, url } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		let desk = await machine("member", "U_member", "desk");
+		await choose("member", laptop.id);
+		expect((await laptop.poll([])).kind).toBe("planners");
+		await visit();
+		// Opening it again is not asking: the poll hears nothing.
+		let polling = laptop.poll([channel.id], 600);
+		await Bun.sleep(100);
+		await runtime.plannerUsed(channel.id);
+		expect(await polling).toEqual({ waiting: true });
+		// Asking for it lists it, with the same list it already runs, in the poll that is waiting.
+		polling = laptop.poll([channel.id], 3_000);
+		await Bun.sleep(100);
+		await runtime.plannerUsed(channel.id, true);
+		expect(await polling).toEqual({
+			kind: "planners",
+			planners: [{ id: channel.id, url }],
+			retry: [channel.id],
+		});
+		// Said once: the next poll hears nothing more of it.
+		expect(await laptop.poll([channel.id], 400)).toEqual({ waiting: true });
+		// Asked while no poll waits: the first poll after hears it at once.
+		await runtime.plannerUsed(channel.id, true);
+		expect(await laptop.poll([channel.id], 3_000)).toEqual({
+			kind: "planners",
+			planners: [{ id: channel.id, url }],
+			retry: [channel.id],
+		});
+		// A machine that was not the one asked is told nothing.
+		await runtime.plannerUsed(channel.id, true);
+		expect(await desk.poll([], 400)).not.toHaveProperty("retry");
 	});
 });

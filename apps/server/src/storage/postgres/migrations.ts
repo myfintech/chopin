@@ -122,6 +122,9 @@ const MIGRATIONS = [{
 	id: "033_planner_hold_machine_owner",
 	path: join(import.meta.dir, "migrations/033_planner_hold_machine_owner.sql"),
 }, {
+	id: "034_planner_model_choices",
+	path: join(import.meta.dir, "migrations/034_planner_model_choices.sql"),
+}, {
 	id: "mantl_user_preferences",
 	path: join(import.meta.dir, "migrations/mantl_user_preferences.sql"),
 }, {

@@ -12,6 +12,7 @@ import {
 	useEffect,
 	useId,
 	useLayoutEffect,
+	useMemo,
 	useReducer,
 	useRef,
 	useState,
@@ -44,9 +45,15 @@ import {
 	withoutRetracted,
 } from "./delivery";
 import type { DraftInputHandle } from "./draft-input";
-import type { PlannerNotice } from "./planner-status";
+import { bannerSlot } from "./banner-slot";
+import { ConnectionBannerView } from "./connection-banner";
+import type { ConnectionBanner, TranscriptFacts } from "./connection-banner";
+import { silencesFailedSends } from "./connection-phase";
+import { ErrorState } from "./error-state";
+import { failureBanner, retryPayload, sendFailureView, withoutFailure } from "./failure";
 import { TypingReporter } from "./typing";
 import { ChatComposer } from "./composer";
+import type { ComposerNotice } from "./composer";
 
 import { CommandPicker } from "./command-picker";
 import {
@@ -60,6 +67,8 @@ import {
 	filterCommands,
 } from "./commands";
 import { MentionPicker } from "./mention-picker";
+import { composerModelNotice } from "./model-picker-state";
+import { useModelChoice } from "./use-model-choice";
 import {
 	chatAuthors,
 	filterMentions,
@@ -134,7 +143,7 @@ export type ChatProps = {
 	people?: readonly string[];
 	/** Hosted mode keeps the shared chat while repository-scoped agent work is disabled. */
 	agent?: boolean;
-	/** The page is showing its offline notice, which is the one thing said about the connection. */
+	/** The page is showing its connection banner, which is the one thing said about the connection. */
 	offline?: boolean;
 	active?: boolean;
 	/** `history` marks the transcript arriving, after which `busy` is known rather than assumed. */
@@ -166,12 +175,12 @@ export type ChatProps = {
 	/** One calm line shown while the transcript has loaded and is still empty. */
 	emptyNotice?: string;
 	/**
-	 * The strip for the composer's top edge about the document's remote Planner, when its state
-	 * needs one: a machine that cannot be connected to, or, for a viewer with no machine button to
-	 * say it, any state that is not healthy (`plannerPlacement` decides). Absent while it is
-	 * attached, and under every other harness.
+	 * The page's one connection banner: its phase, and what Reconnect asks for. Chat draws it above
+	 * the composer when it is on screen; the page draws it at the document otherwise.
 	 */
-	plannerStrip?: PlannerNotice;
+	banner?: ConnectionBanner;
+	/** What the transcript tells the banner: a reply running, its size, and whether it is current. */
+	onTranscript?: (facts: TranscriptFacts) => void;
 };
 
 /** How long a message the server had no room for waits before it is sent again. */
@@ -247,7 +256,8 @@ export function Chat(
 		people = [],
 		notice,
 		emptyNotice,
-		plannerStrip,
+		banner,
+		onTranscript,
 		onShowDecisions,
 		onResearch,
 		onShowResearch,
@@ -293,12 +303,29 @@ export function Chat(
 	let [participationKey, setParticipationKey] = useState(0);
 	let typing = useRef<TypingReporter | undefined>(undefined);
 	let counts = runCounts(runs);
+	// What the document's agent can be set to run, and what everyone in the room has set it to.
+	let { control: modelControl, saved: modelSaved, unreadable: modelUnreadable } = useModelChoice({
+		wire,
+		room,
+		connected,
+		enabled: agent && !readonly && !archived,
+	});
+	// A refused choice, a choice the server could not read, or one the agent can no longer honour is
+	// said until it is made again. One object while its words stand: the composer's strip eases in
+	// and out as that value changes.
+	let modelShown = composerModelNotice(modelControl, modelUnreadable, modelSaved);
+	let modelWords = modelShown?.text;
+	let modelTone = modelShown?.tone ?? "info";
+	let modelNotice = useMemo<ComposerNotice | undefined>(
+		() => modelWords ? { tone: modelTone, text: modelWords } : undefined,
+		[modelWords, modelTone],
+	);
 	let [draft, setDraft] = useState<ComposerDraft>(() => restoreDraft(room, handle));
 	let [submitting, setSubmitting] = useState(false);
 	// A send pressed during a blip, made once the connection is back.
 	let [held, setHeld] = useState(false);
 	let sending = submitting || held;
-	let [sendError, setSendError] = useState<SendFailure>();
+	let [sendError, setSendError] = useState<SendFailure & { code?: string }>();
 	let [researchBlock, setResearchBlock] = useState<ResearchLaunchBlock>();
 	let researching = useRef(false);
 	// Neither a research request the connection could not take nor a send it cut off outlives it.
@@ -341,6 +368,15 @@ export function Chat(
 	// the same Wire. Only that transcript makes this composer current.
 	if (!connected) synchronized.current = undefined;
 	let transcriptReady = connected && synchronized.current === wire;
+	let reportTranscript = useRef(onTranscript);
+	reportTranscript.current = onTranscript;
+	useEffect(() => {
+		reportTranscript.current?.({
+			turn: turn?.id,
+			messages: entries.length,
+			current: transcriptReady,
+		});
+	}, [turn?.id, entries.length, transcriptReady]);
 	// The document says when the connection is lost; Chat only holds back what it cannot send.
 	let connectionNotice = useConnectionNotice(!connected, wire?.restarting);
 	let quietRestart = useRef(false);
@@ -350,6 +386,30 @@ export function Chat(
 		transcriptReady,
 		connectionNotice !== "none",
 	);
+	let [retried, setRetried] = useState<string>();
+	let failed = failureBanner(entries, turn, handle);
+	let sendBanner = shownSend ? sendFailureView(shownSend, shownSend.code) : undefined;
+	let retryTurn = failed?.retry
+		? () => {
+			let payload = retryPayload(entries, failed.entry, () => crypto.randomUUID());
+			if (!payload) return;
+			setRetried(payload.requestId);
+			dispatchOutbox({
+				kind: "add",
+				item: { payload, handle, ts: Math.floor(Date.now() / 1000) },
+			});
+		}
+		: undefined;
+	let retrying = !!retried
+		&& outbox.some(item => item.payload.requestId === retried && !item.failure);
+	useEffect(() => {
+		if (retried && !retrying) setRetried(undefined);
+	}, [retried, retrying]);
+	// The failed reply whose banner has been drawn: a machine that drops after it did not cause it.
+	let [shownFailure, setShownFailure] = useState<string>();
+	// Only a banner that says why a send could not go gives a refused message's line its quiet;
+	// a Planner's absence is another fact, and the message still says it was not sent.
+	let quietFailures = !!banner && silencesFailedSends(banner.view);
 	let composerReady = transcriptReady && !readonly && !archived;
 	// What the composer and the empty transcript show. A restart is waited out in silence, and
 	// nothing is to change on the page for it: until the fresh transcript is here they read as
@@ -650,7 +710,12 @@ export function Chat(
 			// A restart cut the send off. The draft keeps its request id, so it is made again once
 			// the server is back, and the server answers one it already holds with that message.
 			if (error instanceof WireLost && error.restarting) setHeld(true);
-			else setSendError(sendFailure(error));
+			else {
+				setSendError({
+					...sendFailure(error),
+					...(error instanceof WireRefusal && error.code ? { code: error.code } : {}),
+				});
+			}
 		}).finally(() => {
 			if (submission.current !== token) return;
 			submission.current = undefined;
@@ -849,6 +914,57 @@ export function Chat(
 		unavailable: "Research couldn’t open in the document",
 	};
 
+	let bannerId = useId();
+	let slot = bannerSlot(
+		banner?.view,
+		!!sendBanner,
+		!!failed,
+		!readonly && !archived,
+		!!failed && shownFailure === failed.entry,
+	);
+	let leadNode = slot.lead === "send" && sendBanner
+		? (
+			<ErrorState
+				id={bannerId}
+				kind={sendBanner.kind}
+				link={sendBanner.link}
+				onRetry={sendBanner.retry ? submit : undefined}
+				retryDisabled={!composerReady || submitting}
+				title={sendBanner.title}
+			/>
+		)
+		: slot.lead === "failure" && failed
+		? (
+			<ErrorState
+				detail={failed.detail}
+				id={bannerId}
+				kind={failed.kind}
+				link={failed.link}
+				onRetry={retryTurn}
+				retrying={retrying}
+				title={failed.title}
+			/>
+		)
+		: undefined;
+	let drawnFailure = slot.lead === "failure" ? failed?.entry : undefined;
+	useEffect(() => {
+		if (drawnFailure) setShownFailure(drawnFailure);
+	}, [drawnFailure]);
+	let connectionId = `${bannerId}-connection`;
+	let connectionNode = slot.connection && banner
+		? <ConnectionBannerView id={connectionId} onRetry={banner.onRetry} view={banner.view} />
+		: undefined;
+	let bannerNode = leadNode || connectionNode
+		? (
+			<>
+				{leadNode}
+				{connectionNode}
+			</>
+		)
+		: undefined;
+	let bannerIds = [leadNode ? bannerId : undefined, connectionNode ? connectionId : undefined]
+		.filter(Boolean).join(" ");
+
 	let transcriptView = (
 		<Transcript
 			active={active}
@@ -876,12 +992,18 @@ export function Chat(
 			researchOffers={researchOffers}
 			sourceDestination={sourceDestination}
 			entries={[
-				...withNoticesAfter(withoutRetracted(entries, retractions), unanswered),
+				...withNoticesAfter(
+					withoutFailure(
+						withoutRetracted(entries, retractions),
+						slot.lead === "failure" ? failed?.entry : undefined,
+					),
+					unanswered,
+				),
 				...echoes(outbox),
 			]}
 			onDelete={deleteMessage}
 			onRetry={retryMessage}
-			quietFailures={offline}
+			quietFailures={quietFailures}
 			completedWork={transcript.completedWork}
 			suspendedWork={suspendedWork}
 			handle={handle}
@@ -927,17 +1049,17 @@ export function Chat(
 				rootRef={composerRoot}
 				inputRef={textarea}
 				agent={!!agent}
+				model={modelControl}
 				mode={{
 					chopin: effectiveMode,
 					disabled: !draftable || sending || !agent,
 					onToggle: toggleMode,
 				}}
-				notice={shownSend
-					? {
-						tone: "error",
-						text: shownSend.text,
-						action: { label: "Retry", onClick: submit, disabled: !composerReady || submitting },
-					}
+				banner={bannerNode
+					? { id: bannerIds, node: bannerNode, invalid: slot.lead === "send" }
+					: undefined}
+				notice={slot.quietsNotices
+					? undefined
 					: researchBlock && !(offline && researchBlock === "disconnected")
 					? {
 						tone: "info",
@@ -952,7 +1074,7 @@ export function Chat(
 					? { tone: "info", text: "Research isn’t available in this document" }
 					: !agent
 					? repliesOffNotice(offline)
-					: plannerStrip}
+					: modelNotice}
 				unavailable={archived ? "archived" : readonly ? "readonly" : undefined}
 				references={referencesEnabled
 					? {

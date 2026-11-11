@@ -13,6 +13,7 @@ import { agentTools } from "../document-provenance";
 import { GITHUB_TOOL_SCHEMAS } from "./github-tools";
 import { BACKGROUND_TOOL_NAMES, PLANNER_TOOL_NAMES, VISUAL_PLANNER_TOOL_NAMES } from "./tool-names";
 import { harnessFor } from "./harnesses";
+import { carryingThinkingLevel } from "./turn-level";
 
 import type { HarnessV1 } from "@ai-sdk/harness";
 import type { ToolSet } from "ai";
@@ -101,7 +102,7 @@ export function createPlannerAgent(
 		? VISUAL_PLANNER_TOOL_NAMES
 		: PLANNER_TOOL_NAMES;
 	return new HarnessAgent({
-		harness,
+		harness: carryingThinkingLevel(harness),
 		tools: plannerTools,
 		activeTools: [...names],
 		permissionMode: "allow-reads",

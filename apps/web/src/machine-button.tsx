@@ -28,6 +28,15 @@ import type { ChoosableMachine, MachineChoice, MachineRow, MachineState } from "
 export const ADD_MACHINE_PATH = "/machines?add";
 
 /**
+ * Opens the machine menu from elsewhere on the page, as a click on the button does: the one
+ * button a document has, in the title bar or a phone's top bar. Nothing where it is not drawn.
+ */
+export function openMachinePicker() {
+	document.querySelector<HTMLButtonElement>("button.machine-button[aria-expanded='false']")
+		?.click();
+}
+
+/**
  * A machine as an icon with its state as a dot on the icon's corner: the cloud icon for one the
  * background service runs, the laptop otherwise, the same two as Add machine's menu. The dot is
  * the Machines page's status dot. With no machine it is the laptop in tertiary ink, no dot.
@@ -132,7 +141,8 @@ export function MachineButton(
 	{ choice, phone = false, planner }: {
 		choice: MachineChoice;
 		phone?: boolean;
-		planner?: PlannerStatus;
+		/** Null means the visible connection banner tells this status instead. */
+		planner?: PlannerStatus | null;
 	},
 ) {
 	let id = useId();
@@ -242,8 +252,10 @@ export function MachineButton(
 		// A row scrolled out of the panel comes into view as it takes focus.
 		items[next]?.scrollIntoView({ block: "nearest" });
 	};
-	let label = plannerButtonLabel(machineButtonLabel(state), planner);
-	let glyph = plannerGlyph(planner);
+	let label = planner === null && !shown && !state?.automatic?.label
+		? "Choose machine"
+		: plannerButtonLabel(machineButtonLabel(state), planner ?? undefined);
+	let glyph = planner === null ? "none" : plannerGlyph(planner);
 	// An offline machine dims the button, as its menu row is dimmed; it stays a button, so another
 	// machine can be chosen. The menu row says why.
 	let offline = !!shown && !shown.connected;
@@ -302,7 +314,7 @@ export function MachineButton(
 				aria-label={label}
 				className={offline ? "machine-button machine-offline" : "machine-button"}
 				data-phone={phone || undefined}
-				data-planner={glyph ?? (planner ? planner.kind : undefined)}
+				data-planner={planner === null ? undefined : glyph ?? (planner ? planner.kind : undefined)}
 				data-tooltip={label}
 				data-tooltip-verbatim=""
 				onClick={() => open ? close(false) : openAt("first")}

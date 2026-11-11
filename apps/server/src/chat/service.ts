@@ -33,6 +33,7 @@ import type { ChildDocuments } from "./children";
 import * as Service from "../plan/service";
 import * as DocumentProvenance from "../document-provenance";
 import { instruction } from "@chopin/protocol/address";
+import { UNREADABLE_NOTICE } from "@chopin/protocol/model-choice";
 import { settledStages } from "@chopin/protocol/run-stages";
 
 import { annotatedText, compose, focusContext, referenceCatalog, remember } from "./address";
@@ -59,9 +60,11 @@ export type { Announcer, NoticeInput } from "./notices";
 import { isChannelId } from "../channels/id";
 import { holdsQuestion } from "../questions/records";
 import { broadcast, fail, PASSING, reply, tell } from "../wire";
+import { introduce } from "../people";
 import { MAX_MESSAGE_BYTES } from "./limits";
 import { contributed } from "./initiative";
 import { checkPlannerReply, PlannerReplyError, publishPlannerReplies } from "./reply-policy";
+import { TOOL_UNAVAILABLE, turnFailureOf } from "./turn-failure";
 import { runDuration } from "./run-duration";
 import type { InitiativeSchedule } from "./initiative-schedule";
 
@@ -361,6 +364,10 @@ export type Chat = {
 	 * third in.
 	 */
 	starting?: boolean;
+	/** The fallback notice the transcript last said, so a choice that stays gone is said once. */
+	modelNotice?: string;
+	/** Whether the composers were last told the choice could not be read, so only a change is sent. */
+	modelUnreadable?: boolean;
 	/** Per-turn owner for revocation and credential rotation fencing. */
 	openingOwner?: { sessionId: string; generation: number; revision: number };
 	/** Current session. Disposable per turn, except a full Planner session kept while it owns workflow runs. */
@@ -770,6 +777,8 @@ export function greet(chat: Chat, ws: Socket): void {
 		queued: visible(chat),
 		participation: { enabled: !!chat.initiativeEnabled, paused: false },
 	});
+	// After the history, which ends whatever an earlier connection was told of it.
+	if (chat.modelUnreadable) tell(ws, { kind: "chat:model-unreadable", ts: 0, unreadable: true });
 }
 
 export type Room = {
@@ -822,6 +831,11 @@ export type Room = {
 	/** Runs only after a new member entry is durably saved and its human turn reserved. */
 	memberMessagePersisted?: (entry: Wire.Entry, claimantSessionId: string | undefined) => void;
 	openPlannerSession?: typeof import("../harness/session")["openPlannerSession"];
+	/**
+	 * What the document's chosen model and thinking level come to for the next turn, checked against
+	 * what its harness offers now. Absent where nothing can be chosen.
+	 */
+	modelChoice?: () => Promise<import("./model-choice").TurnModel>;
 	invokedBy?: string;
 	ownerAvailable?: () => Promise<void>;
 	jobs?: JobService;
@@ -939,7 +953,7 @@ export async function send(context: Room, ws: Socket, msg: Request<Wire.Send>): 
  */
 export async function invoke(
 	context: Room,
-	user: { id: string; login: string },
+	user: { id: string; login: string; avatarUrl?: string },
 	text: string,
 	checkout?: string,
 	focus?: Focus,
@@ -1027,6 +1041,8 @@ export async function invoke(
 		}
 		if (chat.closed) return "planner-unavailable" as const;
 		if (verified) rememberCheckout(room, verified);
+		// The caller has no socket in the room, so nothing else has told it who they are.
+		introduce(server, room, { login: user.login, avatarUrl: user.avatarUrl });
 		announce(server, room, entry);
 		if (waits || occupied(chat)) {
 			chat.waiting.push({
@@ -2835,6 +2851,8 @@ async function run(
 	let firstEntry = chat.entries.length;
 	let failed = false;
 	let replyOnly = false;
+	// The turn a failure notice names, kept past `finally`, which clears the live fields.
+	let began: { request?: string; focus?: string } = {};
 
 	if (!reserved) {
 		chat.busy = true;
@@ -2861,6 +2879,10 @@ async function run(
 
 	chat.readiness = about?.readiness;
 	chat.focus = about?.focus ?? member?.focus;
+	began = {
+		request: member && chat.turn ? member.entryId : undefined,
+		focus: chat.focus?.channelId,
+	};
 	chat.activeRequest = member && chat.turn
 		? {
 			entryId: member.entryId,
@@ -2945,8 +2967,32 @@ async function run(
 			}
 		} else {
 			let existingDecisions = new Set(plan.records.keys());
+			let unreadable = false;
+			let picked = await context.modelChoice?.().catch((error): { notice: string } => {
+				console.error("[chat] could not read the model choice:", error);
+				unreadable = true;
+				return { notice: UNREADABLE_NOTICE };
+			});
+			// A choice the harness no longer offers, or that could not be read, falls back to its
+			// default: say so, once.
+			if (picked?.notice && picked.notice !== chat.modelNotice) {
+				say(chat, server, room, {
+					id: ulid(),
+					author: { kind: "system" },
+					text: picked.notice,
+					ts: now(),
+				});
+			}
+			chat.modelNotice = picked?.notice;
+			// The composers show it too, and are told when it no longer holds.
+			if (unreadable !== !!chat.modelUnreadable) {
+				chat.modelUnreadable = unreadable;
+				broadcast(server, room, { kind: "chat:model-unreadable", ts: 0, unreadable });
+			}
+			let { notice: _, ...choice } = picked ?? {};
+			let session = opened.session;
 			await publishPlannerReplies({
-				session: opened.session,
+				session: { stream: (text, abort) => session.stream(text, abort, choice) },
 				prompt,
 				signal,
 				decide: context.decide,
@@ -2997,15 +3043,27 @@ async function run(
 					reason: jobReason(err),
 				};
 		} else if (!chat.closed && failed && !opened?.session.shuttingDown?.()) {
+			let suspended = !!opened?.session.suspended?.();
+			// Read before `chat.interruption` is cleared below.
+			let failure = turnFailureOf({
+				error: err,
+				interruption: chat.interruption,
+				suspended,
+				request: chat.activeRequest?.entryId,
+				focus: chat.focus?.channelId,
+			});
 			say(chat, server, room, {
 				id: ulid(),
 				author: { kind: "system" },
-				text: opened?.session.suspended?.()
+				text: suspended
 					? "The machine's connection dropped during this reply. Its workflows and open "
 						+ "questions are kept; ask again once it has reconnected."
+					: failure.kind === "tool"
+					? TOOL_UNAVAILABLE
 					: err instanceof Error
 					? err.message
 					: "The agent could not be reached.",
+				turnFailure: failure,
 				ts: now(),
 			});
 		}
@@ -3045,6 +3103,7 @@ async function run(
 							id: ulid(),
 							author: { kind: "system" },
 							text: "Chopin's session could not close cleanly. Try again.",
+							turnFailure: turnFailureOf({ error: err, suspended: false, ...began }),
 							ts: now(),
 						});
 					} catch (noticeError) {
@@ -4048,15 +4107,24 @@ export function translate(context: Room, part: TextStreamPart<ToolSet>): void {
 			chat.interruption = "Chopin's tool approval was denied.";
 			chat.turnController?.abort();
 			return;
-		case "error":
+		case "error": {
 			chat.tooling = undefined;
+			let reported = part.error instanceof Error ? part.error : new Error(String(part.error));
+			let failure = turnFailureOf({
+				error: reported,
+				suspended: false,
+				request: chat.activeRequest?.entryId,
+				focus: chat.focus?.channelId,
+			});
 			say(chat, server, room, {
 				id: ulid(),
 				author: { kind: "system" },
-				text: part.error instanceof Error ? part.error.message : String(part.error),
+				text: failure.kind === "tool" ? TOOL_UNAVAILABLE : reported.message,
+				turnFailure: failure,
 				ts: now(),
 			});
 			return;
+		}
 	}
 }
 

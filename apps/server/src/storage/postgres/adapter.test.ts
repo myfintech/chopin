@@ -1053,6 +1053,7 @@ if (url) {
 				"031_planner_deferred_turns",
 				"032_mcp_sessions",
 				"033_planner_hold_machine_owner",
+				"034_planner_model_choices",
 				"mantl_document_provenance",
 				"mantl_user_preferences",
 			]);

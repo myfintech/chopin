@@ -109,12 +109,13 @@ that validates `attached` strictly and never asks never sees the field. A server
 from before features ignores the header and answers without `features`; a
 client must then use none of them.
 
-| Feature                    | What it allows                                                                                                                                                 |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `run-stage-deltas`         | [Delta run cards](#run-stage-deltas), with no stage count limit                                                                                                |
-| `decision-option-previews` | An option's [`preview`](#option-previews) as its own visual, and the `upload_plan_image` host tool                                                             |
-| `resumable-sessions`       | [Resuming](#resuming-after-a-dropped-link) the sessions, runs and questions of a link that dropped unexpectedly                                                |
-| `restart-notice`           | A [`restarting`](#server-to-client) message before the server closes the link with 1012, and the [client rule](#when-the-server-is-restarting) that follows it |
+| Feature                    | What it allows                                                                                                                                                                |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `run-stage-deltas`         | [Delta run cards](#run-stage-deltas), with no stage count limit                                                                                                               |
+| `decision-option-previews` | An option's [`preview`](#option-previews) as its own visual, and the `upload_plan_image` host tool                                                                            |
+| `resumable-sessions`       | [Resuming](#resuming-after-a-dropped-link) the sessions, runs and questions of a link that dropped unexpectedly                                                               |
+| `restart-notice`           | A [`restarting`](#server-to-client) message before the server closes the link with 1012, and the [client rule](#when-the-server-is-restarting) that follows it                |
+| `capability-catalog`       | A [`capabilities`](#capability-catalog) report of the models, thinking levels and commands the client offers, and a person's choice of model and thinking level in the `turn` |
 
 ### Pings
 
@@ -172,17 +173,18 @@ uploads its largest frames; raise `AGENT_CONNECTION_TIMEOUT_MS` for it.
 
 Every message is one JSON object in one text frame, with a string `type`. A
 frame may hold at most **2 MiB** (2,097,152 bytes) of UTF-8. Objects are strict:
-a field this page does not list is refused. Binary frames are refused.
+a field this page does not list is refused, except inside a
+[capability catalog](#capability-catalog), which is read as written. Binary frames are refused.
 
 Shared limits, in characters unless stated:
 
-| Kind  | Fields                                                                                                                                                                                            | Limit      |
-| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| id    | `session`, `turn`, `request`, `toolCallId`, part `id`, run and stage `id`, `run`, `workflowRunId`, `workflowStageId`, `rootRunId`, `active` and `paused` entries, `document.id` in `attached`     | 1 to 128   |
-| name  | tool names, `toolName`, `names` entries, `modelId`, `responseFormat.name`                                                                                                                         | 1 to 128   |
-| short | question `header`, `finishReason.raw`                                                                                                                                                             | up to 128  |
-| note  | `message`, every `title`, `error`, `turn.model`, `responseFormat.description`, question text, option `label` and `description`, `choices` entries, `placeholder`, `initial`, run and stage `name` | up to 4000 |
-| text  | `prompt`, `instructions`, `delta`, `input`                                                                                                                                                        | the frame  |
+| Kind  | Fields                                                                                                                                                                                        | Limit      |
+| ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| id    | `session`, `turn`, `request`, `toolCallId`, part `id`, run and stage `id`, `run`, `workflowRunId`, `workflowStageId`, `rootRunId`, `active` and `paused` entries, `document.id` in `attached` | 1 to 128   |
+| name  | tool names, `toolName`, `names` entries, `responseFormat.name`                                                                                                                                | 1 to 128   |
+| short | question `header`, `finishReason.raw`                                                                                                                                                         | up to 128  |
+| note  | `message`, every `title`, `error`, `responseFormat.description`, question text, option `label` and `description`, `choices` entries, `placeholder`, `initial`, run and stage `name`           | up to 4000 |
+| text  | `prompt`, `instructions`, `delta`, `input`, and the model and level fields of the [capability catalog](#capability-catalog): `modelId`, `turn.model`, `turn.thinkingLevel`                    | the frame  |
 
 Other fields state their own limits where they appear.
 
@@ -407,7 +409,7 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
 
 ```text
 { "type": "start", "session": "", "mode": "planner" }
-{ "type": "turn", "session": "", "turn": "", "prompt": "", "instructions?": "", "model?": "", "tools": [], "responseFormat?": {} }
+{ "type": "turn", "session": "", "turn": "", "prompt": "", "instructions?": "", "model?": "", "thinkingLevel?": "", "tools": [], "responseFormat?": {} }
 { "type": "abort", "session": "", "turn": "" }
 { "type": "host-tool-result", "session": "", "turn": "", "toolCallId": "", "output": json, "isError?": true }
 { "type": "input-result", "request": "", "status": "answered", "value?": json, "message?": "" }
@@ -427,8 +429,11 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
 - `turn` runs one turn. `tools` lists at most 256 of Chopin's host tools as
   `{ "name": "", "description?": "", "inputSchema?": {json schema} }`;
   `description` may be 64,000 characters. `instructions` is the Planner's
-  system prompt for the turn. `model` is set only when the operator configured
-  `MODEL`. `responseFormat` is `{ "type": "text" }` or
+  system prompt for the turn. `model` is set when the operator configured
+  `MODEL`, or, with `capability-catalog`, when a person chose a model from the
+  [catalog](#capability-catalog) the client reported, which then replaces it.
+  `thinkingLevel` is sent only with `capability-catalog`, and only when a person chose one.
+  `responseFormat` is `{ "type": "text" }` or
   `{ "type": "json", "schema?": {}, "name?": "", "description?": "" }`; for
   `json`, the turn's text must be that JSON.
 - `abort` stops the turn. Answer with `turn-end`; after **10 seconds** the
@@ -476,10 +481,12 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
 { "type": "detach" }
 { "type": "resume", "sessions": [{ "session": "", "requests": [""] }] }
 { "type": "input-received", "request": "" }
+{ "type": "capabilities", "catalog": {} }
 ```
 
 `resume` and `input-received` belong to the `resumable-sessions` feature and are defined in
-[Resuming after a dropped link](#resuming-after-a-dropped-link) and below.
+[Resuming after a dropped link](#resuming-after-a-dropped-link) and below. `capabilities` belongs to
+`capability-catalog` and is defined in [Capability catalog](#capability-catalog).
 
 - `started` or `start-failed` answers `start`. Cut `message` here, in
   `turn-end`, `control-result`, and an `error` part to 4000 characters: a longer
@@ -537,6 +544,91 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
 Messages for a session or turn that has ended are ignored, except a
 `host-tool-call`, which gets an error result (`The turn has ended.` or
 `The session has ended.`).
+
+### Capability catalog
+
+With `capability-catalog`, a client tells Chopin what it offers in one message, so that a
+document's composer can let a person choose what the client runs. The catalog is one value that
+grows by adding fields; adding a kind of capability later needs no new message and no new feature.
+Commands already fit it, as listed below. Chopin reads a catalog as it was written. Nothing says
+how a model, a thinking level or a command is spelled or how long its text runs, so Chopin refuses
+no string for its spelling or its length (a level may be `extra high` or `低`, an `id` any length,
+a `name` or `kind` empty) and never changes one. A field it has no use for is ignored and kept,
+never refused, and no count bounds the models or commands a client lists. Only the frame's size
+bounds a catalog, and only a value of the wrong type (a number where a string is listed, a
+string where an array is) breaks a rule here. An odd entry never closes the link.
+
+The one thing Chopin leaves out is what nobody could be asked for. A model whose `id` is empty is
+malformed, because a turn names a model by its `id`: Chopin skips that entry, keeps every other
+model and the link, and logs it. An empty string among a model's `thinkingLevels` is dropped from
+that model's levels in the same way (a model left with none has no reasoning control), and so is a
+`models.default` with an empty `id`, or an empty `thinkingLevel` of the default. An empty model or
+level can therefore never be chosen, and a turn never carries one.
+
+```text
+{ "type": "capabilities", "catalog": {
+    "models?": {
+      "available": [{
+        "id": "", "name": "",
+        "provider?": { "id": "", "name?": "" },
+        "description?": "",
+        "thinkingLevels?": [""]
+      }],
+      "default?": { "id": "", "thinkingLevel?": "" }
+    },
+    "commands?": [{ "name": "", "description?": "", "kind": "" }]
+} }
+```
+
+- **When.** Send it right after `attached`, and after the `resume` of a resumable link, which stays
+  the first message. Send it again whenever the client's offer changes, for example after the
+  person signs in to another provider. Each report replaces the earlier one whole: a field left out
+  is no longer offered, and `{ "catalog": {} }` withdraws everything. A client that offered the
+  feature and does not report offers no choice, the same as a client from before the feature. Sending
+  `capabilities` without having offered the feature is a `protocol` violation, and a catalog whose fields have the
+  wrong type (listed below), a `malformed-message` one. The catalog is held with the link, not stored: after a
+  server restart a resumed client sends it again.
+- **`models.available`** lists the models in the order to show them within a provider, as many as the
+  frame holds (Atomic's own list runs past 1,700).
+  `id` is the exact string the client wants back as a turn's `model`; Chopin never parses, bounds
+  or normalizes it, and skips an entry whose `id` is empty. `name` is what a person reads. `provider` groups models in the picker: `id`
+  groups, `name` (default: `id`) labels the group, and a model with no `provider` is listed without a
+  group. `description` is one line of text. Chopin shows names and descriptions as text, never as
+  Markdown. A model listed twice stays listed twice, in the order given; a choice of its `id` is
+  the first entry's.
+- **`thinkingLevels`** are the levels of reasoning this model supports, as strings in the order to
+  show them. Atomic's are `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`; other clients
+  may define their own, spelled as they like. Chopin shows
+  every level exactly as written, Atomic's own included (`xhigh`, not Extra high), its case
+  unchanged, so that `xhigh` and `extra high`, `ß-fast` and `SS-fast`, and `high` and `High` are
+  each two levels a person can tell apart, and the turn carries the string they saw. The composer's own first step, which returns the level to the model's own, is called Default, or Model default where the model lists a level of that name, so no level shares its label. A model with none or an empty list has no reasoning control, and the composer
+  hides it. An empty string is not a level: it is dropped. Chopin sends back only a level the model
+  listed.
+- **`models.default`** is what the client runs when a turn names no model or no level. Its `id`
+  should be one of `available`; the composer shows that model as the document's current one until
+  somebody chooses another. An operator's `MODEL` takes its place when it is set. A default with an
+  empty `id` is ignored, and an empty `thinkingLevel` is dropped from it.
+- **`commands`** is reserved for the commands a client offers, such as skills,
+  prompt templates and workflows: `name`, `description` and `kind`, a string the client defines
+  (`skill`, `prompt`, `workflow`). Chopin keeps them with the catalog, as written, and does not show
+  them yet. Send them only when they are real: a client that
+  has none omits the field.
+
+A person's choice reaches the client in the next turn: `model` is the chosen model's `id`, and
+`thinkingLevel` one of that model's levels (or the default model's, when no model was chosen),
+each exactly as the client spelled it. Neither is ever empty: an empty model `id` or level is
+skipped when the catalog is read (above), so no one can choose it, and a `model` that is absent
+means no model was chosen (an operator's empty `MODEL` reads the same way).
+Chopin checks both against the last catalog the client reported when it accepts the choice and
+again when the turn starts. A model the catalog no longer lists, or a level its model no longer
+lists, is not sent: the turn runs with the client's default, and the document's Chat says so. A
+client must still treat an unknown `model` as an error, because its catalog can have changed
+since the report. Without a catalog (an older client, or one that reported none) the composer
+offers no choice and `thinkingLevel` is never sent, and a model a person had chosen is said, in the
+composer, to be no longer available, as the document's Chat says on the next turn.
+
+The two fields are independent of the protocol version: nothing here changes an existing message
+for a client that did not offer the feature, so the subprotocol stays `chopin.agent.v1`.
 
 ### Stream parts
 

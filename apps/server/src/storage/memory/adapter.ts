@@ -14,6 +14,7 @@ import { MemoryDeferredTurnStore } from "./deferred-turns";
 import { MemoryMcpSessionStore } from "./mcp-sessions";
 import { MemoryPlannerCredentialStore } from "./planner-credentials";
 import { MemoryPlannerLinkHoldStore } from "./planner-holds";
+import { MemoryPlannerModelChoiceStore } from "./planner-model-choices";
 import { MemoryResearchWorkspaceStore } from "./research";
 import { MemoryPreferenceStore } from "../../user-preferences/memory";
 import { MemoryProvenanceStore } from "../../document-provenance/memory";
@@ -68,6 +69,7 @@ import type {
 	NavigationStore,
 	PlannerCredentialStore,
 	PlannerLinkHoldStore,
+	PlannerModelChoiceStore,
 	ResearchWorkspaceStore,
 	RunStageStore,
 	SessionStore,
@@ -201,6 +203,12 @@ export class MemoryStorage implements StorageAdapter {
 		assertLease: held => this.#assertLease(held),
 	});
 	readonly plannerHolds: PlannerLinkHoldStore = this.#plannerHolds;
+	readonly #plannerModelChoices = new MemoryPlannerModelChoiceStore({
+		channelExists: id => this.#channels.has(id),
+		userExists: id => this.#users.has(id),
+		assertLease: held => this.#assertLease(held),
+	});
+	readonly plannerModelChoices: PlannerModelChoiceStore = this.#plannerModelChoices;
 	readonly #plannerCredentials = new MemoryPlannerCredentialStore({
 		machineExists: id => this.#machines.has(id),
 		channelExists: id => this.#channels.has(id),
@@ -227,6 +235,16 @@ export class MemoryStorage implements StorageAdapter {
 			return Promise.resolve(user(saved));
 		},
 		get: id => Promise.resolve(this.#users.get(id)).then(value => value && user(value)),
+		byLogins: logins => {
+			let wanted = new Set(logins.map(login => login.toLowerCase()));
+			let owners = new Map<string, UserRecord>();
+			for (let value of this.#users.values()) {
+				let key = value.login.toLowerCase();
+				let held = owners.get(key);
+				if (wanted.has(key) && (!held || held.updatedAt < value.updatedAt)) owners.set(key, value);
+			}
+			return Promise.resolve([...owners.values()].map(user));
+		},
 	};
 
 	readonly sessions: SessionStore = {
@@ -659,6 +677,7 @@ export class MemoryStorage implements StorageAdapter {
 		this.#decisionAnswers.deleteChannel(id);
 		this.#versions.deleteChannel(id);
 		this.#plannerHolds.deleteChannel(id);
+		this.#plannerModelChoices.deleteChannel(id);
 		this.#plannerCredentials.deleteChannel(id);
 		this.#deferredTurns.deleteChannel(id);
 		this.#snapshots.delete(id);
