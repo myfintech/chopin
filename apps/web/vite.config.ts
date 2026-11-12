@@ -5,7 +5,10 @@ import react from "@vitejs/plugin-react";
 import tsconfigPaths from "vite-tsconfig-paths";
 
 import { initialJavaScriptBudget, initialStylesheetBudget } from "./bundle-budget";
-import { MANTL_INITIAL_JAVASCRIPT_BUDGET } from "./bundle-budget.mantl";
+import {
+	MANTL_INITIAL_JAVASCRIPT_BUDGET,
+	MANTL_INITIAL_STYLESHEET_BUDGET,
+} from "./bundle-budget.mantl";
 
 import type { Plugin, ServerOptions } from "vite";
 
@@ -75,7 +78,7 @@ export default defineConfig({
 		tailwindcss(),
 		tsconfigPaths(),
 		initialJavaScriptBudget(MANTL_INITIAL_JAVASCRIPT_BUDGET),
-		initialStylesheetBudget(),
+		initialStylesheetBudget(MANTL_INITIAL_STYLESHEET_BUDGET),
 	],
 	build: {
 		rollupOptions: {
