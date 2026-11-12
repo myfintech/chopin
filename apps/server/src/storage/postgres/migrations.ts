@@ -125,6 +125,27 @@ const MIGRATIONS = [{
 	id: "034_planner_model_choices",
 	path: join(import.meta.dir, "migrations/034_planner_model_choices.sql"),
 }, {
+	id: "035_planner_model_name",
+	path: join(import.meta.dir, "migrations/035_planner_model_name.sql"),
+}, {
+	id: "036_chat_attachments",
+	path: join(import.meta.dir, "migrations/036_chat_attachments.sql"),
+}, {
+	id: "037_chat_threads",
+	path: join(import.meta.dir, "migrations/037_chat_threads.sql"),
+}, {
+	id: "038_plan_image_sizes",
+	path: join(import.meta.dir, "migrations/038_plan_image_sizes.sql"),
+}, {
+	id: "039_plan_image_types",
+	path: join(import.meta.dir, "migrations/039_plan_image_types.sql"),
+}, {
+	id: "040_chat_attachment_originals",
+	path: join(import.meta.dir, "migrations/040_chat_attachment_originals.sql"),
+}, {
+	id: "041_document_full_width",
+	path: join(import.meta.dir, "migrations/041_document_full_width.sql"),
+}, {
 	id: "mantl_user_preferences",
 	path: join(import.meta.dir, "migrations/mantl_user_preferences.sql"),
 }, {

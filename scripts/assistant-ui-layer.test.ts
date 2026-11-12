@@ -33,7 +33,8 @@ function variables(css: string, select: (rule: postcss.Rule | postcss.AtRule) =>
 let layer = read(LAYER_FILE);
 let tailwindOwn = variables(
 	tailwind,
-	node => node.type === "atrule" && node.name === "theme" && node.params === "default",
+	node =>
+		node.type === "atrule" && node.name === "theme" && node.params.split(/\s+/).includes("default"),
 );
 let scoped = variables(
 	layer,
@@ -101,6 +102,7 @@ describe("the assistant-ui geometry layer", () => {
 	});
 
 	test("is Tailwind's scale where Chopin's is not: assistant-ui's radii, 14px and 12px type", () => {
+		expect(scoped.get("--radius")).toBe("0.25rem");
 		expect(scoped.get("--radius-sm")).toBe("0.25rem");
 		expect(scoped.get("--radius-md")).toBe("0.375rem");
 		expect(scoped.get("--radius-lg")).toBe("0.5rem");
@@ -189,6 +191,13 @@ describe("the assistant-ui geometry layer", () => {
 		expect(hit).toContain(":not([data-chopin-control])");
 	});
 
+	test("holds endless pulse and shimmer animations still under reduced motion", () => {
+		expect(layer).toContain("@media (prefers-reduced-motion: reduce)");
+		expect(layer).toContain(".animate-pulse");
+		expect(layer).toContain(".shimmer");
+		expect(layer).toContain("animation: none;");
+	});
+
 	test("gives a coarse pointer an invisible target and never a bigger visible box", () => {
 		let hit = layer.slice(layer.indexOf("@layer components"));
 		expect(hit).toContain(":root[data-plan-coarse-pointer]");
@@ -267,6 +276,29 @@ describe("assistant-ui's colours", () => {
 		expect(block(".dark")).toEqual(block(":root"));
 	});
 
+	test("every raw palette colour a copy names is a Chopin role: accent blue is petrol, green and red are its own", () => {
+		let theme = variables(css, node => node.type === "atrule" && node.name === "theme");
+		let used = new Set<string>();
+		for (let file of recorded.filter(entry => entry.file.endsWith(".tsx"))) {
+			for (
+				let match of read(file.file).matchAll(
+					/(?:bg|text|border|ring|caret|fill|stroke|from|to|via|outline|decoration|inset-ring)-(blue|emerald|red|green|amber|yellow|orange|purple|pink|rose|sky|indigo|violet|teal|cyan|lime|fuchsia|slate|gray|zinc|neutral|stone)-\d+/g,
+				)
+			) used.add(`--color-${match[1]}-${match[0].match(/\d+$/)![0]}`);
+		}
+		expect([...used].sort()).toEqual([...used].filter(name => theme.has(name)).sort());
+		expect(theme.get("--color-blue-500")).toBe("var(--color-brand)");
+		expect(theme.get("--color-blue-400")).toBe("var(--color-brand)");
+		expect(theme.get("--color-emerald-500")).toBe("var(--color-success)");
+		// The red of an icon or a ring is the destructive one; the red a copy writes words in
+		// (`text-red-600`, a file's reason) is Chopin's danger text, because the destructive red does
+		// not reach the contrast of text on a soft fill (the chip's browser spec runs axe on it).
+		for (let shade of ["400", "500"]) {
+			expect(theme.get(`--color-red-${shade}`)).toBe("var(--color-destructive)");
+		}
+		expect(theme.get("--color-red-600")).toBe("var(--color-danger-text)");
+	});
+
 	test("every role has its Tailwind colour, except the one Chopin already names", () => {
 		let theme = variables(css, node => node.type === "atrule" && node.name === "theme");
 		for (let role of ROLES.filter(role => role !== "destructive")) {
@@ -274,5 +306,19 @@ describe("assistant-ui's colours", () => {
 		}
 		expect(theme.has("--color-destructive")).toBe(false);
 		expect(chopinOwn.has("--color-destructive")).toBe(true);
+	});
+
+	test("splits the copies' stylesheet from the entry theme, keeping Tailwind's layer order", () => {
+		let webTheme = read("apps/web/src/theme.css");
+		expect(webTheme).not.toContain("assistant-ui.css");
+		expect(webTheme).toContain('@source not "./components";');
+		let firstLayer = sheet.nodes.find(
+			node => node.type === "atrule" && node.name === "layer",
+		);
+		expect(firstLayer?.type === "atrule" ? firstLayer.params : undefined).toBe(
+			"theme, base, components, utilities",
+		);
+		expect(css).toContain('@source "./components";');
+		expect(css).toContain('@import "@chopin/visuals/theme.css" reference;');
 	});
 });

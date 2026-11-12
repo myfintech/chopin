@@ -11,9 +11,36 @@ an element only draws what it is given.
 assistant-ui ships each element twice. The **standalone** lane, `elements-<name>`, takes props and
 callbacks; the **connected** lane, `<name>`, reads a runtime. Copy the standalone one. Where an
 element has only a connected form, or the connected one cannot express Chopin's state (one thread,
-several authors, a queue the server keeps), say so in the pull request and draw it from props
-instead of adding the runtime. The model selector, `elements-model-selector`, is the first one
-copied.
+several authors, a transcript the server keeps), say so in the pull request and draw it from props
+instead of adding the runtime. The model selector, `elements-model-selector`, was the first one
+copied, and the composer, `elements-composer`, with the `surfaces` recipes and `range` helper it
+stands on, is Chat's composer shell. Its menu and rows (`ComposerMenu`, `ComposerPersonItem`,
+`ComposerCommandItem`) are Chat's `@` and `/` menus. The same Composer holds the standalone elements for what a message
+carries: its staged-file chips (`ComposerAttachments`, `ComposerAttachmentChip`) and the dictation's
+voice and button (`ComposerVoice`, `ComposerVoiceButton`) fill the box's slots, and
+`elements-message-attachment` draws a sent message's non-image files. Every image in Chat — from a
+Planner turn, from Markdown, or attached to a sent message — is drawn by `image` (assistant-ui has no
+separate `elements-image` item; `image.tsx` is already props-driven and imports only two prop types,
+declared locally in `part-types.d.ts` without installing `@assistant-ui/react`) and
+`elements-image-gallery` (with the `href` helper it stands on, and its `<Dialog>` lightbox). Those, the
+received-files tiles, the staged-file chips and a Chat message's code blocks are the one place where
+Slack's look wins over assistant-ui's proportions: Chat draws its images, placeholders, files and code
+as Slack does, so Chopin's own unlayered rules (`src/chat/image.css`, `src/chat/media/media.css`,
+`src/chat/markdown.css`) restyle the copies from outside, as the message rows' toolbar is, while the
+copies keep their structure, behaviour and recorded bytes; the plate's pristine specimens keep
+assistant-ui's geometry, and `e2e/design/chat-media.e2e.ts` and `e2e/chat-code-blocks.e2e.ts` hold
+Chat's to Slack's. A code block's colours come through the `SyntaxHighlighter` slot that
+`markdown-primitive.tsx` already offers, so the copy needs no patch for them.
+Chat draws no context-window usage: `ComposerContext` stays in the copied `elements-composer` unused, and
+`elements-context-breakdown` is drawn only on the design-audit plate. Because assistant-ui ships no
+compaction marker, the expandable compaction divider is Chopin's own `Unfold` disclosure.
+Every copy's `lucide-react` import is mapped in `tsconfig.json` to `src/chat/assistant-ui/lucide.tsx`, which draws each icon it names with Chopin's own (`packages/icons`), so Chat has one icon language and no lucide artwork ships; a copy that names an icon the file lacks fails `bun run types`, and the icon is added there, drawn in `packages/icons`. `markdown-text` has only a connected entry, so its `@assistant-ui/react` and
+`@assistant-ui/react-markdown` imports map in `tsconfig.json` to Chopin's props-driven
+`react-markdown` seam (`src/chat/assistant-ui/markdown-primitive.tsx`). The tile the registry calls
+`attachment` draws a live runtime attachment through `AttachmentPrimitive` and has no props-driven
+form, so it is not copied and the chip carries a file's states from props. `elements-agent-handoff`
+and `elements-subagent-list` draw research delegation, unpatched, inside the attachment of a Chat
+app message. Each carries a [recorded patch](#patching-a-copy) where Chat needed an extension point.
 
 ## Add it
 
@@ -119,7 +146,9 @@ Shadows are Tailwind's, tinted: each `rgb(0 0 0 / x)` of Tailwind's shadow value
 (`--shadow-color`) at the same opacity, so no raw black is drawn. It maps roles only. Chopin's `btn-outline` edge, `btn-secondary` fill and depth shadows are not mapped,
 because assistant-ui draws none of them. Chopin is light only, so `.dark` reads the same tokens and
 `dark:` classes follow `.dark`, never the system setting. A copy that names a raw palette colour
-(`blue-500`) needs a line in that file's `@theme`, mapped to the Chopin token that plays the role.
+(`blue-500`) needs a line in that file's `@theme`, mapped to the Chopin token that plays the role:
+`red-600`, which a copy writes words in (a file's reason), is the danger text, since the destructive
+red does not read as text on a soft fill (a browser spec checks the contrast).
 
 ## Drive it from Chopin's state
 
@@ -159,12 +188,20 @@ mapping `--accent` to a green: the spec names the trigger's hover fill.
 Add both for every element; a copy without them is not accepted. To keep a spec honest, change a
 mapping or a class on purpose once and see it fail.
 
-The layer is on every page, so its selectors have to be cheap: every rule's subject is a tag, a class,
-an attribute or a pseudo-class the browser can find an element by (`button`, `.border-t`,
-`[role="option"]`, `:focus-visible`), the ancestors it asks about are a handful of
-`[data-slot|=word]`, and no subject is `*`, `[class*=]`, `:is(...)` or `:where(...)`; a unit test reads
-the generated file for it. The first draft put a `*` rule under every copy, which made the browser
-test every element's ancestors against some forty selectors on each style recalculation, and a 100ms
-assertion of an unrelated workspace spec (`responsive-workspace.e2e.ts`, content swaps) went from
-nine passes in ten to none. If a spec that races a timer starts failing after a layer change, make the
-layer cheaper rather than the spec looser.
+The copies' utilities, animations, geometry layer and colour roles ship in one separate stylesheet
+(`apps/web/src/assistant-ui.css`), excluded from `theme.css` (`@source not "./components"`) and
+attached by [`apps/web/vite.config.ts`](../apps/web/vite.config.ts) to each copied `.tsx` module at
+transform time so no file on disk changes. A page without a copied element never downloads it,
+[`bundle-budget.ts`](../apps/web/bundle-budget.ts) keeps it out of the entry stylesheet, and Vite's
+preload helper waits for its `<link>` before resolving the dynamic import that mounts the first copy.
+
+Once a copy mounts, the layer is on that page, so its selectors have to be cheap: every rule's
+subject is a tag, a class, an attribute or a pseudo-class the browser can find an element by
+(`button`, `.border-t`, `[role="option"]`, `:focus-visible`), the ancestors it asks about are a
+handful of `[data-slot|=word]`, and no subject is `*`, `[class*=]`, `:is(...)` or `:where(...)`; a
+unit test reads the generated file for it. The first draft put a `*` rule under every copy, which
+made the browser test every element's ancestors against some forty selectors on each style
+recalculation, and a 100ms assertion of an unrelated workspace spec
+(`responsive-workspace.e2e.ts`, content swaps) went from nine passes in ten to none. If a spec that
+races a timer starts failing after a layer change, make the layer cheaper rather than the spec
+looser.

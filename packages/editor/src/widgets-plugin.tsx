@@ -26,8 +26,11 @@ import { TableChrome } from "./table/chrome";
 import { ThreadObserver } from "./threads";
 import { Toolbar } from "./toolbar";
 import {
+	BlockKeysPlugin,
 	CalloutPlugin,
 	CardGapPlugin,
+	CodeKeysPlugin,
+	CodePaintPlugin,
 	ColumnsPlugin,
 	DecisionDeletionPlugin,
 	DecoratorSelectionPlugin,
@@ -74,6 +77,9 @@ export const widgetsPlugin = realmPlugin<WidgetOptions>({
 		realm.pub(addComposerChild$, DiscardedNavigationPlugin);
 		realm.pub(addComposerChild$, CardGapPlugin);
 		realm.pub(addComposerChild$, PreviewPlugin);
+		realm.pub(addComposerChild$, CodePaintPlugin);
+		realm.pub(addComposerChild$, CodeKeysPlugin);
+		realm.pub(addComposerChild$, BlockKeysPlugin);
 		realm.pub(addComposerChild$, CalloutPlugin);
 		realm.pub(addComposerChild$, DocumentTitlePlugin);
 		realm.pub(addComposerChild$, EnterPlugin);

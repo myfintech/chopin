@@ -435,11 +435,21 @@ have, how the last one ended and the last line it printed to stderr that says
 why (a closing "Exiting with code 1" notice does not count), with tokens and
 `--env` values masked, your home directory shown as `~` and the line cut at 300
 characters. From the second launch in a row, the document's machine button turns
-its dot to a warning and its menu says **Can't connect to studio**
-with a **How to fix** link (see [Can't connect to a machine](#cant-connect-to-a-machine)),
+its dot to a warning and its menu says **Can't connect to studio** with the steps
+to fix it (see [Can't connect to a machine](#cant-connect-to-a-machine)),
 while the connector keeps retrying. Once the Planner attaches, or a launch stays up, it
 goes. A Chopin from before this does not know the report; the connector asks it
 once and carries on.
+
+A chopin older than 0.0.23 cannot make the report, and a Planner that never attaches
+without exiting makes none, so Chopin says what it saw itself. Each launch asks Chopin for a
+credential, so from the third launch in a row the machine's **Can't connect** reads
+_It started and stopped again before it connected_, with the release the machine runs and
+`chopin update` where that release is older than 0.0.23. Two minutes after a machine was asked, with
+no Planner attached, it reads _It hasn't answered yet_ or _It started but hasn't connected yet_
+and _Waiting since 7:26 PM_, whatever release it runs. Run `chopin update` on that machine and
+restart the service (`chopin service restart`): its next failure then comes with the reason
+the Planner printed.
 
 A connector started with `--planner-command` says it can run Planners, and
 lists each Planner it runs because Chopin asked this machine for it
@@ -496,24 +506,26 @@ however long nobody views the document.
 A Planner stays on its machine while that machine is connected, even when
 another comes online; it moves when the machine disconnects or the creator
 changes the document's machine or their default. Until it attaches, the
-machine button's dot is a thin spinner and its name says **Connecting to
+machine button's dot is three petrol dots that brighten in turn and its name says **Connecting to
 studio** (the machine's name), and an `@chopin` message sent meanwhile waits for
 it. Once it has attached the button says nothing more about it.
 
 ### Can't connect to a machine
 
 Chopin asked a machine to run a document's Planner, and the Planner's backend
-exited before it stayed up, more than once in a row. The machine button, left of
-**Build plan**, has a warning dot, and its menu opens onto **Can't connect to
-studio**, the last line the backend wrote to stderr that says why, and how often
-and when it was tried, such as _Tried 3 times, last at 6:29 PM. Still trying._,
-with a **How to fix** link to this section. A person who has no machine button,
-such as a teammate with no machine of their own, reads what the menu would say
-on the composer's top edge instead, whatever is being typed: the reason exactly
-as the machine reported it, and how often and when it was tried, under **Can't
-connect to @mona's machine**, since only the owner's login is ever named, never
-the machine. A screen reader hears **Can't connect to studio** once, as it
-appears, from a live region of the page that does not depend on either.
+exited before it stayed up, more than once in a row. Nothing about it is drawn in
+Chat. The machine button, left of **Build plan**, has a warning dot, and its menu
+opens onto **Can't connect to studio**: one sentence of why, numbered steps (such
+as `chopin status` on the machine, in a block with a **Copy** button) and
+**Learn more**, which links here. **Show
+details** unfolds the last line the backend wrote to stderr that says why, exactly
+as reported, and when it was last tried. chopin's avatar carries the same warning
+dot. A person who has no machine button, such as a teammate with no machine of
+their own, sees it there, and when they ask chopin something it can't take, chopin
+says so in a row only they see, with **How to fix** unfolding the same steps under
+**Can't connect to @mona's machine**, since only the owner's login is ever named,
+never the machine. A screen reader hears **Can't connect to studio** once, as it
+appears, from a live region of the page.
 
 Chopin keeps retrying, and the connector backs off between launches, so nothing
 needs pressing once the cause is fixed: the next launch attaches, the warning
@@ -608,7 +620,10 @@ running keeps going until it finishes, like a Planner mid-reply.
   goes, even if that machine had not been asked yet. An editor's choice made
   while the creator's own stood is only stored, for their own builds and runs,
   and counts again once the creator chooses no machine. Builds and runs follow
-  each person's own choice, whoever created the document.
+  each person's own choice, whoever created the document. A person whose choice does
+  not place it is told so in the machine menu, above the machines: _The document's
+  creator chose where its replies come from, so your choice runs your builds and
+  runs._ What Chat says of the Planner keeps naming the machine it is on.
 - A document left on **Default machine** whose creator has no connected
   machine that can run Planners uses a shared one too. Builds, runs and
   investigations never go to a teammate's machine unless the person chose it for
@@ -696,7 +711,7 @@ instead.
 
 |             | In the sandbox                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Writes      | Only the worktree the connector made for it (a run's, or a Planner's own; never your checkout), the repository's git directory in the few places commits and refs go and that worktree's entry (see [Git in the sandbox](#git-in-the-sandbox)), the agent's own state (`~/.atomic`, `~/.copilot` or `~/.pdd-kit` for the built-in agents), a private temporary directory, and what you add with `--sandbox-write`. Nothing else.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Writes      | Only the worktree the connector made for it (a run's, or a Planner's own; never your checkout), the repository's git directory in the few places commits and refs go and that worktree's entry (see [Git in the sandbox](#git-in-the-sandbox)), the agent's own state (`~/.atomic` or `~/.copilot` for the built-in agents), a private temporary directory, and what you add with `--sandbox-write`. Nothing else.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Reads       | The rest of the disk on Linux and macOS, except `~/.ssh`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `.netrc`, `.git-credentials` and browser profiles, which read as empty or unreadable, and the connector's state directory (`--base-dir`), of which it sees only its own worktree and the folder of its own tokens. The machine token and every other run's and Planner's files, tokens included, are out of its sight, those made after it started too; so is the state directory when a working directory holds it, as a home does. **On Windows a ProcessContainer reads only what it is given, so it is not the rest of the disk:** your profile folder (the same names are unreadable), the directories on `PATH` and those that `PYTHONHOME`, `GOROOT`, `GOPATH`, `CARGO_HOME`, `RUSTUP_HOME`, `JAVA_HOME`, `DOTNET_ROOT`, `NODE_PATH`, `VIRTUAL_ENV`, `CONDA_PREFIX` and the other tool variables in MXC's own baseline name, the programs installed per user in `%LOCALAPPDATA%\Programs`, its working directory and its worktree, the repository's git directory whole (its configuration, hooks, objects and every worktree's entry, since a worktree's `.git` leads into it), and what Windows lets every container read (`C:\Windows`, `C:\Program Files`). A folder on another drive, in another user's profile or anywhere else, a checkout among them, is not readable, but for the checkout a Planner runs in, and for a run's checkout's git directory, which is read without that checkout's files. |
 | Network     | Only through a proxy on your machine that allows the hosts below and refuses the rest. A direct connection fails, IPv6 is blocked, and the proxy resolves names.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | Environment | Everything it has today, including `GH_TOKEN` and `--env` values. `TMPDIR` points at the private directory, `PATH` names each directory by its real path, and `NODE_USE_ENV_PROXY=1` makes Node's own `fetch` use the proxy; the proxy variables come from MXC.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
@@ -709,8 +724,7 @@ Hosts an agent may reach (the full list is `HOST_GROUPS` in
   the hosts GitHub serves raw files and release downloads from
   (`objects.githubusercontent.com`, `raw.githubusercontent.com`,
   `release-assets.githubusercontent.com`,
-  `github-releases.githubusercontent.com`), where provers such as Verus, Z3,
-  cvc5, F\* and elan ship their releases;
+  `github-releases.githubusercontent.com`);
 - the model providers: `api.anthropic.com`, `api.openai.com`, `chatgpt.com`,
   `auth.openai.com`, `generativelanguage.googleapis.com`,
   `oauth2.googleapis.com`, `*.githubcopilot.com`,
@@ -729,21 +743,13 @@ Hosts an agent may reach (the full list is `HOST_GROUPS` in
   Haskell (Hackage, GHCup), OCaml (opam), Elixir and Erlang (Hex), Swift
   (swift.org, CocoaPods), Dart (pub.dev), Julia, R (CRAN), Zig, C and C++
   (Conan), Bazel and Nix;
-- the formal-methods toolchains beyond those registries: Lean
-  (`lean-lang.org` and `*.lean-lang.org` for elan, releases and Reservoir;
-  Mathlib's build cache at `mathlib4.lean-cache.cloud` and
-  `lakecache.blob.core.windows.net`; the Lean docs), and the docs and
-  installers of Verus, F\*, Pulse and KaRaMeL (`aka.ms`, `fstar-lang.org`),
-  LemmaScript, Rocq and Isabelle;
-- research: `pldb.kirancodes.me`, a read-only search of programming-languages
-  papers that pdd-kit's agents use, and arXiv;
 - the hosts you add.
 
 Every built-in host is a fixed public service. None is general-purpose storage
 that a stranger could write to and read back, such as
-`storage.googleapis.com`, a `*.blob.core.windows.net` account other than
-Mathlib's cache, Amazon S3, gists or a paste site, since those are where an
-injected instruction would send what an agent read. A test keeps it that way.
+`storage.googleapis.com`, a `*.blob.core.windows.net` account, Amazon S3, gists
+or a paste site, since those are where an injected instruction would send what
+an agent read. A test keeps it that way.
 The registries and GitHub still accept a publish or a push from whoever holds
 a token, so the list narrows where data can go but doesn't close every path.
 If a project needs one of those storage hosts, as Flutter's SDK does

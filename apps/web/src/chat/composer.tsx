@@ -5,24 +5,95 @@
  * passes what to show; the design audit renders the same component in each live state.
  */
 
-import { useCallback, useId, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useId, useRef, useState } from "react";
 import type { ReactNode, Ref } from "react";
 
-import { ChopinMark, SendAction } from "@chopin/editor";
-import { usePhone } from "@chopin/editor/pointer";
 import { useTransitionPresence } from "@chopin/editor/transition-presence";
-import { ArchiveIcon, CloseIcon, InfoIcon, LockIcon, PlusIcon, WarningIcon } from "@chopin/icons";
-import { DraftInput } from "./draft-input";
+import { PLANNER_NAME } from "@chopin/editor/people";
+import {
+	ArchiveIcon,
+	AtSignIcon,
+	DocumentIcon,
+	InfoIcon,
+	LockIcon,
+	PlusIcon,
+	SparkleIcon,
+	TextStyleIcon,
+	WarningIcon,
+} from "@chopin/icons";
+import { ComposerVoice, ComposerVoiceButton } from "@/components/assistant-ui/elements/composer";
+import { FormatBar } from "./format-bar";
+import { LinkForm } from "./link-form";
+import { sendStop } from "./assistant-ui/send-stop";
+import { SendStopButton } from "./assistant-ui/send-stop-button";
 import { motionContract } from "../motion-contract";
-import { ModeSwitch } from "./mode-switch";
-import { ModelPicker, ModelPickerTrigger } from "./model-picker";
+import { currentShortcutPlatform, shortcutLabel } from "../shortcuts";
+import { draftPlaceholder } from "./ask-chopin";
+import { ModelPill } from "./assistant-ui/model-pill";
+import type { Format } from "./format";
+import type { FileView } from "./attachments/files";
 import type { ModelControl } from "./use-model-choice";
 import type { DraftInputHandle, DraftInputProps } from "./draft-input";
-import plannerStop from "../assets/icons/planner-stop.svg";
+import type { RichDraftHandle } from "./rich/rich-draft-input";
 import plannerResume from "../assets/icons/planner-resume.svg";
 import "./composer.css";
 
 const MOTION = motionContract("collapse");
+
+/** The files of the message, drawn by code that loads when the first one is added. */
+let StagedFiles = lazy(() => import("./attachments/staged-files"));
+
+/**
+ * The draft's rich text is Lexical, which is fetched beside the page's code rather than in it, as
+ * soon as the composer's own code runs, so it is there by the time the draft is reached.
+ */
+let loadRichDraft = () => import("./rich/rich-draft-input");
+let RichDraftInput = lazy(() =>
+	loadRichDraft().then(module => ({ default: module.RichDraftInput }))
+);
+if (typeof window !== "undefined") void loadRichDraft();
+
+/** What the composer needs to take, show and send files; absent where the server takes none. */
+export type ComposerFiles = {
+	files: readonly FileView[];
+	/** The browser's own copy of a file, for its thumbnail. */
+	source: (id: string) => File | undefined;
+	/** Why images cannot be added, in words, when the model the message is for cannot read them. */
+	imagesReason?: string;
+	/** Adding and removing are off while a message is being sent. */
+	disabled: boolean;
+	/** The message is waiting for its files to finish uploading before it goes. */
+	waiting: boolean;
+	onAdd: (files: File[]) => void;
+	onRemove: (id: string) => void;
+	onRetry: (id: string) => void;
+};
+
+/** What the composer needs to dictate; absent where nothing can turn speech into words. */
+export type ComposerDictation = {
+	/** Listening, or working on what was heard. */
+	active: boolean;
+	phase: "idle" | "starting" | "listening" | "transcribing";
+	seconds: number;
+	/** What the button says on hover: where the speech goes, and the key that starts it. */
+	tooltip: string;
+	/** Spoken once to a screen reader when it starts and when it stops. */
+	announcement: string;
+	disabled: boolean;
+	onToggle: () => void;
+};
+
+function clock(seconds: number): string {
+	return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+/** What a file picker offers when images cannot be read: text, which is what can be sent. */
+const TEXT_ONLY =
+	"text/*,.md,.markdown,.json,.csv,.log,.yaml,.yml,.toml,.xml,.html,.css,.js,.ts,.tsx,.py";
+
+function dragsFiles(event: DragEvent | React.DragEvent): boolean {
+	return [...(event.dataTransfer?.types ?? [])].includes("Files");
+}
 
 export type ComposerNotice = {
 	/**
@@ -45,8 +116,11 @@ export type ChatComposerProps = {
 	inputRef?: Ref<DraftInputHandle>;
 	/** Whether this document's Planner is on; without it the composer is marked off. */
 	agent: boolean;
-	/** Whether the draft is addressed to Chopin, and the Chat/Chopin switch. */
-	mode?: { chopin: boolean; disabled: boolean; onToggle: () => void };
+	/**
+	 * Present where Chopin can be asked: the sparkle button, which writes `@chopin` into the draft,
+	 * at the caret when the field has the focus (`atCaret`) and at its start when it has not.
+	 */
+	chopin?: { disabled: boolean; onAsk: (atCaret: boolean) => void };
 	/** Why the draft can't be sent, above the field. */
 	notice?: ComposerNotice;
 	/**
@@ -62,14 +136,33 @@ export type ChatComposerProps = {
 	model?: ModelControl;
 	/** Present when `#` references are on: the instructions and the Mention docs button. */
 	references?: { disabled: boolean; onMentionDocs: () => void };
+	/** The formatting toolbar above the draft, which `shown` says is on, and the Aa button that turns it off. */
+	format?: { shown: boolean; disabled: boolean; onToggle: () => void };
+	/** The `@` button, which starts a mention at the caret. */
+	mention?: { disabled: boolean; onMention: () => void };
+	/** Present where the server takes images and files with a message. */
+	files?: ComposerFiles;
+	/** Present where the browser or the server can turn speech into words. */
+	dictation?: ComposerDictation;
 	/** Whether the draft accepts input at all, before a send is in flight. */
 	draftable: boolean;
 	sending: boolean;
 	sendDisabled: boolean;
 	onSubmit: () => void;
-	run?: { action: "stop" | "resume"; disabled: boolean; onClick: () => void };
+	/**
+	 * What the Planner's run offers. Stop shares the round button with Send, which stops only while
+	 * the draft is empty and `disabled` is false; Resume is a button of its own.
+	 */
+	run?: {
+		action: "stop" | "resume";
+		disabled: boolean;
+		refusedWhileBusy?: boolean;
+		onClick: () => void;
+	};
 	/** Reference, command and mention pickers, open over the field. */
 	pickers?: ReactNode;
+	/** What leads the row of controls: a thread's choice to also send the reply to Chat. */
+	rowStart?: ReactNode;
 	input: Omit<
 		DraftInputProps,
 		| "role"
@@ -81,7 +174,6 @@ export type ChatComposerProps = {
 		| "readOnly"
 		| "placeholder"
 		| "onSubmit"
-		| "historyGroupKey"
 	>;
 };
 
@@ -90,34 +182,79 @@ export function ChatComposer(
 		rootRef,
 		inputRef,
 		agent,
-		mode,
+		chopin,
 		model,
 		notice,
 		banner,
 		unavailable,
 		references,
+		format,
+		mention,
+		files,
+		dictation,
 		draftable,
 		sending,
 		sendDisabled,
 		onSubmit,
 		run,
 		pickers,
+		rowStart,
 		input,
 	}: ChatComposerProps,
 ) {
 	let instructionsId = useId();
 	let cueId = useId();
-	let modelId = useId();
-	let modelTrigger = useRef<HTMLButtonElement>(null);
-	let [modelOpen, setModelOpen] = useState(false);
-	let closeModel = useCallback((restore: boolean) => {
-		setModelOpen(false);
-		if (restore) requestAnimationFrame(() => modelTrigger.current?.focus());
-	}, []);
-	let modelTriggerNode = useCallback(() => modelTrigger.current, []);
+	// The draft's own handle, which the toolbar formats through, given to `inputRef` as well.
+	let rich = useRef<RichDraftHandle | null>(null);
+	let setInput = useCallback((handle: RichDraftHandle | null) => {
+		rich.current = handle;
+		if (typeof inputRef === "function") inputRef(handle);
+		else if (inputRef) (inputRef as { current: DraftInputHandle | null }).current = handle;
+	}, [inputRef]);
+	let [active, setActive] = useState<ReadonlySet<Format>>(() => new Set());
+	let [linking, setLinking] = useState<{ address: string }>();
+	let openLink = () => {
+		let handle = rich.current;
+		if (!handle || format?.disabled) return;
+		handle.holdSelection();
+		setLinking({ address: handle.linkAddress() ?? "" });
+	};
+	let formatDraft = (kind: Format) => {
+		if (kind === "link") openLink();
+		else rich.current?.format(kind);
+	};
+	let filePicker = useRef<HTMLInputElement>(null);
+	let filesReasonId = useId();
+	// Files dragged over the surface. Leaving it for a child of it is not leaving: only a leave that
+	// ends outside it, or in no element at all (the window), does, and a drag that ends anywhere
+	// else (a drop elsewhere, Escape) is ended by the window, so the surface never stays lit.
+	let [dragging, setDragging] = useState(false);
+	useEffect(() => {
+		if (!dragging) return;
+		let end = () => setDragging(false);
+		window.addEventListener("dragend", end);
+		window.addEventListener("drop", end);
+		return () => {
+			window.removeEventListener("dragend", end);
+			window.removeEventListener("drop", end);
+		};
+	}, [dragging]);
+	let droppable = !!files && !files.disabled && !unavailable;
 	let error = notice?.tone === "error" || !!banner?.invalid;
-	let phone = usePhone();
-	let chopin = !!mode?.chopin;
+	let describedBy = [
+		references ? instructionsId : undefined,
+		banner?.id,
+		notice ? cueId : undefined,
+	].filter(Boolean).join(" ") || undefined;
+	let field = useRef<HTMLDivElement>(null);
+	let hasDraft = input.value.trim() !== "" || !!files?.files.length;
+	let button = sendStop({
+		running: run?.action === "stop",
+		hasDraft,
+		canSend: !sendDisabled,
+		canStop: !!run && !run.disabled,
+		refusedWhileBusy: !!run?.refusedWhileBusy,
+	});
 	// A failed send is shown at once; any other strip eases open and shut, so it does not jump
 	// what is above it, and keeps its words while it fades.
 	let strip = useTransitionPresence(
@@ -188,9 +325,30 @@ export function ChatComposer(
 	return (
 		<div
 			ref={rootRef}
-			className="chat-composer relative shrink-0 px-2.5 pb-2.5"
+			className="chat-composer relative shrink-0"
 			data-planner={agent ? undefined : "off"}
+			onKeyDown={dictation
+				? event => {
+					// Escape stops listening wherever the focus is in the composer; the chord starts and stops it.
+					if (event.key === "Escape" && dictation.active) {
+						event.preventDefault();
+						event.stopPropagation();
+						dictation.onToggle();
+					} else if (
+						event.altKey && event.shiftKey && !event.ctrlKey && !event.metaKey
+						&& event.code === "KeyM" && !dictation.disabled
+					) {
+						event.preventDefault();
+						dictation.onToggle();
+					}
+				}
+				: undefined}
 		>
+			{dictation && (
+				<p aria-live="polite" className="sr-only" data-chat-dictation-announcement="" role="status">
+					{dictation.announcement}
+				</p>
+			)}
 			{references && (
 				<p className="sr-only" id={instructionsId}>
 					Type # to reference a document.
@@ -208,19 +366,51 @@ export function ChatComposer(
 						<div className={MOTION.contentClassName}>{stripBody}</div>
 					</div>
 				))}
+			{/* The box: a rounded rectangle with a hairline, the formatting toolbar above the draft and a row of controls under it; the menus open over it. */}
 			<div
 				aria-busy={sending}
-				className="composer-surface field"
-				data-mode={chopin ? "chopin" : "chat"}
+				className="composer-surface"
 				data-error={error || undefined}
+				data-dropping={dragging || undefined}
+				onDragEnter={droppable
+					? event => {
+						if (!dragsFiles(event)) return;
+						event.preventDefault();
+						setDragging(true);
+					}
+					: undefined}
+				onDragOver={droppable
+					? event => {
+						if (!dragsFiles(event)) return;
+						event.preventDefault();
+						event.dataTransfer.dropEffect = "copy";
+						setDragging(true);
+					}
+					: undefined}
+				onDragLeave={droppable
+					? event => {
+						let into = event.relatedTarget;
+						if (!(into instanceof Node && event.currentTarget.contains(into))) setDragging(false);
+					}
+					: undefined}
+				onDrop={droppable
+					? event => {
+						if (!dragsFiles(event)) return;
+						event.preventDefault();
+						setDragging(false);
+						files!.onAdd([...event.dataTransfer.files]);
+					}
+					: undefined}
 			>
 				{pickers}
-				{model && modelOpen && !unavailable && (
-					<ModelPicker
-						control={model}
-						id={modelId}
-						onClose={closeModel}
-						trigger={modelTriggerNode}
+				{linking && !unavailable && (
+					<LinkForm
+						address={linking.address}
+						onDismiss={() => setLinking(undefined)}
+						onDone={url => {
+							setLinking(undefined);
+							rich.current?.setLink(url);
+						}}
 					/>
 				)}
 				{unavailable
@@ -239,69 +429,125 @@ export function ChatComposer(
 					)
 					: (
 						<>
-							{/* A phone's switch shows only an icon; the chip says where the message goes. */}
-							{phone && chopin && mode && (
-								<span className="composer-chopin-row">
-									<button
-										aria-label="Remove Chopin"
-										className="composer-chopin-chip"
-										data-press="none"
-										disabled={mode.disabled}
-										onClick={mode.onToggle}
-										type="button"
-									>
-										<ChopinMark />
-										<span aria-hidden="true">Chopin</span>
-										<CloseIcon aria-hidden="true" size={12} />
-									</button>
-								</span>
+							{/* What is staged for the message sits above its text: the files, and the voice while it is listened to. */}
+							{files && files.files.length > 0 && (
+								<Suspense fallback={null}>
+									<StagedFiles
+										files={files.files}
+										onRemove={files.onRemove}
+										onRetry={files.onRetry}
+										source={files.source}
+									/>
+								</Suspense>
 							)}
-							<DraftInput
-								aria-activedescendant={input["aria-activedescendant"]}
-								aria-controls={input["aria-controls"]}
-								aria-expanded={input["aria-expanded"]}
-								historyGroupKey={chopin}
-								mentions={input.mentions}
-								onBlur={input.onBlur}
-								onChange={input.onChange}
-								onKeyDown={input.onKeyDown}
-								onSelect={input.onSelect}
-								references={input.references}
-								resetKey={input.resetKey}
-								value={input.value}
-								aria-label="Message"
-								aria-autocomplete="list"
-								aria-describedby={[
-									references ? instructionsId : undefined,
-									banner?.id,
-									notice ? cueId : undefined,
-								].filter(Boolean).join(" ") || undefined}
-								aria-disabled={!draftable || sending}
-								aria-invalid={error || undefined}
-								readOnly={!draftable || sending}
-								role="combobox"
-								onSubmit={onSubmit}
-								placeholder={chopin ? "Ask Chopin…" : "Message your collaborators…"}
-								ref={inputRef}
-							/>
+							{dictation && (dictation.phase === "listening" || dictation.phase === "transcribing")
+								&& (
+									<div className="composer-staging" data-chat-dictation="">
+										<ComposerVoice
+											label={clock(dictation.seconds)}
+											recording={dictation.phase === "listening"}
+											seconds={dictation.seconds}
+										/>
+									</div>
+								)}
+							{files?.waiting && (
+								<p className="composer-files-status" role="status">
+									Sending once your files have uploaded
+								</p>
+							)}
+							<div className="composer-field" ref={field}>
+								<Suspense
+									fallback={
+										<div
+											aria-busy="true"
+											aria-describedby={describedBy}
+											aria-disabled="true"
+											aria-invalid={error || undefined}
+											aria-label="Message"
+											className="composer-draft-input"
+											data-empty=""
+											data-placeholder={draftPlaceholder(agent)}
+											role="combobox"
+										/>
+									}
+								>
+									<RichDraftInput
+										aria-activedescendant={input["aria-activedescendant"]}
+										aria-controls={input["aria-controls"]}
+										aria-expanded={input["aria-expanded"]}
+										mentions={input.mentions}
+										onBlur={input.onBlur}
+										onChange={input.onChange}
+										interim={input.interim}
+										onFiles={files && !files.disabled ? files.onAdd : undefined}
+										onFormats={setActive}
+										onKeyDown={input.onKeyDown}
+										onLink={openLink}
+										onSelect={input.onSelect}
+										references={input.references}
+										resetKey={input.resetKey}
+										value={input.value}
+										aria-label="Message"
+										aria-autocomplete="list"
+										aria-describedby={describedBy}
+										aria-disabled={!draftable || sending}
+										aria-invalid={error || undefined}
+										readOnly={!draftable || sending}
+										role="combobox"
+										onSubmit={onSubmit}
+										placeholder={draftPlaceholder(agent)}
+										ref={setInput}
+									/>
+								</Suspense>
+							</div>
 
-							<div className="composer-footer">
+							{/* After the field in the page, so Tab arrives at the field first; the bar is drawn above it (composer.css). */}
+							{format?.shown && (
+								<FormatBar active={active} disabled={format.disabled} onFormat={formatDraft} />
+							)}
+
+							<div className="composer-row">
 								<div className="composer-left">
-									{mode && (
-										<ModeSwitch
-											effectiveMode={chopin}
-											disabled={mode.disabled}
-											onToggle={mode.onToggle}
-										/>
-									)}
-									{model && (
-										<ModelPickerTrigger
-											control={model}
-											controls={modelId}
-											onToggle={() => setModelOpen(open => !open)}
-											open={modelOpen}
-											triggerRef={modelTrigger}
-										/>
+									{rowStart}
+									{files && (
+										<>
+											<input
+												accept={files.imagesReason ? TEXT_ONLY : undefined}
+												aria-hidden="true"
+												data-chat-file-input=""
+												hidden
+												multiple
+												onChange={event => {
+													let chosen = [...event.currentTarget.files ?? []];
+													// The same file may be chosen again after it was removed.
+													event.currentTarget.value = "";
+													if (chosen.length) files.onAdd(chosen);
+												}}
+												ref={filePicker}
+												tabIndex={-1}
+												type="file"
+											/>
+											<button
+												type="button"
+												className="btn btn-icon btn-ghost"
+												aria-label="Add files"
+												aria-describedby={files.imagesReason ? filesReasonId : undefined}
+												title={files.imagesReason
+													? `Add files. ${files.imagesReason}`
+													: "Add files"}
+												data-tooltip={files.imagesReason
+													? `Add files. ${files.imagesReason}`
+													: "Add files"}
+												data-tooltip-verbatim=""
+												disabled={files.disabled}
+												onClick={() => filePicker.current?.click()}
+											>
+												<PlusIcon size={16} />
+											</button>
+											{files.imagesReason && (
+												<span className="sr-only" id={filesReasonId}>{files.imagesReason}</span>
+											)}
+										</>
 									)}
 									{references && (
 										<button
@@ -314,43 +560,89 @@ export function ChatComposer(
 											disabled={references.disabled}
 											onClick={references.onMentionDocs}
 										>
-											<PlusIcon size={16} />
+											<DocumentIcon size={16} />
 										</button>
 									)}
+									{format && (
+										<button
+											type="button"
+											className="btn btn-icon btn-ghost composer-format-toggle"
+											aria-label="Formatting"
+											aria-pressed={format.shown}
+											title="Formatting"
+											data-tooltip="Formatting"
+											data-tooltip-verbatim=""
+											onClick={format.onToggle}
+										>
+											<TextStyleIcon size={16} />
+										</button>
+									)}
+									{mention && (
+										<button
+											type="button"
+											className="btn btn-icon btn-ghost"
+											aria-label="Mention someone"
+											title="Mention someone"
+											data-tooltip="Mention someone"
+											data-tooltip-verbatim=""
+											disabled={mention.disabled}
+											onClick={mention.onMention}
+										>
+											<AtSignIcon size={16} />
+										</button>
+									)}
+									{chopin && (
+										<button
+											type="button"
+											className="btn btn-icon btn-ghost"
+											aria-keyshortcuts="Control+J Meta+J"
+											aria-label={`Ask ${PLANNER_NAME}`}
+											title={`Ask ${PLANNER_NAME}`}
+											data-tooltip={`Ask ${PLANNER_NAME}`}
+											data-tooltip-shortcut={shortcutLabel("ask-chopin", currentShortcutPlatform())}
+											data-tooltip-verbatim=""
+											disabled={chopin.disabled}
+											// The field keeps its focus and its caret, which is where the mention goes.
+											onMouseDown={event => event.preventDefault()}
+											onClick={() =>
+												chopin.onAsk(!!field.current?.contains(document.activeElement))}
+										>
+											<SparkleIcon size={16} />
+										</button>
+									)}
+									{dictation && (
+										<ComposerVoiceButton
+											active={dictation.active}
+											aria-label="Dictate"
+											aria-pressed={dictation.active}
+											data-tooltip={dictation.tooltip}
+											data-tooltip-verbatim=""
+											disabled={dictation.disabled && !dictation.active}
+											// The field keeps its focus and its caret, which is where the words go.
+											onMouseDown={event => event.preventDefault()}
+											onClick={dictation.onToggle}
+											title={dictation.tooltip}
+										/>
+									)}
+									{model && <ModelPill control={model} />}
 								</div>
 								<div className="composer-actions">
-									<span className="composer-run-control">
-										{/* Two elements, so Stop and Resume never reuse one button. */}
-										{run?.action === "stop" && (
-											<button
-												aria-label="Stop Chopin"
-												disabled={run.disabled}
-												className="btn btn-icon btn-secondary"
-												onClick={run.onClick}
-												title="Stop Chopin"
-												type="button"
-											>
-												<img alt="" className="size-4" src={plannerStop} />
-											</button>
-										)}
-										{run?.action === "resume" && (
-											<button
-												aria-label="Resume Chopin"
-												disabled={run.disabled}
-												className="btn btn-icon btn-secondary"
-												onClick={run.onClick}
-												title="Resume Chopin"
-												type="button"
-											>
-												<img alt="" className="size-4" src={plannerResume} />
-											</button>
-										)}
-									</span>
-									<SendAction
+									{run?.action === "resume" && (
+										<button
+											aria-label={`Resume ${PLANNER_NAME}`}
+											disabled={run.disabled}
+											className="btn btn-icon btn-ghost"
+											onClick={run.onClick}
+											title={`Resume ${PLANNER_NAME}`}
+											type="button"
+										>
+											<img alt="" className="size-4" src={plannerResume} />
+										</button>
+									)}
+									<SendStopButton
 										busy={sending}
-										disabled={sendDisabled}
-										onClick={onSubmit}
-										label="Send message"
+										onClick={button.action === "stop" ? run!.onClick : onSubmit}
+										state={button}
 									/>
 								</div>
 							</div>

@@ -36,6 +36,39 @@ export type StoredImage = {
 
 export type PutImage = Omit<StoredImage, "size" | "createdAt"> & { now: Date };
 
+/**
+ * An image or text file uploaded to a document's Chat. It is only the uploader's until a message
+ * is sent with it (`entryId` is then that message's id, and `position` its place among the
+ * message's files); a person who can read the document reads it from then on.
+ */
+export type StoredChatAttachment = {
+	id: string;
+	channelId: string;
+	name: string;
+	kind: "image" | "file";
+	/** What the bytes are, as sniffed on arrival, never what the sender claimed. */
+	mimeType: string;
+	bytes: Uint8Array;
+	size: number;
+	uploadedBy: string;
+	createdAt: Date;
+	entryId?: string;
+	position?: number;
+	/** What an image was before the browser sent a smaller copy of it, as its sender said. */
+	original?: ChatAttachmentOriginal;
+};
+
+export type ChatAttachmentOriginal = { size: number; width: number; height: number };
+
+export type PutChatAttachment =
+	& Omit<StoredChatAttachment, "size" | "createdAt" | "entryId" | "position">
+	& {
+		now: Date;
+	};
+
+/** What a person has uploaded to one document and not yet sent. */
+export type StagedChatAttachments = { count: number; bytes: number };
+
 /** One stage of a workflow run whose card Chat shows, as its run last reported it. */
 export type RunStageRecord = {
 	id: string;
@@ -252,6 +285,8 @@ export type ChannelRecord = {
 	updatedAt: Date;
 	archivedAt?: Date;
 	description?: ChannelDescription;
+	/** Every block uses the sheet's full width, Notion's Full width. Absent: the readable column. */
+	fullWidth?: true;
 	unansweredDecisions: number;
 };
 
@@ -275,6 +310,7 @@ export type CreateChannel =
 		| "updatedAt"
 		| "archivedAt"
 		| "description"
+		| "fullWidth"
 		| "unansweredDecisions"
 	>
 	& {
@@ -286,6 +322,13 @@ export type CreateChannel =
 export type RenameChannel = {
 	id: string;
 	title: string;
+	now: Date;
+};
+
+/** Turns a document's Full width on or off; a change advances `updatedAt`, as a rename does. */
+export type ChannelWidthInput = {
+	id: string;
+	fullWidth: boolean;
 	now: Date;
 };
 
@@ -418,11 +461,6 @@ export type CommitChannel = {
 	researchProjections?: ResearchProjectionChange[];
 	/** Lifecycle and shutdown maintenance may persist after document archival. */
 	allowArchived?: boolean;
-	/**
-	 * Deferred Planner turns written or moved in this commit's transaction, so a request is
-	 * durable no later than the entry that acknowledges it. A repeated operation applies none.
-	 */
-	deferredTurns?: DeferredTurnChange[];
 	provenance?: ProvenanceChange;
 };
 
@@ -437,8 +475,6 @@ export class ResearchProjectionConflict extends StorageError {
 }
 
 export type CommitResult = {
-	/** What each of the commit's `deferredTurns` did, in the same order; absent for a repeat. */
-	deferredTurns?: DeferredTurnOutcome[];
 	sidecar?: JsonValue;
 	/** Present when the operation synchronizes an authored title. */
 	channel?: ChannelRecord;
@@ -1017,9 +1053,50 @@ export type StoredPlannerLinkHold = PlannerLinkHold & {
 export type PlannerModelChoice = {
 	channelId: string;
 	model?: string;
+	/** The catalog's name for the chosen model, when known. */
+	modelName?: string;
 	thinkingLevel?: string;
 	/** Who chose it last. */
 	userId: string;
+	updatedAt: Date;
+};
+
+export type EntryForkPoint = {
+	atomicLeafId?: string | null;
+	remote?: { session: string; turn?: string };
+};
+
+export type ChatThreadForkState = {
+	/** Transcript entries of top-level Chat up to and including the root message at fork time. */
+	bootstrapEntries: import("@chopin/protocol").Chat.Entry[];
+	summary?: string;
+	/** Serialized Atomic `FileEntry[]` for this thread's branched session. */
+	atomicEntries?: JsonValue[];
+	atomicLeafId?: string | null;
+	/** Remote session and turn to branch from on the first turn, or continue from. */
+	remoteFrom?: { session: string; turn?: string };
+};
+
+export type ChatThreadRecord = {
+	channelId: string;
+	rootId: string;
+	root: import("@chopin/protocol").Chat.Entry;
+	forkedAt: number;
+	createdBy: string;
+	entries: import("@chopin/protocol").Chat.Entry[];
+	compactions: import("@chopin/protocol").Chat.CompactionRecord[];
+	usage?: import("@chopin/protocol").Chat.ContextUsage;
+	forkState: ChatThreadForkState;
+	updatedAt: Date;
+};
+
+export type ChatSessionState = {
+	channelId: string;
+	compactions: import("@chopin/protocol").Chat.CompactionRecord[];
+	usage?: import("@chopin/protocol").Chat.ContextUsage;
+	atomicEntries?: JsonValue[];
+	atomicLeafId?: string | null;
+	entryForks: Record<string, EntryForkPoint>;
 	updatedAt: Date;
 };
 
@@ -1040,109 +1117,3 @@ export type McpSession = {
 	createdAt: Date;
 	lastSeenAt: Date;
 };
-
-export const DEFERRED_TURN_KINDS = [
-	"composer",
-	"invoke_planner",
-	"invoke_system",
-	"comment",
-	"draft",
-] as const;
-export type DeferredTurnKind = (typeof DEFERRED_TURN_KINDS)[number];
-
-export const DEFERRED_TURN_STATES = [
-	"waiting",
-	"started",
-	"ended",
-	"interrupted",
-	"cancelled",
-] as const;
-export type DeferredTurnState = (typeof DEFERRED_TURN_STATES)[number];
-
-/**
- * Why Chopin cancelled a request it could not run, for what its sender is told: the agent was
- * reset, the sender can no longer write, or the document is gone. A request its sender took back
- * or a comment whose thread was resolved has none.
- */
-export const DEFERRED_CANCEL_REASONS = ["agent", "access", "unavailable"] as const;
-export type DeferredCancelReason = (typeof DEFERRED_CANCEL_REASONS)[number];
-
-/** An acknowledged Planner request whose turn had not started, kept until it runs or is resolved. */
-export type DeferredTurn = {
-	id: string;
-	/** The root document whose Chat and Planner the request is for. */
-	documentId: string;
-	/** What the acknowledgement named; unique within the document. */
-	requestId: string;
-	kind: DeferredTurnKind;
-	handle: string;
-	userId: string;
-	/** Empty for a comment, whose prompt is built from its thread when it starts. */
-	text: string;
-	references: JsonValue[];
-	/** A composer message's destination and fingerprints, for recognising a retried send. */
-	delivery?: JsonValue;
-	focusChannelId?: string;
-	focusTitle?: string;
-	/** The comment thread, and the child holding it when it is not in the document. */
-	threadId?: string;
-	threadChannelId?: string;
-	/** The revision a task draft was asked for. */
-	planRevision?: number;
-	claimantSessionId?: string;
-	ownerSessionIdAtAccept?: string;
-	state: DeferredTurnState;
-	createdAt: Date;
-	/** The writer lease the latest transition was written under. */
-	fencing: number;
-	resolvedAt?: Date;
-	/** Set only on a cancelled turn, when Chopin cancelled it. */
-	cancelReason?: DeferredCancelReason;
-};
-
-export type NewDeferredTurn = Omit<
-	DeferredTurn,
-	"state" | "fencing" | "resolvedAt" | "cancelReason"
->;
-
-/**
- * Moves one turn from the state it is expected to be in. Only `waiting` to `started` or
- * `cancelled`, and `started` to `ended` or `interrupted`, are legal; anything else changes nothing.
- */
-export type DeferredTurnTransition = {
-	id: string;
-	from: DeferredTurnState;
-	to: DeferredTurnState;
-	at: Date;
-	/** Why Chopin cancelled it; kept only with a move to `cancelled`. */
-	reason?: DeferredCancelReason;
-};
-
-export type DeferredTurnChange =
-	| { action: "insert"; turn: NewDeferredTurn }
-	| ({ action: "transition" } & DeferredTurnTransition);
-
-export type DeferredTurnOutcome =
-	| {
-		action: "insert";
-		/**
-		 * `repeated`: the document already has this request, returned as it first was.
-		 * `thread-waiting`: a comment thread already has a waiting turn, returned, and nothing was
-		 * written.
-		 */
-		status: "inserted" | "repeated" | "thread-waiting";
-		turn: DeferredTurn;
-	}
-	| { action: "transition"; changed: true; turn: DeferredTurn }
-	| {
-		action: "transition";
-		changed: false;
-		/** No such row, a pair the states do not allow, or a row not in the state asked for. */
-		reason: "missing" | "illegal" | "state";
-		turn?: DeferredTurn;
-	};
-
-export function legalDeferredTransition(from: DeferredTurnState, to: DeferredTurnState): boolean {
-	return (from === "waiting" && (to === "started" || to === "cancelled"))
-		|| (from === "started" && (to === "ended" || to === "interrupted"));
-}

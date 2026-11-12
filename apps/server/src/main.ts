@@ -19,12 +19,15 @@ import { displayTitle, parse, ulid } from "@chopin/dialect";
 import {
 	harnessFor,
 	plannerCatalog,
+	plannerCommands,
 	plannerOfferKnown,
 	plannerRanWithoutOffer,
+	plannerSteers,
 	shutdownHarnesses,
 } from "./harness/harnesses";
-import { chooseModel, publishModelState, turnModel } from "./chat/model-choice";
+import { chooseModel, publishModelState, turnModel, turnReadsImages } from "./chat/model-choice";
 import type { ModelChoiceDeps } from "./chat/model-choice";
+import * as Threads from "./chat/threads";
 import {
 	admitAgent,
 	AGENT_UPGRADE_HEADERS,
@@ -32,7 +35,6 @@ import {
 	openAgentSocket,
 } from "./harness/remote/endpoint";
 import {
-	disconnectedMessage,
 	notAttachedMessage,
 	PlannerAttachments,
 	startingMessage,
@@ -43,7 +45,11 @@ import { documentUrl } from "./channels/document-url";
 import { ActiveOwnerBindings } from "./agent/active-owner";
 import { registerAuthRoutes } from "./auth/routes";
 import { registerExperimentRoutes } from "./experiments/routes";
+import { attachmentLimits } from "./attachments/limits";
+import { registerAttachmentRoutes } from "./attachments/routes";
 import { registerImageRoutes } from "./images/routes";
+import { openaiTranscriber } from "./transcription/openai";
+import { registerTranscriptionRoutes } from "./transcription/routes";
 import type { ExperimentRuntime } from "./experiments/routes";
 import type { Instruction, ServerInstructionDeps } from "./chat/server-instruction";
 import { fingerprint } from "./experiments/service";
@@ -51,13 +57,16 @@ import * as Chat from "./chat/service";
 import { answerWake } from "./chat/wake";
 import { plannerAttachment } from "./chat/planner-attachment";
 import * as Initiative from "./chat/initiative";
-import { deferralWiring, keepsRequests } from "./chat/deferred";
+import * as Reactions from "./chat/reactions";
+import { respond as respondToReaction } from "./chat/reaction-reply";
 import { createChildDocuments } from "./chat/children";
 import { createRootChat } from "./chat/root";
 import { serverInstruction as runServerInstruction } from "./chat/server-instruction";
-import { resolveChild } from "./chat/children";
 import { CHAT_CAPABILITIES, incomingFrame, sidebarFrame } from "./chat/incoming";
+import { registerMentionRoutes } from "./chat/mention-routes";
 import { ReferenceService } from "./chat/references";
+import { RepositoryFiles } from "./chat/repository-files";
+import { RepositoryPeople } from "./chat/repository-people";
 import { createConversationRuntime } from "./conversation-plan/runtime";
 import { createEditingUnlocked } from "./plan/editing-unlocked";
 import { researchBriefDefinition } from "./jobs/research-brief";
@@ -76,6 +85,7 @@ import * as Comments from "./comments/service";
 import { clientBuild, proxy, serve } from "./client";
 import { describe, load } from "./config";
 import { GitHubClient, GitHubError } from "./github/client";
+import { plannerWorkspace } from "./harness/atomic/workspace";
 import { GitHubReferences } from "./github/references";
 import { builders, named, pictures, present } from "./people";
 import { registerConnectorScript } from "./http/connector-script";
@@ -156,6 +166,7 @@ import { WriterLease } from "./storage/writer-lease";
 import {
 	broadcast,
 	broadcastRepository,
+	DEFLATE,
 	fail,
 	PASSING,
 	relay,
@@ -167,6 +178,7 @@ import {
 
 import { AGENT_PATH, LINK_CLOSE } from "@chopin/agent-link";
 import { SERVICE_RESTART } from "@chopin/protocol/restart";
+import { PLANNER_NAME } from "@chopin/protocol/address";
 
 import type { Server, ServerWebSocket } from "bun";
 import type { AgentSocketData } from "./harness/remote/endpoint";
@@ -174,7 +186,7 @@ import type { RepositoryAuthorizer, WatchTopics } from "./socket/decision-watch"
 import type { DocumentSummaryInput } from "./jobs/document-summary";
 import type { JobDefinition } from "./jobs/registry";
 import type { InvestigationPlacement } from "./plan/room";
-import type { ChannelRecord, DeferredTurn, Lease, PlannerLinkHold } from "./storage/model";
+import type { ChannelRecord, Lease, PlannerLinkHold } from "./storage/model";
 import type {
 	AuthorizationResult,
 	SidebarSocket,
@@ -186,6 +198,8 @@ import type {
 type ResearchRequestView = ResearchWire.RequestView;
 
 const config = load();
+/** What a message may carry in force now; none where the server takes no files. */
+const chatAttachmentLimits = attachmentLimits(config);
 /** The one decisions boundary, checked against Atomic's registry before anything starts. */
 const decide = await openDecisions(config);
 const visualAdmission = createVisualAdmission(decide);
@@ -256,6 +270,42 @@ let researchService: ResearchWorkspaceService | undefined;
 let researchRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
 let recoveringResearch: Promise<void> | undefined;
 let referenceService: ReferenceService | undefined;
+/**
+ * The files a person can mention: a checkout the Planner works in, where the document has one,
+ * and else what GitHub lists for the default branch, read as the person's own session.
+ */
+const repositoryFiles = new RepositoryFiles({
+	checkout: async (channelId, repository) => {
+		if (config.harness !== "atomic") return undefined;
+		let workspace = await plannerWorkspace(channelId, repository);
+		return workspace.checkout ? workspace.cwd : undefined;
+	},
+	remote: async (sessionId, repository) => {
+		let github = hostedAuth.github;
+		if (!(github instanceof GitHubClient)) return undefined;
+		let session = await hostedAuth.sessions.resolve(sessionId);
+		if (!session) return undefined;
+		let { value } = await hostedAuth.sessions.use(
+			session,
+			token =>
+				github.repositoryFiles(token, repository.owner, repository.name, repository.defaultBranch),
+		);
+		return value;
+	},
+});
+const repositoryPeople = new RepositoryPeople({
+	remote: async (sessionId, repository) => {
+		let github = hostedAuth.github;
+		if (!github.repositoryCollaborators) return undefined;
+		let session = await hostedAuth.sessions.resolve(sessionId);
+		if (!session) return undefined;
+		let { value } = await hostedAuth.sessions.use(
+			session,
+			token => github.repositoryCollaborators!(token, repository.owner, repository.name),
+		);
+		return value;
+	},
+});
 let summaryCoordinator: DocumentSummaryCoordinator | undefined;
 let liveSync: LiveSyncCoordinator | undefined;
 let buildReadiness: BuildReadiness | undefined;
@@ -272,7 +322,7 @@ let readinessReviews = new ReadinessReviews({
 			current => {
 				if (Service.implementationActive(current) || current.chat?.busy) return;
 				return {
-					handle: "Chopin",
+					handle: PLANNER_NAME,
 					said: "Checking decisions and investigations needed before building",
 					text: READINESS_INSTRUCTION,
 					about,
@@ -403,7 +453,7 @@ async function relinkDecisions(channelId: string): Promise<void> {
 		let pending = pendingLinks(current);
 		if (pending.length === 0) return;
 		return {
-			handle: "Chopin",
+			handle: PLANNER_NAME,
 			text: relinkInstruction(pending),
 			said: "Linking decisions to the document after the build",
 		};
@@ -699,6 +749,18 @@ function conversation(
 				&& Rooms.get(room.id) === room && room.plan === opened && !room.closing
 				&& !archivingChannels.has(room.id) && !deletingChannels.has(room.id);
 		},
+		reactionAuthorize: async (sessionId, actor) => {
+			let member = [...room.members.values()].find(member =>
+				!member.data.closed && member.data.sessionId === sessionId
+				&& Initiative.actor(member) === actor
+			);
+			// Read access is enough: this only keeps a reader's reaction from being answered after the
+			// reader has left or lost it. It starts nothing and grants nothing.
+			if (!member || await refreshAccess(member, true) !== "allowed") return false;
+			return !member.data.closed && room.members.get(member.data.client) === member
+				&& Rooms.get(room.id) === room && room.plan === opened && !room.closing
+				&& !archivingChannels.has(room.id) && !deletingChannels.has(room.id);
+		},
 		plannerNotAttached: plannerAttachments
 			? async () => {
 				if (await plannerAttachments!.confirmed(room.id)) return undefined;
@@ -714,15 +776,9 @@ function conversation(
 			}
 			: undefined,
 		plannerStarting: plannerAttachments ? () => plannerStarting(room.id) : undefined,
-		// A person's request that cannot start is kept as a row, except under `AUTH_MODE=local`,
-		// which is never handed over and keeps its queue in memory.
-		...deferralWiring(config, {
-			plannerReady: plannerAttachments ? () => plannerAttachments!.confirmed(room.id) : undefined,
-			restoreComment: row => restoreComment(context, row),
-			threadEnded: row =>
-				Comments.failed(server, row.threadChannelId ?? row.documentId, row.threadId!),
-		}),
-		persist: (chat, deferred) => Service.persistDeferred(opened, chat, deferred),
+		// A message sent while a turn runs reaches it only where the harness takes input mid-run.
+		steers: () => plannerSteers(room.id),
+		persist: chat => Service.persist(opened, chat),
 		...(room.parentChannelId
 			? {
 				rootChannelId: room.parentChannelId,
@@ -738,6 +794,9 @@ function conversation(
 				}),
 			}),
 		modelChoice: () => turnModel(modelChoices, room.id),
+		commands: () => modelChoices.commands?.(room.id) ?? Promise.resolve(undefined),
+		fileExists: (path, sessionId) => repositoryFiles.has(room.id, repository, sessionId, path),
+		readsImages: () => turnReadsImages(modelChoices, room.id),
 		activeOwner: () => ownerBindings!.resolve(room.id),
 		ownerAvailable: () => ownerAvailable(room.id),
 		jobs: config.backgroundJobs ? jobService : undefined,
@@ -941,146 +1000,23 @@ function conversation(
 			}
 			: undefined,
 	});
-	return context;
+	return Threads.bindTopLevel(context);
 }
 
 /**
- * The queue item of a comment sent to Chopin that a restart left waiting, built again from its
- * thread. A thread in a child is read through that child, which stays open until the turn ends.
+ * A message an earlier release held for a machine is left as an ordinary posted message: nothing
+ * is held now, so it is never taken by a Planner, and its row is closed. Only the holder of the
+ * writer lease changes it, so an old process serving beside this one is never changed under it.
  */
-async function restoreComment(context: Chat.Room, row: DeferredTurn): Promise<unknown> {
-	if (!row.threadId) return undefined;
-	if (!row.threadChannelId) return Comments.restore(context, row.threadId, row.handle);
-	let child = await resolveChild(
-		storage.channels,
-		context.room,
-		context.repository.id,
-		row.threadChannelId,
-	);
-	if (!child) return undefined;
-	let held = Rooms.hold(child.id);
-	let release = () => {
-		held.release();
-		evict(held.room);
-	};
-	try {
-		await plan(held.room, server);
-		let restored = Comments.restore(
-			conversation(held.room, undefined, context.repository),
-			row.threadId,
-			row.handle,
+async function retireHeldMessages(): Promise<void> {
+	let lease = writerLease.held;
+	if (!lease) return;
+	let retired = await storage.deferredTurns.retire(lease, new Date());
+	if (retired > 0) {
+		console.log(
+			`chopin: ${retired} message(s) an earlier release held for a Planner were left as ordinary messages`,
 		);
-		if (!restored) {
-			release();
-			return undefined;
-		}
-		let ended = restored.ended;
-		restored.ended = async outcome => {
-			try {
-				await ended?.(outcome);
-			} finally {
-				release();
-			}
-		};
-		return {
-			...restored,
-			threadChannel: child.id,
-			focus: { channelId: child.id, title: child.title },
-		};
-	} catch (err) {
-		release();
-		throw err;
 	}
-}
-
-/**
- * Saved Planner requests of a document, started if they may start: the document is opened and held
- * while a turn runs, and what a restart cut off is marked. Who may start them is Chat's start
- * rule; this only needs a repository to open the document under, from the owner or from a
- * waiting request's sender whose login is live.
- */
-async function startDeferred(channelId: string): Promise<void> {
-	if (!config.agent || !keepsRequests(config)) return;
-	if (deletingChannels.has(channelId) || archivingChannels.has(channelId)) return;
-	let channel = await storage.channels.get(channelId);
-	if (!channel || channel.parentChannelId || channel.archivedAt) return;
-	let repository: Chat.Room["repository"] | undefined;
-	let binding = await ownerBindings?.resolve(channelId);
-	if (binding) {
-		repository = binding.repository;
-		binding.release();
-	} else {
-		let rows = await storage.deferredTurns.list(channelId, ["waiting", "started"]);
-		let claimants = new Set(
-			rows.flatMap(row => [row.claimantSessionId, row.ownerSessionIdAtAccept]).filter(
-				(id): id is string => !!id,
-			),
-		);
-		for (let id of claimants) {
-			let session = await hostedAuth.sessions.resolve(id);
-			if (!session) continue;
-			let checked = await hostedAuth.sessions.use(
-				session,
-				token =>
-					hostedAuth.github.repositoryAccess(
-						token,
-						channel.repositoryOwner,
-						channel.repositoryName,
-					),
-			);
-			if (checked.value?.id === channel.repositoryId) {
-				repository = checked.value;
-				break;
-			}
-		}
-	}
-	if (!repository) return;
-	let found = repository;
-	await withDocumentTransition(channelId, async () => {
-		await Rooms.get(channelId)?.closing;
-		let held = Rooms.hold(channelId);
-		let release = () => {
-			held.release();
-			evict(held.room);
-		};
-		let running = false;
-		try {
-			await plan(held.room, server);
-			let context = conversation(held.room, undefined, found);
-			await Chat.recover(context);
-			if (context.chat.running) {
-				running = true;
-				void context.chat.running.finally(release).catch(() => {});
-			}
-		} finally {
-			if (!running) release();
-		}
-	});
-}
-
-let startingDeferred: Promise<void> | undefined;
-let startAgain = false;
-
-/** Tries every document with saved requests; calls that overlap run one more pass, not many. */
-function startAllDeferred(): Promise<void> {
-	if (startingDeferred) {
-		startAgain = true;
-		return startingDeferred;
-	}
-	let pass = (async () => {
-		do {
-			startAgain = false;
-			for (let id of await storage.deferredTurns.documents(["waiting", "started"])) {
-				await startDeferred(id).catch(err =>
-					console.error("chopin: could not start a document's saved requests -", err)
-				);
-			}
-		} while (startAgain);
-	})().finally(() => {
-		startingDeferred = undefined;
-	});
-	startingDeferred = pass;
-	return pass;
 }
 
 /**
@@ -1167,9 +1103,8 @@ async function closeRoom(room: Rooms.Room, force = false): Promise<void> {
  * still starting it, or how to get one.
  */
 async function plannerNotAttached(channelId: string, url: string, repository: string) {
-	if (plannerAttachments?.status(channelId).state === "disconnected") {
-		return disconnectedMessage(plannerAttachments.holder(channelId));
-	}
+	let unavailable = plannerAttachments?.unavailable(channelId);
+	if (unavailable) return unavailable;
 	let starting = await experiments?.plannerStarting(channelId);
 	if (starting) return startingMessage(starting.login, starting.failure);
 	return notAttachedMessage(url, repository, !!experiments?.plannerMachines);
@@ -1203,6 +1138,15 @@ async function plannerStatus(channelId: string): Promise<PlannerAttachment> {
 const modelChoices: ModelChoiceDeps = {
 	catalog: async channelId =>
 		config.agent ? plannerCatalog(config.harness, channelId, config.model || undefined) : undefined,
+	commands: async channelId => {
+		if (!config.agent) return undefined;
+		let channel = await storage.channels.get(channelId);
+		if (!channel) return undefined;
+		return plannerCommands(config.harness, channelId, {
+			owner: channel.repositoryOwner,
+			name: channel.repositoryName,
+		});
+	},
 	known: channelId => plannerOfferKnown(config.harness, channelId),
 	fellBack: channelId => {
 		if (plannerRanWithoutOffer(config.harness, channelId)) announceModel(channelId);
@@ -1270,6 +1214,7 @@ async function plannerWritable(
 	room: Rooms.Room,
 	ws: Socket,
 	rid: string,
+	write = true,
 ): Promise<boolean> {
 	let opened = await readyPlan(room);
 	if (!opened) {
@@ -1286,7 +1231,7 @@ async function plannerWritable(
 		ws.close(4403, "authorization expired");
 		return false;
 	}
-	if (!ws.data.canEdit) {
+	if (write && !ws.data.canEdit) {
 		fail(ws, rid, "repository write access is required");
 		return false;
 	}
@@ -1341,12 +1286,6 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 		case "plan:open": {
 			try {
 				let opened = await plan(room, server);
-				if (!room.parentChannelId) {
-					// What a restart left, before the history is sent: notices and the queue.
-					await Chat.recover(chat(room, ws)).catch(err =>
-						console.error("chopin: could not restore saved requests -", err)
-					);
-				}
 				let currentChannel = await storage.channels.get(room.id);
 				if (currentChannel) applyChannelAccess(ws, currentChannel, ws.data.canManage);
 				implementations?.track(room.id);
@@ -1375,6 +1314,15 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 						? { working: thread => Chat.workingFor(Rooms.get(parent)?.plan?.chat, thread, room.id) }
 						: undefined,
 				);
+				// Thread summaries and session context/compaction state follow the history.
+				if (
+					!parent && !ws.data.closed && room.members.get(ws.data.client) === ws
+					&& room.plan === opened
+				) {
+					await Threads.greetThreads(chat(room, ws), ws).catch(err =>
+						console.error("chopin: could not send thread summaries -", err)
+					);
+				}
 				// What the Planner can be set to run, and what it is set to, for the composer.
 				if (!parent) {
 					void publishModelState(modelChoices, room.id, state => {
@@ -1437,16 +1385,68 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 			}, frame);
 			return;
 
+		case "chat:thread": {
+			let opened = await readyPlan(room);
+			if (!opened) {
+				fail(
+					ws,
+					frame.rid,
+					"document is unavailable",
+					deletingChannels.has(room.id) ? undefined : PASSING,
+				);
+				return;
+			}
+			let access = await refreshAccess(ws);
+			if (access === "unavailable") {
+				fail(ws, frame.rid, "authorization is temporarily unavailable", PASSING);
+				return;
+			}
+			if (access === "denied") {
+				fail(ws, frame.rid, "authorization expired");
+				ws.close(4403, "authorization expired");
+				return;
+			}
+			if (
+				Rooms.get(room.id) !== room || room.plan !== opened || room.closing
+				|| deletingChannels.has(room.id) || ws.data.closed || ws.data.room !== room.id
+				|| room.members.get(ws.data.client) !== ws
+			) {
+				fail(ws, frame.rid, "document is unavailable", PASSING);
+				return;
+			}
+			await Threads.openThread(
+				chat(room, ws),
+				ws,
+				frame,
+				ws.data.canEdit && !ws.data.channelArchivedAt && !archivingChannels.has(room.id),
+			);
+			return;
+		}
+
 		case "chat:send":
 			try {
 				if (!await plannerWritable(room, ws, frame.rid)) return;
-				await Chat.send(chat(room, ws), ws, frame);
+				await Threads.sendMessage(chat(room, ws), ws, frame);
 			} catch (error) {
 				// Nothing it threw says the message is at fault: it is sent again.
 				fail(
 					ws,
 					frame.rid,
 					error instanceof Error ? error.message : "cannot send message",
+					PASSING,
+				);
+			}
+			return;
+
+		case "chat:retry":
+			try {
+				if (!await plannerWritable(room, ws, frame.rid)) return;
+				await Threads.retryMessage(chat(room, ws), ws, frame);
+			} catch (error) {
+				fail(
+					ws,
+					frame.rid,
+					error instanceof Error ? error.message : "cannot retry the reply",
 					PASSING,
 				);
 			}
@@ -1496,7 +1496,6 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 					opened.revision,
 					text,
 					said,
-					ws.data.principalId,
 				);
 				if (!result.ok) {
 					fail(ws, frame.rid, result.reason, result.code);
@@ -1520,20 +1519,27 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 		case "chat:resume":
 		case "chat:pause-run":
 		case "chat:resume-run":
-		case "chat:unqueue":
-		case "chat:delete":
-		case "chat:retry":
 			if (!room.plan) return;
 			if (room.plan.parentChannelId) {
 				if (frame.rid) fail(ws, frame.rid, "this document's Chat is on its root document");
 				return;
 			}
-			if (frame.kind === "chat:abort") await Chat.abort(chat(room, ws), ws);
-			else if (frame.kind === "chat:resume") await Chat.resume(chat(room, ws), ws);
-			else if (frame.kind === "chat:unqueue") Chat.unqueue(chat(room, ws), ws, frame);
-			else if (frame.kind === "chat:delete") await Chat.remove(chat(room, ws), ws, frame);
-			else if (frame.kind === "chat:retry") await Chat.retry(chat(room, ws), ws, frame);
-			else await Chat.controlRun(chat(room, ws), ws, frame);
+			await Threads.controlMessage(chat(room, ws), ws, frame);
+			return;
+
+		case "chat:react":
+			if (!room.plan) return;
+			if (room.plan.parentChannelId) {
+				fail(ws, frame.rid, "this document's Chat is on its root document");
+				return;
+			}
+			// A reader may react; the access check that other requests get on arrival is made here,
+			// since a viewer-allowed frame skips it.
+			if (!await plannerWritable(room, ws, frame.rid, false)) return;
+			{
+				let context = chat(room, ws);
+				await Reactions.react(context, ws, frame, reacted => respondToReaction(context, reacted));
+			}
 			return;
 
 		case "conversation-plan:correct":
@@ -1734,8 +1740,10 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 
 const VIEWER_ALLOWED = new Set([
 	"session:ping",
+	"chat:react",
 	"plan:open",
 	"plan:close",
+	"chat:thread",
 	"job:list",
 	"job:get",
 	"conversation-plan:research-link",
@@ -1896,6 +1904,7 @@ function applyChannelAccess(
 			...(description ? { description } : {}),
 			canManage,
 			...(archivedAt ? { archivedAt } : {}),
+			...(channel.fullWidth ? { fullWidth: true } : {}),
 		});
 	}
 	if ((canEdit !== data.canEdit || canManage !== data.canManage) && !data.closed && publish) {
@@ -1907,6 +1916,8 @@ function applyChannelAccess(
 	data.channelDescription = description;
 	data.channelDescriptionRevision = descriptionRevision;
 	data.channelArchivedAt = archivedAt;
+	if (channel.fullWidth) data.channelFullWidth = true;
+	else delete data.channelFullWidth;
 	data.canEdit = canEdit;
 	data.canManage = canManage;
 }
@@ -2016,9 +2027,14 @@ function openRoomSocket(ws: Socket): void {
 		canEdit: ws.data.canEdit,
 		canManage: ws.data.canManage,
 		...(ws.data.channelArchivedAt ? { archivedAt: ws.data.channelArchivedAt } : {}),
+		...(ws.data.channelFullWidth ? { fullWidth: true } : {}),
 		backgroundJobs: config.backgroundJobs,
 		webResearch: config.webResearch,
 		...CHAT_CAPABILITIES,
+		...(chatAttachmentLimits ? { attachments: chatAttachmentLimits } : {}),
+		...(config.transcription
+			? { transcription: { provider: "OpenAI", maxBytes: config.transcription.maxBytes } }
+			: {}),
 		...(CLIENT_BUILD && !config.devClient ? { build: CLIENT_BUILD } : {}),
 	});
 	if (plannerAttachments) {
@@ -2133,6 +2149,7 @@ function listen(): Server<SocketData> {
 		},
 
 		websocket: {
+			perMessageDeflate: DEFLATE,
 			open(ws: AnySocket) {
 				openSockets.opened(ws);
 				if (isAgentSocket(ws)) {
@@ -2422,6 +2439,8 @@ function announceChannel(channel: ChannelRecord): void {
 		ws.data.channelDescription = channel.description?.value;
 		ws.data.channelDescriptionRevision = channel.description?.revision ?? 0;
 		ws.data.channelArchivedAt = channel.archivedAt?.toISOString();
+		if (channel.fullWidth) ws.data.channelFullWidth = true;
+		else delete ws.data.channelFullWidth;
 		ws.data.canEdit = ws.data.canManage && !channel.archivedAt;
 		tell(ws, {
 			kind: "session:channel",
@@ -2434,6 +2453,7 @@ function announceChannel(channel: ChannelRecord): void {
 			...(channel.description ? { description: channel.description.value } : {}),
 			canManage: ws.data.canManage,
 			...(channel.archivedAt ? { archivedAt: channel.archivedAt.toISOString() } : {}),
+			...(channel.fullWidth ? { fullWidth: true } : {}),
 		});
 		tell(ws, {
 			kind: "session:access",
@@ -2467,7 +2487,6 @@ async function archiveChannelLocked(channelId: string, now: Date) {
 		});
 		// An archived document keeps no Planner, not even one whose connection dropped.
 		await plannerAttachments?.documentEnded(channelId);
-		await cancelSaved(channelId, "unavailable");
 		announceChannel(result.channel);
 		void Service.announceCatalogueUnanswered(server, storage, result.channel);
 		return result;
@@ -2927,7 +2946,7 @@ async function credentialsWillRotate(sessionId: string, revision: number): Promi
 			() => true,
 			sessionId,
 			revision,
-			"GitHub credentials refreshed, so Chopin's session was restarted. Ask it to continue.",
+			`GitHub credentials refreshed, so ${PLANNER_NAME}'s session was restarted. Ask it to continue.`,
 		),
 		jobs,
 	]);
@@ -2939,39 +2958,6 @@ async function channelOwnerReset(channelId: string): Promise<void> {
 	ownerBindings?.revokeChannel(channelId);
 	plannerAttachments?.ownerReset(channelId);
 	await Promise.all([resetOpenAgents(room => room.id === channelId), jobs]);
-	await cancelSaved(channelId, "agent");
-}
-
-/**
- * Ends a document's saved Planner requests without running them, because its agent was reset or
- * it was archived. In an open document each says so in Chat; the rest are cancelled in storage.
- */
-async function cancelSaved(channelId: string, why: "agent" | "unavailable"): Promise<void> {
-	if (!keepsRequests(config)) return;
-	let channel = await storage.channels.get(channelId);
-	let room = Rooms.get(channelId);
-	if (channel && room?.plan && !room.plan.parentChannelId) {
-		await Chat.cancelQueued(
-			conversation(room, undefined, {
-				id: channel.repositoryId,
-				owner: channel.repositoryOwner,
-				name: channel.repositoryName,
-				defaultBranch: "",
-			}),
-			why,
-		).catch(err => console.error("chopin: could not cancel saved requests -", err));
-	}
-	let lease = writerLease.held;
-	if (!lease) return;
-	for (let row of await storage.deferredTurns.list(channelId, ["waiting"])) {
-		await storage.deferredTurns.transition(lease, {
-			id: row.id,
-			from: "waiting",
-			to: "cancelled",
-			at: new Date(),
-			reason: why,
-		});
-	}
 }
 
 let hostedAuth = registerAuthRoutes(router, {
@@ -2981,14 +2967,6 @@ let hostedAuth = registerAuthRoutes(router, {
 	liveBuild: !!config.liveBuild,
 	setupAgents: config.setupAgents,
 	onSessionRevoked: sessionRevoked,
-	// A login that is live again may be the one a saved request was waiting for.
-	onSessionRestored: () => {
-		if (server && !cutting) {
-			void startAllDeferred().catch(err =>
-				console.error("chopin: could not start saved requests after a sign-in returned -", err)
-			);
-		}
-	},
 	onCredentialsWillRotate: credentialsWillRotate,
 });
 // A paired machine's Planner backend attaches with a credential from the connector routes.
@@ -3069,7 +3047,7 @@ if (config.agent && config.harness === "remote") {
 				chat: opened.chat,
 				room: channelId,
 				server,
-				persist: (chat, deferred) => Service.persistDeferred(opened, chat, deferred),
+				persist: chat => Service.persist(opened, chat),
 			}, outcome).catch(err =>
 				console.error("chopin: could not update the workflow runs a restart kept -", err)
 			);
@@ -3088,9 +3066,6 @@ if (config.agent && config.harness === "remote") {
 		announceModel(channelId);
 		// Settlements that waited for a Planner can run now.
 		if (planner.state === "attached") {
-			void startDeferred(channelId).catch(err =>
-				console.error("chopin: could not start saved requests after a Planner attached -", err)
-			);
 			void ownerAvailable(channelId).catch(err =>
 				console.error("chopin: could not wake work after a Planner attached -", err)
 			);
@@ -3361,6 +3336,12 @@ registerChannelRoutes(router, hostedAuth, {
 			id,
 			opened => Service.exclusive(opened, () => Service.rename(opened, title)),
 		),
+	// Layout is channel metadata, not document content: no plan lock, and readers hear it at once.
+	setFullWidth: async (id, fullWidth) => {
+		let result = await storage.channels.setFullWidth({ id, fullWidth, now: hostedAuth.clock() });
+		if (result.changed) announceChannel(result.channel);
+		return result;
+	},
 	onChannelRestored: restoreChannel,
 	onVersionRestore: restoreDocumentVersion,
 	onVersionSummaries: config.backgroundJobs && config.agent
@@ -3380,6 +3361,13 @@ registerChannelRoutes(router, hostedAuth, {
 	references: hostedAuth.github instanceof GitHubClient
 		? new GitHubReferences(hostedAuth.github)
 		: undefined,
+});
+registerMentionRoutes(router, hostedAuth, {
+	current: currentDocumentTarget,
+	research: async channelId =>
+		(await storage.research.list(channelId, 100, true)).map(({ id, title }) => ({ id, title })),
+	files: repositoryFiles,
+	people: repositoryPeople,
 });
 registerResearchWorkspaceRoutes(router, hostedAuth, {
 	service: researchService,
@@ -3401,6 +3389,20 @@ registerResearchWorkspaceRoutes(router, hostedAuth, {
 registerNavigationRoutes(router, hostedAuth, { storage });
 registerPreferenceRoutes(router, hostedAuth, { storage });
 registerImageRoutes(router, hostedAuth);
+registerAttachmentRoutes(router, hostedAuth, { limits: chatAttachmentLimits });
+registerTranscriptionRoutes(
+	router,
+	hostedAuth,
+	config.transcription
+		? {
+			maxBytes: config.transcription.maxBytes,
+			transcribe: openaiTranscriber({
+				model: config.transcription.model,
+				apiKey: process.env.OPENAI_API_KEY!,
+			}),
+		}
+		: undefined,
+);
 registerConnectorScript(router, {
 	bundle: join(import.meta.dir, "../../connector/dist/connector.js"),
 	source: join(import.meta.dir, "../../connector/src/main.ts"),
@@ -3547,9 +3549,9 @@ try {
 		console.error(`chopin: ${index} does not exist, so this process stays not ready`);
 	} else {
 		readiness.started();
-		// Saved requests start only after route-ready, off the readiness path.
-		void startAllDeferred().catch(err =>
-			console.error("chopin: could not start saved requests -", err)
+		// Off the readiness path: a message an earlier release held is left as an ordinary one.
+		void retireHeldMessages().catch(err =>
+			console.error("chopin: could not close the messages an earlier release held -", err)
 		);
 		let held = requests.release();
 		console.log(

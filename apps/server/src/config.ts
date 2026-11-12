@@ -12,8 +12,14 @@ import { delimiter, join } from "node:path";
 import { loadAuth } from "./auth/config";
 import { setupAgents } from "./setup-agents";
 import { DEFAULT_COPILOT_MODEL } from "./harness/copilot-sdk/model";
+import {
+	DEFAULT_STORED_IMAGE_BYTES,
+	MAX_STORED_IMAGE_BYTES,
+	MIN_STORED_IMAGE_BYTES,
+} from "./images/format";
 
 import type { SetupAgent } from "@chopin/protocol/agents";
+import type { AttachmentLimits } from "@chopin/protocol/attachment";
 import type { AuthConfig } from "./auth/config";
 import type { StorageConfig } from "./storage/registry";
 
@@ -46,6 +52,11 @@ export type Config = {
 	 */
 	agentConnectionMaxSilenceMs: number;
 	/**
+	 * MAX_STORED_IMAGE_BYTES: the largest image a tool made that Chat hosts, whichever harness ran the
+	 * tool. A larger one is shown as a placeholder naming its size and this limit. 10 MiB by default.
+	 */
+	imageMaxBytes: number;
+	/**
 	 * Whether to run the agent at all.
 	 *
 	 * Off is a deliberate choice, not a fallback: the server still refuses to
@@ -57,6 +68,20 @@ export type Config = {
 	agent: boolean;
 	backgroundJobs: boolean;
 	webResearch: boolean;
+	/**
+	 * What a Chat message may carry, as configured: `CHAT_ATTACHMENT_MAX_BYTES` for one file,
+	 * `CHAT_ATTACHMENT_MAX_COUNT` files per message (0 turns files off) and
+	 * `CHAT_ATTACHMENT_MAX_TOTAL_BYTES` for all of a message's. Under `HARNESS=remote` the limits in
+	 * force are lower still; see `attachmentLimits`.
+	 */
+	chatAttachments: AttachmentLimits;
+	/**
+	 * Dictation's server transcription: `TRANSCRIPTION_MODEL` as `openai/<model>`, off unless it is
+	 * set. With it, a person's browser that has no on-device speech recognition may send a recording
+	 * of what they dictate to this server, which sends it to the provider; without it no audio is
+	 * ever sent anywhere. `TRANSCRIPTION_MAX_BYTES` bounds a recording.
+	 */
+	transcription?: { provider: "openai"; model: string; maxBytes: number };
 	/** Attempt deadline of one public-web evidence attempt, in milliseconds. Defaults to 10 minutes. */
 	researchEvidenceTimeoutMs?: number;
 	/** Explicitly enables the conversation-derived cards prototype. */
@@ -178,6 +203,50 @@ function port(): number {
 	return value;
 }
 
+/** A whole-number setting between `min` and `max`, read from the environment. */
+function whole(name: string, fallback: number, min: number, max: number): number {
+	let raw = process.env[name];
+	if (raw === undefined || raw === "") return fallback;
+	let value = Number(raw);
+	if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < min || value > max) {
+		throw new Error(`${name} must be a whole number between ${min} and ${max}`);
+	}
+	return value;
+}
+
+function transcription(): Config["transcription"] {
+	let raw = process.env.TRANSCRIPTION_MODEL;
+	if (!raw || raw === "off") return undefined;
+	let match = /^(openai)\/(\S{1,100})$/.exec(raw);
+	if (!match) {
+		throw new Error(
+			"TRANSCRIPTION_MODEL must be off, or openai/<model> such as openai/gpt-transcribe",
+		);
+	}
+	if (!process.env.OPENAI_API_KEY) {
+		throw new Error("TRANSCRIPTION_MODEL=openai/... needs OPENAI_API_KEY");
+	}
+	return {
+		provider: "openai",
+		model: match[2]!,
+		maxBytes: whole("TRANSCRIPTION_MAX_BYTES", 5_242_880, 1, 26_214_400),
+	};
+}
+
+function chatAttachments(): AttachmentLimits {
+	let limits = {
+		maxBytes: whole("CHAT_ATTACHMENT_MAX_BYTES", 1_048_576, 1, 16_777_216),
+		maxCount: whole("CHAT_ATTACHMENT_MAX_COUNT", 5, 0, 20),
+		maxTotalBytes: whole("CHAT_ATTACHMENT_MAX_TOTAL_BYTES", 4_194_304, 1, 67_108_864),
+	};
+	if (limits.maxTotalBytes < limits.maxBytes) {
+		throw new Error(
+			"CHAT_ATTACHMENT_MAX_TOTAL_BYTES must be at least CHAT_ATTACHMENT_MAX_BYTES",
+		);
+	}
+	return limits;
+}
+
 /** A duration setting that may be zero, in whole milliseconds up to `max`. */
 function duration(name: string, fallback: number, max: number): number {
 	let raw = process.env[name];
@@ -223,6 +292,22 @@ function researchEvidenceTimeoutMs(): number {
 	if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < 120_000 || value > 1_800_000) {
 		throw new Error(
 			"RESEARCH_EVIDENCE_TIMEOUT_MS must be an integer between 120000 and 1800000 milliseconds",
+		);
+	}
+	return value;
+}
+
+/** MAX_STORED_IMAGE_BYTES: whole bytes, 1 MiB to 256 MiB, 10 MiB by default. */
+function imageMaxBytes(): number {
+	let raw = process.env.MAX_STORED_IMAGE_BYTES;
+	if (raw === undefined) return DEFAULT_STORED_IMAGE_BYTES;
+	let value = Number(raw);
+	if (
+		!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < MIN_STORED_IMAGE_BYTES
+		|| value > MAX_STORED_IMAGE_BYTES
+	) {
+		throw new Error(
+			`MAX_STORED_IMAGE_BYTES must be an integer between ${MIN_STORED_IMAGE_BYTES} and ${MAX_STORED_IMAGE_BYTES} bytes`,
 		);
 	}
 	return value;
@@ -351,9 +436,12 @@ export function load(): Config {
 		agentConnectionPingMs,
 		agentConnectionTimeoutMs,
 		agentConnectionMaxSilenceMs,
+		imageMaxBytes: imageMaxBytes(),
 		agent,
 		backgroundJobs,
 		webResearch: agent && backgroundJobs && process.env.WEB_RESEARCH !== "off",
+		chatAttachments: chatAttachments(),
+		transcription: transcription(),
 		researchEvidenceTimeoutMs: researchEvidenceTimeoutMs(),
 		conversationPlan,
 		conversationInitiativeModel,

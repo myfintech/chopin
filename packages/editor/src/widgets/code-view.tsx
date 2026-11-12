@@ -21,9 +21,12 @@
  */
 
 import { Component, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { codeWraps } from "@chopin/dialect";
 
 import { useColorScheme } from "../color-scheme";
 import { fileNameOf, repaired, titled } from "./code";
+import { accessibleTheme, CODE_THEME, CODE_THEME_BASE } from "./code-theme";
+import { grammar, PLAIN } from "./code-tokens";
 
 import type { ErrorInfo, ReactNode } from "react";
 import type { Kind } from "./code";
@@ -58,17 +61,15 @@ function readOverflow(element: HTMLElement): Overflow {
 		: "scroll";
 }
 
-/** What the highlighter calls text it has no grammar for. */
-const PLAIN = "text";
-
 /**
- * One theme per scheme, picked from the page's resolved colour scheme.
+ * One theme per scheme, picked from the page's resolved colour scheme: pierre-light at AA
+ * (`code-theme.ts`) or pierre-dark.
  *
  * A single theme name, not a `{ dark, light }` pair: a pair paints tokens
  * through CSS variables instead of an inline colour, and the page's scheme is
  * already resolved, so the second palette would never apply.
  */
-const THEME = { dark: "pierre-dark", light: "pierre-light" } as const;
+const THEME = { dark: "pierre-dark", light: CODE_THEME } as const;
 
 /**
  * Keeps the first file's change counts clear of the block's own controls,
@@ -82,39 +83,20 @@ let loading: Promise<Renderer> | undefined;
 
 function load(): Promise<Renderer> {
 	loading ??= Promise.all([import("@pierre/diffs/react"), import("@pierre/diffs")]).then(
-		([react, diffs]) => ({
-			File: react.File,
-			FileDiff: react.FileDiff,
-			parsePatchFiles: diffs.parsePatchFiles,
-			resolveLanguage: diffs.resolveLanguage,
-		}),
+		([react, diffs]) => {
+			diffs.registerCustomTheme(
+				CODE_THEME,
+				async () => accessibleTheme(await diffs.resolveTheme(CODE_THEME_BASE)),
+			);
+			return {
+				File: react.File,
+				FileDiff: react.FileDiff,
+				parsePatchFiles: diffs.parsePatchFiles,
+				resolveLanguage: diffs.resolveLanguage,
+			};
+		},
 	);
 	return loading;
-}
-
-/**
- * Languages the highlighter turned out to have, and the ones it did not.
- *
- * Asked rather than assumed, because a fence may say anything and the answer
- * is not a list this package can hold: `resolveLanguage` rejects what it
- * cannot load, and the renderer's own attempt at an unknown grammar rejects a
- * promise nothing is watching — which leaves the block blank rather than
- * uncoloured. Asking first turns that into plain text.
- */
-const known = new Map<string, string>();
-
-async function grammar(language: string, resolve: Core["resolveLanguage"]): Promise<string> {
-	let seen = known.get(language);
-	if (seen !== undefined) return seen;
-
-	try {
-		await resolve(language);
-		known.set(language, language);
-		return language;
-	} catch {
-		known.set(language, PLAIN);
-		return PLAIN;
-	}
 }
 
 /**
@@ -148,7 +130,7 @@ export type CodeViewProps = {
 	/** The fence's contents, as the document holds them. */
 	source: string;
 	language: string;
-	/** The rest of the info string, which is where a title lives. */
+	/** The rest of the info string, which is where a title and the wrap flag live. */
 	meta: string;
 };
 
@@ -165,7 +147,9 @@ function View({ kind, source, language, meta }: CodeViewProps) {
 	let [broken, setBroken] = useState(false);
 	let [resolved, setResolved] = useState<string>();
 	/** Unknown until the view is laid out, so the renderer is never handed a guess. */
-	let [overflow, setOverflow] = useState<Overflow>();
+	let [measured, setOverflow] = useState<Overflow>();
+	// A block whose fence says `wrap` wraps at any width; the others wrap where the stylesheet says.
+	let overflow = measured && (codeWraps(meta) ? "wrap" : measured);
 	let view = useRef<HTMLDivElement>(null);
 
 	useEffect(() => {

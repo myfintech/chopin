@@ -64,15 +64,16 @@ kept, so it returns to force if the model does. Background jobs never carry a ch
 
 The composer says so even where nothing can be chosen any longer. When a client withdraws all its
 models, or an older client takes its place, there is no catalog and the picker is gone, but the
-stored choice is still sent in `chat:model` and the composer's notice still says that the model is no longer
-available and the default runs, before and after a turn, until somebody's client offers it again.
+stored choice is still sent in `chat:model` and the composer's notice says that the model is no longer
+available and the default runs until a turn records that fallback in Chat. It does not repeat the
+transcript line.
 A document nobody chose for says nothing. The choice is held back while what a remote Planner
 offers is unknown: with no client attached (a machine that is away, a server that has just restarted)
 or one that offered the catalog and has yet to report it. The choice is then neither gone nor
 honored, and the machine's own status speaks. It stops being unknown for a client that offered the
 catalog and never reports it once a turn has run for want of it and fallen back on the saved
-choice: that has happened, Chat says it, and the room is told the choice so every composer says it
-too, for as long as that client stays attached and reports nothing. A report that comes later, or
+choice: that has happened, Chat says it, and the room is told the choice without repeating the
+same fallback above the composer. A report that comes later, or
 another client, starts again from what it reports. A person who can only read the document sees
 none of it.
 
@@ -82,10 +83,45 @@ document's model choice couldn't be read, and the server tells the room with `ch
 (`true`, and `false` when a later turn can read it again; a person who joins meanwhile is sent
 `true` after the Chat history), so every open composer shows the same words in its notice until a
 turn can read the choice again. Nothing stored is changed. These words are the composer's own
-notice, a cause of their own beside the page's connection banner: drawn beneath the machine's
-banner when that is drawn, and giving way, as the composer's other notices do, to the room's
-own connection banner, a refused send and a failed reply, then returning with the connection
+notice, a cause of their own: giving way, as the composer's other notices do, to the page's
+offline bar, a refused send and a failed reply, then returning with the connection
 ([design guide](../apps/web/DESIGN.md)).
+
+### Commands the Planner offers
+
+The same `chat:model` carries `commands`: what `/` offers in Chat besides Chopin's own
+(`/research`), each with a `name`, a `kind` and a one-line `description`. Only the document's own
+Planner supplies them, read each time somebody joins or the state changes:
+
+| Harness                     | Commands                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `atomic`                    | What an Atomic session in the Planner's working directory finds: its prompt templates (`prompt`), its skills (`skill`, named `skill:name`, as Atomic invokes them) and the workflows registered for it (`workflow`). The session is built as a Planner's is, in the operator's agent directory and the checkout, and ended at once; nothing goes to a model. It is read once for 30 seconds per directory, however many people join. Atomic's own extension commands are not offered. |
+| `remote`                    | What the attached client reported in its [capability catalog](agent-connection.md#capability-catalog), as written, and nothing once that client has left. An older client, or one that reports none, offers none, and so does a machine that is away.                                                                                                                                                                                                                                 |
+| `copilot-sdk` and any other | None.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+
+The list is the document's Planner's alone. A remote Planner's commands are held with its attached
+link, so another person's machine, or an earlier client of the same document, never shows its own.
+A list that cannot be read leaves the field out and never fails the model state.
+
+Choosing a command in the composer inserts it as a chip at the start of the draft, and the send
+carries it as a `command` reference (`name` and `commandKind`, the `kind` the Planner reported, so a
+name two kinds share is never run as the other) over the range of its `/name` token. The server
+checks it against what the Planner reports at that moment and refuses what it does not offer, in
+words the composer shows under the draft it keeps: `/name is not one of the commands the Planner
+offers.`, `The Planner has not reported any commands, so /name cannot run.` (nothing attached, or
+a client that reports none), `A command has to open the message.` and `A message can run one
+command.` A command goes to the Planner; sent to the room it is refused. The reference is kept
+with the message (the same persisted shape as a document reference, so a saved request keeps
+it across a restart) and the Planner's turn is built from it:
+
+| Kind                            | The turn's prompt                                                                                                                                                                                                         |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `skill`, `prompt` and any other | Atomic's own invocation, `/name args`, alone: the room's earlier words and the focused child's line wait for the next turn (a fresh session has them in its instructions), so the prompt opens with the `/`.              |
+| `workflow`                      | A request, in the person's turn as any message is, to start the registered workflow by name with the workflow tool's run action; the words after the chip are given as its input, said to be data and not an instruction. |
+
+Chopin's own commands (`/research`) keep their behaviour: they are never sent to the Planner, and
+the Planner's list never replaces them. A command in a queued message is not checked again when its
+turn starts: if the Planner has since lost it, Atomic reads `/name` as text.
 
 ## Coaching in an invoked turn
 
@@ -205,10 +241,9 @@ its Planner may send one, at most 10 an hour per document.
 Under `HARNESS=remote` only attaching claims ownership. An `@chopin` message or
 `invoke_planner` call for a document without an attached Planner is refused with
 `planner-not-attached`, and with one it runs as a turn on that Planner under its
-owner. (A person's request is no longer refused: it is [saved](#saved-requests) and
-starts once a Planner attaches, in hosted mode and under `AUTH_MODE=local` alike.) Other
-Planner requests, such as sending a comment to the Planner or a Build draft, claim nothing
-either: with a client attached they run on it, and without one they are saved the same way.
+owner. Other Planner requests, such as sending a comment to the Planner or a Build draft,
+claim nothing either: with a client attached they run on it, and without one they are refused
+the same way, and never kept for later ([messages while the Planner works](#messages-while-the-planner-works)).
 A research request claims no ownership either: its
 workers run on the attached client as [isolated sessions](#remote-planner), and
 without one the request waits until a client attaches.
@@ -288,12 +323,12 @@ the thread, that last message is posted to the thread for it. Background jobs
 cannot call `reply_comment`.
 
 A child document has no Chat. A comment sent to Chopin inside one is admitted
-by its root's queue and starts or joins a turn on the root's Chat, with the
-child as the turn's focus; the root's transcript notice names the child. That
+by its root's Chat and starts a turn on it, with the
+child as the turn's focus, or is refused while a turn runs there; the root's transcript notice names the child. That
 turn alone may `reply_comment` in that child thread, and its `edit_child` writes
-are the thread's result. The note is saved in the child before the turn is
-queued, and the reply is saved in the child before the child's room sees it.
-Admission, queueing the turn, and `reply_comment` each re-ask storage that the
+are the thread's result. The note is saved in the child before the turn starts,
+and the reply is saved in the child before the child's room sees it.
+Admission, starting the turn, and `reply_comment` each re-ask storage that the
 child still belongs to a live root in the same repository; admission refuses the
 note before saving it when it does not. The end-of-turn fallback reply is posted
 to the child room the note came from, which stays held until that turn ends,
@@ -638,20 +673,23 @@ changes: an attach, a detach into the grace period with the time it ends, a drop
 that keeps work (`disconnected`, with no deadline), the grace period ending, a sign-out, a Planner reset, or the server closing a connection
 whose ownership was released. It names only the holder's GitHub login and
 state, never a machine, checkout, or token. A healthy, attached Planner shows
-nothing. Otherwise the document's machine button carries it (a thin spinner while
+nothing. Otherwise the document's machine button carries it (the connecting dots while
 the machine is connecting, a warning dot where it cannot connect, a muted grey dot
 while the Planner is away, and no dot at all where no machine is connected, the same
 bare icon as a button with no machine, never the machine's own green) with its words in
-the button's name and at the top of its menu, and as the connection banner at the Chat
-composer's top edge, once, as it changes: _reconnecting_ while a machine is being connected to,
-_dropped_ for a machine that cannot be connected to (with the reason exactly as the machine
-reported it, the attempts and _How to fix_, and a button that asks the machine to try again
-through `chat:wake`), that is offline or that has stepped away (no button: only that machine
-can come back), and, for a person with no machine button, _No machine is connected._ The
-page cannot hear the machine while the room's own connection is lost, so the banner then
-tells that connection alone and tells the machine again, with the state then known, once
-the connection is back. `plannerForBanner` and `connectionStep` decide this, so the button
-and the banner cannot disagree. A screen reader hears each phase once as it begins, from
+the button's name and tooltip, with the fix-it steps for a machine that cannot be connected
+to or is offline at the top of its menu (the reason exactly as the machine reported it under
+_Show details_). chopin's avatar carries the same presence. Chat draws none of it, as Slack
+draws a bot's state only as presence: a message to chopin it cannot take is a row only its
+sender sees, with _How to fix_. The web client no longer sends `chat:wake`, since the
+connector retries on its own within seconds; the server still answers it. The page cannot
+hear the machine while the room's own connection is lost, so the live region then tells that
+connection alone and tells the machine again, with the state then known, once the connection
+is back. `plannerForBanner` and `connectionStep` decide this, so the button and the live region
+cannot disagree. A move to another machine is one state, connecting to it, from the
+person's click until the server's word after it is known (`machine-switch.ts`): the `starting`
+word carries the id of the machine asked (`machine`), so a page names its own machine from the
+word alone, and how often a machine was tried is never shown or said. A screen reader hears each phase once as it begins, from
 one live region of the page, and nothing when it clears; the region remembers the machine
 state it last said, so one that carried on through a loss is not said again when the
 connection returns, and a different one is said once. Other harnesses never send it, and
@@ -663,7 +701,7 @@ Your work is kept until 10:31 AM._ for a detached holder with its deadline, and 
 connected._ where none is attached, naming the machine only when it is the one the
 document's button names (the person's choice, else the one Default machine uses now), and
 otherwise only its owner's login (_@mona's machine_).
-_Connecting_ and _No machine is connected_ are said only once they have lasted the 1.5 s a lost connection waits before the page speaks of it, the last state staying until then, so a restart's passing states are never shown; every state clearing goes at once. Through a lost connection the page keeps the last state it knew, however long the machine takes to return: a server that has just started tells `none` to everyone who connects until a machine returns, so the first `none` after the connection comes back is its placeholder, not news of the machine, and nothing is said until another state arrives. A `none` told after any other state, a machine removed while the page is connected, is still said, and so is the first state of a page that has known nothing else. It never names another machine of the list: while the person's machines are loading, while the
+_Connecting_ and _No machine is connected_ are said only once they have lasted the 1.5 s a lost connection waits before the page speaks of it, the last state staying until then, so a restart's passing states are never shown; every state clearing goes at once, and so does the state that follows the person's own choice of a machine, which is what they asked for and no restart's passing. While that choice is being saved the status names no machine, so it never says the one just left. Through a lost connection the page keeps the last state it knew, however long the machine takes to return: a server that has just started tells `none` to everyone who connects until a machine returns, so the first `none` after the connection comes back is its placeholder, not news of the machine, and nothing is said until another state arrives. A `none` told after any other state, a machine removed while the page is connected, is still said, and so is the first state of a page that has known nothing else. It never names another machine of the list: while the person's machines are loading, while the
 list names a machine the document does not run on, a teammate's or another of the person's own,
 for a Planner their own account is starting or has lost, while it describes another account's Planner than the page's connection does, or while it was read before the connection's last word, which describes the Planner as it was (the page reads it again on every word, and a read that began after the word is the one that may name a machine), nothing is named
 until it agrees. Meanwhile the status says nothing of the machine, however long that takes (a read that fails or a hidden tab leaves it empty, never stale), and what it said of an older word does not stay. The state it last showed and said is remembered through that gap, with the live region silent meanwhile, but only so that the same state naming the same machine, such as a word that repeats it with one more attempt, is neither made to wait out its grace again nor announced twice. Any other state that arrives after the gap is drawn by its own rules, never in place of what was shown before the gap: a state that waits (_Connecting_, _No machine is connected_) draws nothing until it has lasted its grace, so a document moved from one machine to another does not read the first machine's _offline_ before it says it is connecting to the second, and a state with no grace is drawn at once. With no gap, in an ordinary transition, the last state still stays through the grace of the next, so a reconnect does not flicker. A `disconnected` Planner's work is
@@ -673,7 +711,7 @@ run cards carry `disconnected` beside the status they last reported: each reads
 its clock held at the last report; an open card says what it last reported and what
 happens when the Planner returns. A card offers Pause, named as waiting for the Planner
 to reconnect, because Chopin holds it, and no Resume, which it cannot hold. While the
-page's connection banner shows, the cards say nothing of the machine: no **disconnected**, no
+page's offline bar shows, the cards say nothing of the machine: no **disconnected**, no
 note, and a plain Pause, with the status as last reported, a still neutral ring and the
 clock held; the words come back with the connection, as the state then is. Decisions
 stay where they were and stay answerable. **Build plan** says to reconnect the machine
@@ -696,12 +734,28 @@ route, not a new connector protocol: a connector that does not report is
 unaffected, and a server without the route answers a reporting connector 404,
 which it takes to mean no.
 
+A connector from before the report (chopin releases before 0.0.23, `PLANNER_REPORTS_FROM`) cannot say why
+its backend exited, and one whose backend never attaches says nothing at all, so Chopin tells what it saw
+itself rather than let _Connecting_ go on for ever. Every launch of a backend asks for a credential from
+every release, so each one asked while the Planner is not attached counts (one asked while it is
+attached is a running backend's renewal, which does not): a second means the first ended, and from the
+third in a row `starting` carries a `failure` whose `attempts` are the launches that ended and whose
+`reason` is Chopin's own (_It started and stopped again before it connected_), naming the release the
+machine runs and that `chopin update` there shows why, where it is older than 0.0.23. A machine asked
+to run a document's Planner that has not attached one after `PLANNER_PATIENCE_MS` (2 minutes: enough for
+a first start that clones and builds) is told the same way, whichever connector it runs: _It hasn't
+answered yet_ or _It started but hasn't connected yet_, with `attempts` 0, which the menu says with
+_Waiting since 7:26 PM._ under _Show details_ (_Last tried at 7:26 PM._ once launches have ended; the
+count is never said). The 15-second sweep announces it once. What a connector reports,
+when it does, is told instead. All of it is forgotten as a report is, and when the document's machine
+is another, so a machine that was waited on is never waited on again from where it left off.
+
 **Unattached documents.** Members, MCP callers, and research requests never claim
 ownership under `HARNESS=remote`. An `@chopin` message or `invoke_planner` call
 for a document with no attached client, including one within its grace period or
-disconnected with its work kept (the message says its machine is offline and that the work
-is kept and picks up when it is back), is saved and waits for a Planner to attach, as
-[saved requests](#saved-requests) describe.
+disconnected with its work kept (the message says its machine is offline, so the message
+was not sent, and to send it again when it is back), is refused with that message and nothing
+is kept, as [messages while the Planner works](#messages-while-the-planner-works) describes.
 Before accepting either, the server rechecks an attached connection as its periodic
 recheck would: if the owner's browser sign-in has ended or storage no longer
 assigns that owner, it closes the connection, releases the ownership, and refuses the
@@ -788,6 +842,104 @@ A harness session is bound to one credential revision. Before an eight-hour
 GitHub App token refresh, Chopin aborts and discards every Planner session
 using that revision. The next turn creates a fresh session with the new token.
 
+## Files in Chat
+
+A message can carry images and text files: the `+` in the composer, a drop on it and a paste
+add them, and each shows as a chip, with its picture for an image, its name and its size until the
+message is sent.
+The server keeps them in the document's storage (the `chat_attachments` table and the memory
+adapter's equivalent; see [Storage](storage.md)), not in the sidecar, and a sent message shows them
+to everyone in the room.
+
+**Upload.** The browser sends each file's bytes to `POST /api/channels/:channelId/attachments`, with
+its name and declared type in the query (`name`, `type`), and sees progress as the bytes go. The
+route needs a session, the app's own origin, and repository write access to a document that is not
+archived. It answers `201` with the file as the server kept it (`id`, `name`, `kind`, `mimeType`,
+`size`), or a refusal with a `reason` (`too-large` 413, `empty`, `unsupported` and `image-type` 422,
+`too-many` and `too-much` 429, `not-allowed` 403). A file is its uploader's alone until a message is
+sent with it: `DELETE` on the same path with the file's `id` takes back one that has not been sent,
+and an upload nobody sent within a day is forgotten. One person may leave unsent at most four times
+what a message may carry.
+
+**What a file is.** The server reads the bytes and decides, whatever the name or declared type say
+(`packages/protocol/attachment.ts`, which the browser runs too, before the upload): a PNG, JPEG,
+WebP or GIF is an image; UTF-8 text with no stray control character is a text file; anything else
+is refused. A file whose name or declared type says it is an image must be one of those four rasters
+by its bytes, so an SVG, a HEIC or a page named `.png` is refused rather than stored under a type
+it is not. The file is stored under the type its bytes have, and a text file, whatever it is called,
+as `text/plain`.
+
+**Limits.** Three settings, each also told to the browser when it joins: `CHAT_ATTACHMENT_MAX_BYTES`
+for one file (1 MiB by default), `CHAT_ATTACHMENT_MAX_COUNT` for a message (5; `0` turns files off)
+and `CHAT_ATTACHMENT_MAX_TOTAL_BYTES` for all of a message's (4 MiB). See
+[Self-hosting](self-hosting.md). Under `HARNESS=remote` the per-file and total caps are never more
+than 1 MiB.
+
+**To the Planner.** A file sent with a message to the Planner reaches its turn as the message's own
+parts: a text file as a file part (`text/plain`) and an image as an image part, and only where the
+model the turn would run reads images, by its catalog entry's `inputTypes`. A model that does not
+say so reads as text only, and so does a harness that reports no catalog (`copilot-sdk`), so the
+`+` explains why images are unavailable there and the server refuses an image sent to the
+Planner all the same ("This model can't read images"); the same image can go to the room. Atomic is
+given images as its own prompt images and each text file written into the prompt under its name;
+the Copilot SDK likewise, with images as blob attachments; a remote Planner's client is sent them
+in the turn's `attachments` if it asked for that feature, and otherwise as words (see [Images and files in a turn](agent-connection.md#images-and-files-in-a-turn)). If the model has stopped
+reading images by the time the turn starts, the prompt says which images were sent and not shown.
+A repair attempt of a turn is given the prompt alone.
+
+**Reading.** `GET /api/channels/:channelId/attachments/:id` answers a person who can read the
+document, and only once a message has been sent with the file (before that only its uploader may). A
+person who cannot, a missing file and another document's file are the same `404`. A raster image is
+served inline under its own type; a text file is a download of `text/plain; charset=utf-8`; every
+answer carries `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none';
+sandbox`, so a stored file is never rendered as HTML or SVG.
+
+## Dictating a message
+
+The composer has a microphone button where speech can be turned into words, and nowhere else. It
+never records until a person presses it (the browser asks for the microphone then and not before),
+and it stops on a second press, on Escape, when the message is sent, when the page is hidden, when
+the person leaves the document and when the document stops taking messages. Nothing runs in the
+background, and what a recognizer reports after a stop is ignored.
+
+**Where speech becomes words.** Where `TRANSCRIPTION_MODEL` is set (off by default; see
+[Self-hosting](self-hosting.md)), always the deployment's transcription, in every browser; the
+browser's own speech recognition is not used at all. The composer records on the device, showing the
+recording and its clock, and when the person stops it shows Transcribing and sends the recording to
+`POST /api/channels/:channelId/transcriptions` for a person who can write to the document, from the
+app's own origin. The server reads the bytes (a recording a browser makes, a WAV or an MP3, up to
+`TRANSCRIPTION_MAX_BYTES`), sends nothing else to the provider, and answers with JSON lines as the
+provider writes the words: `{ "delta" }` for words added, then `{ "text" }` with all of them, or
+`{ "error" }` if the provider stopped part way. The words added are shown beside the caret as they
+come, and the whole text is written there. The route answers 404 where no model is set. The
+`session:hello` frame names the provider and the longest recording it takes
+(`transcription.provider`, `transcription.maxBytes`) only where it is set. A recording stops by
+itself before it is longer than that, is transcribed, and the person is told why it stopped. The
+button waits for that frame, so a browser never starts its own recognition on a deployment that has
+transcription.
+
+Where `TRANSCRIPTION_MODEL` is off, only the browser's own speech recognition (`SpeechRecognition`,
+prefixed or not), and only if the browser says it runs on the device (`processLocally`): a browser
+that cannot say so is treated as having none and has no button, because without it a browser may
+send the audio to a speech service. A device with no model for the person's language is asked to
+fetch one before the microphone opens; if it cannot, the person is told that dictation isn't set up
+on the server and that the device can't recognize their language by itself.
+
+**What it does to the draft.** Words the recognizer is sure of are written into the draft at the
+caret the person had when they pressed the button, spaced as typing would, one result after another;
+words it is still working on are shown beside that place in a quieter ink and replaced by the next
+result, and are never part of the draft's text, selection or history. The draft stays ordinary
+text the person can edit at any time: typing or moving the caret takes dictation with them. A
+message sent while speaking is sent as the person saw it, and so is the draft while a recording is
+being transcribed: typing and moving the caret then are kept, and the words go where the caret went.
+A blocked microphone, no microphone, a language the device cannot recognize, a lost connection and a
+recording that could not be transcribed each stop it with a plain message.
+
+**Accessibility.** The button is "Dictate", pressed while listening, with the chord (Alt+Shift+M, ⌥⇧M on
+a Mac) in its tooltip and in the keyboard shortcuts sheet; a polite live region says when it starts,
+when it stops and why not; and the dot beside it, with the time so far, holds still where the person
+prefers reduced motion.
+
 ## Chat context
 
 [Automatic participation](conversation-initiative.md) is enabled with the Planner and lets
@@ -843,11 +995,53 @@ Chat references are typed server-side resources, not URLs the model can
 follow. `#` selects another ordinary document in the current repository.
 References persist with their message, but `read_reference` accepts only the
 bounded set retained by the active Planner session. A document reference reads
-latest canonical source and reports whether it changed since selection. New
-messages no longer offer `%` research references; persisted references from the
-removed Research Workspace interface still return a bounded compatibility
-projection. Both forms are untrusted evidence, and neither changes the
-room-fixed target of `read_plan` or editing tools.
+latest canonical source and reports whether it changed since selection. Typing `%`
+no longer opens anything; a research card of this document is chosen from `@` (below),
+and persisted references from the removed Research Workspace interface still return a
+bounded compatibility projection. Both forms are untrusted evidence, and neither changes
+the room-fixed target of `read_plan` or editing tools.
+
+The composer's `#` and its Mention docs button also point at the document's own parts and at
+its repository (`@` is for people), as references the Planner receives as identities and not as
+words; their chips are written `@Section` and `%Research card`, as before. A request names the part and never
+its text; the server resolves it against the document as it stands when the message
+is sent, writes the label the person saw from it, and refuses one that has gone, in
+words the composer shows (`That heading is no longer in the document.`,
+`That Decision is no longer in the document.`, `That file is not in the repository.`,
+`This repository's files cannot be listed right now, so a file cannot be mentioned.`,
+`That path is too long to mention.`):
+
+| Kind       | Request       | What the Planner is told beside the words                                                                                                                                                                   |
+| ---------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `heading`  | `anchor`      | `[heading anchor "overview", level 1, line 1 of this document]`. The anchor is the heading's text as GitHub slugs it, `-1`, `-2` after a repeat, in document order, over the document's top-level headings. |
+| `decision` | `decisionId`  | `[Decision id "<id>" of this document]`. The label is the Decision's header (its prompt where it has none).                                                                                                 |
+| `file`     | `path`        | `[file path "src/index.ts" in the repository]`. A plain path from the root: no `..`, `.`, empty part, backslash or control character.                                                                       |
+| `research` | `workspaceId` | As before: a reference read by id with `read_reference`, drawn `%Title`. Only a workspace of this document is accepted.                                                                                     |
+
+The composer asks for what it can offer with `GET /api/channels/:channelId/mentions?query=&limit=`
+(`limit`, 1 to 20 of each kind, is 6 by default; a query is at most 64 characters). A person who
+can read the document gets its headings (`anchor`, `text`, `level`), its Decisions (`id`,
+`title`), its research cards (`workspaceId`, `title`: the workspaces the document holds a card
+for) and its repository's files (`files`, paths), each narrowed by the query (a title or name
+that starts with it first, then a word, then any part) and read from the same source a message's
+mentions are resolved against. Anybody else is told the document does not exist. Files are those
+of the Planner's checkout where the document has one (`HARNESS=atomic`, what `git` tracks and has
+not ignored, kept 10 seconds) and else what GitHub lists for the default branch, read with the
+asking person's own session and kept a minute per repository, up to 50,000 paths; with neither,
+`files` is left out and a file mention is refused.
+
+For `@`, the composer asks `GET /api/channels/:channelId/people` once per document for the people
+who can read it: the repository's collaborators with pull access and their GitHub pictures (bots
+left out, at most three pages of 100), read with the asking person's own session and kept a
+minute per session and repository, with `authoritative: true`. Where GitHub will not list them
+(a reader without push access, or a deployment whose GitHub has no such call) it answers with the
+document's creator and the authors of its recent edits, with `authoritative: false`. Anybody who
+cannot read the document is told it does not exist, as for `mentions`.
+
+None but a document or a research reference can be read by id: a heading, a Decision and a file
+are places the prompt already says how to find (`read_plan` shows the document with its Decisions,
+the repository tools read a file), and are quoted so a name with a quote or a line break stays one
+value. Each is kept with its message, in the same persisted shape, strictly checked on restore.
 
 Messages from people retain their GitHub handles so disagreement is not merged
 into one anonymous user voice.
@@ -943,126 +1137,81 @@ Blocks starting on lines 1-120 (index type lines digest):
   and no blocks. Its `structuredContent` is the whole document as before,
   whatever slice the text carries.
 
-## Saved requests
+## Messages while the Planner works
 
-A request to the Planner that cannot start at once is kept, not dropped and not refused. It is
-acknowledged only after it is saved, as a row in `planner_deferred_turns`, in the same commit as
-the transcript entry that shows it. Five kinds are kept: a Chat message to the Planner, a member
-message from an MCP `invoke_planner` call, an automatic follow-up (`invoke_planner` with
-`as: "system"`), a comment note sent to Chopin in a document or in one of its children, and a task
-draft from Build. Every one is saved first, even when nothing is running and a machine is there: a
-turn begins from its row, once a session is open on the machine, so a session that cannot be
-opened leaves the request waiting and a stop before the turn starts loses nothing. A request waits
-when a turn is running, when no turn may start because the process is stopping, when a saved
-request is already waiting ahead of it, and, under `HARNESS=remote`, whenever no Planner is
-attached, however long that lasts. Behind a running turn the queue holds
-20 requests; past that the server answers `planner-queue-full` before anything is saved, which is
-not a refusal of the message: the sender's browser keeps it and sends it again, in its turn and
-with the same request ID, every few seconds until there is room, and shows it as waiting to send
-meanwhile. A machine that is away has no such bound. As a chat app keeps a message for someone
-who is offline, every request a person sends it is saved, in order, and kept until the machine is
-back and takes it or the sender deletes it; none is refused or dropped for how many wait or how
-long the machine has been away, and nothing is said in Chat about it. Nor is one turned away for
-how many are being saved at the same moment, which is limited to 20 only for a machine that is
-there (past which a send is answered `temporarily-unavailable` and sent again, below): a Chat
-message, an MCP call and a task draft for a machine that is away are each saved, in the order they
-came, however many arrive together and however slowly Chopin finds out that the machine is away.
-What remains is a limit on a message's size. A send whose commit
-went through but whose answer was lost is answered `temporarily-unavailable` like any passing
-trouble, and its row is not forgotten: it is put back in the queue ahead of what was accepted
-after it, and in the transcript, when the sender sends the same request again, when the queue next
-starts and when the document opens again, so it is delivered once and in order whether or not its
-sender asks again, unless it was deleted, which stays deleted. A machine that comes
-back with a long backlog takes it one request at a time, in order; while twenty or more still
-wait, a new message is held by its sender's browser as for any busy machine. So is any other refusal of a send for a passing reason (the message could
-not be saved, the room is changing, authorization is briefly unavailable, too many sends are being
-handled, a reference or the open child could not be looked up for storage's sake, or anything the
-send itself threw): it carries `temporarily-unavailable`. Only a reference the server finds at
-fault (malformed, outside the repository, no longer there) is final. A refusal without either code says the message is at
-fault, and is the only one that marks it Couldn't send. Server-authored turns (answers to open
-decisions, relinking after a build, settling a prototyped passage) and background jobs are not
-kept this way and wait as before. `AUTH_MODE=local` is never handed over. It keeps requests as
-rows only where the Planner runs on a machine that can be away (`HARNESS=remote`), so a message to
-it waits for the machine as anywhere else; with a Planner on the same computer nothing is away and
-the queue stays in memory.
+Nothing a person sends to the Planner is held for later. A message is never "waiting" or
+"delivered later"; it does one of three things, and the sender is told which.
 
-A row is `waiting`, `started`, `ended`, `interrupted` or `cancelled`. Only `waiting` can move to
-`started` or `cancelled`, and only `started` to `ended` or `interrupted`; any other move changes
-nothing and is logged. Every move is written in one commit with the entry or notice it explains
-and published after it commits.
+- **The Planner is idle and a machine can take it:** the message starts a turn.
+- **A turn is running:** the message is posted to the transcript and acknowledged at once, and
+  given to the running turn, which reads it at its next step, after the tool calls of the step it is
+  in and before its next call to the model, as `@handle: text` in the same turn. `PlannerSession.steer`
+  uses the harness's own mid-run input: Atomic's `steer`, and a `steer` frame to a `HARNESS=remote`
+  client that offered the `steer-turn` feature
+  ([Agent connection](agent-connection.md#features)). A message sent before the turn's first model
+  call is given to it as soon as that call is made. Steering takes the write access starting a turn
+  does: `chat:send` is checked before it reaches Chat, so a reader cannot steer, and two people can
+  steer one turn, each message read once in the order it was sent. A message with references
+  carries them, and one sent from a child carries the child as focus.
+- **It cannot be taken:** it is refused, saves nothing and says so. With a harness that takes
+  no input mid-run (the Copilot SDK), or a running turn that is a background job's, the code is
+  `planner-busy` and the words are "chopin can't take messages while it works on this machine. Stop
+  it to ask now."; the server log names the harness. With no machine attached, or one that is away,
+  the code is `planner-not-attached` with the connection's own words, mid-turn or not. For a
+  machine that is away they say what happened and what to do: "@mona's machine is offline, so this
+  message wasn't sent. Send it again when it's back."; inside a deploy's hand-over window before
+  the machine's client has resumed they say "Still connecting to @mona's machine, so this message
+  wasn't sent. Send it again in a moment." They never say that anything is kept: the
+  machine's own work is, and the status beside the composer says so (_Your work is kept._), but
+  the message is not.
 
-**When a request starts.** In the order they were accepted, once the process is ready, and only
-through a check that claims nothing until a login is known to be live. Under `HARNESS=remote` that
-is an attached Planner. Otherwise the document's owner must have a live login, or, with no owner,
-the login of someone whose request is waiting must be live, and it claims the document. A login is
-live again when its browser sends its cookie. The check is tried when the process is ready, when
-a login comes back, when a new request is accepted, when a Planner attaches and when a turn ends.
-A request whose sender can no longer write is cancelled as failed; one whose focused child
-document is gone is cancelled as failed; a comment whose thread was resolved is cancelled without
-a notice, because the resolution is what members see. Only one turn is begun at a time: Chopin's
-own background jobs (such as keeping a title) wait beside saved requests, run after those ahead of
-them, and do not count against the 20 places a person's messages may fill.
+A message sent while a turn is only beginning or finishing has no session to be given to just
+now. It is answered as a passing trouble (`temporarily-unavailable`), and its browser sends it
+again, with the same request ID, in a moment. If a turn ends between a message being posted and
+the turn reading it, an idle Chat starts a turn for the message; otherwise Chat says that Chopin
+did not read it, and it is not sent again on its own. A process that is stopping starts no turn and
+says nothing, so the browser sends the message again to the next process. Sends are admitted one
+at a time, and at most 20 are processed at once (past that a send is answered
+`temporarily-unavailable`).
 
-**What a person sees.** A message appears in Chat at once, as theirs, with `deliveryState`: `sent`
-while the row waits, `delivered` once its prompt is on its way to the machine, and `failed`, with `deliveryFailure`
-(`machine-removed`, `access-lost` or `document-unavailable`), when it can never be delivered as
-sent. The reason is kept on the cancelled row, so a document that was closed when its request was
-cancelled still says why when it opens again. An entry saved before this existed has no state and
-reads as delivered. `chat:delete` removes
-a message that has not been delivered, for everyone, and cancels its row in the same commit; one
-already taken, or someone else's, is refused with the code `message-not-deletable`, and deleting twice
-leaves it deleted. That code is the server's last word; a delete refused for any other reason (storage
-busy, the message being taken by the machine at that moment) says nothing final. `chat:retry`
-sends a `failed` message again as it was. A message that is waiting is not listed in `chat:queue`,
-which lists only requests with no entry of their own. Chat says nothing about why a queue waits,
-however long it does: the message's own mark is the only sign, and the machine's state is shown on
-the machine button alone, as everywhere else. (The design asked for one Chat line after a delay,
-saying what the queue waits for; the rule that machine state is not said anywhere else replaces
-it, so there is no such line and no `DEFERRED_NOTICE_DELAY_MS`.)
+A comment note sent to Chopin, an automatic follow-up (`invoke_planner` with `as: "system"`) and a
+task draft from Build need a turn of their own, which a running turn cannot give them. While a turn
+runs they are refused before anything is saved: "Chopin is working on something else. Try again when
+it has finished." (`planner-busy` for MCP). An `invoke_planner` call that is a message is given to the
+running turn like one sent in Chat, and its `settled` hook runs once that is done. A comment
+note sent to Chopin in a child document is admitted by the root's Chat in the same way.
 
-The sender's own message carries one quiet mark, in plain words and readable by a screen reader:
-**Waiting to send** (a clock) while only the browser has it, in an outbox that sends it by itself, in
-order and once, when the page's connection is back; **Sent** (one tick) once the server has it and
-the machine has not taken it, whether the machine is away, still starting, or between processes
-during a deploy; **Delivered** (two ticks) once the machine took it. A message not yet delivered
-has a menu with **Delete**, even one the browser has already put on the wire, whatever the server
-last answered it (an earlier attempt of a message it turned down for a passing reason may have
-been kept, its answer lost): the server is told to drop it as soon as there is a connection,
-cancels its saved row if it had one, and remembers that it was taken back so that a send still on
-its way from a lost connection cannot bring it back. A message
-taken back while the page is offline, or whose delete the server has not answered, leaves the Chat
-at once and stays gone across a reload: the browser keeps the ids in the tab's session storage, as
-it keeps the outbox, and asks again until the server answers, so the message is never delivered and
-never comes back. The outbox remembers which messages were put on the wire, across a reload too, so
-that a message whose answer was lost, taken back after the page was reloaded offline, is still told
-to the server; only a message that provably never left the page is just dropped. Only the server's
-last word (`message-not-deletable`) ends the asking, and shows the message again with its mark; a
-refusal for a passing reason keeps the message hidden and is asked again after a few seconds, as a
-lost connection is asked again on the next one. A message that can
-never be delivered as sent, or that the server turned down for good, says **Couldn't send** on
-itself, with the reason and **Try again** and **Delete**, and never in a strip above the composer. While the
-page's connection banner shows, that line gives way to it and returns with the connection.
-A full queue is not that: the message stays marked as waiting to send. The outbox is used only
-with a server that acknowledges sends (`chatSendAcks`), and only for messages to the machine.
+What still waits for the running turn, in memory, is Chopin's own scheduling, which nobody typed
+and which is neither saved nor shown: background jobs (such as keeping a title) and the turns the
+server writes for itself (answers to open decisions, relinking after a build, settling a prototyped
+passage, an ended workflow run, a readiness check, an initiative proposal). They start in the
+order they were asked once the running turn ends, a job that is no longer worth running is dropped
+at that point, and none counts against what a person may send.
 
-**Delivered is true.** A request kept as a row is handed to its machine only once a session is
-open there: the row moves from `waiting` to `started`, and its message to `delivered`, in the
-commit that follows a successful open, immediately before the prompt is sent. If the machine
-cannot open a session, which is what a link that dropped as the request was starting does, the
-row stays `waiting` and the message stays **Sent**, at the head of the queue and in order. It is
-tried again when something says the machine may be there (a request accepted, the machine back, a
-login restored), once each time, never in a loop, and without a failure notice or any line in
-Chat. A message that starts at once is marked **Sent** until the same point and **Delivered** then. What is not
-claimed: the prompt is handed over, not confirmed read, and a connection that drops between the
-commit and the send ends the turn with its usual notice and is not run again, as any started
-turn.
+**What a person sees.** The message is in Chat at once, as theirs, with no mark. While only the
+browser has it, in an outbox that sends it by itself, in order and once, when the page's connection
+is back, it says **Sending**; never waiting, queued or a clock. When the server refuses it because
+no machine took it or the running turn cannot take input mid-run, and the composer holds no newer
+draft, the message's words (with its mention, references and staged files) return to the composer
+draft, chopin says why in a row at the end of the transcript only that person sees (with _How
+to fix_ where the machine has something to fix), so nothing typed is lost, and while Chopin works the composer's
+one button offers Stop so the person can stop Chopin and send it. When a newer draft was already
+typed, or another refusal turned the message down, it says **Couldn't send** on itself, with the
+reason, **Try again** and **Delete**, which act on the outbox alone since the server kept nothing.
+While the page's offline bar shows, both give way to it and return with the connection. The
+outbox is used only with a server that acknowledges sends (`chatSendAcks`), and only for messages
+to the machine. A teammate sees the steering message as an ordinary one where it was sent in the
+transcript, between the Planner's own lines. Stop is how to ask now: with an empty draft (or a
+draft refused because Chopin is working) it ends the running turn.
 
-**Restarts.** When a document opens, rows `started` under an older fencing token are marked
-`interrupted`, each with one Chat notice, and are never run again, because their turn may already
-have changed the document. A turn cut off at `HANDOVER_TURN_WAIT_MS` ends its row the same way. The
-rows still `waiting` rejoin the queue, a comment's prompt is built again from its thread as it
-reads now, and a task draft is the document's live draft again, so a second press of Build returns
-it. A retried `chat:send` with a request ID the process no longer holds is answered from its row.
+**Rows an earlier release kept.** An earlier release saved a Planner request that waited as a row in
+`planner_deferred_turns` and marked its Chat entry `deliveryState`. Nothing writes or reads those rows
+now, and the table, its columns and its rows are kept, so a rollback finds them as they were. When
+the process is ready, the holder of the writer lease closes the rows still open
+(`deferredTurns.retire`: `waiting` becomes `cancelled`, `started` becomes `interrupted`, once a
+start, logged with a count). A message that had waited stays in its Chat as an ordinary message
+no Planner took; the entry's stored `deliveryState` and `deliveryFailure` are dropped as the
+Chat is restored, so it shows no mark. See [Storage](storage.md#a-live-database-from-an-earlier-release).
 
 ## Session lifecycle
 

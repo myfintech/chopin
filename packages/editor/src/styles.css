@@ -33,7 +33,7 @@
 .plan-research-draft-host,
 .plan-research-draft {
 	width: 100%;
-	max-width: var(--document-prose-measure);
+	max-width: var(--plan-measure, var(--document-prose-measure));
 }
 
 .motion-research-draft {
@@ -166,14 +166,14 @@
 .plan-research-composer,
 .plan-research-tracked {
 	width: 100%;
-	max-width: var(--document-prose-measure);
+	max-width: var(--plan-measure, var(--document-prose-measure));
 }
 
-/* One surface: the composer is the field, so focus rings the whole card. */
+/* One surface: the composer is the field, so its edge is the control boundary and focus rings it. */
 .plan-research-composer {
 	position: relative;
 	display: grid;
-	border: var(--edge-width) solid var(--color-edge);
+	border: var(--edge-width) solid var(--color-control-boundary);
 	border-radius: var(--radius-lg);
 	background: var(--color-page);
 	box-shadow: var(--shadow-resting);
@@ -1600,14 +1600,16 @@
  * The drawer's progress is read only while a finger drags the sheet: it keeps
  * its last value when the sheet's detents change underneath it. With one detent
  * it runs from 0 open to 1 dismissed; with two, from 0 at the large detent to 1
- * at the medium one.
+ * at the medium one. The backdrop asks of its own siblings, never of `body`: a `:has()` on `body`
+ * made every change in the page that a `:has()` might care about restyle the whole page.
  */
-body:has(.plan-comment-sheet-popup[data-swiping]) .plan-comment-sheet-backdrop {
+.plan-comment-sheet-backdrop:has(~ .plan-comment-sheet-viewport
+	.plan-comment-sheet-popup[data-swiping]) {
 	opacity: calc(var(--backdrop-opacity) * (1 - var(--drawer-swipe-progress, 0)));
 }
 
-body:has(.plan-comment-sheet-popup[data-swiping])
-	.plan-comment-sheet-backdrop[data-plan-comment-sheet-detents] {
+.plan-comment-sheet-backdrop[data-plan-comment-sheet-detents]:has(~ .plan-comment-sheet-viewport
+	.plan-comment-sheet-popup[data-swiping]) {
 	opacity: calc(
 		var(--backdrop-opacity) +
 			(
@@ -1666,6 +1668,10 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 /* The finger owns the sheet while it drags; the spring takes over on release. */
 .plan-comment-sheet-popup[data-swiping] {
 	transition: none;
+}
+
+.plan-comment-sheet-popup[data-swiping] .plan-comment-sheet-head {
+	cursor: grabbing;
 }
 
 .plan-comment-sheet-grabber {
@@ -2312,15 +2318,15 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	overflow: visible;
 }
 
-/* The draft is content in progress, so the empty-document prompt would only overlap it. */
+/*
+ * The draft is content in progress, so the empty-document prompt would only overlap it. The draft
+ * marks the editor's wrapper (`data-plan-research-draft`) rather than the wrapper asking with
+ * `:has()`, which would restyle the whole document whenever a block was added or removed.
+ */
 .plan
-	.mdxeditor-root-contenteditable:has(.plan-content[contenteditable="true"]
-		> .plan-research-draft-host)
-	> .plan-content:not([contenteditable]) {
-	display: none;
-}
-
-.plan .plan-content:has(.plan-research-draft-host) ~ .plan-body-placeholder {
+	.mdxeditor-root-contenteditable[data-plan-research-draft]
+	> .plan-content:not([contenteditable]),
+.plan .mdxeditor-root-contenteditable[data-plan-research-draft] .plan-body-placeholder {
 	display: none;
 }
 
@@ -3005,17 +3011,31 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	max-inline-size: none;
 	max-block-size: none;
 	margin: 0;
-	padding: 4rem 1.5rem 1.5rem;
+	padding: calc(env(safe-area-inset-top, 0px) + 4rem) calc(env(safe-area-inset-right, 0px) + 1.5rem)
+		calc(env(safe-area-inset-bottom, 0px) + 1.5rem) calc(env(safe-area-inset-left, 0px) + 1.5rem);
 	border: 0;
 	background: var(--color-text-primary);
 	color: var(--color-page);
 	font-family: var(--font-sans);
 }
 
+/* A closed dialog stays hidden: only an open one is a grid. */
+.plan-image-lightbox[open] {
+	display: grid;
+	grid-template-rows: minmax(0, 1fr) auto;
+	gap: 1rem;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	.plan-image-lightbox[open] {
+		animation: plan-source-in var(--duration-base) var(--ease-out);
+	}
+}
+
 .plan-image-lightbox-toolbar {
 	position: absolute;
-	inset-block-start: 1rem;
-	inset-inline-end: 1rem;
+	inset-block-start: calc(env(safe-area-inset-top, 0px) + 1rem);
+	inset-inline-end: calc(env(safe-area-inset-right, 0px) + 1rem);
 	display: flex;
 	gap: 0.5rem;
 }
@@ -3025,7 +3045,7 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	align-items: center;
 	justify-content: center;
 	inline-size: 100%;
-	block-size: 100%;
+	min-block-size: 0;
 	overflow: auto;
 	overscroll-behavior: contain;
 }
@@ -3046,6 +3066,56 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	max-block-size: none;
 	block-size: auto;
 	margin-inline: auto;
+}
+
+.plan-image-lightbox-broken {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 0.5rem;
+	color: color-mix(in srgb, var(--color-page) 70%, transparent);
+	font-size: var(--text-sm);
+}
+
+.plan-image-lightbox-footer {
+	display: flex;
+	align-items: center;
+	gap: 0.75rem;
+	inline-size: min(100%, 48rem);
+	margin-inline: auto;
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
+}
+
+.plan-image-lightbox-text {
+	flex: 1;
+	min-inline-size: 0;
+	max-block-size: 30dvh;
+	overflow-y: auto;
+	overflow-wrap: anywhere;
+}
+
+.plan-image-lightbox-text p {
+	margin: 0;
+}
+
+.plan-image-lightbox-caption {
+	color: color-mix(in srgb, var(--color-page) 70%, transparent);
+	font-size: var(--text-xs);
+	line-height: var(--text-xs--line-height);
+}
+
+.plan-image-lightbox-generated {
+	margin-inline-start: 0.5rem;
+	color: color-mix(in srgb, var(--color-page) 70%, transparent);
+	font-size: var(--text-xs);
+}
+
+.plan-image-lightbox-count {
+	flex-shrink: 0;
+	color: color-mix(in srgb, var(--color-page) 70%, transparent);
+	font-size: var(--text-xs);
+	font-variant-numeric: tabular-nums;
 }
 
 /*
@@ -3996,14 +4066,14 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 }
 
 .plan-content .plan-code-chrome,
-.plan-content .plan-code-chrome .plan-code-toggle,
+.plan-content .plan-code-chrome :is(.plan-code-toggle, .plan-code-wrap),
 .plan-content .plan-code-chrome .plan-code-language [data-nucleo-icon] {
 	transition: opacity var(--duration-fast) var(--ease-out);
 }
 
 @media (prefers-reduced-motion: reduce) {
 	.plan-content .plan-code-chrome,
-	.plan-content .plan-code-chrome .plan-code-toggle,
+	.plan-content .plan-code-chrome :is(.plan-code-toggle, .plan-code-wrap),
 	.plan-content .plan-code-chrome .plan-code-language [data-nucleo-icon],
 	.plan-content .plan-diagram {
 		transition: none;
@@ -4039,7 +4109,7 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 		[aria-expanded="true"]), :has(.plan-code-chrome[data-editing])) {
 		/* Only a named language says something the rendering does not. */
 		& .plan-code-chrome:not([data-kind="code"]),
-		& .plan-code-toggle,
+		& :is(.plan-code-toggle, .plan-code-wrap),
 		& .plan-code-language [data-nucleo-icon] {
 			opacity: 0;
 		}
@@ -4083,13 +4153,15 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	}
 }
 
-.plan-content .plan-code-toggle[aria-expanded="true"] {
+.plan-content :is(.plan-code-toggle[aria-expanded="true"], .plan-code-wrap[aria-pressed="true"]) {
 	background: var(--color-brand-wash);
 	color: var(--color-brand);
 }
 
 /* A global icon colour rule would otherwise keep the icon grey. */
-.plan-content .plan-code-toggle[aria-expanded="true"] [data-nucleo-icon] {
+.plan-content
+	:is(.plan-code-toggle[aria-expanded="true"], .plan-code-wrap[aria-pressed="true"])
+	[data-nucleo-icon] {
 	color: inherit;
 }
 
@@ -4180,6 +4252,40 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	.planCode[data-plan-text]
 	[data-plan-source]:has(> br[data-lexical-managed-linebreak]:only-child)::before {
 	content: "Text";
+}
+
+/*
+ * Wrap lines, the block's own setting: long lines wrap at any width instead of scrolling, the
+ * coloured copy with the hanging indent it has on a phone, and the source as plain wrapped text.
+ */
+.plan-content .planCode[data-plan-wrap] .plan-code-view > diffs-container {
+	min-inline-size: 0;
+}
+
+.plan-content .planCode[data-plan-wrap] [data-plan-source] {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+/*
+ * Wrapped lines reach the block's end, where nothing could scroll them out from under its
+ * controls, so where the controls float over the code they take a row of their own above it, as
+ * they already do on touch.
+ */
+@media (hover: hover) and (pointer: fine) {
+	.plan-content
+		.planCode[data-plan-wrap]:not([data-plan-presentation], [data-plan-language="wireframe"], [data-plan-text]) {
+		/* The controls' 40px row, less the 12px the code already starts below the block's edge. */
+		padding-block-start: calc(var(--spacing) * 7);
+
+		& .plan-code-chrome {
+			background: none;
+		}
+
+		& .plan-diff-chrome-room {
+			display: none;
+		}
+	}
 }
 
 /*
@@ -5524,7 +5630,7 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	width: var(--plan-check-size);
 	height: var(--plan-check-size);
 	box-sizing: border-box;
-	border: 1px solid var(--color-control-edge);
+	border: 1px solid var(--color-control-boundary);
 	border-radius: var(--radius-sm);
 	background-color: var(--color-page);
 	box-shadow: var(--shadow-resting);
@@ -5603,8 +5709,11 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	animation: plan-bubble-enter var(--duration-fast) var(--ease-out);
 }
 
-/* An open comment card owns the reader's attention; a lingering selection's toolbar would cover it. */
-:root:has(.plan-comment-card.motion-comment-surface:not(.is-closing)) .plan-formatting-toolbar {
+/*
+ * An open comment card owns the reader's attention; a lingering selection's toolbar would cover it.
+ * The card marks the page (`data-plan-comment-card`) rather than the page asking with `:has()`.
+ */
+:root[data-plan-comment-card] .plan-formatting-toolbar {
 	display: none;
 }
 

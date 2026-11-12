@@ -9,6 +9,7 @@ import {
 	AGENT_VERSION,
 	encodeMessage,
 	LINK_CLOSE,
+	MAX_LINK_ATTACHMENT_BYTES,
 	MAX_LINK_MESSAGE_BYTES,
 	MAX_LINK_NOTE_LENGTH,
 	parseClientMessage,
@@ -17,6 +18,8 @@ import {
 	toolErrorSchema,
 	usableCatalog,
 } from "./protocol";
+
+import type { ServerMessage, ServerMessageOf } from "./protocol";
 
 describe("Agent connection messages", () => {
 	it("accepts each client message the protocol declares", () => {
@@ -324,6 +327,10 @@ describe("Agent connection messages", () => {
 			resumableSessions: AGENT_FEATURES.resumableSessions,
 			restartNotice: AGENT_FEATURES.restartNotice,
 			capabilityCatalog: AGENT_FEATURES.capabilityCatalog,
+			attachments: AGENT_FEATURES.attachments,
+			sessionForks: AGENT_FEATURES.sessionForks,
+			steerTurn: AGENT_FEATURES.steerTurn,
+			retryTurn: AGENT_FEATURES.retryTurn,
 			restartResumeRetryMs: RESTART_RESUME_RETRY_MS,
 		});
 		expect(AGENT_FEATURES.restartNotice).toBe("restart-notice");
@@ -331,6 +338,47 @@ describe("Agent connection messages", () => {
 		let source = await Bun.file(new URL("./client.ts", import.meta.url)).text();
 		let imports = [...source.matchAll(/^import\s+(type\s+)?/gm)];
 		expect(imports.every(match => match[1])).toBe(true);
+	});
+
+	it("carries a person's message for the running turn as a steer, named by its request", () => {
+		expect(AGENT_FEATURES.steerTurn).toBe("steer-turn");
+		let steer = {
+			type: "steer",
+			request: "r",
+			session: "s",
+			turn: "t",
+			prompt: "@bo: also X",
+		} as const;
+		expect(parseServerMessage(encodeMessage(steer))).toEqual({ ok: true, message: steer });
+		for (let missing of ["request", "session", "turn", "prompt"]) {
+			let { [missing]: _, ...rest } = steer as Record<string, unknown>;
+			expect(parseServerMessage(JSON.stringify(rest))).toMatchObject({ ok: false });
+		}
+		expect(parseServerMessage(JSON.stringify({ ...steer, extra: 1 }))).toMatchObject({ ok: false });
+		// Only the server steers: a client that sends one is malformed.
+		expect(parseClientMessage(JSON.stringify(steer))).toMatchObject({ ok: false });
+	});
+
+	it("names the Chat message a turn answers, and a retry of it as `true` or nothing", () => {
+		expect(AGENT_FEATURES.retryTurn).toBe("retry-turn");
+		let turn: ServerMessage = {
+			type: "turn",
+			session: "s",
+			turn: "t",
+			prompt: "@ana: Hey there!",
+			message: "m",
+			retry: true,
+			tools: [],
+		};
+		expect(parseServerMessage(encodeMessage(turn))).toEqual({ ok: true, message: turn });
+		let { message: _, retry: __, ...plain } = turn as ServerMessageOf<"turn">;
+		expect(parseServerMessage(encodeMessage(plain))).toEqual({ ok: true, message: plain });
+		expect(parseServerMessage(JSON.stringify({ ...turn, retry: false }))).toMatchObject({
+			ok: false,
+		});
+		expect(parseServerMessage(JSON.stringify({ ...turn, message: "" }))).toMatchObject({
+			ok: false,
+		});
 	});
 
 	it("marks a refusal as worth retrying only when the server says so", () => {
@@ -667,6 +715,168 @@ describe("What Chopin can offer of a capability catalog", () => {
 		expect(usableCatalog({})).toEqual({ catalog: {}, skipped: [] });
 		expect(usableCatalog({ commands: [{ name: "", kind: "" }] }).catalog).toEqual({
 			commands: [{ name: "", kind: "" }],
+		});
+	});
+});
+
+describe("Images and files in a turn", () => {
+	let turn = {
+		type: "turn" as const,
+		session: "s",
+		turn: "t",
+		prompt: "@ana: What is this?",
+		tools: [],
+	};
+	let image = {
+		id: "a1",
+		name: "shot.png",
+		kind: "image" as const,
+		mediaType: "image/png",
+		size: 7,
+		data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]).toString("base64"),
+	};
+	let file = {
+		id: "a2",
+		name: "notes.md",
+		kind: "file" as const,
+		mediaType: "text/plain",
+		size: 8,
+		data: Buffer.from("# Notes\n").toString("base64"),
+	};
+
+	it("is a feature a client asks for, named as the documentation names it", () => {
+		expect(AGENT_FEATURES.attachments).toBe("attachments");
+		expect(WIRE.attachments).toBe(AGENT_FEATURES.attachments);
+		// A turn's files fit inside one message with room for its prompt and tools.
+		expect(MAX_LINK_ATTACHMENT_BYTES * 4 / 3).toBeLessThan(MAX_LINK_MESSAGE_BYTES);
+	});
+
+	it("round-trips a turn's files, in order, with their bytes as base64", () => {
+		let message = { ...turn, attachments: [image, file] };
+		let parsed = parseServerMessage(JSON.stringify(message));
+		expect(parsed).toEqual({ ok: true, message });
+		expect(encodeMessage(message)).toBe(JSON.stringify(message));
+	});
+
+	it("keeps the turn an older client sees exactly as it was: the field is optional and never sent empty", () => {
+		expect(parseServerMessage(JSON.stringify(turn))).toEqual({ ok: true, message: turn });
+		expect(encodeMessage(turn)).toBe(JSON.stringify(turn));
+		expect(JSON.stringify(turn)).not.toContain("attachments");
+	});
+
+	it("refuses a file the protocol does not describe", () => {
+		for (
+			let bad of [
+				{ ...file, kind: "document" },
+				{ ...file, size: -1 },
+				{ ...file, name: "" },
+				{ ...file, extra: true },
+				{ id: "a3", name: "x", kind: "file", mediaType: "text/plain", size: 0 },
+			]
+		) {
+			expect(
+				parseServerMessage(JSON.stringify({ ...turn, attachments: [bad] })),
+				JSON.stringify(bad),
+			)
+				.toMatchObject({ ok: false });
+		}
+		expect(parseServerMessage(JSON.stringify({ ...turn, attachments: "shot.png" }))).toMatchObject({
+			ok: false,
+		});
+	});
+
+	it("takes what a model reads as a catalog reports it, and leaves the rest of the catalog alone", () => {
+		let reported = {
+			models: {
+				available: [
+					{ id: "acme/vision", name: "Vision", inputTypes: ["text", "image"] },
+					{ id: "acme/text", name: "Text", inputTypes: ["text"] },
+					{ id: "acme/unsaid", name: "Unsaid" },
+				],
+			},
+		};
+		let message = { type: "capabilities" as const, catalog: reported };
+		expect(parseClientMessage(JSON.stringify(message))).toEqual({ ok: true, message });
+		expect(usableCatalog(reported)).toEqual({ catalog: reported, skipped: [] });
+		expect(
+			parseClientMessage(JSON.stringify({
+				type: "capabilities",
+				catalog: { models: { available: [{ id: "a", name: "A", inputTypes: "image" }] } },
+			})),
+		).toMatchObject({ ok: false });
+	});
+});
+
+describe("Session forks and compaction parts", () => {
+	it("validates fork server messages and session-forks feature", () => {
+		expect(AGENT_FEATURES.sessionForks).toBe("session-forks");
+		expect(WIRE.sessionForks).toBe(AGENT_FEATURES.sessionForks);
+		let fork = {
+			type: "fork" as const,
+			session: "thread-session-1",
+			mode: "planner" as const,
+			from: { session: "root-session-1", turn: "turn-2" },
+		};
+		expect(parseServerMessage(encodeMessage(fork))).toEqual({ ok: true, message: fork });
+		let forkWithoutTurn = {
+			type: "fork" as const,
+			session: "thread-session-2",
+			mode: "planner" as const,
+			from: { session: "root-session-1" },
+		};
+		expect(parseServerMessage(encodeMessage(forkWithoutTurn))).toEqual({
+			ok: true,
+			message: forkWithoutTurn,
+		});
+		expect(
+			parseServerMessage(JSON.stringify({ ...fork, extra: true })),
+		).toMatchObject({ ok: false, code: "malformed-message" });
+	});
+
+	it("validates compacting, compaction and contextWindow stream parts", () => {
+		let compacting = {
+			type: "part" as const,
+			session: "s",
+			turn: "t",
+			part: { type: "compacting" as const },
+		};
+		expect(parseClientMessage(encodeMessage(compacting))).toEqual({
+			ok: true,
+			message: compacting,
+		});
+		let compacted = {
+			type: "part" as const,
+			session: "s",
+			turn: "t",
+			part: {
+				type: "compaction" as const,
+				trigger: "auto" as const,
+				summary: "Summarized earlier messages.",
+				tokensBefore: 44541,
+				tokensAfter: 12100,
+			},
+		};
+		expect(parseClientMessage(encodeMessage(compacted))).toEqual({
+			ok: true,
+			message: compacted,
+		});
+		let finishWithWindow = {
+			type: "part" as const,
+			session: "s",
+			turn: "t",
+			part: {
+				type: "finish" as const,
+				finishReason: { unified: "stop" as const },
+				totalUsage: {
+					inputTokens: { total: 12000 },
+					outputTokens: { total: 800 },
+					contextWindow: 128000,
+				},
+			},
+		};
+		expect(parseClientMessage(encodeMessage(finishWithWindow))).toEqual({
+			ok: true,
+			message: finishWithWindow,
 		});
 	});
 });

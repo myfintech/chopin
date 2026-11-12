@@ -20,6 +20,7 @@ import {
 	CloseIcon,
 	DocumentIcon,
 	EllipsisIcon,
+	FitWidthIcon,
 	MagnifierIcon,
 	PencilIcon,
 } from "@chopin/icons";
@@ -68,7 +69,14 @@ import {
 	showsMachineChoice,
 	useMachineChoice,
 } from "./machine-choice";
-import { plannerPlacement, plannerStatus, plannerWithheld } from "./chat/planner-status";
+import { switchedStatus } from "./chat/machine-switch";
+import {
+	plannerPresence,
+	plannerSentence,
+	plannerStatus,
+	plannerWithheld,
+} from "./chat/planner-status";
+import { machineFix } from "./machine-fix";
 import {
 	ConnectionAnnouncement,
 	NO_TRANSCRIPT,
@@ -117,6 +125,9 @@ import {
 } from "./document-activity";
 import { newestDocumentMetadata } from "./document-actions";
 import { DocumentActionsMenu } from "./document-actions-menu";
+import { useDocumentWidth } from "./document-width";
+import { setDocumentFullWidth } from "./api";
+import { MenuSwitchItem } from "./menu-switch";
 import { DocumentContents } from "./document-contents";
 import {
 	DocumentHistoryPanel,
@@ -248,6 +259,8 @@ type TitleProps = {
 	onRenamed: (channel: DocumentMetadata) => void;
 	project?: { id: string; name: string };
 	room: string;
+	/** Full width, the document's own layout, offered where it changes what the reader sees. */
+	width?: { full: boolean; onChange: (full: boolean) => void };
 };
 
 /** An open Zoom child: this title becomes a crumb back, and the child's title follows it. */
@@ -280,6 +293,7 @@ export function DocumentTitle(
 		path,
 		project,
 		room,
+		width,
 	}: TitleProps & { decision?: boolean; icon?: boolean; path?: TitlePath },
 ) {
 	let group = useRef<HTMLDivElement>(null);
@@ -396,6 +410,12 @@ export function DocumentTitle(
 						className="title-control-action"
 						decision={decision}
 						onAction={action => action === "rename" ? onEditingChange("rename") : onAction(action)}
+						settings={width && !decision && !archivedAt && (
+							<MenuSwitchItem checked={width.full} onChange={width.onChange}>
+								<FitWidthIcon aria-hidden="true" size={16} />
+								Full width
+							</MenuSwitchItem>
+						)}
 						trigger={decision
 							? <EllipsisIcon aria-hidden="true" size={14} />
 							: (
@@ -469,6 +489,7 @@ export function Header(
 				onRenamed={props.onRenamed}
 				project={props.project}
 				room={props.room}
+				width={props.width}
 			/>
 			{(props.build || props.tools || members) && (
 				<div className="ml-auto flex shrink-0 items-center gap-3 pl-2">
@@ -489,6 +510,7 @@ export function RoomWorkspace(
 		canManage,
 		description,
 		descriptionRevision,
+		fullWidth,
 		handle,
 		label,
 		onMetadataChanged,
@@ -611,10 +633,17 @@ export function RoomWorkspace(
 	let [chatSendAcks, setChatSendAcks] = useState<{ wire?: Wire; enabled: boolean }>({
 		enabled: false,
 	});
+	// The caps on what a message may carry, told on joining and scoped to the socket that told them.
+	let [chatAttachments, setChatAttachments] = useState<{
+		wire?: Wire;
+		settings?: Session.AttachmentSettings;
+		transcription?: { provider: string; maxBytes: number };
+	}>({});
 	let [metadata, setMetadata] = useState<WorkspaceMetadata>({
 		archivedAt,
 		description,
 		descriptionRevision,
+		...(fullWidth ? { fullWidth } : {}),
 		title: label,
 		slug,
 		updatedAt,
@@ -746,13 +775,15 @@ export function RoomWorkspace(
 	let machinesEnabled = profile.implementation && !!effectiveCanEdit
 		&& !(archivedAt ?? metadata.archivedAt);
 	let machineChoice = useMachineChoice(room, machinesEnabled);
-	// What is not well with the Planner. Where it is told, the machine button, the composer's top
-	// edge, or both, is decided once for every place that tells it (`plannerPlacement`). Which
+	// What is not well with the Planner, told quietly: presence on the machine button and on chopin,
+	// its story and fix-it steps in the button's menu and in a refused message's How to fix. Which
 	// machine it is on is said only once the person's machines are in, and read after the socket's
 	// last word: null says nothing until then.
 	let attachment = plannerAttachment.wire === wire ? plannerAttachment.planner : undefined;
-	let listCurrent = machineChoice.read
-		> (plannerAttachment.wire === wire ? plannerAttachment.heard ?? 0 : 0);
+	// While a choice is being saved the list is the person's own guess at the answer: it still
+	// describes the Planner as it was, and must not be read as the machine of the word that comes.
+	let listCurrent = !machineChoice.saving && machineChoice.read
+			> (plannerAttachment.wire === wire ? plannerAttachment.heard ?? 0 : 0);
 	let machineName = plannerMachineName(
 		machineChoice.state,
 		attachment,
@@ -761,15 +792,37 @@ export function RoomWorkspace(
 		listCurrent,
 	);
 	let lastSeen = plannerLastSeen(machineChoice.state);
-	let plannerNow = useMemo(
+	let plannerReal = useMemo(
 		() => plannerStatus(attachment, machineName, lastSeen),
 		[attachment, machineName, lastSeen],
 	);
-	let plannerWithheldNow = plannerWithheld(attachment, machineName);
+	let realWithheld = plannerWithheld(attachment, machineName);
+	// A move to another machine is one state, connecting to it, from the click until the server's
+	// word after it is known; only then does the server's own status say the rest.
+	let switching = machineChoice.switching;
+	let switched = switchedStatus(switching, {
+		status: plannerReal,
+		saving: machineChoice.saving,
+		heard: plannerAttachment.wire === wire ? plannerAttachment.heard : undefined,
+		withheld: realWithheld,
+	});
+	let endSwitch = machineChoice.endSwitch;
+	useEffect(() => {
+		if (switching && switched.over) endSwitch(switching);
+	}, [switching, switched.over, endSwitch]);
+	let midSwitch = !!switching && !switched.over;
+	let switchedText = switched.status && plannerSentence(switched.status);
+	let plannerNow = useMemo(
+		() => midSwitch ? switched.status : plannerReal,
+		// oxlint-disable-next-line react-hooks/exhaustive-deps -- the switch's status is its words
+		[midSwitch, switchedText, plannerReal],
+	);
+	let plannerWithheldNow = !midSwitch && realWithheld;
 	let plannerNote = useSettledPlannerStatus(
 		plannerNow,
-		plannerAttachment.placeholder,
+		!midSwitch && plannerAttachment.placeholder,
 		plannerWithheldNow,
+		machineChoice.chosen,
 	);
 	// The choice shows only while the person has a paired machine, live, or the document lists a
 	// teammate's shared one: it appears with their first and goes with their last.
@@ -1184,6 +1237,7 @@ export function RoomWorkspace(
 			archivedAt,
 			description,
 			descriptionRevision,
+			...(fullWidth ? { fullWidth } : {}),
 			title: label,
 			slug,
 			updatedAt,
@@ -1191,7 +1245,22 @@ export function RoomWorkspace(
 		next = newestDocumentMetadata(metadataRef.current, next);
 		metadataRef.current = next;
 		setMetadata(next);
-	}, [archivedAt, description, descriptionRevision, label, room, slug, updatedAt]);
+	}, [archivedAt, description, descriptionRevision, fullWidth, label, room, slug, updatedAt]);
+	// The switch moves when pressed; the server's answer, and every reader's, follow its broadcast.
+	let [widthChoice, setWidthChoice] = useState<{ room: string; full: boolean; request: number }>();
+	let widthRequests = useRef(0);
+	let chooseWidth = useCallback((full: boolean) => {
+		let request = ++widthRequests.current;
+		setWidthChoice({ room, full, request });
+		// A refusal puts the switch back: the document keeps the width the server holds.
+		void setDocumentFullWidth(room, full).then(detail => updateMetadata(detail.channel), () => {})
+			.finally(() => {
+				setWidthChoice(current => current?.request === request ? undefined : current);
+			});
+	}, [room, updateMetadata]);
+	let documentFull = widthChoice?.room === room ? widthChoice.full : !!metadata.fullWidth;
+	// A phone's column is already the screen's.
+	let shownFull = useDocumentWidth(documentArea, documentFull && !phone);
 
 	useEffect(() => () => research.reset(), [research]);
 	useEffect(() => {
@@ -1247,6 +1316,11 @@ export function RoomWorkspace(
 				setEffectiveCanManage(frame.canManage);
 				setChatReferences({ wire: socket, enabled: frame.chatReferences === true });
 				setChatSendAcks({ wire: socket, enabled: frame.chatSendAcks === true });
+				setChatAttachments({
+					wire: socket,
+					settings: frame.attachments,
+					transcription: frame.transcription,
+				});
 				setResearchExecution(frame.webResearch === true);
 				updateMetadata(frame);
 				if (accessChanged) onRepositoryAccessChanged();
@@ -1328,30 +1402,41 @@ export function RoomWorkspace(
 			? !(presentation.type === "parent-with-child" && planVisible)
 			: titleBuildShown);
 	let chatShowsBanner = profile.chat && workspacePresentation.chatVisible;
-	// A lost connection and the Planner's own are told once, by one banner: at the Chat composer
-	// while Chat is on screen, else at the top of the document. Decided here, above both, so a
-	// person switching between them neither waits out the grace period again nor hears of it twice.
+	// A lost connection is drawn once, by the offline bar: over Chat's transcript while Chat is on
+	// screen, else at the top of the document; the Planner's state is spoken from the same place and
+	// never drawn there. Decided here, above both, so a person switching between them neither waits
+	// out the grace period again nor hears of it twice.
 	let banner = useConnectionBanner({
 		lost: isOffline(status, !!outage),
 		failures: outage?.failures ?? 0,
 		synced: planState.synced,
 		unsaved: planState.unsaved ?? false,
 		transcript: profile.chat ? transcriptFacts : NO_TRANSCRIPT,
-		planner: profile.chat
-			? plannerForBanner(plannerNote, hasMachineButton && !chatShowsBanner)
-			: undefined,
+		planner: profile.chat ? plannerForBanner(plannerNote, hasMachineButton) : undefined,
 		// Only the machine's own word on this socket is a return; a status that is withheld, hidden
 		// by the machine button or from another socket is not.
-		plannerAttached: profile.chat && attachment?.state === "attached",
+		plannerAttached: profile.chat && !midSwitch && attachment?.state === "attached",
 		lostEdits: planState.lost ?? 0,
 		plannerHeld: plannerWithheldNow,
+		plannerMove: machineChoice.moves,
 		reconnect: () => wire?.reconnect(),
-		wake: () => {
-			void wire?.ask("chat:wake", {}).catch(() => {});
-		},
-		chooseMachine: hasMachineButton ? openMachinePicker : undefined,
 	});
-	let plannerWhere = plannerPlacement(plannerNote, hasMachineButton, banner.view, chatShowsBanner);
+	// Only the viewer's own machine is told to run something; another's owner is asked to.
+	let ownMachine = !!attachment && "login" in attachment
+		&& attachment.login.toLowerCase() === handle.toLowerCase();
+	// The menu lists the machines and Add machine already, so no machine at all needs no steps there.
+	let menuFix = plannerNote?.kind === "none"
+		? undefined
+		: machineFix(plannerNote, { mine: ownMachine, choose: hasMachineButton, place: "menu" });
+	let noteFix = machineFix(plannerNote, {
+		mine: ownMachine,
+		choose: hasMachineButton,
+		place: "note",
+	});
+	// Mid-switch the old machine's attachment is not chopin's state: it is connecting to the new one.
+	let presence = agent
+		? plannerPresence(midSwitch ? undefined : attachment, plannerNote)
+		: undefined;
 	useTitlingReport({
 		wire: workspaceCanEdit ? wire : undefined,
 		room,
@@ -1733,7 +1818,11 @@ export function RoomWorkspace(
 	);
 	let planArea = (
 		<div className="history-layout">
-			<div className="history-layout-main" ref={documentArea}>
+			<div
+				className="history-layout-main"
+				data-document-width={shownFull ? "full" : undefined}
+				ref={documentArea}
+			>
 				<div className="h-full" data-live-document hidden={!!viewedVersion}>{plan}</div>
 				{viewedVersion && (
 					<DocumentVersionView
@@ -1778,6 +1867,7 @@ export function RoomWorkspace(
 		onRenamed: updateMetadata,
 		project: { id: repository.id, name: repository.name },
 		room,
+		...(phone ? {} : { width: { full: documentFull, onChange: chooseWidth } }),
 	};
 
 	if (presentation.type === "child") {
@@ -1944,7 +2034,11 @@ export function RoomWorkspace(
 	let titleBuild = buildSlot && (
 		<>
 			{!phone && machinePicker && (
-				<MachineButton choice={machinePicker} planner={plannerWhere.button} />
+				<MachineButton
+					choice={machinePicker}
+					fix={menuFix}
+					planner={plannerNote}
+				/>
 			)}
 			{buildSlot}
 		</>
@@ -1979,8 +2073,13 @@ export function RoomWorkspace(
 								agent={agent}
 								offline={banner.offline}
 								// Only while Chat is on screen: off screen it is still mounted, and the document draws
-								// the banner at its top, so a second one in the hidden composer would be a second banner.
+								// the offline bar at its top, so a second one in hidden Chat would be a second bar.
 								banner={chatShowsBanner ? banner : undefined}
+								machine={{
+									presence,
+									fix: noteFix,
+									...(hasMachineButton ? { choose: openMachinePicker } : {}),
+								}}
 								onTranscript={setTranscriptFacts}
 								focus={presentation.type === "parent-with-child" ? presentation.childId : undefined}
 								onOpenChild={presentation.onChildOpen}
@@ -2037,6 +2136,10 @@ export function RoomWorkspace(
 									onOpenCard: showDecisionCard,
 								}}
 								referencesEnabled={chatReferences.wire === wire && chatReferences.enabled}
+								attachments={chatAttachments.wire === wire ? chatAttachments.settings : undefined}
+								transcription={chatAttachments.wire === wire
+									? chatAttachments.transcription
+									: null}
 								repository={repository}
 								room={room}
 								sendAcknowledgements={chatSendAcks.wire === wire && chatSendAcks.enabled}
@@ -2064,7 +2167,8 @@ export function RoomWorkspace(
 										editingDocument={!childOpen && !!barEdit?.editing}
 										label={metadata.title}
 										machine={machinePicker}
-										planner={plannerWhere.button}
+										planner={plannerNote}
+										fix={menuFix}
 										members={members}
 										onAction={action => onDocumentAction(room, action)}
 										onComments={() => {

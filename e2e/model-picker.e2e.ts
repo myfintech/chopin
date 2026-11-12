@@ -14,7 +14,7 @@ import { finishTurn } from "../apps/server/src/testing/agent-link";
 import { connectionBanner } from "./banner";
 import { chatInput, fillChat } from "./chat-input";
 import { createChannel, registerTestDatabase } from "./database";
-import { NONE, strip } from "./planner-status";
+import { announced, NONE } from "./planner-status";
 import { e2eDatabaseName, e2ePort } from "./ports";
 import { expectInsideViewport, expectNoHorizontalOverflow } from "./responsive";
 import { authenticate, content, expect, ready, roomPath, test } from "./room";
@@ -324,7 +324,7 @@ function notice(page: Page) {
 	return page.locator(".chat-composer .composer-notice:not([data-banner])");
 }
 
-/** The control in the composer's footer: named for the model that will run and its level. */
+/** The pill in the composer's toolbar: named for the model that will run and its level. */
 function trigger(page: Page) {
 	return chat(page).getByRole("button", { name: /^Model: / });
 }
@@ -341,8 +341,13 @@ function option(page: Page, name: string) {
 	return popover(page).getByRole("option", { name: new RegExp(`^${name}\\b`) });
 }
 
+/** The element's check, which only the chosen model's row draws. */
+function checked(page: Page, name: string) {
+	return option(page, name).locator("span.absolute");
+}
+
 function levels(page: Page) {
-	return popover(page).getByRole("radiogroup", { name: "Reasoning", exact: true });
+	return popover(page).getByRole("radiogroup", { name: "Thinking", exact: true });
 }
 
 function level(page: Page, name: string) {
@@ -365,6 +370,11 @@ async function openPicker(page: Page) {
 	await expect(search(page)).toBeFocused();
 }
 
+/** The pill's name: the first thing in it, which gives way to an ellipsis. */
+function name(model: Locator) {
+	return model.locator("span").first();
+}
+
 /** Say `text` to Chopin and wait until it has been answered. */
 async function ask(page: Page, text: string, answers: number) {
 	let input = chatInput(chat(page));
@@ -381,7 +391,8 @@ async function shoot(page: Page | Locator, name: string) {
 }
 
 async function expectAccessible(page: Page) {
-	let result = await new AxeBuilder({ page }).include("[data-chat-model-picker]").analyze();
+	let result = await new AxeBuilder({ page }).include('[data-slot="model-selector-content"]')
+		.analyze();
 	expect(result.violations.map(violation => `${violation.id}: ${violation.help}`)).toEqual([]);
 }
 
@@ -391,12 +402,12 @@ test("offers a choice only while the attached client reports models", async ({ b
 	let page = await open(browser, HANDLE, room, DESKTOP);
 	// Nobody is attached: there is no catalog, so nothing is offered that nobody could honor.
 	await expect(chatInput(chat(page))).toBeVisible();
-	await expect(strip(page)).toHaveText(NONE);
+	await expect(announced(page)).toHaveText(NONE);
 	await expect(trigger(page)).toHaveCount(0);
 
 	// A client from before the catalog reports nothing, so the composer hides the control.
 	let older = await attachClient(room);
-	await expect(strip(page)).toHaveCount(0);
+	await expect(announced(page)).toHaveText("");
 	await expect(trigger(page)).toHaveCount(0);
 	await older.client.detach();
 
@@ -436,17 +447,17 @@ test("lists models by provider, filters them, and chooses with the mouse, reason
 
 	await openPicker(page);
 	await expect(trigger(page)).toHaveAttribute("aria-expanded", "true");
-	let list = popover(page).getByRole("listbox", { name: "Models", exact: true });
+	let list = popover(page).getByRole("listbox");
 	await expect(list.getByRole("group", { name: "Acme" }).getByRole("option")).toHaveCount(2);
 	await expect(list.getByRole("group", { name: "Beta" }).getByRole("option")).toHaveCount(1);
 	await expect(list.getByRole("option")).toHaveText([
 		/^Large\s*Slower and more careful\.$/,
-		/^Small\s*Fast for short questions\.\s*Default$/,
+		/^Small\s*Default\. Fast for short questions\.$/,
 		/^Deep\s*Reads the whole repository first\.$/,
 	]);
-	// The model that will run is tinted; none has a check mark.
-	await expect(option(page, "Small")).toHaveAttribute("aria-selected", "true");
-	await expect(option(page, "Large")).toHaveAttribute("aria-selected", "false");
+	// The model that will run has the element's check; no other does.
+	await expect(checked(page, "Small")).toHaveCount(1);
+	await expect(checked(page, "Large")).toHaveCount(0);
 	// Small has no reasoning levels, so the control is not drawn.
 	await expect(levels(page)).toHaveCount(0);
 	await shoot(page, "model-picker-open-desktop");
@@ -459,7 +470,7 @@ test("lists models by provider, filters them, and chooses with the mouse, reason
 	await expect(list.getByRole("option")).toHaveText([/^Deep/]);
 	await search(page).fill("zzz");
 	await expect(list.getByRole("option")).toHaveCount(0);
-	await expect(popover(page).getByRole("status")).toHaveText("No matching models.");
+	await expect(popover(page).getByText("No matching models.", { exact: true })).toBeVisible();
 	await search(page).fill("");
 
 	// Choosing closes the popover, returns to the trigger and names the model.
@@ -524,27 +535,22 @@ test("opens, searches, moves and chooses from the keyboard", async ({ browser })
 	let { client } = await attachClient(room, CATALOG);
 	await expect(trigger(page)).toBeVisible();
 
-	// Enter opens it with the search field focused and the model that will run active.
+	// Enter opens it with the search field focused and the model that will run highlighted.
 	await trigger(page).focus();
 	await trigger(page).press("Enter");
 	await expect(search(page)).toBeFocused();
-	await expect(search(page)).toHaveAttribute("aria-expanded", "true");
-	let active = async () => {
-		let id = await search(page).getAttribute("aria-activedescendant");
-		if (!id) return "none";
-		let row = page.locator(`[id="${id}"]`);
-		await expect(row).toHaveAttribute("data-active", "true");
-		return (await row.innerText()).split("\n")[0]!;
-	};
-	expect(await active()).toBe("Small");
+	let active = async () =>
+		(await popover(page).locator('[cmdk-item][data-selected="true"]').first().innerText())
+			.split("\n")[0]!;
+	await expect.poll(active).toBe("Small");
 
-	// The arrow keys move the active row and wrap at the ends; the field keeps the focus.
+	// The arrow keys move the highlighted row, and stop at either end; the field keeps the focus.
 	await search(page).press("ArrowDown");
-	expect(await active()).toBe("Deep");
+	await expect.poll(active).toBe("Deep");
 	await search(page).press("ArrowDown");
-	expect(await active()).toBe("Large");
+	await expect.poll(active).toBe("Deep");
 	await search(page).press("ArrowUp");
-	expect(await active()).toBe("Deep");
+	await expect.poll(active).toBe("Small");
 	await expect(search(page)).toBeFocused();
 
 	// Typing filters, Enter chooses the active row, closes, and focus returns to the trigger.
@@ -586,9 +592,16 @@ test("opens, searches, moves and chooses from the keyboard", async ({ browser })
 	// A pointer outside the popover closes it and leaves the draft's focus alone.
 	await trigger(page).click();
 	await expect(popover(page)).toBeVisible();
-	await chatInput(chat(page)).click();
+	// A corner of the draft that the popover does not cover: it opens level with the pill, which the
+	// row's other controls (the + and the microphone among them) push along the box, so it may cover
+	// the far corner and leave the near one.
+	let draft = chatInput(chat(page));
+	let corner = (await draft.boundingBox())!;
+	let covered = (await popover(page).boundingBox())!;
+	let near = covered.x > corner.x + 12;
+	await draft.click({ position: { x: near ? 6 : corner.width - 6, y: 6 } });
 	await expect(popover(page)).toHaveCount(0);
-	await expect(chatInput(chat(page))).toBeFocused();
+	await expect(draft).toBeFocused();
 	await client.detach();
 });
 
@@ -649,14 +662,14 @@ test("lists a catalog that repeats a model or a level as the client reported it"
 	// Every entry is listed in the order given, and only the first of an id is the model that runs.
 	let rows = popover(page).getByRole("option");
 	await expect(rows).toHaveCount(4);
-	await expect(rows.locator(".composer-model-row-name")).toHaveText([
-		"Echo one",
-		"Echo again",
-		"Two",
-		"Echo third",
+	await expect(rows).toHaveText([
+		/^Echo one\s*Default\.$/,
+		/^Echo again\s*Default\.$/,
+		/^Two$/,
+		/^Echo third\s*Default\.$/,
 	]);
-	await expect(popover(page).locator('[role="option"][aria-selected="true"]')).toHaveCount(1);
-	await expect(rows.first()).toHaveAttribute("aria-selected", "true");
+	await expect(popover(page).getByRole("option").locator("span.absolute")).toHaveCount(1);
+	await expect(rows.first().locator("span.absolute")).toHaveCount(1);
 	// Each group is named by its own heading, whatever its provider's id is made of.
 	await expect(popover(page).getByRole("group", { name: "Echo Lab" })).toHaveCount(1);
 	await expect(popover(page).getByRole("group", { name: "None" })).toHaveCount(1);
@@ -826,7 +839,7 @@ test("lists and runs a catalog of any spelling as the client wrote it, skipping 
 	await openPicker(page);
 	await expect(popover(page).getByRole("option")).toHaveText([
 		/^Long\s*d+$/,
-		/^lab\/plain\s*Default$/,
+		/^lab\/plain\s*Default\.$/,
 	]);
 	await expect(popover(page).getByRole("option", { name: /Blank/ })).toHaveCount(0);
 	await expect(levels(page)).toHaveCount(0);
@@ -870,7 +883,7 @@ test("lists every model of a catalog as large as two gateways' together, and sea
 	await expect(trigger(page)).toHaveAccessibleName("Model: Model 0");
 	await openPicker(page);
 	await expect(popover(page).getByRole("option")).toHaveCount(710);
-	await expect(popover(page).getByRole("group")).toHaveCount(2);
+	await expect(popover(page).locator("[cmdk-group]")).toHaveCount(2);
 	await search(page).fill("model 709");
 	await expect(popover(page).getByRole("option")).toHaveCount(1);
 	await search(page).press("Enter");
@@ -968,8 +981,8 @@ test("falls back to the default with a notice when the chosen model has gone, an
 
 	// The client no longer offers Large: what will run is the default, and the composer says so.
 	client.report(WITHOUT_LARGE);
-	// The catalog no longer lists it, so it is named by the id the client gave it.
-	let gone = "acme/large is no longer available, so Chopin used its default model.";
+	// The chosen model keeps the display name the catalog reported.
+	let gone = "Large is no longer available, so chopin used its default model.";
 	await expect(trigger(page)).toHaveAccessibleName(`Model: Small, ${gone}`);
 	// The tooltip stays short: the composer's notice already says why.
 	await expect(trigger(page)).toHaveAttribute("title", "Model: Small");
@@ -986,7 +999,8 @@ test("falls back to the default with a notice when the chosen model has gone, an
 	expect(turnFor(asked, "while it is gone").model).toBeUndefined();
 	expect(turnFor(asked, "while it is gone").thinkingLevel).toBeUndefined();
 	await ask(page, "and again", 2);
-	await expect(chat(page).getByText(gone, { exact: true })).toHaveCount(2);
+	await expect(chat(page).getByText(gone, { exact: true })).toHaveCount(1);
+	await expect(notice(page).filter({ hasText: gone })).toHaveCount(0);
 	let said = chat(page).locator("[data-entry-author='system'], li, div").filter({ hasText: gone });
 	await expect(said.first()).toBeVisible();
 
@@ -1005,7 +1019,7 @@ test("falls back to the default with a notice when the chosen model has gone, an
 		},
 	});
 	let reasoning =
-		"high reasoning is no longer available for this model, so Chopin used its default.";
+		"high reasoning is no longer available for this model, so chopin used its default.";
 	await expect(trigger(page)).toHaveAccessibleName(`Model: Large, ${reasoning}`);
 	await ask(page, "level gone", 4);
 	expect(turnFor(asked, "level gone")).toMatchObject({ model: "acme/large" });
@@ -1031,7 +1045,7 @@ test("says a saved choice has gone once a turn fell back for a client that offer
 	await level(page, "high").click();
 	await page.keyboard.press("Escape");
 	await expect(trigger(teammate)).toHaveAccessibleName("Model: Large, reasoning high");
-	let gone = "acme/large is no longer available, so Chopin used its default model.";
+	let gone = "Large is no longer available, so chopin used its default model.";
 
 	// Nobody is attached: the choice is neither gone nor honored, and nothing says it has gone.
 	await first.client.detach();
@@ -1040,27 +1054,28 @@ test("says a saved choice has gone once a turn fell back for a client that offer
 
 	// A client that offers the catalog and has yet to report is the same: nothing is said yet.
 	let silent = await attachClient(room, CATALOG, { silent: true });
-	await expect(strip(page).filter({ hasText: NONE })).toHaveCount(0);
+	await expect(announced(page).filter({ hasText: NONE })).toHaveCount(0);
 	await page.waitForTimeout(500);
 	await expect(trigger(page)).toHaveCount(0);
 	await expect(notice(page).filter({ hasText: gone })).toHaveCount(0);
 	await expect(notice(teammate).filter({ hasText: gone })).toHaveCount(0);
 
-	// A turn runs the client's default and Chat says why. That fallback has happened now, so every
-	// composer that can write says it too, after a reload as well; somebody who only reads sees neither.
+	// A turn runs the client's default and Chat records why once, including after a reload.
+	// The composer's duplicate notice goes; the reader has no composer notice either.
 	await ask(page, "while it never reports", 1);
 	expect(turnFor(silent.asked, "while it never reports").model).toBeUndefined();
 	expect(turnFor(silent.asked, "while it never reports").thinkingLevel).toBeUndefined();
-	await expect(chat(page).getByText(gone, { exact: true })).toHaveCount(2);
-	await expect(notice(page).filter({ hasText: gone })).toBeVisible();
-	await expect(notice(teammate).filter({ hasText: gone })).toBeVisible();
+	await expect(chat(page).getByText(gone, { exact: true })).toHaveCount(1);
+	await expect(notice(page).filter({ hasText: gone })).toHaveCount(0);
+	await expect(notice(teammate).filter({ hasText: gone })).toHaveCount(0);
 	await expect(trigger(page)).toHaveCount(0);
 	await expect(trigger(reader)).toHaveCount(0);
 	await expect(notice(reader).filter({ hasText: "no longer available" })).toHaveCount(0);
 	await shoot(chat(page), "model-picker-never-reported-desktop");
 	await page.reload();
 	await ready(page);
-	await expect(notice(page).filter({ hasText: gone })).toBeVisible();
+	await expect(chat(page).getByText(gone, { exact: true })).toHaveCount(1);
+	await expect(notice(page).filter({ hasText: gone })).toHaveCount(0);
 
 	// It reports at last: the picker returns with the choice, and the notice goes.
 	silent.client.report(CATALOG);
@@ -1077,16 +1092,16 @@ test("says a saved choice has gone once a turn fell back for a client that offer
 	// of it before a turn has, and nothing is said once it has gone.
 	await silent.client.detach();
 	let later = await attachClient(room, CATALOG, { silent: true });
-	await expect(strip(page).filter({ hasText: NONE })).toHaveCount(0);
+	await expect(announced(page).filter({ hasText: NONE })).toHaveCount(0);
 	await page.waitForTimeout(500);
 	await expect(notice(page).filter({ hasText: gone })).toHaveCount(0);
 	await ask(page, "while the next never reports", 3);
-	await expect(notice(page).filter({ hasText: gone })).toBeVisible();
+	await expect(notice(page).filter({ hasText: gone })).toHaveCount(0);
 	await later.client.detach();
 	await expect(notice(page).filter({ hasText: gone })).toHaveCount(0);
 });
 
-test("keeps a saved choice's notice when the client withdraws every model or an older client takes its place, before and after a turn", async ({ browser }) => {
+test("keeps a saved choice's notice until Chat records the fallback when the client withdraws every model or an older client takes its place", async ({ browser }) => {
 	test.setTimeout(180_000);
 	let room = await newRoom();
 	let page = await open(browser, HANDLE, room, DESKTOP);
@@ -1106,7 +1121,7 @@ test("keeps a saved choice's notice when the client withdraws every model or an 
 	await expect(trigger(page)).toHaveAccessibleName("Model: Large, reasoning high");
 	await expect(trigger(teammate)).toHaveAccessibleName("Model: Large, reasoning high");
 	await expect(notice(page).filter({ hasText: "no longer available" })).toHaveCount(0);
-	let gone = "acme/large is no longer available, so Chopin used its default model.";
+	let gone = "Large is no longer available, so chopin used its default model.";
 
 	// The client withdraws every model: the picker goes, and the saved choice's words stay, to
 	// everyone who can write, before any turn. Somebody who can only read sees neither.
@@ -1119,16 +1134,16 @@ test("keeps a saved choice's notice when the client withdraws every model or an 
 	await expect(notice(reader).filter({ hasText: "no longer available" })).toHaveCount(0);
 	await shoot(chat(page), "model-picker-withdrawn-desktop");
 
-	// The default runs, Chat says so once, and the notice is still there after the turn and a reload.
+	// The default runs, Chat says so once, and the duplicate notice is gone even after a reload.
 	await ask(page, "while it is withdrawn", 1);
 	expect(turnFor(asked, "while it is withdrawn").model).toBeUndefined();
 	expect(turnFor(asked, "while it is withdrawn").thinkingLevel).toBeUndefined();
-	// The line in Chat and the notice.
-	await expect(chat(page).getByText(gone, { exact: true })).toHaveCount(2);
-	await expect(notice(page).filter({ hasText: gone })).toBeVisible();
+	await expect(chat(page).getByText(gone, { exact: true })).toHaveCount(1);
+	await expect(notice(page).filter({ hasText: gone })).toHaveCount(0);
 	await page.reload();
 	await ready(page);
-	await expect(notice(page).filter({ hasText: gone })).toBeVisible();
+	await expect(chat(page).getByText(gone, { exact: true })).toHaveCount(1);
+	await expect(notice(page).filter({ hasText: gone })).toHaveCount(0);
 	await expect(trigger(page)).toHaveCount(0);
 
 	// The client goes, and an older one that reports no models takes its place. Nothing is said while
@@ -1136,13 +1151,13 @@ test("keeps a saved choice's notice when the client withdraws every model or an 
 	await client.detach();
 	await expect(notice(page).filter({ hasText: gone })).toHaveCount(0);
 	let older = await attachClient(room);
-	await expect(notice(page).filter({ hasText: gone })).toBeVisible();
-	await expect(notice(teammate).filter({ hasText: gone })).toBeVisible();
+	await expect(notice(page).filter({ hasText: gone })).toHaveCount(0);
+	await expect(notice(teammate).filter({ hasText: gone })).toHaveCount(0);
 	await expect(trigger(page)).toHaveCount(0);
 	await ask(page, "with an older client", 2);
 	expect(turnFor(older.asked, "with an older client").model).toBeUndefined();
 	expect(turnFor(older.asked, "with an older client").thinkingLevel).toBeUndefined();
-	await expect(notice(page).filter({ hasText: gone })).toBeVisible();
+	await expect(notice(page).filter({ hasText: gone })).toHaveCount(0);
 
 	// A client that offers the model again brings the picker and the choice back, as it was stored.
 	await older.client.detach();
@@ -1203,7 +1218,7 @@ test("says the default ran when a turn cannot read the document's model choice, 
 	await expect(trigger(teammate)).toHaveAccessibleName("Model: Large, reasoning high");
 
 	// The server cannot read the stored choice: the turn runs the client's default, never silently.
-	let unread = "This document's model choice couldn't be read, so Chopin used its default model.";
+	let unread = "This document's model choice couldn't be read, so chopin used its default model.";
 	await choicesReadable(false);
 	try {
 		await ask(page, "while it cannot be read", 1);
@@ -1242,8 +1257,8 @@ test("gives way to the room's connection banner and comes back with the connecti
 	await openPicker(page);
 	await level(page, "high").click();
 	await page.keyboard.press("Escape");
-	let gone = "acme/large is no longer available, so Chopin used its default model.";
-	let unread = "This document's model choice couldn't be read, so Chopin used its default model.";
+	let gone = "Large is no longer available, so chopin used its default model.";
+	let unread = "This document's model choice couldn't be read, so chopin used its default model.";
 
 	// The model has gone: its notice is drawn, and no banner is above it.
 	client.report(WITHOUT_LARGE);
@@ -1254,7 +1269,7 @@ test("gives way to the room's connection banner and comes back with the connecti
 	// for the composer's other notices, and the picker is still there.
 	await cut();
 	await expect(connectionBanner(page)).toHaveAttribute("data-layer", "socket", {
-		timeout: 15_000,
+		timeout: 20_000,
 	});
 	await expect(notice(page)).toHaveCount(0);
 	await expect(trigger(page)).toBeVisible();
@@ -1273,29 +1288,19 @@ test("gives way to the room's connection banner and comes back with the connecti
 		await ask(page, "while it cannot be read", 1);
 		await expect(notice(page).filter({ hasText: unread })).toBeVisible();
 
-		// The machine goes. Its banner is another cause: drawn above the notice, which stays, and
-		// both describe the draft.
+		// The machine goes. That is another cause, said to a screen reader and never drawn: the
+		// notice stays, alone above the composer, and describes the draft.
 		await client.detach();
-		await expect(connectionBanner(page)).toHaveAttribute("data-layer", "planner");
-		await expect(strip(page)).toHaveText(HELD);
+		await expect(announced(page)).toHaveText(HELD);
+		await expect(connectionBanner(page)).toHaveCount(0);
 		await expect(notice(page).filter({ hasText: unread })).toBeVisible();
-		await expect(connectionBanner(page)).toHaveCount(1);
-		let [banner, words] = await Promise.all([
-			strip(page).boundingBox(),
-			notice(page).boundingBox(),
-		]);
-		// Stacked as the composer's strips are: the notice starts below the banner's top and covers
-		// no more of it than the half rem each strip is tucked under the next.
-		expect(words!.y).toBeGreaterThan(banner!.y);
-		expect(banner!.y + banner!.height - words!.y).toBeLessThanOrEqual(9);
 		let described = await chatInput(chat(page)).getAttribute("aria-describedby");
-		expect(described).toContain((await strip(page).getAttribute("id"))!);
 		expect(described).toContain((await notice(page).getAttribute("id"))!);
 	} finally {
 		await choicesReadable(true);
 	}
 
-	// A machine returns: its banner goes and the notice stays until a turn can read the choice.
+	// A machine returns: the notice stays until a turn can read the choice.
 	let again = await attachClient(room, CATALOG);
 	await expect(connectionBanner(page)).toHaveCount(0);
 	await expect(notice(page).filter({ hasText: unread })).toBeVisible();
@@ -1325,13 +1330,12 @@ test("names the model on a phone trigger, opens a list as wide as the composer a
 	let model = trigger(page);
 	await expect(model).toBeVisible();
 	await expect(model).toHaveAccessibleName("Model: Small");
-	// The trigger keeps the model's short name beside its icon, and stays a full touch target.
-	await expect(model.locator(".composer-model-symbol")).toBeVisible();
-	await expect(model.locator(".composer-model-name")).toBeVisible();
-	await expect(model.locator(".composer-model-name")).toHaveText("Small");
+	// The pill keeps the model's name, drawn as a 28px ghost pill with a 44px touch target.
+	await expect(name(model)).toBeVisible();
+	await expect(name(model)).toHaveText("Small");
 	let box = (await model.boundingBox())!;
-	expect(box.width).toBeGreaterThanOrEqual(36);
-	expect(box.height).toBeGreaterThanOrEqual(36);
+	expect(box.height).toBeCloseTo(28, 0);
+	expect(await model.evaluate(element => getComputedStyle(element, "::after").height)).toBe("44px");
 	await expectInsideViewport(model);
 	await expectNoHorizontalOverflow(page);
 	await shoot(page, "model-picker-closed-phone");
@@ -1344,8 +1348,8 @@ test("names the model on a phone trigger, opens a list as wide as the composer a
 	await option(page, "Large").tap();
 	await expect(popover(page)).toHaveCount(0);
 	await expect(model).toHaveAccessibleName("Model: Large");
-	await expect(model.locator(".composer-model-name")).toHaveText("Large");
-	await expect(model.locator(".composer-model-name")).toBeVisible();
+	await expect(name(model)).toHaveText("Large");
+	await expect(name(model)).toBeVisible();
 
 	await model.tap();
 	await expect(levels(page).getByRole("radio")).toHaveCount(5);
@@ -1353,16 +1357,17 @@ test("names the model on a phone trigger, opens a list as wide as the composer a
 	await expectInsideViewport(levels(page));
 	for (let radio of await levels(page).getByRole("radio").all()) {
 		await expectInsideViewport(radio);
-		// The composer's own controls set the size of a touch target here, the trigger among them
-		// (the pill control is in rem, so the two differ by under a pixel).
-		expect((await radio.boundingBox())!.height).toBeGreaterThanOrEqual(box.height - 1);
+		// A level is drawn as the element draws it and reached through its 44px target.
+		expect(await radio.evaluate(element => getComputedStyle(element, "::after").height)).toBe(
+			"44px",
+		);
 	}
 	await level(page, "xhigh").tap();
 	await expect(model).toHaveAccessibleName("Model: Large, reasoning xhigh");
 	await expect(popover(page)).toBeVisible();
-	// The level is in the accessible name and the open list; the pill has no room for it beside the name.
-	await expect(model.locator(".composer-model-name")).toBeVisible();
-	await expect(model.locator(".composer-model-level")).toBeHidden();
+	// The level is in the accessible name and the open list, and in lighter ink beside the name.
+	await expect(name(model)).toBeVisible();
+	await expect(model.locator("span").nth(1)).toHaveText("xhigh");
 	await shoot(page, "model-picker-open-phone");
 	await expectAccessible(page);
 	await expectNoHorizontalOverflow(page);
@@ -1393,18 +1398,19 @@ test("keeps the model's name on a touch phone's trigger at every phone width, cu
 			.getByRole("button", { name: /^Chat/ }).tap();
 		await expect.poll(async () => (await chat(page).boundingBox())?.x).toBe(0);
 		let model = trigger(page);
-		let name = model.locator(".composer-model-name");
+		let label = name(model);
 		let words = async () =>
-			name.evaluate(element => ({
+			label.evaluate(element => ({
 				clipped: element.scrollWidth > element.clientWidth,
 				ellipsis: getComputedStyle(element).textOverflow,
 			}));
-		// The pill rests as one row and every control in it stays inside the phone, apart from the others.
+		// The toolbar rests as one row under the draft and every control in it stays inside the phone,
+		// apart from the others, with the longest name given way to an ellipsis.
 		let row = async () => {
 			let mention = chat(page).getByRole("button", { name: "Mention docs" });
-			let mode = chat(page).getByRole("button", { name: "Talk to Chopin" });
+			let mode = chat(page).getByRole("button", { name: "Ask chopin", exact: true });
 			let send = chat(page).getByRole("button", { name: "Send message" });
-			let controls = [model, mention, chatInput(chat(page)), mode, send];
+			let controls = [mention, mode, model, send];
 			let boxes = await Promise.all(controls.map(async control => (await control.boundingBox())!));
 			for (let control of controls) await expectInsideViewport(control);
 			for (let index = 1; index < boxes.length; index++) {
@@ -1414,15 +1420,16 @@ test("keeps the model's name on a touch phone's trigger at every phone width, cu
 				expect(Math.abs(before.y + before.height / 2 - boxes[index]!.y - boxes[index]!.height / 2))
 					.toBeLessThanOrEqual(2);
 			}
-			// The draft keeps room to type in beside the longest name.
-			expect(boxes[2]!.width, `draft at ${width}px`).toBeGreaterThanOrEqual(80);
-			expect(boxes[0]!.height).toBeGreaterThanOrEqual(36);
+			// The draft keeps its own row above them, as wide as the box.
+			expect((await chatInput(chat(page)).boundingBox())!.width, `draft at ${width}px`)
+				.toBeGreaterThanOrEqual(width - 60);
+			expect(boxes[2]!.height).toBeCloseTo(28, 0);
 			await expectNoHorizontalOverflow(page);
 		};
 
 		await expect(model).toHaveAccessibleName("Model: Small");
-		await expect(name).toBeVisible();
-		await expect(name).toHaveText("Small");
+		await expect(label).toBeVisible();
+		await expect(label).toHaveText("Small");
 		// A short name shows whole.
 		expect(await words()).toMatchObject({ clipped: false });
 		await row();
@@ -1433,8 +1440,8 @@ test("keeps the model's name on a touch phone's trigger at every phone width, cu
 		await option(page, "Acme Reasoning").tap();
 		await expect(popover(page)).toHaveCount(0);
 		await expect(model).toHaveAccessibleName(`Model: ${longName}`);
-		await expect(name).toBeVisible();
-		await expect(name).toHaveText(longName);
+		await expect(label).toBeVisible();
+		await expect(label).toHaveText(longName);
 		expect(await words()).toEqual({ clipped: true, ellipsis: "ellipsis" });
 		await row();
 		await shoot(page, `model-picker-long-name-phone-${width}`);
@@ -1450,7 +1457,7 @@ test("keeps the model's name on a touch phone's trigger at every phone width, cu
 		await model.tap();
 		await option(page, "Small").tap();
 		await expect(model).toHaveAccessibleName("Model: Small");
-		await expect(name).toHaveText("Small");
+		await expect(label).toHaveText("Small");
 		expect(await words()).toMatchObject({ clipped: false });
 		await row();
 		await page.context().close();

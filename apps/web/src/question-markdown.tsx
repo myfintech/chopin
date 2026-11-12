@@ -17,14 +17,14 @@ import { QuestionMarkdownContext } from "@chopin/question/react";
 import { gfmTableFromMarkdown } from "mdast-util-gfm-table";
 import { gfmTable } from "micromark-extension-gfm-table";
 
+import { MarkdownText } from "@/components/assistant-ui/elements/markdown-text";
 import { CHAT_COMPONENTS, CHAT_ELEMENTS, MarkdownPhrase } from "./chat/markdown";
 import { orderedRunsRemarkPlugin } from "./chat/ordered-runs";
-import { MarkdownText } from "./markdown-text/markdown-text";
 
 import type { ReactNode } from "react";
 import type { QuestionMarkdownRenderer } from "@chopin/question/react";
+import type { SyntaxHighlighterProps } from "./chat/assistant-ui/markdown-primitive";
 import type { MarkdownComponents } from "./chat/markdown";
-import type { SyntaxHighlighterProps } from "./markdown-text/markdown-text";
 
 const CardDiagram = lazy(() =>
 	import("@chopin/editor/card-diagram").then(({ CardDiagram }) => ({ default: CardDiagram }))
@@ -33,7 +33,7 @@ const ImageLightbox = lazy(() =>
 	import("@chopin/editor/image-lightbox").then(({ ImageLightbox }) => ({ default: ImageLightbox }))
 );
 
-const BLOCK_ELEMENTS = [...CHAT_ELEMENTS, "img"];
+const BLOCK_ELEMENTS = CHAT_ELEMENTS;
 /** An option's own visual may also be a small table. */
 const PREVIEW_ELEMENTS = [...BLOCK_ELEMENTS, "table", "thead", "tbody", "tr", "th", "td"];
 
@@ -83,12 +83,11 @@ function CardImage({ alt, document, src }: { alt: string; document: string; src?
 			{viewing && (
 				<Suspense fallback={null}>
 					<ImageLightbox
-						alt={alt}
+						images={[{ src: url, alt }]}
 						onClose={() => {
 							setViewing(false);
 							requestAnimationFrame(() => view.current?.focus());
 						}}
-						src={url}
 					/>
 				</Suspense>
 			)}
@@ -194,7 +193,7 @@ export function questionMarkdown(document: string): QuestionMarkdownRenderer {
 	};
 }
 
-let ROOT_PROPS = { "data-question-markdown": "" };
+let ROOT_PROPS = { "data-question-markdown": "", "data-slot": undefined };
 
 /** Card text in this document renders as Markdown, with this document's images. */
 export function QuestionMarkdownProvider(

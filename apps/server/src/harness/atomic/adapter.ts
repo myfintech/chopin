@@ -230,6 +230,7 @@ export async function atomicCatalog(
 				provider: { id: model.provider, name: runtime.getProvider(model.provider)?.name },
 				description: contextLabel(model.contextWindow),
 				...(levels.length ? { thinkingLevels: levels } : {}),
+				...(model.input ? { inputTypes: [...model.input] } : {}),
 			};
 		}),
 		...(fallback ? { default: { model: defaultModel! } } : {}),
@@ -420,13 +421,36 @@ function bounded<T>(operation: Promise<T>, message: string): Promise<T> {
 	]).finally(() => clearTimeout(timer));
 }
 
-function promptText(prompt: HarnessV1PromptTurnOptions["prompt"]): string {
-	if (typeof prompt === "string") return prompt;
-	if (typeof prompt.content === "string") return prompt.content;
-	return prompt.content.map(part => {
-		if (part.type !== "text") throw unsupported(`${part.type} prompt parts`);
-		return part.text;
-	}).join("\n\n");
+/** An image as Atomic's prompt takes it. */
+type ImageContent = { type: "image"; data: string; mimeType: string };
+
+/**
+ * What a turn's prompt comes to for Atomic: its text, with each text file written into it under its
+ * name, and each image as the image Atomic's own prompt takes. Anything else is not offered.
+ */
+export function promptParts(
+	prompt: HarnessV1PromptTurnOptions["prompt"],
+): { text: string; images: ImageContent[] } {
+	if (typeof prompt === "string") return { text: prompt, images: [] };
+	if (typeof prompt.content === "string") return { text: prompt.content, images: [] };
+	let texts: string[] = [];
+	let images: ImageContent[] = [];
+	for (let part of prompt.content) {
+		if (part.type === "text") texts.push(part.text);
+		else if (part.type === "image" || part.type === "file" && part.mediaType.startsWith("image/")) {
+			let data = part.type === "image" ? part.image : part.data;
+			let mimeType = part.mediaType ?? "image/png";
+			if (!(data instanceof Uint8Array)) throw unsupported("image prompt parts that are not bytes");
+			images.push({ type: "image", data: Buffer.from(data).toString("base64"), mimeType });
+		} else if (part.type === "file" && part.data instanceof Uint8Array) {
+			texts.push(
+				`<file name=${JSON.stringify(part.filename ?? "file")}>\n${
+					new TextDecoder().decode(part.data)
+				}\n</file>`,
+			);
+		} else throw unsupported(`${part.type} prompt parts`);
+	}
+	return { text: texts.join("\n\n"), images };
 }
 
 function sameNames(actual: readonly string[], expected: readonly string[]): boolean {
@@ -469,6 +493,13 @@ export function resultText(result: unknown): string {
 	return serialize(result);
 }
 
+export function resultWithImages(result: unknown, toolName: string): NonNullable<unknown> {
+	let content = (result as { content?: unknown } | null)?.content;
+	let made = toolName !== "read" && Array.isArray(content)
+		&& content.some(part => part?.type === "image");
+	return made ? { content } : resultText(result);
+}
+
 /**
  * The stream parts for a tool Atomic runs itself: a builtin, extension, workflow
  * or subagent tool. Host tools report through `hostTool`, and a nested call
@@ -499,7 +530,9 @@ export function ownToolParts(
 	return [{
 		type: "tool-result",
 		...own,
-		result: resultText(event.type === "tool_execution_end" ? event.result : event.partialResult),
+		result: event.type === "tool_execution_end"
+			? resultWithImages(event.result, event.toolName)
+			: resultText(event.partialResult),
 		...(event.type === "tool_execution_end"
 			? { isError: event.isError }
 			: { preliminary: true }),
@@ -546,8 +579,20 @@ type Run = {
 	inputs: Map<number, string>;
 	stopped: boolean;
 	failure?: Error;
-	last?: { stopReason: string; errorMessage?: string };
+	last?: {
+		stopReason: string;
+		errorMessage?: string;
+		usage?: {
+			input?: number;
+			output?: number;
+			cacheRead?: number;
+			cacheWrite?: number;
+			totalTokens?: number;
+		};
+	};
 	stop: () => void;
+	/** Gives the model a person's message at its next step, between a step's tool calls and its next call. */
+	steer: (text: string) => Promise<void>;
 	done: Promise<void>;
 };
 
@@ -559,6 +604,7 @@ function control(run: Run): HarnessV1PromptControl {
 		async submitToolApproval() {
 			// The adapter emits no approval requests; there is nothing to answer.
 		},
+		submitUserMessage: text => run.steer(text),
 		done: run.done,
 	};
 }
@@ -570,13 +616,86 @@ function listen(run: Run, signal: AbortSignal | undefined): void {
 	void run.done.catch(() => {}).finally(() => signal.removeEventListener("abort", run.stop));
 }
 
+/**
+ * The commands an Atomic session in `cwd` offers as `/name`: its prompt templates, its skills
+ * (named `skill:name`, as Atomic invokes them) and the workflows registered for it. It reads them
+ * from a session built as a Planner's is, in the operator's agent directory and the checkout, and
+ * ends that session at once: nothing is sent to a model. Atomic's own extension commands are not
+ * listed, since a person could not run them from a message.
+ */
+export async function sessionCommands(
+	runtime: ModelRuntime,
+	settings: Pick<AtomicSettings, "extensions">,
+	cwd: string,
+	agentDir = getAgentDir(),
+): Promise<Wire.CommandOption[]> {
+	let operator = JSON.parse(await optionalFile(join(agentDir, "settings.json")) ?? "{}");
+	let settingsManager = await fullSettings(operator, cwd);
+	let loader = new DefaultResourceLoader({
+		cwd,
+		agentDir,
+		settingsManager,
+		additionalExtensionPaths: [...settings.extensions ?? []],
+	});
+	await loader.reload();
+	let { session } = await createAgentSession({
+		cwd,
+		agentDir,
+		modelRuntime: runtime,
+		fallbackModels: [],
+		sessionManager: SessionManager.inMemory(cwd),
+		settingsManager,
+		resourceLoader: loader,
+	});
+	try {
+		let commands: Wire.CommandOption[] = [];
+		for (let template of session.promptTemplates) {
+			commands.push({ name: template.name, description: template.description, kind: "prompt" });
+		}
+		for (let skill of loader.getSkillCatalog?.().commands ?? []) {
+			commands.push({
+				name: `skill:${skill.name}`,
+				description: skill.description,
+				kind: "skill",
+			});
+		}
+		let workflow = session.getToolDefinition("workflow");
+		if (workflow) {
+			let listed = await workflow.execute(
+				"chopin-commands",
+				{ action: "list" } as never,
+				undefined,
+				undefined,
+				session.extensionRunner.createContext() as never,
+			);
+			let items = (JSON.parse(resultText(listed)) as { items?: unknown }).items;
+			for (let item of Array.isArray(items) ? items : []) {
+				let { name, description } = item as { name?: unknown; description?: unknown };
+				if (typeof name !== "string") continue;
+				commands.push({
+					name,
+					...(typeof description === "string" ? { description } : {}),
+					kind: "workflow",
+				});
+			}
+		}
+		return commands;
+	} finally {
+		await session.dispose();
+	}
+}
+
 /** Host-process `HarnessV1` implementation over `@bastani/atomic`. */
 export function createAtomicAdapter(
 	settings: AtomicSettings,
 ): HarnessV1 & {
 	shutdown(): Promise<void>;
+	/** A turn takes a person's message while it runs, through `submitUserMessage`. */
+	steers: true;
 	/** What a document's Planner can be set to run; see `atomicCatalog`. */
 	catalog(defaultModel: string | undefined): Promise<Wire.ModelCatalog>;
+	/** The commands a Planner working in `cwd` offers; see `sessionCommands`. */
+	commands(cwd: string): Promise<Wire.CommandOption[]>;
 } {
 	if (!ATOMIC_AUTH_MODES.includes(settings.auth)) {
 		throw new Error(`HARNESS_AUTH ${settings.auth} is not a supported atomic authentication mode`);
@@ -589,6 +708,7 @@ export function createAtomicAdapter(
 		harnessId: "atomic",
 		builtinTools: {},
 		supportsBuiltinToolFiltering: true,
+		steers: true,
 
 		async doStart(startOptions: HarnessV1StartOptions): Promise<HarnessV1Session> {
 			if (startOptions.resumeFrom || startOptions.continueFrom) {
@@ -677,6 +797,37 @@ export function createAtomicAdapter(
 						}
 						run.emit(part);
 					}
+					if (
+						sessionManager
+						&& (event.type === "entry_appended" || event.type === "message_end"
+							|| event.type === "compaction_end")
+					) {
+						let header = sessionManager.getHeader();
+						if (header) {
+							full.onSessionEntries?.(
+								[header, ...sessionManager.getEntries()],
+								sessionManager.getLeafId(),
+							);
+						}
+					}
+				}
+				if (event.type === "compaction_start") {
+					run.emit({ type: "raw", rawValue: { type: "compacting" } });
+					return;
+				}
+				if (event.type === "compaction_end") {
+					if (!event.aborted && event.result) {
+						run.emit({
+							type: "compaction",
+							trigger: event.reason === "manual" ? "manual" : "auto",
+							summary: event.result.compactedText,
+							tokensBefore: event.result.tokensBefore,
+							tokensAfter: event.result.stats.tokensAfter,
+						});
+					} else {
+						run.emit({ type: "raw", rawValue: { type: "compaction-idle" } });
+					}
+					return;
 				}
 				if (!("message" in event) || event.message.role !== "assistant") return;
 				if (event.type === "message_start") {
@@ -749,7 +900,25 @@ export function createAtomicAdapter(
 					if (full && settings.journal) {
 						await mkdir(dirname(settings.journal), { recursive: true, mode: 0o700 });
 					}
-					sessionManager ??= SessionManager.inMemory(cwd);
+					if (!sessionManager) {
+						if (full?.sessionEntries?.length) {
+							sessionManager = SessionManager.inMemory(
+								cwd,
+								undefined,
+								structuredClone(full.sessionEntries) as Parameters<
+									typeof SessionManager.inMemory
+								>[2],
+							);
+							if (full.branchLeafId !== undefined) {
+								if (full.branchLeafId === null) await sessionManager.resetLeaf();
+								else if (sessionManager.getEntry(full.branchLeafId)) {
+									await sessionManager.branch(full.branchLeafId);
+								}
+							}
+						} else {
+							sessionManager = SessionManager.inMemory(cwd);
+						}
+					}
 					let loader = new DefaultResourceLoader({
 						cwd,
 						agentDir,
@@ -879,7 +1048,7 @@ export function createAtomicAdapter(
 				async doPromptTurn(turn: PlannerTurn): Promise<HarnessV1PromptControl> {
 					if (closed) throw new Error("Atomic session is closed.");
 					if (current) throw new Error("Atomic session already has an active turn.");
-					let text = promptText(turn.prompt);
+					let { text, images } = promptParts(turn.prompt);
 					let agent = await prepare(turn);
 					let structured = turn.responseFormat?.type === "json";
 					let names = full
@@ -917,6 +1086,17 @@ export function createAtomicAdapter(
 							run.pending.clear();
 							void bounded(agent.abort(), "Atomic abort timed out.").catch(() => {});
 						},
+						steer: async text => {
+							// Atomic would start a turn of its own for a message it is given while idle, and
+							// Chopin never starts one it did not ask for.
+							if (run.stopped || current !== run || !agent.isStreaming) {
+								throw new Error("The turn is not running.");
+							}
+							await bounded(
+								agent.steer(text, undefined, { expandPromptTemplates: false }),
+								"Atomic steering timed out.",
+							);
+						},
 						done: Promise.resolve(),
 					};
 					current = run;
@@ -925,7 +1105,10 @@ export function createAtomicAdapter(
 							if (!run.stopped) {
 								run.emit({ type: "stream-start", modelId: agent.model?.id });
 								await agent.agent.waitForIdle();
-								await agent.prompt(text, { expandPromptTemplates: !!full });
+								await agent.prompt(text, {
+									expandPromptTemplates: !!full,
+									...(images.length ? { images } : {}),
+								});
 							}
 							if (run.failure) throw run.failure;
 							if (run.stopped) return;
@@ -941,15 +1124,53 @@ export function createAtomicAdapter(
 								run.emit({ type: "text-delta", id, delta: JSON.stringify(policy.result.value) });
 								run.emit({ type: "text-end", id });
 							}
+							let recorded = run.last?.usage;
+							let inputTotal = (recorded?.input ?? 0) + (recorded?.cacheRead ?? 0)
+								+ (recorded?.cacheWrite ?? 0);
+							let outputTotal = recorded?.output ?? 0;
+							let hasUsage = inputTotal + outputTotal > 0;
+							let turnUsage = hasUsage
+								? {
+									inputTokens: {
+										total: inputTotal,
+										noCache: recorded?.input ?? 0,
+										cacheRead: recorded?.cacheRead ?? 0,
+										cacheWrite: recorded?.cacheWrite ?? 0,
+									},
+									outputTokens: {
+										total: outputTotal,
+										text: outputTotal,
+										reasoning: 0,
+									},
+								}
+								: ZERO_USAGE;
+							if (hasUsage && agent.model?.contextWindow && agent.model.contextWindow > 0) {
+								run.emit({
+									type: "raw",
+									rawValue: {
+										type: "context-window",
+										contextWindow: agent.model.contextWindow,
+									},
+								});
+							}
+							if (full && sessionManager) {
+								let header = sessionManager.getHeader();
+								if (header) {
+									full.onSessionEntries?.(
+										[header, ...sessionManager.getEntries()],
+										sessionManager.getLeafId(),
+									);
+								}
+							}
 							run.emit({
 								type: "finish-step",
 								finishReason: { unified: "stop", raw: undefined },
-								usage: ZERO_USAGE,
+								usage: turnUsage,
 							});
 							run.emit({
 								type: "finish",
 								finishReason: { unified: "stop", raw: undefined },
-								totalUsage: ZERO_USAGE,
+								totalUsage: turnUsage,
 							});
 						} finally {
 							if (current === run) current = undefined;
@@ -985,6 +1206,10 @@ export function createAtomicAdapter(
 
 		async catalog(defaultModel) {
 			return atomicCatalog(await (runtime ??= createRuntime(settings)), settings, defaultModel);
+		},
+
+		async commands(cwd) {
+			return sessionCommands(await (runtime ??= createRuntime(settings)), settings, cwd);
 		},
 
 		async shutdown() {

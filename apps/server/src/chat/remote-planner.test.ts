@@ -3,7 +3,11 @@ import { afterEach, expect, test } from "bun:test";
 import { ActiveOwnerBindings } from "../agent/active-owner";
 import { createPlannerAgent } from "../harness/agents";
 import { createRemoteAdapter } from "../harness/remote/adapter";
-import { disconnectedMessage, notAttachedMessage } from "../harness/remote/attachments";
+import {
+	disconnectedMessage,
+	notAttachedMessage,
+	PlannerAttachments,
+} from "../harness/remote/attachments";
 import { openPlannerSession } from "../harness/session";
 import * as Plan from "../plan/service";
 import { configured } from "../testing/config";
@@ -23,6 +27,9 @@ import { GitHubError } from "../github/client";
 import { laterTimers } from "../testing/decisions";
 import { expectPlainStatusLines } from "../testing/plain-words";
 import * as Chat from "./service";
+import { ReferenceService } from "./references";
+import { plannerCommands } from "../harness/harnesses";
+import { attachedLink } from "../harness/remote/registry";
 import * as Question from "@chopin/question";
 import { answerTurns } from "../questions/answer-turns";
 import * as Questions from "../questions/service";
@@ -30,6 +37,8 @@ import * as Store from "../questions/store";
 import { member } from "../questions/text-response.test-fixtures";
 
 import type { Server } from "bun";
+import type { Chat as Wire } from "@chopin/protocol";
+import type { CapabilityCatalog } from "@chopin/agent-link";
 import type { AgentClient, AgentHandlers } from "@chopin/agent-link/client";
 import type { HostedAuth } from "../auth/routes";
 import type { Socket, SocketData } from "../wire";
@@ -96,9 +105,8 @@ async function remoteRoom(graceMs?: number, operationMs?: number) {
 		plannerNotAttached: async () =>
 			await server.attachments.confirmed(channel.id)
 				? undefined
-				: server.attachments.status(channel.id).state === "disconnected"
-				? disconnectedMessage(server.attachments.holder(channel.id))
-				: notAttachedMessage(url, "octo-org/score"),
+				: server.attachments.unavailable(channel.id)
+					?? notAttachedMessage(url, "octo-org/score"),
 		activeOwner: () => owners.resolve(channel.id),
 		persist: () => Plan.persist(plan),
 		openPlannerSession: (binding, options) =>
@@ -126,7 +134,11 @@ async function remoteRoom(graceMs?: number, operationMs?: number) {
 			replies.push(JSON.parse(text));
 		},
 	} as unknown as Socket;
-	let send = async (text: string, to: "planner" | "room" = "planner") => {
+	let send = async (
+		text: string,
+		to: "planner" | "room" = "planner",
+		references?: Wire.ReferenceRequest[],
+	) => {
 		let rid = crypto.randomUUID();
 		await Chat.send(context, ws, {
 			kind: "chat:send",
@@ -134,6 +146,7 @@ async function remoteRoom(graceMs?: number, operationMs?: number) {
 			requestId: crypto.randomUUID(),
 			to,
 			text,
+			...(references ? { references } : {}),
 			ts: 0,
 		} as never);
 		return replies.find(reply => reply.rid === rid);
@@ -206,50 +219,56 @@ test("with no attached Planner, @chopin and invoke_planner are refused with how 
 	expect(context.chat.entries.map(entry => entry.text)).toEqual(["Just talking"]);
 });
 
-/** Keeps a person's requests as rows, as `main.ts` does in hosted mode. */
-function withRows(room: Awaited<ReturnType<typeof remoteRoom>>) {
-	let { context, server, channel } = room;
-	context.deferred = {};
-	context.plannerReady = () => server.attachments.confirmed(channel.id);
-	context.persist = (chat, deferred) => Plan.persistDeferred(context.plan, chat, deferred);
-}
+test("a message to a machine whose link dropped is refused saying it was not sent and to send it again, never that it is kept, and nothing is posted", async () => {
+	let down = await resumablePlanner({ graceMs: GRACE_MS });
+	let { context } = down;
+	await down.drop();
+	let entries = context.chat.entries.length;
+	let saves = 0;
+	let persist = context.persist;
+	context.persist = async chat => {
+		saves++;
+		await persist(chat);
+	};
 
-test("with rows, a message sent while no Planner is attached is saved as sent, never refused, and the client that attaches afterwards receives it once, as the owner, in order", async () => {
+	let refused = await down.send("@chopin and then this");
+	expect(refused).toMatchObject({
+		kind: "session:error",
+		code: "planner-not-attached",
+		message: "@member's machine is offline, so this message wasn't sent. "
+			+ "Send it again when it's back.",
+	});
+	expect(String(refused?.message)).not.toMatch(/kept|picks up/);
+	// The machine's own work is another matter: it is kept, and the refusal does not touch it.
+	expect(context.chat.entries).toHaveLength(entries);
+	expect(context.chat.waiting).toEqual([]);
+	expect(saves).toBe(0);
+	expect(context.chat.retained).toBeDefined();
+});
+
+test("a message sent in the hand-over window before the machine resumes is refused saying still connecting, and nothing is posted", async () => {
 	let room = await remoteRoom();
-	let { context } = room;
-	withRows(room);
-	let first = await room.send("@chopin draft the plan");
-	let second = await room.send("@chopin and then this");
-	expect(first).toMatchObject({ kind: "chat:send", queued: true });
-	expect(second).toMatchObject({ kind: "chat:send", queued: true });
-	expect(context.chat.entries.map(entry => entry.deliveryState)).toEqual(["sent", "sent"]);
-	expect(await room.owner()).toBeUndefined();
-	expect(await room.storage.deferredTurns.list(room.channel.id, ["waiting"])).toHaveLength(2);
-
-	let script = scriptedPlanner();
-	let member = await attach(room.server.url, room.channel.id, script.handlers);
+	let { channel, context, server } = room;
+	let member = await attach(server.url, channel.id, scriptedPlanner().handlers);
 	cleanups.push(() => member.detach());
-	// What `main.ts` does when a Planner attaches.
-	await Chat.kick(context);
-	await context.chat.running;
-	expect(script.turns.map(turn => turn.prompt)).toEqual([
-		expect.stringContaining("draft the plan"),
-		expect.stringContaining("and then this"),
-	]);
-	expect(await room.owner()).toBe(room.logins.get("member"));
-	expect(
-		context.chat.entries.filter(entry => entry.author.kind === "member").map(entry =>
-			entry.deliveryState
-		),
-	).toEqual(["delivered", "delivered"]);
-	expect((await room.storage.deferredTurns.list(room.channel.id)).map(row => row.state)).toEqual([
-		"ended",
-		"ended",
-	]);
-	// Another attach finds nothing left to send.
-	await Chat.kick(context);
-	await Bun.sleep(20);
-	expect(script.turns).toHaveLength(2);
+	let rows = server.attachments.freeze(GRACE_MS);
+	let next = new PlannerAttachments(context.auth as never, GRACE_MS);
+	cleanups.push(() => next.close());
+	await next.restore(rows.map(row => ({ ...row, fencing: 1 })));
+	context.plannerNotAttached = async () =>
+		await next.confirmed(channel.id)
+			? undefined
+			: next.unavailable(channel.id) ?? disconnectedMessage(next.holder(channel.id));
+	expect(next.status(channel.id)).toEqual({ state: "attached", login: "member" });
+	let refused = await room.send("@chopin outline the plan");
+	expect(refused).toMatchObject({
+		kind: "session:error",
+		code: "planner-not-attached",
+		message: "Still connecting to @member's machine, so this message wasn't sent. "
+			+ "Send it again in a moment.",
+	});
+	expect(context.chat.entries).toEqual([]);
+	expect(context.chat.waiting).toEqual([]);
 });
 
 test("other harnesses keep claiming ownership for the sender as before", async () => {
@@ -322,10 +341,10 @@ test("an attached Planner receives @chopin and invoke_planner turns as their own
 	await Chat.resume(context, room.ws);
 	expect(controls).toEqual([{ type: "stop", run: undefined }, { type: "resume", run: undefined }]);
 	expect(context.chat.entries.map(entry => entry.text)).toContain(
-		"@rival stopped Chopin and paused its workflows.",
+		"@rival stopped chopin and paused its workflows.",
 	);
 	expect(context.chat.entries.map(entry => entry.text)).toContain(
-		"@rival resumed Chopin's workflows.",
+		"@rival resumed chopin's workflows.",
 	);
 });
 
@@ -781,8 +800,12 @@ test("a dropped link's grace period only leases ownership: a Stop that ends a qu
 	// left to keep, the account's ownership is leased for the grace period as a detach's is.
 	await Chat.abort(context, down.ws);
 	await until(() => context.plan.records.get(id)?.status === "cancelled");
-	expect(down.said().at(-1)).toBe("@rival stopped Chopin and withdrew its open question.");
+	expect(down.said().at(-1)).toBe("@rival stopped chopin and withdrew its open question.");
 	await until(() => server.attachments.status(down.channel.id).state === "held");
+	// The machine stepped away: a message to it is refused as one to a machine that is offline.
+	expect(await context.plannerNotAttached!()).toBe(
+		"@member's machine is offline, so this message wasn't sent. Send it again when it's back.",
+	);
 	await clock.pass(GRACE_MS - 1);
 	expect(server.attachments.status(down.channel.id)).toMatchObject({ state: "held" });
 	await clock.pass(1);
@@ -845,7 +868,7 @@ test("a Stop pressed while the attached Planner's link is down says it is pendin
 	// Nothing has stopped: the run card stays as last reported, and the notice does not say otherwise.
 	expect(context.chat.runs?.map(run => run.status)).toEqual(["running"]);
 	expect(said().at(-1)).toBe(
-		"@rival asked Chopin to stop. Its machine is disconnected, so its workflows will pause when it reconnects.",
+		"@rival asked chopin to stop. Its machine is disconnected, so its workflows will pause when it reconnects.",
 	);
 
 	let client = await down.reconnect();
@@ -881,7 +904,7 @@ test("a Stop pressed while the attached Planner's link is down withdraws a quest
 	let id = [...context.plan.records.keys()][0]!;
 	expect(context.plan.records.get(id)?.status).toBe("open");
 	await Chat.abort(context, down.ws);
-	expect(said().at(-1)).toBe("@rival stopped Chopin and withdrew its open question.");
+	expect(said().at(-1)).toBe("@rival stopped chopin and withdrew its open question.");
 	expect(context.plan.records.get(id)?.status).toBe("cancelled");
 	expect(context.chat.retained).toBeUndefined();
 
@@ -903,7 +926,7 @@ test("a Stop the client had not answered when its link dropped is held, says it 
 	// Nothing has stopped, and the notice does not say so.
 	expect(context.chat.runs?.map(run => run.status)).toEqual(["running"]);
 	expect(said().at(-1)).toBe(
-		"@rival asked Chopin to stop. Its machine is disconnected, so its workflows will pause when it reconnects.",
+		"@rival asked chopin to stop. Its machine is disconnected, so its workflows will pause when it reconnects.",
 	);
 
 	down.answering();
@@ -1068,7 +1091,7 @@ test("a Stop pressed before the server notices the link died says it was not con
 	let { context, server } = down;
 	down.proxy!.hold();
 	await Chat.abort(context, down.ws);
-	let stop = "@rival asked Chopin to stop its workflows. It has not confirmed yet, and if its "
+	let stop = "@rival asked chopin to stop its workflows. It has not confirmed yet, and if its "
 		+ "machine is disconnected they will pause when it reconnects.";
 	expect(down.said().at(-1)).toBe(stop);
 	expect(context.chat.runs?.map(run => run.status)).toEqual(["running"]);
@@ -1089,7 +1112,7 @@ test("a pause of one run the client did not confirm in time is reported as not c
 	down.proxy!.hold();
 	await Chat.controlRun(context, down.ws, { kind: "chat:pause-run", runId: "run-1" });
 	expect(down.said().at(-1)).toBe(
-		"@rival asked to pause plan-review. Chopin has not confirmed yet, and if its "
+		"@rival asked to pause plan-review. chopin has not confirmed yet, and if its "
 			+ "machine is disconnected it will pause when it reconnects.",
 	);
 });
@@ -1115,7 +1138,7 @@ test("a Stop of every run that a Resume of another run partly undid is still rep
 	await down.drop();
 	await stopping;
 	expect(down.said().some(text => text === "@rival stopped the turn.")).toBe(false);
-	expect(down.said().some(text => text.startsWith("@rival asked Chopin to stop."))).toBe(true);
+	expect(down.said().some(text => text.startsWith("@rival asked chopin to stop."))).toBe(true);
 	await down.reconnect();
 	await until(() => down.controls.includes("stop run-1"));
 });
@@ -1221,4 +1244,613 @@ test("a Stop the client confirms after the wait for it ended is not sent again w
 	await down.reconnect();
 	await Bun.sleep(300);
 	expect(down.controls).toEqual(["stop"]);
+});
+
+const COMMANDS: NonNullable<CapabilityCatalog["commands"]> = [
+	{ name: "skill:notes", kind: "skill", description: "Take notes" },
+	{ name: "review", kind: "prompt" },
+	{ name: "ship", kind: "workflow", description: "Ship it" },
+];
+
+function command(name: string, commandKind: string, start: number): Wire.CommandRequest {
+	return { kind: "command", name, commandKind, start, end: start + name.length + 1 };
+}
+
+/** A remote room that checks commands against what its attached client reports, as main.ts does. */
+async function commandRoom(source = "") {
+	let room = await remoteRoom();
+	room.context.references = new ReferenceService({
+		storage: room.storage,
+		current: async channelId => ({
+			channelId,
+			revision: 2,
+			source,
+			sourceHash: Plan.sourceHash(source),
+		}),
+		research: {} as never,
+	});
+	room.context.commands = () =>
+		plannerCommands("remote", room.channel.id, { owner: "octo-org", name: "score" });
+	return room;
+}
+
+async function reportingClient(
+	room: Awaited<ReturnType<typeof commandRoom>>,
+	catalog: CapabilityCatalog | undefined,
+) {
+	let script = scriptedPlanner();
+	let client = await connectAgent({
+		url: room.server.url,
+		token: MEMBER_TOKEN,
+		document: room.channel.id,
+		handlers: script.handlers,
+		resumable: false,
+		...(catalog ? { capabilities: catalog } : {}),
+	});
+	cleanups.push(() => client.detach());
+	return { client, turns: script.turns };
+}
+
+test("a command the attached client reports runs on that client as its own /name args, and one it does not report is refused where the person reads it", async () => {
+	let room = await commandRoom();
+	let { turns } = await reportingClient(room, { commands: COMMANDS });
+	await until(() => attachedLink(room.channel.id)?.catalog?.commands?.length === 3);
+	let { context } = room;
+
+	// A skill: Atomic's own invocation opens the prompt, with nothing in front of it.
+	await room.send("we should write release notes", "room");
+	expect(
+		await room.send("@chopin /skill:notes for today", "planner", [
+			command("skill:notes", "skill", "@chopin ".length),
+		]),
+	).toMatchObject({ kind: "chat:send" });
+	await context.chat.running;
+	expect(turns.map(turn => turn.prompt)).toEqual(["/skill:notes for today"]);
+	let said = context.chat.entries.findLast(entry => entry.author.kind === "member");
+	expect(said).toMatchObject({
+		text: "/skill:notes for today",
+		delivery: { destination: "planner" },
+		references: [{ kind: "command", name: "skill:notes", commandKind: "skill", start: 0, end: 12 }],
+	});
+
+	// The prompt is the command alone, and the Planner still has what the room said: a fresh
+	// session is told it in its instructions.
+	expect((turns[0] as { instructions?: string }).instructions).toContain(
+		"Durable conversation context follows:\n@rival: we should write release notes",
+	);
+
+	// A prompt template, then a workflow, which is asked for by name.
+	await room.send("/review the diff", "planner", [command("review", "prompt", 0)]);
+	await context.chat.running;
+	expect(turns.at(-1)!.prompt).toBe("/review the diff");
+	await room.send("/ship the v2 branch", "planner", [command("ship", "workflow", 0)]);
+	await context.chat.running;
+	expect(turns.at(-1)!.prompt).toContain('Start the registered workflow "ship" now');
+	expect(turns.at(-1)!.prompt.endsWith("the v2 branch")).toBe(true);
+
+	// An unknown command is refused, says so, and posts and runs nothing.
+	let before = context.chat.entries.length;
+	let ran = turns.length;
+	expect(await room.send("/deploy now", "planner", [command("deploy", "workflow", 0)]))
+		.toMatchObject({
+			kind: "session:error",
+			message: "/deploy is not one of the commands the Planner offers.",
+		});
+	// The same name as another kind is not the command either.
+	expect(await room.send("/review", "planner", [command("review", "skill", 0)])).toMatchObject({
+		message: "/review is not one of the commands the Planner offers.",
+	});
+	expect(context.chat.entries).toHaveLength(before);
+	expect(turns).toHaveLength(ran);
+});
+
+test("a command is refused while the attached client reports none, and again once it has left", async () => {
+	let room = await commandRoom();
+	let { client } = await reportingClient(room, undefined);
+	let { context } = room;
+	await until(() => attachedLink(room.channel.id) !== undefined);
+	let said = "The Planner has not reported any commands, so /review cannot run.";
+	expect(await room.send("/review", "planner", [command("review", "prompt", 0)])).toMatchObject({
+		kind: "session:error",
+		message: said,
+	});
+	await client.detach();
+	expect(await room.send("/review", "planner", [command("review", "prompt", 0)])).toMatchObject({
+		message: expect.stringContaining("cannot run"),
+	});
+	expect(context.chat.entries.filter(entry => entry.author.kind === "member")).toHaveLength(0);
+});
+
+test("a command goes only to the Planner, and not to the people in the room", async () => {
+	let room = await commandRoom();
+	await reportingClient(room, { commands: COMMANDS });
+	await until(() => attachedLink(room.channel.id)?.catalog?.commands?.length === 3);
+	expect(await room.send("/review the diff", "room", [command("review", "prompt", 0)]))
+		.toMatchObject({
+			kind: "session:error",
+			message: "A command runs in the Planner's turn, so it goes to chopin.",
+		});
+	expect(room.context.chat.entries).toHaveLength(0);
+});
+
+test("a heading, a Decision and a file mentioned in a message reach the attached client as structured references, and a part that has gone is refused", async () => {
+	let source = [
+		"# Overview",
+		"",
+		'<Questionnaire id="01HQ0000000000000000000000">',
+		'<Question id="q1" header="Rollout" prompt="How?" multiple="false">',
+		'<Option id="o1" label="Canary" />',
+		"</Question>",
+		"</Questionnaire>",
+		"",
+	].join("\n");
+	let room = await commandRoom(source);
+	room.context.fileExists = async (path, session) =>
+		session === room.logins.get("rival") ? path === "src/index.ts" : undefined;
+	let { turns } = await reportingClient(room, undefined);
+	let { context } = room;
+	let text = "@chopin compare @ov with @ro in @idx";
+	let at = (token: string) => text.indexOf(token);
+	let mention = [
+		{ kind: "heading", anchor: "overview", start: at("@ov"), end: at("@ov") + 3 },
+		{
+			kind: "decision",
+			decisionId: "01HQ0000000000000000000000",
+			start: at("@ro"),
+			end: at("@ro") + 3,
+		},
+		{ kind: "file", path: "src/index.ts", start: at("@idx"), end: at("@idx") + 4 },
+	] as Wire.ReferenceRequest[];
+	expect(await room.send(text, "planner", mention)).toMatchObject({ kind: "chat:send" });
+	await context.chat.running;
+	let said = context.chat.entries.find(entry => entry.author.kind === "member");
+	expect(said?.text).toBe("compare @Overview with @Rollout in @src/index.ts");
+	expect(said?.references?.map(reference => reference.kind)).toEqual([
+		"heading",
+		"decision",
+		"file",
+	]);
+	expect(turns.at(-1)!.prompt).toBe(
+		'@rival: compare @Overview [heading anchor "overview", level 1, line 1 of this document] with '
+			+ '@Rollout [Decision id "01HQ0000000000000000000000" of this document] in '
+			+ '@src/index.ts [file path "src/index.ts" in the repository]',
+	);
+
+	let before = context.chat.entries.length;
+	expect(
+		await room.send("@chopin see @x", "planner", [
+			{ kind: "heading", anchor: "removed", start: 12, end: 14 },
+		]),
+	).toMatchObject({
+		kind: "session:error",
+		message: "That heading is no longer in the document.",
+	});
+	expect(
+		await room.send("@chopin see @x", "planner", [
+			{ kind: "file", path: "../etc/passwd", start: 12, end: 14 },
+		]),
+	).toMatchObject({ kind: "session:error", message: "invalid or unavailable chat reference" });
+	// A file the sender's session cannot list is not one it can mention.
+	expect(
+		await room.send("@chopin see @x", "planner", [
+			{ kind: "file", path: "src/other.ts", start: 12, end: 14 },
+		]),
+	).toMatchObject({ kind: "session:error", message: "That file is not in the repository." });
+	expect(context.chat.entries).toHaveLength(before);
+});
+
+function pixels(width: number, height: number, seed: number): string {
+	let size = [width, height].flatMap(value => [
+		value >>> 24,
+		value >>> 16 & 255,
+		value >>> 8 & 255,
+		value & 255,
+	]);
+	let signature = [
+		0x89,
+		0x50,
+		0x4e,
+		0x47,
+		0x0d,
+		0x0a,
+		0x1a,
+		0x0a,
+		0,
+		0,
+		0,
+		13,
+		0x49,
+		0x48,
+		0x44,
+		0x52,
+	];
+	return Buffer.from([...signature, ...size, 8, 6, 0, 0, 0, seed]).toString("base64");
+}
+
+test("a Stop while an attached Planner's image is uploading waits for it, keeps it with that turn, and the next turn's images go on the next turn", async () => {
+	let room = await remoteRoom();
+	let { context, storage } = room;
+	let started = Promise.withResolvers<void>();
+	let release = Promise.withResolvers<void>();
+	let put = storage.images.put.bind(storage.images);
+	storage.images.put = async image => {
+		if (image.bytes[image.bytes.length - 1] === 1) {
+			started.resolve();
+			await release.promise;
+		}
+		await put(image);
+	};
+	let client = await attach(
+		room.server.url,
+		room.channel.id,
+		scriptedPlanner({
+			async turn(turn) {
+				if (turn.message.prompt.includes("draw it")) {
+					turn.offerTools(["draw"]);
+					turn.emit({
+						type: "tool-call",
+						toolCallId: "draw-1",
+						toolName: "draw",
+						input: "{}",
+						providerExecuted: true,
+					});
+					turn.emit({
+						type: "tool-result",
+						toolCallId: "draw-1",
+						toolName: "draw",
+						result: {
+							content: [{ type: "text", text: "Drew it" }, {
+								type: "image",
+								data: pixels(800, 600, 2),
+								mimeType: "image/png",
+								alt: "Ground floor",
+							}],
+						},
+					});
+					finishTurn(turn);
+					return;
+				}
+				void turn.callHostTool("upload_plan_image", {
+					data: pixels(40, 30, 1),
+					mimeType: "image/png",
+					alt: "Stopped mid-upload",
+				});
+				await new Promise(resolve => {
+					turn.signal.addEventListener("abort", resolve, { once: true });
+				});
+			},
+		}).handlers,
+	);
+	cleanups.push(() => client.detach());
+
+	expect(await room.send("@chopin upload one")).toMatchObject({ kind: "chat:send" });
+	await started.promise;
+	await Chat.abort(context, room.ws);
+	release.resolve();
+	await context.chat.running;
+	expect(await room.send("@chopin draw it")).toMatchObject({ kind: "chat:send" });
+	await context.chat.running;
+
+	let holders = context.chat.entries.filter(entry => entry.images);
+	expect(holders.map(entry => ({
+		author: entry.author,
+		tools: entry.tools?.map(tool => [tool.name, tool.result]),
+		images: entry.images?.map(({ alt, width, height, generated }) => ({
+			alt,
+			width,
+			height,
+			generated,
+		})),
+	}))).toEqual([
+		{
+			author: { kind: "agent" },
+			tools: [["upload_plan_image", "Turn stopped."]],
+			images: [{ alt: "Stopped mid-upload", width: 40, height: 30, generated: true }],
+		},
+		{
+			author: { kind: "agent" },
+			tools: [["draw", "Drew it\n1 image"]],
+			images: [{ alt: "Ground floor", width: 800, height: 600, generated: true }],
+		},
+	]);
+	let stopped = context.chat.entries.findIndex(entry => entry.text === "@rival stopped the turn.");
+	let next = context.chat.entries.findIndex(entry => entry.text.includes("draw it"));
+	expect(context.chat.entries.indexOf(holders[0]!)).toBeLessThan(stopped);
+	expect(context.chat.entries.indexOf(holders[1]!)).toBeGreaterThan(next);
+	let saved = (context.plan.persistence.committedSidecar as { transcript: Chat.Chat["entries"] })
+		.transcript.filter(entry => entry.images);
+	expect(saved.map(entry => [entry.id, entry.images])).toEqual(
+		holders.map(entry => [entry.id, entry.images]),
+	);
+	for (let image of holders.flatMap(entry => entry.images!)) {
+		expect(await storage.images.get(room.channel.id, image.src.slice(8, 72))).toMatchObject({
+			mimeType: "image/png",
+			uploadedBy: RIVAL.id,
+		});
+	}
+});
+
+test("a turn that ends while its tool's image is still being stored waits for it, then saves the image with the turn", async () => {
+	let room = await remoteRoom();
+	let { context, storage } = room;
+	let started = Promise.withResolvers<void>();
+	let release = Promise.withResolvers<void>();
+	let put = storage.images.put.bind(storage.images);
+	storage.images.put = async image => {
+		if (image.bytes[image.bytes.length - 1] === 3) {
+			started.resolve();
+			await release.promise;
+		}
+		await put(image);
+	};
+	let image = (seed: number, alt: string) => ({
+		type: "image",
+		data: pixels(640, 480, seed),
+		mimeType: "image/png",
+		alt,
+	});
+	let client = await attach(
+		room.server.url,
+		room.channel.id,
+		scriptedPlanner({
+			async turn(turn) {
+				let next = turn.message.prompt.includes("next");
+				turn.offerTools(["draw"]);
+				let toolCallId = next ? "draw-2" : "draw-1";
+				turn.emit({
+					type: "tool-call",
+					toolCallId,
+					toolName: "draw",
+					input: "{}",
+					providerExecuted: true,
+				});
+				turn.emit({
+					type: "tool-result",
+					toolCallId,
+					toolName: "draw",
+					result: { content: [next ? image(4, "Next floor") : image(3, "Slow floor")] },
+				});
+				finishTurn(turn);
+			},
+		}).handlers,
+	);
+	cleanups.push(() => client.detach());
+
+	expect(await room.send("@chopin draw it")).toMatchObject({ kind: "chat:send" });
+	await started.promise;
+	let ended = false;
+	let running = context.chat.running!.then(() => (ended = true));
+	await Bun.sleep(50);
+	expect(ended).toBe(false);
+	expect(context.chat.busy).toBe(true);
+	release.resolve();
+	await running;
+
+	let saved = () =>
+		(context.plan.persistence.committedSidecar as { transcript: Chat.Chat["entries"] })
+			.transcript.filter(entry => entry.images)
+			.map(entry => [entry.id, entry.images!.map(item => item.alt)]);
+	let first = context.chat.entries.find(entry => entry.images);
+	expect(first?.tools?.map(tool => tool.result)).toEqual(["1 image"]);
+	expect(saved()).toEqual([[first!.id, ["Slow floor"]]]);
+
+	expect(await room.send("@chopin the next one")).toMatchObject({ kind: "chat:send" });
+	await context.chat.running;
+	let holders = context.chat.entries.filter(entry => entry.images);
+	expect(holders.map(entry => entry.images!.map(item => item.alt))).toEqual([
+		["Slow floor"],
+		["Next floor"],
+	]);
+	expect(saved()).toEqual(holders.map(entry => [entry.id, entry.images!.map(item => item.alt)]));
+});
+
+test("a remote client that reuses a tool call id in a later turn keeps each turn's image and tool result on that turn's message", async () => {
+	let room = await remoteRoom();
+	let { context } = room;
+	let image = (seed: number, alt: string) => ({
+		type: "image",
+		data: pixels(640, 480, seed),
+		mimeType: "image/png",
+		alt,
+	});
+	let client = await attach(
+		room.server.url,
+		room.channel.id,
+		scriptedPlanner({
+			async turn(turn) {
+				let next = turn.message.prompt.includes("next");
+				turn.offerTools(["draw"]);
+				turn.emit({
+					type: "tool-call",
+					toolCallId: "draw-1",
+					toolName: "draw",
+					input: "{}",
+					providerExecuted: true,
+				});
+				turn.emit({
+					type: "tool-result",
+					toolCallId: "draw-1",
+					toolName: "draw",
+					result: { content: [next ? image(4, "Next floor") : image(3, "Slow floor")] },
+				});
+				finishTurn(turn);
+			},
+		}).handlers,
+	);
+	cleanups.push(() => client.detach());
+
+	expect(await room.send("@chopin draw it")).toMatchObject({ kind: "chat:send" });
+	await context.chat.running;
+	expect(await room.send("@chopin the next one")).toMatchObject({ kind: "chat:send" });
+	await context.chat.running;
+
+	let holders = context.chat.entries.filter(entry => entry.images);
+	expect(holders.map(entry => entry.images!.map(item => item.alt))).toEqual([
+		["Slow floor"],
+		["Next floor"],
+	]);
+	expect(holders.map(entry => entry.tools!.map(tool => [tool.id, tool.status, tool.result])))
+		.toEqual([
+			[["draw-1", "done", "1 image"]],
+			[["draw-1", "done", "1 image"]],
+		]);
+	let kinds = context.chat.entries.map(entry => entry.author.kind);
+	expect(kinds.indexOf("member")).toBeLessThan(context.chat.entries.indexOf(holders[0]!));
+	expect(context.chat.entries.indexOf(holders[0]!)).toBeLessThan(
+		context.chat.entries.findLastIndex(entry => entry.author.kind === "member"),
+	);
+	expect(context.chat.entries.findLastIndex(entry => entry.author.kind === "member")).toBeLessThan(
+		context.chat.entries.indexOf(holders[1]!),
+	);
+});
+
+test("a refused reply's repair attempt may reuse a tool call id, and both attempts' images stay on the turn's message, each once", async () => {
+	let room = await remoteRoom();
+	let { context } = room;
+	context.decide = async ({ state }) => ({
+		model: "test/classifier",
+		answers: {
+			input: { type: "noul", noul: (state as { reply: string }).reply.includes("?") ? 1 : 0 },
+		},
+		usage: { input_tokens: 0, output_tokens: 0 },
+		latencyMs: 0,
+	});
+	let attempts = 0;
+	let client = await attach(
+		room.server.url,
+		room.channel.id,
+		scriptedPlanner({
+			async turn(turn) {
+				let repair = ++attempts > 1;
+				turn.offerTools(["draw"]);
+				turn.emit({
+					type: "tool-call",
+					toolCallId: "draw-1",
+					toolName: "draw",
+					input: "{}",
+					providerExecuted: true,
+				});
+				let result = {
+					type: "tool-result" as const,
+					toolCallId: "draw-1",
+					toolName: "draw",
+					result: {
+						content: [{
+							type: "image",
+							data: pixels(640, 480, repair ? 6 : 5),
+							mimeType: "image/png",
+							alt: repair ? "Second try" : "First try",
+						}],
+					},
+				};
+				turn.emit(result);
+				if (repair) turn.emit(result);
+				turn.emit({ type: "text-start", id: "answer" });
+				turn.emit({
+					type: "text-delta",
+					id: "answer",
+					delta: repair ? "Drew it." : "Which floor should I draw?",
+				});
+				turn.emit({ type: "text-end", id: "answer" });
+				finishTurn(turn);
+			},
+		}).handlers,
+	);
+	cleanups.push(() => client.detach());
+
+	expect(await room.send("@chopin draw it")).toMatchObject({ kind: "chat:send" });
+	await context.chat.running;
+
+	expect(attempts).toBe(2);
+	let holders = context.chat.entries.filter(entry => entry.images);
+	expect(holders.map(entry => entry.images!.map(item => item.alt))).toEqual([
+		["First try", "Second try"],
+	]);
+	expect(holders[0]!.tools!.map(tool => [tool.id, tool.status, tool.result])).toEqual([
+		["draw-1", "done", "1 image"],
+	]);
+	expect(context.chat.entries.map(entry => entry.text)).toContain("Drew it.");
+	let saved = (context.plan.persistence.committedSidecar as { transcript: Chat.Chat["entries"] })
+		.transcript.filter(entry => entry.images);
+	expect(saved.map(entry => [entry.id, entry.images!.map(item => item.alt)])).toEqual([
+		[holders[0]!.id, ["First try", "Second try"]],
+	]);
+});
+
+test("a refused reply's first attempt image that finishes storing after the repair attempt began stays with its own tool's message", async () => {
+	let room = await remoteRoom();
+	let { context, storage } = room;
+	let release = Promise.withResolvers<void>();
+	let put = storage.images.put.bind(storage.images);
+	storage.images.put = async image => {
+		if (image.bytes[image.bytes.length - 1] === 8) await release.promise;
+		await put(image);
+	};
+	context.decide = async ({ state }) => ({
+		model: "test/classifier",
+		answers: {
+			input: { type: "noul", noul: (state as { reply: string }).reply.includes("?") ? 1 : 0 },
+		},
+		usage: { input_tokens: 0, output_tokens: 0 },
+		latencyMs: 0,
+	});
+	let attempts = 0;
+	let client = await attach(
+		room.server.url,
+		room.channel.id,
+		scriptedPlanner({
+			async turn(turn) {
+				let repair = ++attempts > 1;
+				if (!repair) {
+					turn.offerTools(["draw"]);
+					turn.emit({
+						type: "tool-call",
+						toolCallId: "draw-1",
+						toolName: "draw",
+						input: "{}",
+						providerExecuted: true,
+					});
+					turn.emit({
+						type: "tool-result",
+						toolCallId: "draw-1",
+						toolName: "draw",
+						result: {
+							content: [{
+								type: "image",
+								data: pixels(640, 480, 8),
+								mimeType: "image/png",
+								alt: "Slow first try",
+							}],
+						},
+					});
+				}
+				turn.emit({ type: "text-start", id: "answer" });
+				turn.emit({
+					type: "text-delta",
+					id: "answer",
+					delta: repair ? "Drew it." : "Which floor should I draw?",
+				});
+				turn.emit({ type: "text-end", id: "answer" });
+				finishTurn(turn);
+			},
+		}).handlers,
+	);
+	cleanups.push(() => client.detach());
+
+	expect(await room.send("@chopin draw it")).toMatchObject({ kind: "chat:send" });
+	while (!context.chat.entries.some(entry => entry.text === "Drew it.")) await Bun.sleep(5);
+	release.resolve();
+	await context.chat.running;
+
+	expect(attempts).toBe(2);
+	let holders = context.chat.entries.filter(entry => entry.images);
+	expect(holders.map(entry => [
+		entry.tools?.map(tool => [tool.id, tool.status, tool.result]),
+		entry.images!.map(item => item.alt),
+	])).toEqual([[[["draw-1", "done", "1 image"]], ["Slow first try"]]]);
+	let saved = (context.plan.persistence.committedSidecar as { transcript: Chat.Chat["entries"] })
+		.transcript.filter(entry => entry.images);
+	expect(saved.map(entry => [entry.id, entry.images!.map(item => item.alt)])).toEqual([
+		[holders[0]!.id, ["Slow first try"]],
+	]);
 });

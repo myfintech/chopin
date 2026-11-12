@@ -242,6 +242,17 @@ function slowFirstRead<T extends object, K extends keyof T>(owner: T, read: K) {
 	return release;
 }
 
+test("a removed model keeps the name its catalog reported for the room and the turn", async () => {
+	let offered: Wire.ModelCatalog | undefined = catalog;
+	let { deps, opened, choose } = await sets(() => offered);
+	await choose({ model: "acme/large" });
+	offered = { models: [catalog.models[1]!], default: catalog.default };
+	expect((await modelState(deps, opened.channel.id)).modelName).toBe("Large");
+	expect((await turnModel(deps, opened.channel.id)).notice).toBe(
+		"Large is no longer available, so chopin used its default model.",
+	);
+});
+
 describe("the stored choice a room is told where nothing can be chosen", () => {
 	test("is told while the harness knows it offers nothing, and held back while it cannot know yet", async () => {
 		let offered: Wire.ModelCatalog | undefined = catalog;
@@ -257,6 +268,7 @@ describe("the stored choice a room is told where nothing can be chosen", () => {
 			kind: "chat:model",
 			ts: 0,
 			choice: chosen,
+			modelName: "Large",
 		});
 		// No client is attached, or it has yet to report (a restart, a blip): nothing is said of the
 		// choice, which is neither gone nor honoured, and the machine's own status speaks.
@@ -269,6 +281,7 @@ describe("the stored choice a room is told where nothing can be chosen", () => {
 			ts: 0,
 			catalog,
 			choice: chosen,
+			modelName: "Large",
 		});
 		expect(await opened.storage.plannerModelChoices.get(opened.channel.id)).toMatchObject(chosen);
 		// Nobody chose: there is no choice to say, known or not.
@@ -299,7 +312,7 @@ describe("the stored choice a room is told where nothing can be chosen", () => {
 		// The turn found no catalog to check it against: the default runs, with the notice, and the
 		// harness is told that it did.
 		expect(await turnModel(silent, opened.channel.id)).toEqual({
-			notice: "acme/large is no longer available, so Chopin used its default model.",
+			notice: "Large is no longer available, so chopin used its default model.",
 		});
 		expect(fellBack).toEqual([opened.channel.id]);
 		// So the choice is now told, and the composer can say what the turn did.
@@ -307,6 +320,7 @@ describe("the stored choice a room is told where nothing can be chosen", () => {
 			kind: "chat:model",
 			ts: 0,
 			choice: { model: "acme/large", thinkingLevel: "high" },
+			modelName: "Large",
 		});
 	});
 
@@ -344,7 +358,7 @@ describe("the stored choice a room is told where nothing can be chosen", () => {
 		deps.known = () => true;
 		await choose({ model: "acme/large" });
 		offered = undefined;
-		let gone = "acme/large is no longer available, so Chopin used its default model.";
+		let gone = "Large is no longer available, so chopin used its default model.";
 		expect(await turnModel(deps, opened.channel.id)).toEqual({ notice: gone });
 		expect((await modelState(deps, opened.channel.id)).choice).toEqual({ model: "acme/large" });
 		offered = catalog;
@@ -469,7 +483,7 @@ describe("what the next turn runs", () => {
 		await choose({ model: "acme/large", thinkingLevel: "high" });
 		offered = { models: [catalog.models[1]!], default: catalog.default };
 		expect(await turnModel(deps, opened.channel.id)).toEqual({
-			notice: "acme/large is no longer available, so Chopin used its default model.",
+			notice: "Large is no longer available, so chopin used its default model.",
 		});
 		// Still stored, so the model coming back restores the choice.
 		expect((await modelState(deps, opened.channel.id)).choice).toEqual({
@@ -524,7 +538,7 @@ describe("what the next turn runs", () => {
 		};
 		expect(await turnModel(deps, opened.channel.id)).toEqual({
 			model: "acme/large",
-			notice: "high reasoning is no longer available for this model, so Chopin used its default.",
+			notice: "high reasoning is no longer available for this model, so chopin used its default.",
 		});
 	});
 
@@ -534,7 +548,7 @@ describe("what the next turn runs", () => {
 		await choose({ model: "acme/large" });
 		offered = undefined;
 		expect(await turnModel(deps, opened.channel.id)).toMatchObject({
-			notice: "acme/large is no longer available, so Chopin used its default model.",
+			notice: "Large is no longer available, so chopin used its default model.",
 		});
 	});
 });
@@ -682,7 +696,7 @@ describe("a Planner turn", () => {
 
 	test("says once, in Chat, that a choice that is gone ran the default, and again only when it changes", async () => {
 		let notice: string | undefined =
-			"Large is no longer available, so Chopin used its default model.";
+			"Large is no longer available, so chopin used its default model.";
 		let { send, models, said, finish } = await room(async () => (notice ? { notice } : {}));
 		try {
 			await send("first");
@@ -690,16 +704,16 @@ describe("a Planner turn", () => {
 			expect(models).toEqual([undefined, undefined]);
 			expect(said().filter(text => text.includes("no longer available"))).toEqual([notice]);
 			for (let text of said()) expectPlain(text, "the fallback notice");
-			notice = "Small is no longer available, so Chopin used its default model.";
+			notice = "Small is no longer available, so chopin used its default model.";
 			await send("third");
 			notice = undefined;
 			await send("fourth");
-			notice = "Small is no longer available, so Chopin used its default model.";
+			notice = "Small is no longer available, so chopin used its default model.";
 			await send("fifth");
 			expect(said().filter(text => text.includes("no longer available"))).toEqual([
-				"Large is no longer available, so Chopin used its default model.",
-				"Small is no longer available, so Chopin used its default model.",
-				"Small is no longer available, so Chopin used its default model.",
+				"Large is no longer available, so chopin used its default model.",
+				"Small is no longer available, so chopin used its default model.",
+				"Small is no longer available, so chopin used its default model.",
 			]);
 		} finally {
 			await finish();
@@ -722,7 +736,7 @@ describe("a Planner turn", () => {
 		}
 		expect(models).toEqual([undefined]);
 		// Never silently: the default ran, and the room is told that the choice could not be read.
-		let unread = "This document's model choice couldn't be read, so Chopin used its default model.";
+		let unread = "This document's model choice couldn't be read, so chopin used its default model.";
 		expect(lines.filter(text => text.includes("couldn't be read"))).toEqual([unread]);
 		for (let text of lines) expectPlain(text, "the unreadable-choice notice");
 		expect(opened.broadcasts.filter(frame => frame.kind === "chat:model-unreadable")).toMatchObject(
@@ -787,7 +801,7 @@ describe("a Planner turn", () => {
 		}
 		// The default ran whenever the choice could not be read, and the chosen model when it could.
 		expect(models).toEqual([undefined, undefined, "acme/large", undefined]);
-		let unread = "This document's model choice couldn't be read, so Chopin used its default model.";
+		let unread = "This document's model choice couldn't be read, so chopin used its default model.";
 		expect(lines.filter(text => text.includes("couldn't be read"))).toEqual([unread, unread]);
 		// The composers hear a change only, so the strip is neither repeated nor left up once it is untrue.
 		expect(
@@ -795,5 +809,36 @@ describe("a Planner turn", () => {
 				frame.unreadable
 			),
 		).toEqual([true, false, true]);
+	});
+});
+
+describe("a document's commands in its model state", () => {
+	test("tells the room what the harness offers, in the order and with the duplicates it reported", async () => {
+		let { opened, deps } = await sets(() => undefined);
+		let commands: Wire.CommandOption[] = [
+			{ name: "review", kind: "prompt", description: "Review the diff" },
+			{ name: "review", kind: "prompt" },
+		];
+		deps.commands = async () => commands;
+		expect((await modelState(deps, opened.channel.id)).commands).toEqual(commands);
+	});
+
+	test("leaves the field out where the harness offers none, and never fails the state for it", async () => {
+		let { opened, deps } = await sets();
+		expect("commands" in await modelState(deps, opened.channel.id)).toBe(false);
+		deps.commands = async () => [];
+		expect("commands" in await modelState(deps, opened.channel.id)).toBe(false);
+		let error = console.error;
+		console.error = () => {};
+		try {
+			deps.commands = async () => {
+				throw new Error("no session");
+			};
+			let state = await modelState(deps, opened.channel.id);
+			expect("commands" in state).toBe(false);
+			expect(state.catalog).toEqual(catalog);
+		} finally {
+			console.error = error;
+		}
 	});
 });

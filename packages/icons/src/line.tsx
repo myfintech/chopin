@@ -95,6 +95,29 @@ export function EllipsisIcon(props: IconProps) {
 	);
 }
 
+export function EllipsisVerticalIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<circle cx="9" cy="3.75" fill="currentColor" r="1.25" stroke="none" />
+			<circle cx="9" cy="9" fill="currentColor" r="1.25" stroke="none" />
+			<circle cx="9" cy="14.25" fill="currentColor" r="1.25" stroke="none" />
+		</LineIcon>
+	);
+}
+
+export function ReactionAddIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<path d="M9.75 16.25C5.19 16.25 1.75 13.31 1.75 9C1.75 4.93 4.93 1.75 9 1.75C9.4 1.75 9.79 1.78 10.17 1.84" />
+			<path d="M16.25 8.1C16.25 12.69 13.19 16.25 9 16.25" />
+			<path d="M5.9 10.5C6.45 11.75 7.6 12.5 9 12.5C10.4 12.5 11.55 11.75 12.1 10.5" />
+			<circle cx="6.5" cy="7" fill="currentColor" r=".85" stroke="none" />
+			<circle cx="11.5" cy="7" fill="currentColor" r=".85" stroke="none" />
+			<path d="M14.25 1.25V5.25M12.25 3.25H16.25" />
+		</LineIcon>
+	);
+}
+
 export function InfoIcon(props: IconProps) {
 	return (
 		<LineIcon {...props}>
@@ -383,6 +406,18 @@ export function FitWidthIcon(props: IconProps) {
 	);
 }
 
+/** Wrap lines: a long line turning back under itself. */
+export function WrapIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<line x1="2.75" x2="15.25" y1="4.75" y2="4.75" />
+			<path d="M2.75 9h9.75a2.125 2.125 0 0 1 0 4.25H9.25" />
+			<polyline points="10.75 11.75 9.25 13.25 10.75 14.75" />
+			<line x1="2.75" x2="6.25" y1="13.25" y2="13.25" />
+		</LineIcon>
+	);
+}
+
 /** Actual size: a 1:1 ratio. */
 export function ActualSizeIcon(props: IconProps) {
 	return (
@@ -442,6 +477,58 @@ export function UsersIcon(props: IconProps) {
 			<path d="M1.75 15.25c0-2.9 2.25-5 5-5s5 2.1 5 5" />
 			<path d="M11.75 3.15a2.75 2.75 0 0 1 0 5.2" />
 			<path d="M13.5 10.6c1.65.7 2.75 2.4 2.75 4.65" />
+		</LineIcon>
+	);
+}
+
+/** A paperclip, for adding files to a message. */
+export function PaperclipIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<path d="m15.25 8.5-5.9 5.9a3.5 3.5 0 0 1-4.95-4.95l6.2-6.2a2.333 2.333 0 0 1 3.3 3.3L7.7 12.75a1.167 1.167 0 0 1-1.65-1.65l5.6-5.6" />
+		</LineIcon>
+	);
+}
+
+/** A microphone, for dictating a message. */
+export function MicIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<rect height="9" rx="2.5" width="5" x="6.5" y="1.75" />
+			<path d="M3.75 8.5a5.25 5.25 0 0 0 10.5 0" />
+			<line x1="9" x2="9" y1="13.75" y2="16.25" />
+		</LineIcon>
+	);
+}
+
+/** An arrow into a tray: save the file. */
+export function DownloadIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<line x1="9" x2="9" y1="2.75" y2="11.25" />
+			<polyline points="5.5 7.75 9 11.25 12.5 7.75" />
+			<path d="M2.75 11.75v1.5c0 1.1.9 2 2 2h8.5c1.1 0 2-.9 2-2v-1.5" />
+		</LineIcon>
+	);
+}
+
+export function ImageOffIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<rect height="12.5" rx="2" ry="2" width="12.5" x="2.75" y="2.75" />
+			<circle cx="6.75" cy="6.75" r="1.25" />
+			<path d="M15.25 11.25 11.957 7.957c-.391-.391-1.024-.391-1.414 0L3.25 15.25" />
+			<line x1="1.75" x2="16.25" y1="1.75" y2="16.25" />
+		</LineIcon>
+	);
+}
+
+export function ExternalLinkIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<path d="M13.25 10.25v3c0 1.1-.9 2-2 2h-6.5c-1.1 0-2-.9-2-2v-6.5c0-1.1.9-2 2-2h3" />
+			<polyline points="10.75 2.75 15.25 2.75 15.25 7.25" />
+			<line x1="15.25" x2="8.75" y1="2.75" y2="9.25" />
 		</LineIcon>
 	);
 }

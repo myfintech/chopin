@@ -22,6 +22,10 @@ function entry(id: string, author: Chat.Author, text = ""): Chat.Entry {
 	return { id, author, text, ts: 1_700_000_001 };
 }
 
+function image(src: string): Chat.Image {
+	return { src, alt: src, width: 4, height: 3, generated: true };
+}
+
 describe("transcript work retention", () => {
 	it("keeps a prose anchor and its later tool together on the first completed render", () => {
 		let state = transcriptReducer(initialTranscript, {
@@ -50,7 +54,7 @@ describe("transcript work retention", () => {
 			endOffset: 3,
 			anchorId: "prose",
 		}]);
-		let messages = group(state.entries, [], state.turn, state.completedWork).flatMap(item =>
+		let messages = group(state.entries, state.turn, state.completedWork).flatMap(item =>
 			item.kind === "messages" ? item.messages : []
 		);
 		expect(messages.find(message => message.id === "prose")?.tools).toMatchObject([{
@@ -78,7 +82,7 @@ describe("transcript work retention", () => {
 		});
 
 		expect(state.completedWork).toMatchObject([{ anchorId: "prose", endOffset: 3 }]);
-		let messages = group(state.entries, [], state.turn, state.completedWork).flatMap(item =>
+		let messages = group(state.entries, state.turn, state.completedWork).flatMap(item =>
 			item.kind === "messages" ? item.messages : []
 		);
 		expect(messages.find(message => message.id === "prose")?.tools).toMatchObject([{
@@ -113,7 +117,7 @@ describe("transcript work retention", () => {
 		state = transcriptReducer(state, { kind: "history", entries: history });
 
 		expect(state.completedWork).toMatchObject([{ anchorId: "prose-a", endOffset: 3 }]);
-		let messages = group(state.entries, [], state.turn, state.completedWork).flatMap(item =>
+		let messages = group(state.entries, state.turn, state.completedWork).flatMap(item =>
 			item.kind === "messages" ? item.messages : []
 		);
 		expect(messages.find(message => message.id === "prose-a")?.tools).toMatchObject([{
@@ -192,29 +196,135 @@ describe("when a restart is waited out in silence", () => {
 	});
 });
 
-describe("a message removed before it was delivered", () => {
-	it("leaves the others where they were, and moves the turn and the finished work that count entries up", () => {
+describe("a tool call id a remote client reuses in a later turn", () => {
+	it("keeps each turn's tool and images on its own message", () => {
 		let state = transcriptReducer(initialTranscript, {
 			kind: "history",
-			entries: [
-				entry("one", { kind: "member", handle: "ana" }, "one"),
-				entry("two", { kind: "member", handle: "ana" }, "two"),
-				entry("reply", { kind: "agent" }, "On it."),
-			],
-			turn: { ...turn, entryOffset: 2 },
+			entries: [{
+				...entry("first", { kind: "agent" }),
+				tools: [{ id: "call-1", name: "make_image", status: "done" }],
+				images: [image("/images/first.png")],
+			}],
 		});
-		expect(state.turn?.entryOffset).toBe(2);
-		state = transcriptReducer(state, { kind: "removed", id: "two" });
-		expect(state.entries.map(item => item.id)).toEqual(["one", "reply"]);
-		expect(state.turn?.entryOffset).toBe(1);
-		expect(state.activeAnchorId).toBe("reply");
-		// An entry after the turn's start does not move it, and one that is gone changes nothing.
-		let later = transcriptReducer(state, {
+		state = transcriptReducer(state, {
 			kind: "message",
-			entry: entry("three", { kind: "member", handle: "ana" }, "three"),
+			entry: entry("second", { kind: "agent" }),
 		});
-		later = transcriptReducer(later, { kind: "removed", id: "three" });
-		expect(later.turn?.entryOffset).toBe(1);
-		expect(transcriptReducer(later, { kind: "removed", id: "nothing" })).toBe(later);
+		state = transcriptReducer(state, {
+			kind: "tool",
+			entryId: "second",
+			activity: { id: "call-1", name: "make_image", status: "running" },
+		});
+		state = transcriptReducer(state, {
+			kind: "message",
+			entry: {
+				...entry("second", { kind: "agent" }),
+				tools: [{ id: "call-1", name: "make_image", status: "done" }],
+				images: [image("/images/second.png")],
+			},
+		});
+
+		let [first, second] = state.entries;
+		expect(first?.tools).toEqual([{ id: "call-1", name: "make_image", status: "done" }]);
+		expect(first?.images?.map(item => item.src)).toEqual(["/images/first.png"]);
+		expect(second?.tools).toEqual([{ id: "call-1", name: "make_image", status: "done" }]);
+		expect(second?.images?.map(item => item.src)).toEqual(["/images/second.png"]);
+	});
+
+	it("draws the images of each message on that message", () => {
+		let groups = group([
+			{
+				...entry("first", { kind: "agent" }, "One."),
+				images: [{ src: "/images/first.png", alt: "first", width: 4, height: 3 }],
+			},
+			{
+				...entry("second", { kind: "agent" }, "Two."),
+				images: [{ src: "/images/second.png", alt: "second", width: 4, height: 3 }],
+			},
+		]);
+		let messages = groups.flatMap(item => item.kind === "messages" ? item.messages : []);
+
+		expect(messages.map(message => message.images?.map(item => item.alt))).toEqual([
+			["first"],
+			["second"],
+		]);
+	});
+});
+
+describe("message reactions", () => {
+	let reaction = (emoji: string, ...handles: string[]) => ({ emoji, handles });
+
+	it("replaces one message's reactions and leaves every other message as it was", () => {
+		let state = transcriptReducer(initialTranscript, {
+			kind: "history",
+			entries: [entry("a", { kind: "agent" }, "one"), entry("b", { kind: "agent" }, "two")],
+		});
+		let next = transcriptReducer(state, {
+			kind: "reactions",
+			id: "a",
+			reactions: [reaction("❓", "ana"), reaction("✅", "ana", "mina")],
+		});
+		expect(next.entries[0]!.reactions).toEqual([
+			reaction("❓", "ana"),
+			reaction("✅", "ana", "mina"),
+		]);
+		expect(next.entries[1]).toBe(state.entries[1]!);
+		expect(next.turn).toBe(state.turn);
+	});
+
+	it("clears them when the last one is taken back, and ignores a message it does not have", () => {
+		let state = transcriptReducer(initialTranscript, {
+			kind: "history",
+			entries: [{ ...entry("a", { kind: "agent" }, "one"), reactions: [reaction("✅", "ana")] }],
+		});
+		let cleared = transcriptReducer(state, { kind: "reactions", id: "a", reactions: [] });
+		expect(cleared.entries[0]!.reactions).toBeUndefined();
+		expect(
+			transcriptReducer(state, { kind: "reactions", id: "gone", reactions: [reaction("✅", "x")] }),
+		)
+			.toBe(state);
+	});
+
+	it("keeps a message's reactions when its entry is replaced by a streamed one", () => {
+		let state = transcriptReducer(initialTranscript, {
+			kind: "history",
+			entries: [entry("a", { kind: "agent" }, "one")],
+		});
+		let reacted = transcriptReducer(state, {
+			kind: "reactions",
+			id: "a",
+			reactions: [reaction("👎", "ana")],
+		});
+		let finished = transcriptReducer(reacted, {
+			kind: "message",
+			entry: { ...entry("a", { kind: "agent" }, "one more"), reactions: [reaction("👎", "ana")] },
+		});
+		expect(finished.entries[0]!.reactions).toEqual([reaction("👎", "ana")]);
+	});
+});
+
+describe("a retried reply", () => {
+	it("drops the failed attempt's entries and the work they showed, and keeps the message", () => {
+		let state = transcriptReducer(initialTranscript, {
+			kind: "history",
+			entries: [entry("prompt", { kind: "member", handle: "ana" })],
+			turn,
+		});
+		state = transcriptReducer(state, {
+			kind: "message",
+			entry: entry("partial", { kind: "agent" }, "Partial draft."),
+		});
+		state = transcriptReducer(state, { kind: "turn" });
+		state = transcriptReducer(state, {
+			kind: "message",
+			entry: entry("failure", { kind: "system" }, "503 Service Unavailable"),
+		});
+		expect(state.completedWork.map(item => item.anchorId)).toEqual(["partial"]);
+
+		state = transcriptReducer(state, { kind: "removed", ids: ["partial", "failure"] });
+		expect(state.entries.map(item => item.id)).toEqual(["prompt"]);
+		expect(state.completedWork).toEqual([]);
+		// Ids it no longer has change nothing.
+		expect(transcriptReducer(state, { kind: "removed", ids: ["partial"] })).toBe(state);
 	});
 });

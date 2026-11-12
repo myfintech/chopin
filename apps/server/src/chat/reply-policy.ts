@@ -1,7 +1,8 @@
+import { PLANNER_NAME } from "@chopin/protocol/address";
 import type { TextStreamPart, ToolSet } from "ai";
 import type { Decide } from "../conversation-plan/decisions";
 import type { JevQuestion } from "../conversation-plan/jev";
-import type { PlannerSession } from "../harness/session";
+import type { PlannerFiles, PlannerSession } from "../harness/session";
 
 type Part = TextStreamPart<ToolSet>;
 
@@ -19,12 +20,12 @@ let inputQuestion: JevQuestion = {
 	},
 };
 
-const UNVERIFIED = "Chopin could not verify its Chat response. Try again.";
+const UNVERIFIED = `${PLANNER_NAME} could not verify its Chat response. Try again.`;
 
 /** A failure of the Chat reply check alone; the Planner session that produced the reply is sound. */
 export class PlannerReplyError extends Error {}
 
-const REPLY_FAILED = "Chopin's reply failed. Try again.";
+const REPLY_FAILED = `${PLANNER_NAME}'s reply failed. Try again.`;
 
 /**
  * A reply that ended with nothing from the model or harness to say why. The words are Chopin's
@@ -102,13 +103,18 @@ export async function checkPlannerReply(
 export async function publishPlannerReplies(options: {
 	session: Pick<PlannerSession, "stream">;
 	prompt: string;
+	/** The files sent with the message, which only the first attempt is given with its prompt. */
+	files?: PlannerFiles;
 	signal: AbortSignal;
 	decide: Decide | undefined;
+	/** False for a session with no tools to repair with. */
+	repair?: boolean;
 	/** Count new, durably captured Planner decisions from the authoritative document state. */
 	capturedDecisions?: () => number;
 	/** Count decisions that already existed and that the Planner repeated this turn. */
 	keptDecisions?: () => number;
 	publish: (part: Part) => void;
+	beginAttempt?: () => void;
 }): Promise<void> {
 	let { session, decide, publish } = options;
 	let controller = new AbortController();
@@ -149,7 +155,13 @@ export async function publishPlannerReplies(options: {
 		}`;
 		let failure: unknown;
 		try {
-			let result = await session.stream(prompt, signal);
+			options.beginAttempt?.();
+			let result = await session.stream(
+				prompt,
+				signal,
+				undefined,
+				attempt === 0 ? options.files : undefined,
+			);
 			for await (let part of result.fullStream) {
 				// Keep consuming after a local failure: cancelling a tee does not settle its producer.
 				if (signal.aborted) continue;
@@ -197,6 +209,9 @@ export async function publishPlannerReplies(options: {
 			throw error;
 		}
 		if (!rejected) return;
+		if (options.repair === false) {
+			throw new PlannerReplyError(`${PLANNER_NAME}'s answer asked for input, so it was withheld.`);
+		}
 	}
 	let count = options.capturedDecisions?.() ?? 0;
 	let kept = options.keptDecisions?.() ?? 0;
@@ -214,6 +229,6 @@ export async function publishPlannerReplies(options: {
 		return;
 	}
 	throw new PlannerReplyError(
-		"Chopin could not move its questions into inline decisions. Try again.",
+		`${PLANNER_NAME} could not move its questions into inline decisions. Try again.`,
 	);
 }

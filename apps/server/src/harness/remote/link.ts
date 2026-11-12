@@ -30,6 +30,7 @@ import type {
 	RefusalCode,
 	ServerMessage,
 	ServerMessageOf,
+	TurnAttachment,
 } from "@chopin/agent-link";
 import type { Chat as Wire } from "@chopin/protocol";
 import type { JsonValue, PlannerHeldSession } from "../../storage/model";
@@ -138,13 +139,49 @@ function within<T>(operation: Promise<T>, ms: number, message: string): Promise<
 	]).finally(() => clearTimeout(timer));
 }
 
-function promptText(prompt: HarnessV1PromptTurnOptions["prompt"]): string {
-	if (typeof prompt === "string") return prompt;
-	if (typeof prompt.content === "string") return prompt.content;
-	return prompt.content.map(part => {
-		if (part.type !== "text") throw unsupported(`${part.type} prompt parts`);
-		return part.text;
-	}).join("\n\n");
+/**
+ * What a turn's prompt comes to for an attached client. With `attachments` its images and text
+ * files go in the turn's own field, as bytes; without it a client is sent what it has always been
+ * sent, the prompt as text: each text file written into it under its name, and an image, which the
+ * client cannot be given, said in words so the model can tell the person it could not see it.
+ */
+export function promptParts(
+	prompt: HarnessV1PromptTurnOptions["prompt"],
+	takesAttachments: boolean,
+): { prompt: string; attachments: TurnAttachment[] } {
+	if (typeof prompt === "string") return { prompt, attachments: [] };
+	if (typeof prompt.content === "string") return { prompt: prompt.content, attachments: [] };
+	let texts: string[] = [];
+	let attachments: TurnAttachment[] = [];
+	for (let part of prompt.content) {
+		if (part.type === "text") {
+			texts.push(part.text);
+			continue;
+		}
+		let image = part.type === "image";
+		let data = part.type === "image" ? part.image : part.type === "file" ? part.data : undefined;
+		if (!(data instanceof Uint8Array)) throw unsupported(`${part.type} prompt parts`);
+		let name = part.type === "file"
+			? part.filename ?? "file"
+			: String((part.providerOptions?.chopin as { name?: unknown } | undefined)?.name ?? "image");
+		if (takesAttachments) {
+			attachments.push({
+				id: crypto.randomUUID(),
+				name,
+				kind: image ? "image" : "file",
+				mediaType: part.mediaType ?? "application/octet-stream",
+				size: data.byteLength,
+				data: Buffer.from(data).toString("base64"),
+			});
+		} else if (image) {
+			texts.push(
+				`(An image, ${name}, was sent with this message, but this client can't be given images.)`,
+			);
+		} else {
+			texts.push(`<file name=${JSON.stringify(name)}>\n${new TextDecoder().decode(data)}\n</file>`);
+		}
+	}
+	return { prompt: texts.join("\n\n"), attachments };
 }
 
 function hostError(message: string): { error: string } {
@@ -183,6 +220,8 @@ type Port = {
 		runId?: string,
 		sent?: (request: string) => void,
 	): Promise<void>;
+	/** Gives the client's running `turn` a person's message; rejects when it could not take it. */
+	steer(session: string, turn: string, prompt: string): Promise<void>;
 	forget(session: string): void;
 	/** Whether the client's work in `session` goes on past a restart: it is kept, not destroyed. */
 	kept(session: string): boolean;
@@ -308,7 +347,13 @@ class RemoteSession {
 
 	async start(): Promise<HarnessV1Session> {
 		let mode = this.planner.isolated ? "isolated" as const : "planner" as const;
-		if (!this.#port.send({ type: "start", session: this.id, mode })) {
+		let forkFrom = this.#port.features?.includes(AGENT_FEATURES.sessionForks)
+			? this.planner.forkFrom
+			: undefined;
+		let message = forkFrom
+			? { type: "fork" as const, session: this.id, mode, from: forkFrom }
+			: { type: "start" as const, session: this.id, mode };
+		if (!this.#port.send(message)) {
 			throw new Error("The agent connection is closed.");
 		}
 		await within(
@@ -316,6 +361,7 @@ class RemoteSession {
 			this.#port.timeoutMs,
 			"The machine did not start the session.",
 		);
+		if (forkFrom) this.planner.forkedNatively = true;
 		this.planner.control = (action, runId) => this.#command(action, runId);
 		this.planner.rootOf = runId => this.#roots.get(runId) ?? runId;
 		return this.#session();
@@ -694,13 +740,27 @@ class RemoteSession {
 			}
 			case "error":
 				return turn.emit({ type: "error", error: new Error(part.error) });
+			case "compacting":
+				return turn.emit({ type: "raw", rawValue: { type: "compacting" } });
 			case "finish-step":
+				if (part.usage.contextWindow !== undefined) {
+					turn.emit({
+						type: "raw",
+						rawValue: { type: "context-window", contextWindow: part.usage.contextWindow },
+					});
+				}
 				return turn.emit({
 					type: "finish-step",
 					finishReason: finishReason(part.finishReason),
 					usage: usage(part.usage),
 				});
 			case "finish":
+				if (part.totalUsage.contextWindow !== undefined) {
+					turn.emit({
+						type: "raw",
+						rawValue: { type: "context-window", contextWindow: part.totalUsage.contextWindow },
+					});
+				}
 				return turn.emit({
 					type: "finish",
 					finishReason: finishReason(part.finishReason),
@@ -779,6 +839,17 @@ class RemoteSession {
 			async submitToolApproval() {
 				// The remote Planner asks no approvals; host tools are already allowed.
 			},
+			// Only a client that offered `steer-turn` is sent a `steer`, so only its turns take a message.
+			...(this.#port.features?.includes(AGENT_FEATURES.steerTurn)
+				? {
+					submitUserMessage: async (text: string) => {
+						if (turn.ended || turn.stopped || this.#current !== turn) {
+							throw new Error("The turn is not running.");
+						}
+						await this.#port.steer(this.id, turn.id, text);
+					},
+				}
+				: {}),
 			done: turn.settle.promise,
 		};
 	}
@@ -786,7 +857,8 @@ class RemoteSession {
 	async #prompt(options: PlannerTurn): Promise<HarnessV1PromptControl> {
 		this.#ready();
 		if (options.skills.length > 0) throw unsupported("skills");
-		let prompt = promptText(options.prompt);
+		let takesAttachments = this.#port.features?.includes(AGENT_FEATURES.attachments) === true;
+		let { prompt, attachments } = promptParts(options.prompt, takesAttachments);
 		await this.#port.revalidate();
 		this.#ready();
 		// A client that did not ask for option previews is not offered the tool that makes their images.
@@ -795,6 +867,10 @@ class RemoteSession {
 		let hostNames = offered.map(tool => tool.name);
 		let hostTools = this.planner.hostTools;
 		this.planner.hostTools = undefined;
+		let answers = this.#port.features?.includes(AGENT_FEATURES.retryTurn)
+			? this.planner.turnMessage
+			: undefined;
+		this.planner.turnMessage = undefined;
 		// The level is only ever one the client's own catalog listed for the model.
 		let thinkingLevel = this.#port.features?.includes(AGENT_FEATURES.capabilityCatalog)
 			? options.thinkingLevel
@@ -818,9 +894,13 @@ class RemoteSession {
 			session: this.id,
 			turn: turn.id,
 			prompt,
+			...(attachments.length ? { attachments } : {}),
 			...(options.instructions === undefined ? {} : { instructions: options.instructions }),
 			...(options.model ? { model: options.model } : {}),
 			...(thinkingLevel ? { thinkingLevel } : {}),
+			...(answers
+				? { message: answers.id, ...(answers.retry ? { retry: true as const } : {}) }
+				: {}),
 			tools: offered.map(tool => ({
 				name: tool.name,
 				...(tool.description === undefined ? {} : { description: tool.description }),
@@ -833,6 +913,7 @@ class RemoteSession {
 				: {}),
 		});
 		if (!sent) throw new Error("The agent connection could not carry this turn.");
+		this.planner.onRemoteTurn?.({ session: this.id, turn: turn.id });
 		this.planner.activeTools = hostNames;
 		this.#current = turn;
 		this.#listen(turn, options.abortSignal);
@@ -963,6 +1044,7 @@ export class AgentLink {
 		this.#port = {
 			send: message => this.#send(message),
 			control: (session, action, runId, sent) => this.#control(session, action, runId, sent),
+			steer: (session, turn, prompt) => this.#steer(session, turn, prompt),
 			forget: session => {
 				this.#sessions.delete(session);
 				this.#cancelInputs(session);
@@ -1134,6 +1216,11 @@ export class AgentLink {
 		return this.#catalog;
 	}
 
+	/** Whether the client offered `steer-turn`: a message for a running turn can reach it. */
+	get steers(): boolean {
+		return this.#options.features?.includes(AGENT_FEATURES.steerTurn) === true;
+	}
+
 	/**
 	 * Whether what the client offers is yet to be told: it offered `capability-catalog` and has not
 	 * sent `capabilities`, and no turn has run without it (`settleWithoutCatalog`). A client from
@@ -1212,8 +1299,25 @@ export class AgentLink {
 		try {
 			return await session.start();
 		} catch (error) {
-			// Withdraws any question the client asked while the session was starting.
 			await session.close();
+			// When a client refuses `fork` (e.g. parent session evicted), fall back to `start`.
+			if (
+				planner.forkFrom
+				&& this.#state === "attached"
+				&& error instanceof Error
+				&& error.message.startsWith("The machine refused the session:")
+			) {
+				planner.forkFrom = undefined;
+				planner.forkedNatively = false;
+				let fallback = new RemoteSession(sessionId, planner, this.#port);
+				this.#sessions.set(sessionId, fallback);
+				try {
+					return await fallback.start();
+				} catch (retryError) {
+					await fallback.close();
+					throw retryError;
+				}
+			}
 			throw error;
 		}
 	}
@@ -1722,6 +1826,26 @@ export class AgentLink {
 				if (this.#late.size > MAX_LATE_CONTROLS) this.#late.delete(this.#late.keys().next().value!);
 			}
 			throw error;
+		} finally {
+			this.#controls.delete(request);
+		}
+	}
+
+	/** A person's message for a running turn, answered by the client's `control-result`. */
+	async #steer(session: string, turn: string, prompt: string): Promise<void> {
+		let request = crypto.randomUUID();
+		let pending = Promise.withResolvers<void>();
+		this.#controls.set(request, pending);
+		if (!this.#send({ type: "steer", request, session, turn, prompt })) {
+			this.#controls.delete(request);
+			throw new Error("The agent connection is closed.");
+		}
+		try {
+			await within(
+				pending.promise,
+				this.#port.timeoutMs,
+				"The machine did not answer a message sent to its turn.",
+			);
 		} finally {
 			this.#controls.delete(request);
 		}

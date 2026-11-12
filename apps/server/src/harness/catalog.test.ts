@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { atomicThinkingLevels, remoteCatalog } from "./catalog";
+import { atomicThinkingLevels, remoteCatalog, remoteCommands } from "./catalog";
 
 describe("the thinking levels Atomic offers a model", () => {
 	it("offers none for a model that does not reason", () => {
@@ -123,6 +123,23 @@ describe("the catalog of a remote Planner", () => {
 		expect(catalog.models[709]).toEqual({ id: "p/m709", name: "M 709", provider: { id: "p" } });
 	});
 
+	it("tells the room what each model reads, as the client reported it, and nothing where it did not", () => {
+		let catalog = remoteCatalog({
+			models: {
+				available: [
+					{ id: "a", name: "A", inputTypes: ["text", "image"] },
+					{ id: "b", name: "B", inputTypes: [] },
+					{ id: "c", name: "C" },
+				],
+			},
+		}, undefined)!;
+		expect(catalog.models).toEqual([
+			{ id: "a", name: "A", inputTypes: ["text", "image"] },
+			{ id: "b", name: "B", inputTypes: [] },
+			{ id: "c", name: "C" },
+		]);
+	});
+
 	it("carries a default the client spelled with empty strings as it did", () => {
 		let catalog = remoteCatalog({
 			models: { available: [{ id: "", name: "" }], default: { id: "", thinkingLevel: "" } },
@@ -137,5 +154,32 @@ describe("the catalog of a remote Planner", () => {
 	it("has no default when neither names one", () => {
 		let { default: _, ...models } = reported.models;
 		expect(remoteCatalog({ models }, undefined)!.default).toBeUndefined();
+	});
+});
+
+describe("the commands of a remote Planner", () => {
+	it("are none for a client that reported none", () => {
+		expect(remoteCommands(undefined)).toBeUndefined();
+		expect(remoteCommands({})).toBeUndefined();
+		expect(remoteCommands({ models: { available: [] } })).toBeUndefined();
+		expect(remoteCommands({ commands: [] })).toBeUndefined();
+	});
+
+	it("keep the order, spelling, duplicates and kinds the client gave, and leave a missing description out", () => {
+		expect(remoteCommands({
+			commands: [
+				{ name: "Review", kind: "prompt", description: "" },
+				{ name: "skill:x", kind: "skill" },
+				{ name: "Review", kind: "prompt", description: "again" },
+				{ name: "ship", kind: "Pipeline" },
+				{ name: "", kind: "workflow" },
+			],
+		})).toEqual([
+			{ name: "Review", kind: "prompt", description: "" },
+			{ name: "skill:x", kind: "skill" },
+			{ name: "Review", kind: "prompt", description: "again" },
+			{ name: "ship", kind: "Pipeline" },
+			{ name: "", kind: "workflow" },
+		]);
 	});
 });

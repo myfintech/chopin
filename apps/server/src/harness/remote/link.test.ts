@@ -1008,6 +1008,48 @@ describe("Agent connection protocol", () => {
 		}
 	});
 
+	it("names a turn's message, and a retry of it, only to a client that asked for retry-turn", async () => {
+		let { server, channel } = await setup();
+		for (
+			let [header, answers, sent] of [
+				[undefined, { id: "msg-1", retry: true }, {}],
+				["steer-turn", { id: "msg-1", retry: true }, {}],
+				["retry-turn", { id: "msg-1" }, { message: "msg-1" }],
+				["retry-turn", { id: "msg-1", retry: true }, { message: "msg-1", retry: true }],
+				["retry-turn", undefined, {}],
+			] as const
+		) {
+			let planner: RemotePlanner = { channelId: channel.id, isolated: false };
+			let agent = agentFor(adapterFor(server, planner));
+			let raw = await rawLink(server.url, undefined, header);
+			raw.send({ type: "attach", version: 1, document: channel.id });
+			await raw.next("attached");
+			let started = raw.next("start").then(start => {
+				raw.send({ type: "started", session: start.session });
+				return raw.next("turn");
+			});
+			let session = await agent.createSession({ sandboxSession });
+			cleanups.push(() => session.destroy());
+			planner.turnMessage = answers ? { ...answers } : undefined;
+			let outcome = (async () => {
+				let result = await agent.stream({ session, prompt: "@ana: hello" });
+				for await (let _part of result.fullStream);
+			})();
+			let turn = await started;
+			expect({ message: turn.message, retry: turn.retry }).toEqual({
+				message: undefined,
+				retry: undefined,
+				...sent,
+			});
+			// Taken by its turn: the next one names nothing unless it is told again.
+			expect(planner.turnMessage).toBeUndefined();
+			raw.send({ type: "turn-end", session: turn.session, turn: turn.turn, status: "finished" });
+			await outcome;
+			raw.send({ type: "detach" });
+			await raw.closed;
+		}
+	});
+
 	it("merges stage deltas into a run's stages, and a full card replaces them", async () => {
 		let { server, channel, client } = await setup({});
 		expect(client.features).toEqual(["run-stage-deltas", "decision-option-previews"]);
@@ -1526,6 +1568,89 @@ describe("Agent connection protocol", () => {
 	});
 });
 
+describe("Agent connection steering", () => {
+	/** A turn that hangs until it is aborted, on a session of its own. */
+	async function hanging(handlers: Partial<AgentHandlers>) {
+		let running = Promise.withResolvers<void>();
+		let fixture = await setup({
+			async turn(context) {
+				context.emit({ type: "stream-start", modelId: "scripted" });
+				running.resolve();
+				await new Promise(resolve => context.signal.addEventListener("abort", resolve));
+			},
+			...handlers,
+		});
+		let harness = adapterFor(fixture.server, { channelId: fixture.channel.id, isolated: false });
+		let agent = agentFor(harness);
+		let session = await agent.createSession({ sandboxSession });
+		cleanups.push(() => session.destroy());
+		let abort = new AbortController();
+		let result = await agent.stream({ session, prompt: "turn", abortSignal: abort.signal });
+		let drained = (async () => {
+			for await (let _part of result.fullStream);
+		})();
+		await running.promise;
+		return {
+			...fixture,
+			harness,
+			session,
+			end: async () => {
+				abort.abort();
+				await drained.catch(() => {});
+			},
+		};
+	}
+
+	it("reaches the running turn of a client that offered steer-turn, which answers it", async () => {
+		let heard: Array<{ turn: string; prompt: string }> = [];
+		let { session, server, channel, harness, end } = await hanging({
+			steer(message) {
+				heard.push({ turn: message.turn, prompt: message.prompt });
+			},
+		});
+		expect(server.links.at(-1)!.steers).toBe(true);
+		expect(harness.steers(channel.id)).toBe(true);
+		await session.experimental_steerTurn("@bo: Also say what it costs.");
+		expect(heard).toHaveLength(1);
+		expect(heard[0]!.prompt).toBe("@bo: Also say what it costs.");
+		await end();
+	});
+
+	it("is offered only to a client that asked for steer-turn, and says so for its document", async () => {
+		let { server, channel, harness, session, end } = await hanging({});
+		expect(server.links.at(-1)!.steers).toBe(false);
+		expect(harness.steers(channel.id)).toBe(false);
+		await expect(session.experimental_steerTurn("@bo: hello")).rejects.toThrow(
+			/does not support steering/,
+		);
+		await end();
+	});
+
+	it("tells the sender when the client could not take it", async () => {
+		let { session, end } = await hanging({
+			steer() {
+				throw new Error("The model is between steps.");
+			},
+		});
+		await expect(session.experimental_steerTurn("@bo: hello")).rejects.toThrow(
+			"The model is between steps.",
+		);
+		await end();
+	});
+
+	it("is refused once the turn has ended, without a frame going to the client", async () => {
+		let heard: string[] = [];
+		let { session, end } = await hanging({
+			steer(message) {
+				heard.push(message.prompt);
+			},
+		});
+		await end();
+		await expect(session.experimental_steerTurn("@bo: too late")).rejects.toThrow();
+		expect(heard).toEqual([]);
+	});
+});
+
 describe("Agent connection capability catalog", () => {
 	let catalog = {
 		models: {
@@ -1737,6 +1862,114 @@ describe("Agent connection capability catalog", () => {
 					? [{ model: "acme/large", thinkingLevel: "high" }, {}, { thinkingLevel: "low" }]
 					: [{ model: "acme/large" }, {}, {}],
 			);
+		}
+	});
+
+	it("carries a message's images and files to a client that offered attachments, and as words to one that did not", async () => {
+		let png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
+		let notes = new TextEncoder().encode("# Notes\n");
+		let files = {
+			readsImages: true,
+			attachments: [
+				{ name: "shot.png", kind: "image" as const, mimeType: "image/png", bytes: png },
+				{ name: "notes.md", kind: "file" as const, mimeType: "text/plain", bytes: notes },
+			],
+		};
+		for (let offered of [true, false]) {
+			let f = await hostInputRoom();
+			cleanups.push(f.close);
+			let linked = await linkAuth(f.room.id);
+			let server = linkServer(linked.auth, 300);
+			cleanups.push(server.stop);
+			let seen: Array<{ prompt: string; attachments?: unknown }> = [];
+			let client = await connectAgent({
+				url: server.url,
+				token: MEMBER_TOKEN,
+				document: f.room.id,
+				resumable: false,
+				attachments: offered,
+				handlers: {
+					async turn(context) {
+						seen.push({
+							prompt: context.message.prompt,
+							...(context.message.attachments ? { attachments: context.message.attachments } : {}),
+						});
+						finishTurn(context);
+					},
+				},
+			});
+			cleanups.push(() => client.detach());
+			expect(client.features.includes("attachments")).toBe(offered);
+			let agent = createPlannerAgent(
+				createRemoteAdapter(sessionId => ({
+					link: server.links.at(-1)!,
+					planner: remotePlanner(sessionId)!,
+				})),
+			);
+			let owner = {
+				channelId: f.room.id,
+				token: "test-token",
+				repository: { id: "R_test", owner: "org", name: "repo", defaultBranch: "main" },
+				signal: new AbortController().signal,
+				currentToken: () => "test-token",
+				revalidate: async () => true,
+				release() {},
+			} as unknown as ActiveOwnerBinding;
+			let opened = await openPlannerSession(owner, {
+				room: f.room,
+				repository: owner.repository,
+				instructions: "Plan.",
+				harness: "remote",
+			}, {
+				githubTools: async () => ({ ok: true, value: {} }),
+				createSandbox: async () => sandboxSession,
+				registerCredential: () => () => {},
+				agent,
+			});
+			if (!opened.ok) throw new Error("Planner unavailable");
+			let session = opened.value;
+			cleanups.push(() => session.destroy());
+			let run = async (sent?: typeof files) => {
+				let result = await session.stream(
+					"@ana: What is this?",
+					new AbortController().signal,
+					undefined,
+					sent,
+				);
+				for await (let _part of result.fullStream);
+			};
+			await run(files);
+			await run();
+			if (offered) {
+				expect(seen[0]!.prompt).toBe("@ana: What is this?");
+				expect(seen[0]!.attachments).toEqual([
+					{
+						id: expect.any(String),
+						name: "shot.png",
+						kind: "image",
+						mediaType: "image/png",
+						size: png.byteLength,
+						data: Buffer.from(png).toString("base64"),
+					},
+					{
+						id: expect.any(String),
+						name: "notes.md",
+						kind: "file",
+						mediaType: "text/plain",
+						size: notes.byteLength,
+						data: Buffer.from(notes).toString("base64"),
+					},
+				]);
+			} else {
+				// Nothing a client did not ask for reaches it: its files are in the prompt, as words.
+				expect(seen[0]).not.toHaveProperty("attachments");
+				expect(seen[0]!.prompt).toBe(
+					"@ana: What is this?\n\n(An image, shot.png, was sent with this message, but this client can't be given images.)\n\n"
+						+ '<file name="notes.md">\n# Notes\n\n</file>',
+				);
+			}
+			// A turn with no files is the turn it always was.
+			expect(seen[1]).toEqual({ prompt: "@ana: What is this?" });
 		}
 	});
 

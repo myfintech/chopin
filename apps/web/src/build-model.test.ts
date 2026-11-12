@@ -249,10 +249,10 @@ describe("refusals", () => {
 		);
 		for (let queued of ["the reply queue is full", "the Planner queue is full"]) {
 			expect(draftRefusalCopy(queued))
-				.toBe("Chopin is busy with other requests. Try again shortly.");
+				.toBe("chopin is busy with other requests. Try again shortly.");
 		}
-		for (let off of ["Chopin is not running", "the Planner is not running"]) {
-			expect(draftRefusalCopy(off)).toBe("Chopin isn’t running for this document.");
+		for (let off of ["chopin is not running", "the Planner is not running"]) {
+			expect(draftRefusalCopy(off)).toBe("chopin isn’t running for this document.");
 		}
 		expect(draftRefusalCopy("not connected")).toBeUndefined();
 		expect(draftRefusalCopy("could not save the request")).toBeUndefined();
@@ -310,7 +310,7 @@ describe("first build", () => {
 		expect(advanceFirstBuild(resent, { type: "draft-ended", drafted: false, changed: true }))
 			.toEqual({
 				stage: "failed",
-				message: "The document changed while Chopin was breaking it into tasks.",
+				message: "The document changed while chopin was breaking it into tasks.",
 			});
 	});
 
@@ -375,10 +375,16 @@ describe("first build", () => {
 		// Chopin says so when the machine was connected but its connection dropped.
 		expect(
 			draftRefusalCopy(
-				"@mona's machine is offline, so it can't reply now. Your work is kept and picks up when it's back.",
+				"@mona's machine is offline, so this message wasn't sent. Send it again when it's back.",
 				"planner-not-attached",
 			),
 		).toBe("Reconnect the machine to build.");
+		expect(
+			draftRefusalCopy(
+				"Still connecting to @mona's machine, so this message wasn't sent. Send it again in a moment.",
+				"planner-not-attached",
+			),
+		).toBe("Still connecting to @mona's machine. Try again in a moment.");
 	});
 
 	it("returns to the button when drafting or starting fails", () => {
@@ -784,7 +790,7 @@ describe("build status", () => {
 		});
 		expect(look(snapshot({ graph: undefined }), { planner: false })).toEqual({
 			kind: "plan",
-			blocked: "Chopin isn’t running for this document",
+			blocked: "chopin isn’t running for this document",
 		});
 		expect(look(undefined)).toEqual({ kind: "plan", blocked: "Chopin isn’t connected" });
 	});

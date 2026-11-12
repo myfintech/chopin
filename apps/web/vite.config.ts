@@ -1,17 +1,54 @@
+import { resolve } from "node:path";
 import { defineConfig } from "vite";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import tsconfigPaths from "vite-tsconfig-paths";
 
-import { initialJavaScriptBudget } from "./bundle-budget";
+import { initialJavaScriptBudget, initialStylesheetBudget } from "./bundle-budget";
 import { MANTL_INITIAL_JAVASCRIPT_BUDGET } from "./bundle-budget.mantl";
 
-import type { ServerOptions } from "vite";
+import type { Plugin, ServerOptions } from "vite";
 
 const PORT = Number(process.env.CHOPIN_DEV_WEB_PORT ?? "5173");
 const EXE_HOST = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.exe\.xyz$/;
+const ASSISTANT_UI_STYLESHEET = resolve(import.meta.dirname, "src/assistant-ui.css")
+	.replaceAll("\\", "/");
+const COPIED_COMPONENTS_DIR = `${
+	resolve(import.meta.dirname, "src/components").replaceAll("\\", "/")
+}/`;
 
 type DevNetwork = Pick<ServerOptions, "host" | "allowedHosts" | "hmr">;
+
+/**
+ * Copied registry files under `src/components` cannot be edited on disk (`sources.json` checks
+ * their hashes), so Vite attaches their shared stylesheet at transform time. A page without a
+ * copied element never downloads it, and Vite's preload helper waits for the `<link>` before
+ * resolving the dynamic import that mounts the first copy.
+ */
+export function copiedElementsStyles(
+	componentsDir = COPIED_COMPONENTS_DIR,
+	stylesheet = ASSISTANT_UI_STYLESHEET,
+): Plugin {
+	let importLine = `\nimport ${JSON.stringify(stylesheet)};\n`;
+	return {
+		name: "copied-elements-styles",
+		enforce: "pre",
+		transform(code, id) {
+			let file = id.split("?")[0]!.replaceAll("\\", "/");
+			if (!file.startsWith(componentsDir) || !file.endsWith(".tsx")) return null;
+			return { code: `${code}${importLine}`, map: null };
+		},
+	};
+}
+
+/** Keeps the copies' CSS in one shared asset across whichever lazy chunks mount them. */
+export function assistantUiChunk(
+	id: string,
+	stylesheet = ASSISTANT_UI_STYLESHEET,
+): string | undefined {
+	let file = id.split("?")[0]!.replaceAll("\\", "/");
+	return file === stylesheet ? "assistant-ui" : undefined;
+}
 
 export function devNetwork(exeHost: string | undefined, port = PORT): DevNetwork {
 	if (!exeHost) {
@@ -33,20 +70,48 @@ export function devNetwork(exeHost: string | undefined, port = PORT): DevNetwork
 
 export default defineConfig({
 	plugins: [
+		copiedElementsStyles(),
 		react(),
 		tailwindcss(),
 		tsconfigPaths(),
 		initialJavaScriptBudget(MANTL_INITIAL_JAVASCRIPT_BUDGET),
+		initialStylesheetBudget(),
 	],
+	build: {
+		rollupOptions: {
+			output: {
+				manualChunks: id => assistantUiChunk(id),
+			},
+		},
+	},
 	optimizeDeps: {
 		esbuildOptions: { minifyWhitespace: true, minifySyntax: true },
+		// The Chat draft's editor loads after the page, so the development server would find these
+		// only then and reload the page to bundle them; it bundles them at start instead.
+		include: [
+			"lexical",
+			"@lexical/history",
+			"@lexical/link",
+			"@lexical/list",
+			"@lexical/rich-text",
+			"@lexical/utils",
+		],
 	},
 
 	resolve: {
-		// Only what this app resolves itself. Lexical and Yjs belong to the
-		// editor package, and listing them here would ask Vite to resolve them
-		// from a root that does not have them. Their single-copy guarantee comes
-		// from the catalog pin instead, which `singleton.test.ts` asserts.
+		alias: [
+			{
+				find: "@assistant-ui/react-markdown/styles/dot.css",
+				replacement: resolve(
+					import.meta.dirname,
+					"src/chat/assistant-ui/markdown-dot.css",
+				),
+			},
+		],
+		// Only what this app resolves itself. Yjs belongs to the editor package,
+		// and listing it here would ask Vite to resolve it from a root that does
+		// not have it. Lexical's single copy, which the Chat draft shares with
+		// the editor, comes from the catalog pin both depend on.
 		dedupe: ["react", "react-dom"],
 	},
 

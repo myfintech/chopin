@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { locate } from "../../agent/cli";
 import { Runtime } from "./runtime";
 import { DEFAULT_COPILOT_MODEL } from "./model";
+import { PLANNER_NAME } from "@chopin/protocol/address";
 
 import type {
 	HarnessV1,
@@ -175,12 +176,36 @@ function unsupported(capability: string): () => Promise<never> {
 	};
 }
 
-function promptText(prompt: HarnessV1PromptTurnOptions["prompt"]): string {
-	if (typeof prompt === "string") return prompt;
-	if (typeof prompt.content === "string") return prompt.content;
-	return prompt.content
-		.map(part => (part.type === "text" ? part.text : ""))
-		.join("");
+type Blob = { type: "blob"; data: string; mimeType: string; displayName?: string };
+
+/**
+ * What a turn's prompt comes to for the Copilot SDK: its text, with each text file written into it
+ * under its name, and each image as the blob attachment the SDK takes.
+ */
+export function promptParts(
+	prompt: HarnessV1PromptTurnOptions["prompt"],
+): { prompt: string; attachments: Blob[] } {
+	if (typeof prompt === "string") return { prompt, attachments: [] };
+	if (typeof prompt.content === "string") return { prompt: prompt.content, attachments: [] };
+	let texts: string[] = [];
+	let attachments: Blob[] = [];
+	for (let part of prompt.content) {
+		if (part.type === "text") texts.push(part.text);
+		else if (part.type === "image" && part.image instanceof Uint8Array) {
+			attachments.push({
+				type: "blob",
+				data: Buffer.from(part.image).toString("base64"),
+				mimeType: part.mediaType ?? "image/png",
+			});
+		} else if (part.type === "file" && part.data instanceof Uint8Array) {
+			texts.push(
+				`<file name=${JSON.stringify(part.filename ?? "file")}>\n${
+					new TextDecoder().decode(part.data)
+				}\n</file>`,
+			);
+		}
+	}
+	return { prompt: texts.join("\n\n"), attachments };
 }
 
 type TurnState = {
@@ -306,7 +331,7 @@ export function createCopilotSdk(
 				) throw error;
 				if (model === DEFAULT_COPILOT_MODEL) {
 					throw new Error(
-						`Chopin couldn’t start because its model "${model}" is unavailable. `
+						`${PLANNER_NAME} couldn’t start because its model "${model}" is unavailable. `
 							+ "Ask the server administrator to update the model.",
 						{ cause: error },
 					);
@@ -503,7 +528,12 @@ export function createCopilotSdk(
 					turn.abortSignal?.addEventListener("abort", onAbort, { once: true });
 
 					if (turn.abortSignal?.aborted) onAbort();
-					else session.send({ prompt: promptText(turn.prompt) }).catch(err => settled.reject(err));
+					else {
+						let { prompt, attachments } = promptParts(turn.prompt);
+						session.send({ prompt, ...(attachments.length ? { attachments } : {}) }).catch(err =>
+							settled.reject(err)
+						);
+					}
 
 					return {
 						async submitToolResult({ toolCallId, output: result, isError }) {

@@ -1,6 +1,5 @@
 @import "tailwindcss";
 @import "@chopin/visuals/theme.css";
-@import "./assistant-ui.css";
 @import "./conversation-plan/source.css";
 @import "./build-view.css";
 @import "./criteria.css";
@@ -17,6 +16,7 @@
 @source "../../../packages/editor/src/**/*.{ts,tsx}";
 @source "../../../packages/icons/src/**/*.{ts,tsx}";
 @source "../../../packages/question/src/**/*.{ts,tsx}";
+@source not "./components";
 
 @utility ring-hairline {
 	outline: var(--edge-width) solid var(--color-edge);
@@ -349,8 +349,9 @@
 	}
 }
 
+/* A field's edge is how it is found, so it is the control boundary (3:1 on every ground), not a hairline. */
 @utility field {
-	border: var(--edge-width) solid var(--color-control-edge);
+	border: var(--edge-width) solid var(--color-control-boundary);
 	border-radius: var(--radius-md);
 	background-color: var(--color-page);
 	box-shadow: var(--shadow-resting);
@@ -399,7 +400,7 @@
 
 @utility choice-control {
 	appearance: none;
-	border: var(--edge-width) solid var(--color-control-edge);
+	border: var(--edge-width) solid var(--color-control-boundary);
 	background-color: var(--color-page);
 	color: var(--color-text-primary);
 
@@ -445,14 +446,14 @@
 	}
 }
 
-/* Extra contrast is an opt-in accommodation, not the normal control edge. */
+/* Extra contrast is an opt-in accommodation for other control edges; fields and choices meet it. */
 @media (prefers-contrast: more) {
-	:where(.control-edge, .field, .choice-control):not([aria-invalid="true"]) {
+	:where(.control-edge):not([aria-invalid="true"]) {
 		outline: var(--edge-width) solid var(--color-control-boundary);
 		outline-offset: calc(-1 * var(--edge-width));
 	}
 
-	:where(.control-edge, .field, .choice-control):disabled {
+	:where(.control-edge):disabled {
 		outline-color: var(--color-edge);
 	}
 }
@@ -486,11 +487,12 @@ body {
 	overscroll-behavior: none;
 }
 
+/* `viewport.ts` writes the visual viewport's left, top and width on the element itself. */
 #root {
 	position: fixed;
-	left: var(--app-left, 0px);
-	top: var(--app-top, 0px);
-	width: var(--app-width, 100%);
+	left: 0;
+	top: 0;
+	width: 100%;
 	height: 100%;
 	height: var(--app-height, 100dvh);
 }
@@ -1161,17 +1163,6 @@ body {
 	--activity-badge-ring: var(--color-gray-300);
 }
 
-/* On the ground a white composer is the brightest thing in the column. */
-.workspace-root .chat-composer .field {
-	background: var(--color-inset);
-	box-shadow: none;
-}
-
-.workspace-root[data-workspace-mode="split"] .workspace-chat-panel .chat-composer {
-	padding-inline: var(--spacing);
-	padding-bottom: env(safe-area-inset-bottom);
-}
-
 .motion-panel {
 	opacity: 0;
 	transform: translateX(calc(var(--panel-distance) * var(--panel-direction, 1)));
@@ -1232,10 +1223,6 @@ body {
 	--panel-direction: -1;
 	--panel-distance: var(--page-slide-distance);
 	transition-duration: var(--page-slide-dur);
-}
-
-.workspace-root[data-workspace-travel="back"] {
-	--swap-direction: -1;
 }
 
 .content-swap-stack {
@@ -1334,31 +1321,6 @@ body {
 @media (pointer: coarse) {
 	.workspace-status-row .plan-status-detail {
 		display: block;
-	}
-}
-
-/* Jump-to-source: a tint behind the message that fades; the message itself never moves. */
-.chat-message-body[data-chat-source] {
-	isolation: isolate;
-}
-
-.chat-source-tint {
-	position: absolute;
-	inset: -2px -6px;
-	z-index: -1;
-	border-radius: var(--radius-md);
-	background: var(--color-brand-wash);
-	pointer-events: none;
-	animation: chat-source-tint calc(var(--duration-linger) * 2) var(--ease-out) forwards;
-}
-
-@keyframes chat-source-tint {
-	0%,
-	40% {
-		opacity: 1;
-	}
-	100% {
-		opacity: 0;
 	}
 }
 
@@ -1479,28 +1441,17 @@ body {
 	}
 }
 
-.chat-composer .field {
-	border-color: var(--color-edge);
-	border-radius: var(--radius-lg);
-	box-shadow: var(--shadow-resting);
-}
-
 /*
  * The ring answers keyboard arrival. A clicked composer is already found, so it
  * keeps only the quieter brand edge from `.composer-surface:focus-within`.
  */
-:root:not([data-focus-origin="pointer"]) .chat-composer .field:focus-within {
+:root:not([data-focus-origin="pointer"]) .chat-composer .composer-surface:focus-within {
 	outline: 2px solid var(--color-brand);
 	outline-offset: 2px;
 }
 
 .chat-composer textarea:focus {
 	outline: none;
-}
-
-.chat-composer .send-action:disabled {
-	background-color: var(--color-brand);
-	color: var(--color-page);
 }
 
 @media (min-width: 640px) {
@@ -1513,14 +1464,6 @@ body {
 	.hosted-header {
 		padding-right: calc(1.5rem + env(safe-area-inset-right));
 		padding-left: calc(1.5rem + env(safe-area-inset-left));
-	}
-}
-
-@media (min-width: 1200px) {
-	/* The desktop composer keeps the same clearance on each exposed edge. */
-	.chat-composer {
-		padding-inline: 1rem;
-		padding-bottom: calc(1rem + env(safe-area-inset-bottom));
 	}
 }
 
@@ -1578,18 +1521,17 @@ body {
 }
 
 /* Small controls keep their look; an invisible 44px target grows around them. */
-/* The Chopin chip draws its own target (composer.css), so it is left to it. */
 /* In the components layer so utilities such as `absolute` still win. */
 @layer components {
 	:root[data-plan-coarse-pointer]
 		:where(.btn-icon, .btn-sm, .project-sidebar-action, .project-sidebar-document-action, .chat-composer
-			button:not(.composer-chopin-chip)) {
+			button) {
 		position: relative;
 	}
 
 	:root[data-plan-coarse-pointer]
 		:where(.btn-icon, .btn-sm, .project-sidebar-action, .project-sidebar-document-action, .chat-composer
-			button:not(.composer-chopin-chip))::after {
+			button)::after {
 		content: "";
 		position: absolute;
 		top: 50%;
@@ -1751,6 +1693,7 @@ body {
 
 [data-question-markdown] pre {
 	overflow-x: auto;
+	border: 0;
 	border-radius: var(--radius-md);
 	background: var(--color-inset);
 	padding: 0.5rem 0.75rem;
@@ -2532,10 +2475,11 @@ textarea.question-written-field {
 
 /*
  * The ring answers "where am I?" for keyboard users, so it hides after a pointer
- * press. Text fields keep theirs: a caret alone is easy to lose.
+ * press. Text fields keep theirs: a caret alone is easy to lose. The mark is on the
+ * focused element (`useFocusInput`): keyed on the root, every control restyled.
  */
-:root[data-focus-input="pointer"]
-	:where(button, select, summary, [role="button"], [role="listbox"], [role="option"], [tabindex]:not(input, textarea)):focus-visible {
+:root
+	:where(button, select, summary, [role="button"], [role="listbox"], [role="option"], [tabindex]:not(input, textarea))[data-focus-pointer]:focus-visible {
 	outline: none;
 }
 
@@ -2572,10 +2516,6 @@ textarea.question-written-field {
 }
 
 @media (prefers-reduced-motion: reduce) {
-	.chat-source-tint {
-		animation: none;
-	}
-
 	.btn[aria-busy="true"] [data-button-loader] {
 		animation: none;
 	}

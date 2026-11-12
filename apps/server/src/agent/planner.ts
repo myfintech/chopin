@@ -28,6 +28,7 @@ import type { Component } from "@chopin/dialect/dialect";
 import type { PlannerWorkspace } from "../harness/atomic/workspace";
 import { READ_BYTES } from "../document-reading";
 import { COACHING } from "./coaching";
+import { NAMES_AS_WRITTEN } from "./identity";
 import { DIAGRAM_AUTHORING, ROUTED_DIAGRAM_AUTHORING } from "./visual-authoring";
 
 export { DIAGRAM_AUTHORING };
@@ -138,6 +139,8 @@ row flush h=xl
 
 export const PROMPT = `You are the planner. You produce and maintain the plan — the shared document
 the team works from. You do not implement.
+
+${NAMES_AS_WRITTEN}
 
 ${COACHING}
 
@@ -339,7 +342,9 @@ ${WIREFRAME_AUTHORING}
 Always name a fence's language — \`ts\`, \`python\`, \`sh\` — because the
 language is what colours it, and an unnamed fence is rendered as the grey text
 it claims to be. Add \`title="path/to/file.ts"\` after the language when the
-snippet comes from a file the reader can go and open.
+snippet comes from a file the reader can go and open. A \`wrap\` after the
+language means a reader chose to wrap that block's long lines; keep it, and
+every other word of the info string, when you edit the fence.
 
 A \`${DIFF_LANGUAGE}\` fence renders as a diff, which is how to show a change
 rather than describe one. Write a complete unified patch: the \`---\` and

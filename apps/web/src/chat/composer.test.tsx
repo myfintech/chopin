@@ -2,10 +2,22 @@ import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
+import { INTERNAL } from "@chopin/protocol/plain-words";
+
 import { ChatComposer } from "./composer";
 import { composerModelNotice } from "./model-picker-state";
 
+import type { FileView } from "./attachments/files";
 import type { ChatComposerProps } from "./composer";
+
+const INPUT: ChatComposerProps["input"] = {
+	mentions: [],
+	onChange: () => {},
+	onSelect: () => {},
+	references: [],
+	resetKey: 0,
+	value: "",
+};
 
 /** The markup, with the apostrophe React escapes in text written back, so copy reads as typed. */
 function render(props: Partial<ChatComposerProps> = {}): string {
@@ -15,26 +27,48 @@ function render(props: Partial<ChatComposerProps> = {}): string {
 		onSubmit: () => {},
 		sendDisabled: false,
 		sending: false,
-		input: {
-			mentions: [],
-			onChange: () => {},
-			onSelect: () => {},
-			references: [],
-			resetKey: 0,
-			value: "",
-		},
+		input: INPUT,
 		...props,
 	})).replaceAll("&#x27;", "'");
 }
 
 test("renders the draft as a combobox in the field", () => {
 	let markup = render();
-	expect(markup).toContain('class="composer-surface field"');
+	expect(markup).toContain('class="composer-surface"');
 	expect(markup).toContain('role="combobox"');
 	expect(markup).toContain('aria-label="Message"');
-	expect(markup).toContain("Message your collaborators…");
+	expect(markup).toContain("Message the team, or @chopin to ask");
 	expect(markup).not.toContain("composer-notice");
 	expect(markup).not.toContain('data-planner="off"');
+});
+
+const CHOPIN = { disabled: false, onAsk: () => {} };
+
+test("chopin is asked by a button that writes the mention, with no chip and no mode", () => {
+	let markup = render({ chopin: CHOPIN });
+	let button = markup.match(/<button[^>]*aria-label="Ask chopin"[^>]*>/)![0];
+	expect(button).toContain('aria-keyshortcuts="Control+J Meta+J"');
+	expect(button).not.toContain("disabled");
+	expect(button).not.toContain("aria-pressed");
+	// Nothing is drawn in the field but the draft: no chip, no group, no button to remove one.
+	expect(markup).not.toContain("composer-chip");
+	expect(markup).not.toContain("Asking chopin");
+	expect(markup).not.toContain("Remove chopin");
+	expect(markup).not.toContain("directive-text");
+	expect(markup).not.toContain("Ask chopin…");
+	expect(markup).toMatch(/<div class="composer-field">(<div|<p)[^>]*role="combobox"/);
+	expect(markup.toLowerCase()).not.toContain("talk to chopin");
+	expect(markup).not.toContain("data-mode");
+	expect(render({ chopin: { ...CHOPIN, disabled: true } })).toMatch(
+		/<button[^>]*aria-label="Ask chopin"[^>]*disabled=""/,
+	);
+});
+
+test("without an agent there is nobody to ask: no button, and the team's placeholder", () => {
+	let markup = render({ agent: false });
+	expect(markup).not.toContain('aria-label="Ask chopin"');
+	expect(markup).toContain("Message the team");
+	expect(markup.toLowerCase()).not.toContain("@chopin");
 });
 
 test("a failed send alerts above the field and describes the draft", () => {
@@ -74,12 +108,81 @@ test("read-only and archived documents replace the draft and hide notices", () =
 
 test("shows one run control, and no connection state of its own", () => {
 	let markup = render({ run: { action: "stop", disabled: false, onClick: () => {} } });
-	expect(markup).toContain('aria-label="Stop Chopin"');
-	expect(markup).not.toContain('aria-label="Resume Chopin"');
+	expect(markup).toContain('aria-label="Stop generating"');
+	expect(markup).not.toContain('aria-label="Resume chopin"');
 	// The document says when the connection is lost, once, at the top of its content.
 	expect(markup).not.toContain("composer-connection");
 	expect(markup).not.toContain("Reconnect");
 	expect(markup).not.toContain("Retry");
+});
+
+/** The one send control's tag, which is send or stop and the only one in the composer. */
+function roundButton(markup: string): string {
+	let buttons = markup.match(/<button[^>]*data-send-stop="[^"]*"[^>]*>/g) ?? [];
+	expect(buttons).toHaveLength(1);
+	return buttons[0]!;
+}
+
+/** Whether the tag carries the `disabled` attribute, which its `disabled:` classes do not. */
+const disabled = (tag: string) => / disabled=""/.test(tag);
+
+const STOP = { action: "stop", disabled: false, onClick: () => {} } as const;
+
+test("one round button sends while the Planner is idle, and waits for a draft", () => {
+	let waiting = roundButton(render({ sendDisabled: true }));
+	expect(waiting).toContain('aria-label="Send message"');
+	expect(waiting).toContain('title="Send message"');
+	expect(disabled(waiting)).toBe(true);
+	let ready = roundButton(render({ input: { ...INPUT, value: "Outline the export" } }));
+	expect(ready).toContain('aria-label="Send message"');
+	expect(disabled(ready)).toBe(false);
+});
+
+test("the same button stops a running Planner while nothing is typed", () => {
+	let markup = render({ run: STOP, sendDisabled: true });
+	let button = roundButton(markup);
+	expect(button).toContain('aria-label="Stop generating"');
+	expect(button).toContain('title="Stop generating"');
+	expect(disabled(button)).toBe(false);
+	// One button, not a Stop beside a Send.
+	expect(markup).not.toContain('aria-label="Send message"');
+});
+
+test("a message typed while the Planner runs is sent as it is, and the button is stop again once it is gone", () => {
+	let typing = render({ run: STOP, input: { ...INPUT, value: "And the rollback checks" } });
+	expect(roundButton(typing)).toContain('aria-label="Send message"');
+	expect(disabled(roundButton(typing))).toBe(false);
+	expect(typing).not.toContain('aria-label="Stop generating"');
+	expect(roundButton(render({ run: STOP, sendDisabled: true }))).toContain(
+		'aria-label="Stop generating"',
+	);
+});
+
+test("someone who may not stop the Planner is shown a disabled send, never a stop", () => {
+	let markup = render({
+		run: { action: "stop", disabled: true, onClick: () => {} },
+		sendDisabled: true,
+	});
+	let button = roundButton(markup);
+	expect(button).toContain('aria-label="Send message"');
+	expect(disabled(button)).toBe(true);
+	expect(markup).not.toContain("Stop generating");
+});
+
+test("Resume is a button of its own beside the round one", () => {
+	let markup = render({
+		run: { action: "resume", disabled: false, onClick: () => {} },
+		sendDisabled: true,
+	});
+	expect(markup).toContain('aria-label="Resume chopin"');
+	expect(roundButton(markup)).toContain('aria-label="Send message"');
+});
+
+test("a polite live region waits beside the button, empty until it changes", () => {
+	let markup = render({ run: STOP, sendDisabled: true });
+	expect(markup).toMatch(
+		/<span aria-atomic="true" aria-live="polite" class="sr-only" data-send-stop-status="" role="status"><\/span>/,
+	);
 });
 
 test("puts nothing beneath the composer, whatever the Planner is doing", () => {
@@ -207,7 +310,7 @@ test("a banner alone describes the draft by its ids, with no notice strip of its
 
 test("a saved model's fallback notice is drawn beneath a banner as a status, and both describe the draft", () => {
 	let words = composerModelNotice(undefined, false, { model: "acme/large" })!;
-	expect(words.text).toBe("acme/large is no longer available, so Chopin used its default model.");
+	expect(words.text).toBe("acme/large is no longer available, so chopin used its default model.");
 	let banner = {
 		id: "lead",
 		node: createElement("div", { id: "lead", "data-banner": "" }, "No machine is connected."),
@@ -226,4 +329,169 @@ test("a saved model's fallback notice is drawn beneath a banner as a status, and
 	expect(refused).toContain('aria-invalid="true"');
 	expect(refused).toMatch(/<div class="composer-notice" role="status"/);
 	expect(refused).not.toContain('role="alert"');
+});
+
+const FILES = {
+	files: [],
+	source: () => undefined,
+	disabled: false,
+	waiting: false,
+	onAdd: () => {},
+	onRemove: () => {},
+	onRetry: () => {},
+};
+
+const VIEW: FileView = {
+	id: "a",
+	name: "notes.md",
+	kind: "file",
+	size: 100,
+	sizeLabel: "100 B",
+	state: "done",
+	progress: 100,
+	retry: false,
+};
+
+test("offers a + that attaches only where the server takes files, and names it as it is", () => {
+	let without = render();
+	expect(without).not.toContain("Add files");
+	expect(without).not.toContain('type="file"');
+	let markup = render({ files: FILES });
+	expect(markup).toMatch(/<button[^>]*aria-label="Add files"[^>]*title="Add files"/);
+	// The picker is a hidden input the + opens: it is never a second control to tab to.
+	expect(markup).toMatch(/<input[^>]*hidden=""[^>]*multiple=""[^>]*type="file"/);
+	expect(markup).not.toContain("aria-describedby");
+});
+
+test("says in the + button's own words why images cannot be added, and offers text to pick", () => {
+	let reason = "This model can't read images, so only text files can be sent to it.";
+	let markup = render({ files: { ...FILES, imagesReason: reason } });
+	expect(markup).toContain(`title="Add files. ${reason}"`);
+	expect(markup).toContain(`data-tooltip="Add files. ${reason}"`);
+	expect(markup).toMatch(/<span class="sr-only" id="([^"]+)">This model can't read images/);
+	let id = markup.match(/<span class="sr-only" id="([^"]+)">This model/)![1]!;
+	expect(markup).toContain(`aria-describedby="${id}"`);
+	expect(markup).toMatch(/<input[^>]*accept="text\/\*,\.md/);
+	// Images are not hidden from the picker where they can be read.
+	expect(render({ files: FILES })).not.toContain("accept=");
+});
+
+test("switches the + off while a message is being sent, and says what a waiting send waits for", () => {
+	let sending = render({ files: { ...FILES, disabled: true }, sending: true });
+	expect(sending).toMatch(/<button[^>]*aria-label="Add files"[^>]*disabled=""/);
+	let waiting = render({ files: { ...FILES, waiting: true }, sending: true });
+	expect(waiting).toContain('role="status">Sending once your files have uploaded');
+	expect(render({ files: FILES })).not.toContain("Sending once your files");
+});
+
+test("an archived or read-only document offers no + that attaches", () => {
+	expect(render({ files: FILES, unavailable: "archived" })).not.toContain("Add files");
+});
+
+test("none of the words about files uses a term of Chopin's own", () => {
+	let markup = render({
+		files: {
+			...FILES,
+			waiting: true,
+			imagesReason: "This model can't read images, so only text files can be sent to it.",
+		},
+	});
+	let words = [
+		...markup.matchAll(/\b(?:aria-label|data-tooltip|title)="([^"]*)"/g),
+		...markup.matchAll(/>([^<>]+)</g),
+	].map(match => match[1]!);
+	expect(words.some(text => text.includes("Add files"))).toBe(true);
+	for (let text of words) expect(INTERNAL.test(text), text).toBe(false);
+});
+
+const DICTATION = {
+	active: false,
+	phase: "idle" as const,
+	seconds: 0,
+	tooltip: "Dictate (Alt+Shift+M)",
+	announcement: "",
+	onToggle: () => {},
+	disabled: false,
+};
+
+test("offers the microphone only where speech can be turned into words, named as it is", () => {
+	expect(render()).not.toContain('aria-label="Dictate"');
+	expect(render()).not.toContain("data-chat-dictation-announcement");
+	let idle = render({ dictation: DICTATION });
+	expect(idle).toMatch(/<button[^>]*aria-label="Dictate"[^>]*aria-pressed="false"/);
+	expect(idle).toContain('data-slot="composer-voice-button"');
+	expect(idle).toContain('title="Dictate (Alt+Shift+M)"');
+	expect(idle).toMatch(
+		/<p[^>]*aria-live="polite"[^>]*data-chat-dictation-announcement=""[^>]*role="status"/,
+	);
+	expect(idle).not.toContain('data-slot="composer-voice"');
+});
+
+test("puts the microphone in the bottom row, with the other controls and before the model pill", () => {
+	let markup = render({ dictation: DICTATION });
+	let row = markup.slice(markup.indexOf('class="composer-row"'));
+	let left = row.slice(0, row.indexOf('class="composer-actions"'));
+	expect(left).toContain('aria-label="Dictate"');
+	// The staged files and the voice are above the text, never in the row.
+	expect(left).not.toContain('data-slot="composer-voice"');
+});
+
+test("shows that it is listening with the time so far above the text, and says when it is working on a recording", () => {
+	let listening = render({
+		dictation: { ...DICTATION, active: true, phase: "listening", seconds: 65 },
+	});
+	expect(listening).toMatch(/<button[^>]*aria-label="Dictate"[^>]*aria-pressed="true"/);
+	let voice = listening.indexOf('data-slot="composer-voice"');
+	expect(voice).toBeGreaterThan(-1);
+	// Above the field the words go in, as the staged files are.
+	expect(voice).toBeLessThan(listening.indexOf('role="combobox"'));
+	expect(listening).toMatch(/data-slot="composer-voice"[^>]*data-recording="true"/);
+	// A minute is a minute: the element's own clock would say 0:65.
+	expect(listening).toContain(">1:05<");
+	expect(listening).not.toContain("0:65");
+	let transcribing = render({
+		dictation: { ...DICTATION, active: true, phase: "transcribing", seconds: 3 },
+	});
+	expect(transcribing).toContain("Transcribing");
+	expect(transcribing).not.toContain("data-recording");
+});
+
+test("starting, before the browser has let it listen, draws no voice yet", () => {
+	let starting = render({ dictation: { ...DICTATION, active: false, phase: "starting" } });
+	expect(starting).not.toContain('data-slot="composer-voice"');
+});
+
+test("none of the words about dictation uses a term of Chopin's own", () => {
+	let markup = render({
+		dictation: {
+			...DICTATION,
+			active: true,
+			phase: "transcribing",
+			announcement: "Dictation started",
+		},
+		notice: {
+			tone: "warning",
+			text: "Microphone access is blocked. Allow it in your browser's settings to dictate.",
+			action: { label: "Dismiss", onClick: () => {} },
+		},
+	});
+	let words = [
+		...markup.matchAll(/\b(?:aria-label|data-tooltip|title)="([^"]*)"/g),
+		...markup.matchAll(/>([^<>]+)</g),
+	].map(match => match[1]!);
+	expect(words.some(text => text.includes("Dictation started"))).toBe(true);
+	for (let text of words) expect(INTERNAL.test(text), text).toBe(false);
+});
+
+test("a message of only files is sent by the round button, which stops Chopin only for an empty one", () => {
+	let running: Partial<ChatComposerProps> = {
+		run: { action: "stop", disabled: false, onClick: () => {} },
+	};
+	let staged = { ...FILES, files: [{ ...VIEW, state: "done" as const }] };
+	// With nothing to send, the button that sends is the one that stops.
+	expect(render({ ...running, files: FILES })).toContain('aria-label="Stop generating"');
+	// A file is a message: the same button sends it.
+	let withFile = render({ ...running, files: staged });
+	expect(withFile).toContain('aria-label="Send message"');
+	expect(withFile).not.toContain('aria-label="Stop generating"');
 });

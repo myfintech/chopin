@@ -3,6 +3,8 @@
  * channel authorization and WebSocket admission still run in the real server.
  */
 import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 let issuedCodes = new Map<string, string>();
 let nextCode = 0;
@@ -42,6 +44,16 @@ const repositories = [
 ];
 
 const CREATOR_WRITABLE = new Set(["archive-1", "archive-8", "archive-9"]);
+
+// A reader of octo-org/score whose access is whatever the file named for it says whenever GitHub is
+// asked: "revoked" takes the repository away, "unavailable" answers as GitHub does when it cannot be
+// reached, and anything else, or no file, leaves the access as it was. The test that owns the
+// handle writes the file; the same path is made in e2e/reaction-access.e2e.ts.
+const ACCESS_GATED = "gated-access-";
+
+function accessGate(handle: string): string {
+	return join(tmpdir(), "chopin-e2e-access", handle);
+}
 
 // People GitHub reports with less than the default access to the private
 // octo-org/score: a reader may pull but not push, and an outsider cannot see it.
@@ -276,6 +288,20 @@ let fake = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof f
 					},
 				}));
 			}
+			if (handle.startsWith(ACCESS_GATED)) {
+				let gate = (await readFile(accessGate(handle), "utf8").catch(() => "")).trim();
+				if (gate === "unavailable") {
+					return json({ message: "Service Unavailable" }, { status: 503 });
+				}
+				available = available.map(value => ({
+					...value,
+					permissions: {
+						...value.permissions,
+						pull: gate === "revoked" ? false : value.permissions.pull,
+						push: false,
+					},
+				}));
+			}
 			if (handle === "paged" && url.searchParams.get("page") !== "2") {
 				return tagged(
 					{ repositories: available.slice(0, 1) },
@@ -301,6 +327,20 @@ let fake = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof f
 		}
 		// The head a machine with no checkout of octo-org/score clones.
 		if (url.pathname === "/repos/octo-org/score/commits/main") return json({ sha: "b".repeat(40) });
+		// The files of octo-org/score, which a message can mention.
+		if (url.pathname === "/repos/octo-org/score/git/trees/main") {
+			return json({
+				truncated: false,
+				tree: [
+					{ path: "README.md", type: "blob" },
+					{ path: "docs", type: "tree" },
+					{ path: "docs/design.md", type: "blob" },
+					{ path: "src", type: "tree" },
+					{ path: "src/index.ts", type: "blob" },
+					{ path: "src/chat/composer.tsx", type: "blob" },
+				],
+			});
+		}
 		let reference = /^\/repos\/octo-org\/score\/((?:pulls|issues)\/\d+)$/.exec(url.pathname);
 		let summary = reference && references.get(reference[1]!);
 		if (summary) return tagged(summary, `"reference-${reference![1]}"`);

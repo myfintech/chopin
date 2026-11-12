@@ -481,12 +481,14 @@ test("an invoking caller is introduced to the room with their picture before the
 	}
 });
 
-test("queued invocations post their durable message exactly once", async () => {
+test("invocations while a turn runs are given to it and post their durable message exactly once", async () => {
 	let fixture = await setup();
 	let { context, user } = fixture;
 	let first = Promise.withResolvers<void>();
 	let opened = Promise.withResolvers<void>();
 	let prompts: string[] = [];
+	let steered: string[] = [];
+	context.steers = () => true;
 	context.openPlannerSession = async () => ({
 		ok: true,
 		value: {
@@ -500,6 +502,9 @@ test("queued invocations post their durable message exactly once", async () => {
 					})(),
 				} as never;
 			},
+			steer: async text => {
+				steered.push(text);
+			},
 			destroy: async () => {},
 		},
 	});
@@ -508,12 +513,14 @@ test("queued invocations post their durable message exactly once", async () => {
 		await opened.promise;
 		await Chat.invoke(context, user, "Second");
 		await Chat.invoke(context, user, "Second");
-		expect(context.chat.waiting.map(item => item.text)).toEqual(["Second", "Second"]);
+		await until(() => steered.length === 2);
+		expect(context.chat.waiting).toEqual([]);
 		expect(context.chat.entries.map(entry => entry.text)).toEqual(["First", "Second", "Second"]);
 		expect(new Set(context.chat.entries.map(entry => entry.id)).size).toBe(3);
 		first.resolve();
 		await context.chat.running;
-		expect(prompts).toEqual(["@ana: First", "@ana: Second", "@ana: Second"]);
+		expect(prompts).toEqual(["@ana: First"]);
+		expect(steered).toEqual(["@ana: Second", "@ana: Second"]);
 		expect(context.chat.entries.map(entry => entry.text)).toEqual(["First", "Second", "Second"]);
 		expect(context.chat.waiting).toEqual([]);
 		expect(context.chat.busy).toBe(false);
@@ -525,6 +532,13 @@ test("queued invocations post their durable message exactly once", async () => {
 		first.resolve();
 	}
 });
+
+/** Waits for what a detached delivery has yet to do. */
+async function until(done: () => boolean): Promise<void> {
+	for (let deadline = Date.now() + 2_000; !done(); await Bun.sleep(5)) {
+		if (Date.now() > deadline) throw new Error("timed out waiting");
+	}
+}
 
 test("a child document's Planner cannot be invoked, so its Chat stays empty", async () => {
 	let { context, user } = await setup();
@@ -544,18 +558,14 @@ test("an invoked instruction with focus names the child in its turn", async () =
 	expect(seen[0]!.prompt).toContain(`child id ${focus.channelId}`);
 });
 
-test("failed persistence, an unavailable Planner and a full queue start no invoked turn", async () => {
+test("failed persistence, an unavailable Planner and a busy one that takes no message mid-run start no invoked turn", async () => {
 	let { context, events, user } = await setup();
 	context.config.agent = false;
 	expect(await Chat.invoke(context, user, "Review")).toBe("planner-unavailable");
 	context.config.agent = true;
 	context.chat.busy = true;
-	context.chat.waiting = Array.from(
-		{ length: 20 },
-		(_, index) => ({ id: String(index), handle: "ana", text: "Waiting" }),
-	);
-	expect(await Chat.invoke(context, user, "Review")).toBe("planner-queue-full");
-	context.chat.waiting = [];
+	expect(await Chat.invoke(context, user, "Review")).toBe("planner-busy");
+	expect(context.chat.waiting).toEqual([]);
 	context.chat.busy = false;
 	context.persist = async () => {
 		throw new Error("storage failed");
@@ -778,7 +788,7 @@ test("a Planner that still owns workflow runs outlives its turn, pauses, resumes
 
 	await Chat.abort(context, ws);
 	expect(planner.calls.at(-1)).toBe("pause");
-	expect(said()).toBe("@ana stopped Chopin and paused its workflows.");
+	expect(said()).toBe("@ana stopped chopin and paused its workflows.");
 	planner.set({ active: [], paused: ["run-1"], cards: [card("paused")] });
 	await tick();
 	expect(runs()?.map(run => run.status)).toEqual(["paused"]);
@@ -786,7 +796,7 @@ test("a Planner that still owns workflow runs outlives its turn, pauses, resumes
 
 	await Chat.resume(context, ws);
 	expect(planner.calls.at(-1)).toBe("resume");
-	expect(said()).toBe("@ana resumed Chopin's workflows.");
+	expect(said()).toBe("@ana resumed chopin's workflows.");
 	planner.set({ active: ["run-1"], paused: [], cards: [card("waiting")] });
 	await tick();
 	expect(runs()?.[0]).toMatchObject({
@@ -1011,7 +1021,7 @@ test("an explicit Stop, and the document closing, still end a Planner that waits
 		if (ending === "stop") {
 			await Chat.abort(context, { data: { handle: "ana" } } as unknown as Socket);
 			expect(context.chat.entries.at(-1)?.text).toBe(
-				"@ana stopped Chopin and withdrew its open question.",
+				"@ana stopped chopin and withdrew its open question.",
 			);
 		} else await Chat.close(context.chat);
 		expect(withdrawn.signal.aborted).toBe(true);
@@ -1044,7 +1054,7 @@ test("an explicit Stop leaves a Planner whose workflows are paused and whose que
 
 	await Chat.resume(context, ws);
 	expect(planner.calls.at(-1)).toBe("resume");
-	expect(context.chat.entries.at(-1)?.text).toBe("@ana resumed Chopin's workflows.");
+	expect(context.chat.entries.at(-1)?.text).toBe("@ana resumed chopin's workflows.");
 });
 
 test("a turn the Planner's dropped link ended keeps the session whose client may return, and lets it go for good once the link is given up", async () => {
@@ -1151,7 +1161,7 @@ test("an explicit Stop during a reply ends the turn and pauses the workflows, an
 	expect(signal.aborted).toBe(true);
 	expect(planner.calls).toContain("pause");
 	let said = context.chat.entries.map(entry => entry.text);
-	expect(said).toContain("@ana stopped Chopin and paused its workflows.");
+	expect(said).toContain("@ana stopped chopin and paused its workflows.");
 	expect(said.some(text => text.includes("could not"))).toBe(false);
 	expect(said).not.toContain("Which scope should the plan cover?");
 });
@@ -1181,7 +1191,7 @@ test("concurrent Stop requests pause a retained Planner's workflows only once", 
 	expect(callsBeforePauseSettled).toBe(1);
 	expect(
 		context.chat.entries.filter(entry =>
-			entry.text === "@ana stopped Chopin and paused its workflows."
+			entry.text === "@ana stopped chopin and paused its workflows."
 		),
 	).toHaveLength(1);
 });
@@ -1193,7 +1203,7 @@ test("Stop ignores active progress and resets for resumed or new workflow runs",
 	let ws = { data: { handle: "ana" } } as unknown as Socket;
 	let notices = () =>
 		context.chat.entries.filter(entry =>
-			entry.text === "@ana stopped Chopin and paused its workflows."
+			entry.text === "@ana stopped chopin and paused its workflows."
 		);
 
 	expect(await Chat.invoke(context, user, "Run the workflow")).toBeUndefined();
@@ -1248,8 +1258,8 @@ test("Stop can retry when pausing a retained Planner's workflows fails", async (
 	await Chat.abort(context, ws);
 	expect(planner.calls.filter(call => call === "pause")).toHaveLength(2);
 	expect(context.chat.entries.map(entry => entry.text).slice(-2)).toEqual([
-		"@ana asked Chopin to stop, but its workflows could not be paused.",
-		"@ana stopped Chopin and paused its workflows.",
+		"@ana asked chopin to stop, but its workflows could not be paused.",
+		"@ana stopped chopin and paused its workflows.",
 	]);
 });
 
@@ -2081,7 +2091,7 @@ test("a focused member turn names the child before the member's words", async ()
 		.toBe("shorten the summary");
 });
 
-test("a focused message queued behind a busy turn still names the child when it drains", async () => {
+test("a focused message given to a running turn still names the child", async () => {
 	let { context } = await setup();
 	let child = "0f5b2c1e-8d3a-4b6f-9a21-7c4e5d6f7a8b";
 	context.children = {
@@ -2094,6 +2104,8 @@ test("a focused message queued behind a busy turn still names the child when it 
 	let first = Promise.withResolvers<void>();
 	let opened = Promise.withResolvers<void>();
 	let prompts: string[] = [];
+	let steered: string[] = [];
+	context.steers = () => true;
 	context.openPlannerSession = async () => ({
 		ok: true,
 		value: {
@@ -2102,10 +2114,13 @@ test("a focused message queued behind a busy turn still names the child when it 
 				opened.resolve();
 				return {
 					fullStream: (async function*() {
-						if (prompts.length === 1) await first.promise;
+						await first.promise;
 						yield { type: "finish" };
 					})(),
 				} as never;
+			},
+			steer: async text => {
+				steered.push(text);
 			},
 			destroy: async () => {},
 		},
@@ -2124,14 +2139,15 @@ test("a focused message queued behind a busy turn still names the child when it 
 	await send("@chopin first");
 	await opened.promise;
 	await send("@chopin shorten the summary", child);
-	expect(context.chat.waiting).toHaveLength(1);
+	await until(() => steered.length === 1);
+	expect(context.chat.waiting).toHaveLength(0);
 	first.resolve();
 	await context.chat.running;
-	expect(prompts).toHaveLength(2);
+	expect(prompts).toHaveLength(1);
 	expect(prompts[0]).not.toContain(child);
-	let drained = prompts[1]!;
-	expect(drained.indexOf(`child id ${child}`)).toBeGreaterThanOrEqual(0);
-	expect(drained.indexOf(`child id ${child}`)).toBeLessThan(drained.indexOf("shorten the summary"));
+	let given = steered[0]!;
+	expect(given.indexOf(`child id ${child}`)).toBeGreaterThanOrEqual(0);
+	expect(given.indexOf(`child id ${child}`)).toBeLessThan(given.indexOf("shorten the summary"));
 });
 
 function failingMemberTurn(
@@ -2294,6 +2310,6 @@ test("a stream that stopped without saying why is a failed reply with no words r
 		expect(failed).toHaveLength(1);
 		expect(failed[0]!.turnFailure?.kind).toBe("error");
 		expect(failed[0]!.turnFailure?.detail).toBeUndefined();
-		expect(failed[0]!.text).toBe("Chopin's reply failed. Try again.");
+		expect(failed[0]!.text).toBe("chopin's reply failed. Try again.");
 	}
 });

@@ -10,6 +10,8 @@ export type ModelControl = {
 	catalog: Wire.ModelCatalog;
 	/** What the room holds, or what this browser has asked for until the server has answered. */
 	choice: Wire.ModelChoice | undefined;
+	/** Catalog name saved with this choice, if known. */
+	modelName?: string;
 	/** Why the server refused the last choice, until the next one. */
 	refusal: string | undefined;
 	choose: (next: Wire.ModelChoice) => void;
@@ -20,6 +22,9 @@ type Held = {
 	wire: Socket;
 	catalog?: Wire.ModelCatalog;
 	choice?: Wire.ModelChoice;
+	modelName?: string;
+	/** What the document's agent offers `/` beyond Chat's own commands. */
+	commands?: Wire.CommandOption[];
 	/** The server ran the harness's default because a turn could not read the choice. */
 	unreadable?: boolean;
 };
@@ -44,7 +49,14 @@ export function useModelChoice(
 		connected: boolean;
 		enabled: boolean;
 	},
-): { control: ModelControl | undefined; saved: Wire.ModelChoice | undefined; unreadable: boolean } {
+): {
+	control: ModelControl | undefined;
+	saved: Wire.ModelChoice | undefined;
+	savedName: string | undefined;
+	unreadable: boolean;
+	/** The commands the document's agent offers now, none where it reports none. */
+	commands: Wire.CommandOption[] | undefined;
+} {
 	let [held, setHeld] = useState<Held>();
 	let [asked, setAsked] = useState<Asked>();
 	let [refusal, setRefusal] = useState<string>();
@@ -64,6 +76,8 @@ export function useModelChoice(
 					wire,
 					catalog: frame.catalog,
 					choice: frame.choice,
+					modelName: frame.modelName,
+					commands: frame.commands,
 				}));
 			}),
 			wire.on<Wire.ModelUnreadable>("chat:model-unreadable", frame => {
@@ -104,7 +118,18 @@ export function useModelChoice(
 	let current = held && held.wire === wire && held.room === room ? held : undefined;
 	let unreadable = enabled && current?.unreadable === true;
 	let saved = enabled ? current?.choice : undefined;
-	if (!enabled || !wire || !current?.catalog) return { control: undefined, saved, unreadable };
+	let savedName = enabled ? current?.modelName : undefined;
+	let commands = enabled ? current?.commands : undefined;
+	if (!enabled || !wire || !current?.catalog) {
+		return { control: undefined, saved, savedName, unreadable, commands };
+	}
 	let choice = asked && !sameChoice(asked.choice, current.choice) ? asked.choice : current.choice;
-	return { control: { catalog: current.catalog, choice, refusal, choose }, saved, unreadable };
+	let modelName = choice?.model === current.choice?.model ? savedName : undefined;
+	return {
+		control: { catalog: current.catalog, choice, modelName, refusal, choose },
+		saved,
+		savedName,
+		unreadable,
+		commands,
+	};
 }

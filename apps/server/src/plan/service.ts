@@ -47,7 +47,10 @@ import * as presence from "./presence";
 import * as edit from "./edit";
 import * as room from "./room";
 import * as Chat from "../chat/service";
+import { validateReactions } from "../chat/reactions";
 import { restoreReferences } from "../chat/references";
+import { savedImages, savedRefusals } from "../chat/images";
+import { entriesForStorage, mergePointers } from "../chat/stored-pointers";
 import * as Comments from "../comments/service";
 import * as Questions from "../questions/service";
 import { sidecarUnansweredDecisions } from "../questions/unanswered";
@@ -69,8 +72,6 @@ import type { Brief, CreationOrigin } from "../mcp";
 import { researchProjectionAllowed, ResearchProjectionConflict } from "../storage/model";
 import type {
 	ChannelRecord,
-	DeferredTurnChange,
-	DeferredTurnOutcome,
 	InitialChannel,
 	JsonValue,
 	Lease,
@@ -397,7 +398,7 @@ function state(plan: Plan, chat: ChatView = plan.chat): Sidecar {
 		questions: [...plan.records.values()],
 		openQuestions: Questions.dump(plan.questions),
 		threads: [...plan.threads.values()],
-		transcript: chat.entries,
+		transcript: entriesForStorage(chat.entries),
 		conversationPlan: plan.conversationPlan,
 		...(plan.conversationPlanRetries.length
 			? { conversationPlanRetries: plan.conversationPlanRetries }
@@ -701,6 +702,13 @@ function restoredState(
 			|| Array.isArray(entry.author)
 		) throw new Error("hosted channel has an invalid transcript entry");
 		validateNotice(entry, savedMessages);
+		mergePointers(entry);
+		if (
+			(Object.hasOwn(entry, "images") || Object.hasOwn(entry, "refusedImages"))
+				&& (entry.author as Record<string, JsonValue>).kind !== "agent"
+			|| Object.hasOwn(entry, "images") && !savedImages(entry.images)
+			|| Object.hasOwn(entry, "refusedImages") && !savedRefusals(entry.refusedImages)
+		) throw new Error("hosted channel has an invalid transcript image");
 		if (Object.hasOwn(entry, "references")) {
 			let author = entry.author as Record<string, JsonValue>;
 			if (author.kind !== "member") {
@@ -722,6 +730,7 @@ function restoredState(
 		} catch (err) {
 			throw new Error("hosted channel has invalid chat delivery metadata", { cause: err });
 		}
+		validateReactions(entry as unknown as Chat.Chat["entries"][number]);
 	}
 	let mcpUpdates = restoreMcpUpdates(item.mcpUpdates);
 	let conversationPlan = restoreConversationPlan(
@@ -1013,16 +1022,14 @@ async function commitHosted(
 	allowArchived = false,
 	researchProjections: ResearchProjectionChange[] = [],
 	notifyDocumentPersisted = true,
-	deferredTurns: DeferredTurnChange[] = [],
-): Promise<DeferredTurnOutcome[] | undefined> {
+): Promise<void> {
 	let durable = plan.persistence;
 	if (
 		!update && captured.sidecarText === durable.lastSidecar
 		&& (captured.title === undefined || captured.title === durable.committedTitle)
-		&& deferredTurns.length === 0
 	) {
 		scheduleCheckpoint(plan);
-		return undefined;
+		return;
 	}
 	try {
 		let previousSource = durable.committedSource;
@@ -1042,7 +1049,6 @@ async function commitHosted(
 			now: new Date(),
 			...(researchProjections.length > 0 ? { researchProjections } : {}),
 			...(allowArchived ? { allowArchived: true } : {}),
-			...(deferredTurns.length > 0 ? { deferredTurns } : {}),
 			...DocumentProvenance.commitField(durable.committedSource, captured),
 		});
 		if (!result.repeated) {
@@ -1104,7 +1110,6 @@ async function commitHosted(
 			}
 		}
 		scheduleCheckpoint(plan);
-		return result.deferredTurns;
 	} catch (err) {
 		if (!(err instanceof ResearchProjectionConflict)) durable.fatal(err);
 		throw err;
@@ -1326,31 +1331,6 @@ export function persist(plan: Plan, chat?: () => ChatView): Promise<void> {
 	// Not mapped to void: a second step here would move every save a tick later.
 	let pending = plan.flushing.then(commit, commit) as Promise<unknown> as Promise<void>;
 	plan.flushing = pending;
-	return pending;
-}
-
-/**
- * `persist`, with changes to the deferred Planner requests written in the same transaction, and
- * what each did. A request is durable no later than the entry that acknowledges it.
- */
-export function persistDeferred(
-	plan: Plan,
-	chat?: () => ChatView,
-	deferredTurns?: DeferredTurnChange[],
-): Promise<DeferredTurnOutcome[]> {
-	let commit = () =>
-		commitHosted(
-			plan,
-			undefined,
-			`state:${crypto.randomUUID()}`,
-			capture(plan, chat?.()),
-			false,
-			[],
-			true,
-			deferredTurns,
-		).then(outcomes => outcomes ?? []);
-	let pending = plan.flushing.then(commit, commit);
-	plan.flushing = pending.then(() => {});
 	return pending;
 }
 

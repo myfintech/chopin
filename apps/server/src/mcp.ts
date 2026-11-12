@@ -14,7 +14,7 @@ import {
 	MAX_REQUEST_BYTES,
 	MAX_TITLE_LENGTH,
 	prepare,
-	REPOSITORY_PATH_PATTERN,
+	REPOSITORY_PATH,
 } from "./mcp/create";
 import { prepareUpdate } from "./mcp/update";
 import { MAX_IMAGE_DATA_LENGTH, MAX_IMAGE_REQUEST_BYTES, prepareImage } from "./mcp/image";
@@ -171,7 +171,7 @@ export type InvokePlannerError =
 	| "planner-owner-unavailable"
 	| "checkout-unverified"
 	| "planner-unavailable"
-	| "planner-queue-full"
+	| "planner-busy"
 	| "system-turn-forbidden"
 	| "system-turn-limited";
 
@@ -295,7 +295,7 @@ const IMPLEMENTATION = {
 		planRevision: { type: "integer", minimum: 0 },
 		graphVersion: { type: "integer", minimum: 1 },
 		graphRevision: { type: "integer", minimum: 1 },
-		repository: { type: "string", pattern: REPOSITORY_PATH_PATTERN },
+		repository: REPOSITORY_PATH,
 		branch: { type: "string", minLength: 1, maxLength: 255 },
 		commit: { type: "string", minLength: 1, maxLength: 64 },
 	},
@@ -319,7 +319,7 @@ export const TOOLS: Tool[] = [
 		inputSchema: {
 			type: "object",
 			properties: {
-				repository: { type: "string", pattern: REPOSITORY_PATH_PATTERN },
+				repository: REPOSITORY_PATH,
 				includeArchived: { type: "boolean", default: false },
 			},
 			required: ["repository"],
@@ -376,7 +376,7 @@ export const TOOLS: Tool[] = [
 			type: "object",
 			properties: {
 				idempotencyKey: { type: "string", minLength: 1, maxLength: 128 },
-				repository: { type: "string", pattern: REPOSITORY_PATH_PATTERN },
+				repository: REPOSITORY_PATH,
 				baseBranch: { type: "string", minLength: 1, maxLength: 255 },
 				baseCommit: { type: "string", minLength: 1, maxLength: 64 },
 				title: { type: "string", maxLength: MAX_TITLE_LENGTH },
@@ -617,7 +617,7 @@ export const TOOLS: Tool[] = [
 								"planner-owner-unavailable",
 								"checkout-unverified",
 								"planner-unavailable",
-								"planner-queue-full",
+								"planner-busy",
 								"system-turn-forbidden",
 								"system-turn-limited",
 							],
@@ -632,7 +632,8 @@ export const TOOLS: Tool[] = [
 	},
 	{
 		name: "upload_image",
-		description: "Upload a PNG, JPEG, WebP or GIF image of at most 1 MiB to a Chopin document "
+		description: "Upload a PNG, JPEG, WebP or GIF image of at most 16 MiB (one over 1 MiB is "
+			+ "stored as a smaller copy) to a Chopin document "
 			+ "and return its path and Markdown. Place the Markdown in the document with "
 			+ "update_document. Only people who can read the document can load the image; "
 			+ "uploading the same bytes again returns the same path.",
@@ -649,7 +650,7 @@ export const TOOLS: Tool[] = [
 					type: "string",
 					contentEncoding: "base64",
 					maxLength: MAX_IMAGE_DATA_LENGTH,
-					description: "Standard base64 image bytes, at most 1 MiB decoded.",
+					description: "Standard base64 image bytes, at most 16 MiB decoded.",
 				},
 				mimeType: { type: "string", enum: [...IMAGE_TYPES] },
 			},
@@ -1244,7 +1245,7 @@ export function handler<Caller>(
 						}, true));
 				}
 				if (tool.name === "upload_image" && options.upload) {
-					let prepared = prepareImage(tool.arguments);
+					let prepared = await prepareImage(tool.arguments);
 					if (!prepared) {
 						return notification
 							? undefined

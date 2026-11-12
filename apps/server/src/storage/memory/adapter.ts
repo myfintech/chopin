@@ -5,6 +5,7 @@ import { sidecarUnansweredDecisions } from "../../questions/unanswered";
 import { childSidecarWithoutConversation } from "../child-conversation";
 import { MemoryBackgroundJobStore } from "./jobs";
 import { MemoryExperimentStore } from "./experiments";
+import { MemoryChatAttachmentStore } from "./chat-attachments";
 import { MemoryImageStore } from "./images";
 import { MemoryRunStageStore } from "./run-stages";
 import { MemoryDecisionAnswerStore } from "./decision-answers";
@@ -13,6 +14,7 @@ import { MemoryMachineStore } from "./machines";
 import { MemoryDeferredTurnStore } from "./deferred-turns";
 import { MemoryMcpSessionStore } from "./mcp-sessions";
 import { MemoryPlannerCredentialStore } from "./planner-credentials";
+import { MemoryChatThreadStore } from "./chat-threads";
 import { MemoryPlannerLinkHoldStore } from "./planner-holds";
 import { MemoryPlannerModelChoiceStore } from "./planner-model-choices";
 import { MemoryResearchWorkspaceStore } from "./research";
@@ -34,6 +36,7 @@ import type {
 	ChannelScanPage,
 	ChannelSnapshot,
 	ChannelUpdate,
+	ChannelWidthInput,
 	CommitChannel,
 	CommitResult,
 	CreateChannel,
@@ -58,6 +61,8 @@ import type {
 import type {
 	BackgroundJobStore,
 	ChannelStore,
+	ChatAttachmentStore,
+	ChatThreadStore,
 	CollaborationStore,
 	DecisionAnswerStore,
 	DeferredTurnStore,
@@ -181,6 +186,11 @@ export class MemoryStorage implements StorageAdapter {
 		userExists: id => this.#users.has(id),
 	});
 	readonly images: ImageStore = this.#images;
+	readonly #chatAttachments = new MemoryChatAttachmentStore({
+		channelExists: id => this.#channels.has(id),
+		userExists: id => this.#users.has(id),
+	});
+	readonly chatAttachments: ChatAttachmentStore = this.#chatAttachments;
 	readonly #runStages = new MemoryRunStageStore(id => this.#channels.has(id));
 	readonly runStages: RunStageStore = this.#runStages;
 	readonly #decisionAnswers = new MemoryDecisionAnswerStore(id => this.#channels.has(id));
@@ -209,17 +219,20 @@ export class MemoryStorage implements StorageAdapter {
 		assertLease: held => this.#assertLease(held),
 	});
 	readonly plannerModelChoices: PlannerModelChoiceStore = this.#plannerModelChoices;
+	readonly #chatThreads = new MemoryChatThreadStore({
+		channelExists: id => this.#channels.has(id),
+		assertLease: held => this.#assertLease(held),
+	});
+	readonly chatThreads: ChatThreadStore = this.#chatThreads;
 	readonly #plannerCredentials = new MemoryPlannerCredentialStore({
 		machineExists: id => this.#machines.has(id),
 		channelExists: id => this.#channels.has(id),
 	});
 	readonly plannerCredentials: PlannerCredentialStore = this.#plannerCredentials;
 	readonly mcpSessions: McpSessionStore = new MemoryMcpSessionStore();
-	readonly #deferredTurns = new MemoryDeferredTurnStore({
-		channelExists: id => this.#channels.has(id),
+	readonly deferredTurns: DeferredTurnStore = new MemoryDeferredTurnStore({
 		assertLease: held => this.#assertLease(held),
 	});
-	readonly deferredTurns: DeferredTurnStore = this.#deferredTurns;
 
 	readonly users: UserStore = {
 		put: input => {
@@ -403,6 +416,7 @@ export class MemoryStorage implements StorageAdapter {
 			);
 		},
 		rename: input => this.#renameChannel(input),
+		setFullWidth: input => this.#setChannelWidth(input),
 		archive: input => this.#setChannelArchived(input, true),
 		restore: input => this.#setChannelArchived(input, false),
 		delete: id => this.#deleteChannel(id),
@@ -632,6 +646,22 @@ export class MemoryStorage implements StorageAdapter {
 		return { channel: channel(saved), changed: true };
 	}
 
+	async #setChannelWidth(input: ChannelWidthInput): Promise<RenameResult> {
+		let found = this.#channels.get(input.id);
+		if (!found) throw missing(`channel ${input.id} does not exist`);
+		if (found.archivedAt) throw conflict(`channel ${input.id} is archived`);
+		if (!!found.fullWidth === input.fullWidth) return { channel: channel(found), changed: false };
+		let updatedAt = input.now > found.updatedAt
+			? new Date(input.now)
+			: new Date(found.updatedAt.getTime() + 1);
+		let { fullWidth: _, ...rest } = found;
+		let saved: ChannelRecord = input.fullWidth
+			? { ...rest, fullWidth: true, updatedAt }
+			: { ...rest, updatedAt };
+		this.#channels.set(saved.id, saved);
+		return { channel: channel(saved), changed: true };
+	}
+
 	async #setChannelArchived(
 		input: ChannelArchiveInput,
 		archived: boolean,
@@ -673,13 +703,14 @@ export class MemoryStorage implements StorageAdapter {
 		await this.#research.deleteChannel(id);
 		this.#jobs.deleteChannel(id);
 		this.#images.deleteChannel(id);
+		this.#chatAttachments.deleteChannel(id);
 		this.#runStages.deleteChannel(id);
 		this.#decisionAnswers.deleteChannel(id);
 		this.#versions.deleteChannel(id);
 		this.#plannerHolds.deleteChannel(id);
 		this.#plannerModelChoices.deleteChannel(id);
+		this.#chatThreads.deleteChannel(id);
 		this.#plannerCredentials.deleteChannel(id);
-		this.#deferredTurns.deleteChannel(id);
 		this.#snapshots.delete(id);
 		this.#sequences.delete(id);
 		this.#updates.delete(id);
@@ -980,7 +1011,6 @@ export class MemoryStorage implements StorageAdapter {
 				`channel ${input.channelId} is at revision ${found.revision}, expected ${input.expectedRevision}`,
 			);
 		}
-		for (let change of input.deferredTurns ?? []) this.#deferredTurns.check(change);
 		let existingEvents = this.#events.get(input.channelId) ?? [];
 		let eventIds = new Set(existingEvents.map(value => value.id));
 		for (let item of input.events) {
@@ -1037,9 +1067,6 @@ export class MemoryStorage implements StorageAdapter {
 				: {}),
 		});
 		this.#sequences.set(input.channelId, sequence + 1);
-		let deferredTurns = input.deferredTurns?.length
-			? this.#deferredTurns.apply(input.lease, input.deferredTurns)
-			: undefined;
 		if (input.provenance) this.provenance.record(input.channelId, input.provenance, input.now);
 		let result = {
 			revision,
@@ -1051,7 +1078,7 @@ export class MemoryStorage implements StorageAdapter {
 				: {}),
 		};
 		operations.set(input.operationId, result);
-		return Promise.resolve(deferredTurns ? { ...result, deferredTurns } : result);
+		return Promise.resolve(result);
 	}
 
 	#checkpoint(input: SaveCheckpoint): Promise<void> {

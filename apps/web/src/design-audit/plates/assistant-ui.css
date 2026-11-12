@@ -4,9 +4,56 @@
 	gap: 1rem 1.5rem;
 }
 
+.design-audit-aui + .design-audit-aui {
+	margin-top: 1.5rem;
+}
+
 .design-audit-aui > div {
 	display: flex;
 	flex-direction: column;
 	align-items: flex-start;
 	gap: 0.5rem;
+}
+
+/* The menus open upward from the box they belong to, so each is given the room above its own. */
+.design-audit-aui > div > .design-audit-aui-menu {
+	position: relative;
+	width: 18rem;
+	height: 0;
+	margin-top: 8.5rem;
+}
+
+.design-audit-aui-chips {
+	display: flex;
+	align-items: center;
+	gap: 1rem;
+}
+
+.design-audit-aui-staged {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 0.5rem;
+	width: 24rem;
+	max-width: 100%;
+}
+
+.design-audit-aui-markdown {
+	margin-block-start: 1.5rem;
+	max-inline-size: 36rem;
+	display: flex;
+	flex-direction: column;
+	gap: 0.5rem;
+}
+
+.design-audit-aui-wide {
+	inline-size: min(100%, 24rem);
+}
+
+.design-audit-aui-blocks {
+	margin-top: 1.5rem;
+}
+
+.design-audit-aui-blocks > div {
+	width: min(100%, 24rem);
 }

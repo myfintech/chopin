@@ -151,7 +151,7 @@ describe("palette", () => {
 		expect(hex("--color-gray-100")).toBe("#f8f8f6");
 		expect(hex("--color-gray-150")).toBe("#f4f4f1");
 		expect(hex("--color-brand")).toBe("#06707e");
-		expect(hex("--color-destructive")).toBe("#d54d4c");
+		expect(hex("--color-destructive")).toBe("#cf4747");
 	});
 
 	it("keeps the Chat body ink distinct from the general secondary text", () => {
@@ -329,8 +329,8 @@ describe("controls", () => {
 		expect(declared("--icon-button-padding")).toBe(
 			"calc((var(--icon-button-size) - var(--icon-size-default)) / 2)",
 		);
-		expect(hex("--color-destructive-hover")).toBe("#c44746");
-		expect(hex("--color-destructive-active")).toBe("#b34140");
+		expect(hex("--color-destructive-hover")).toBe("#be4241");
+		expect(hex("--color-destructive-active")).toBe("#ad3c3b");
 	});
 
 	it("gives every button tier guarded states without a rest border", () => {
@@ -452,10 +452,11 @@ describe("controls", () => {
 		);
 	});
 
+	// A field's and a choice's edge is how they are found, so it is the 3:1 control boundary.
 	it("uses the two designed control edges across fields and choices", () => {
 		for (let name of ["field", "choice-control"]) {
 			let rule = utility(name);
-			expect(rule).toMatch(/border:\s*var\(--edge-width\) solid var\(--color-control-edge\)/);
+			expect(rule).toMatch(/border:\s*var\(--edge-width\) solid var\(--color-control-boundary\)/);
 			expect(rule).toMatch(/&:disabled\s*\{[\s\S]*border-color:\s*var\(--color-edge\)/);
 		}
 		expect(utility("field")).toMatch(
@@ -639,13 +640,6 @@ describe("migration", () => {
 	it("puts each listed standard control on its shared utility", () => {
 		let controls: StandardControl[] = [
 			{
-				file: "apps/web/src/chat/composer.tsx",
-				marker: 'className="composer-surface field"',
-				name: "chat composer",
-				tag: "div",
-				utility: "field",
-			},
-			{
 				file: "packages/editor/src/comments.tsx",
 				marker: 'className="plan-comment-composer field"',
 				name: "comment composer",
@@ -766,23 +760,11 @@ describe("migration", () => {
 				size: "btn-sm",
 				tiers: ["btn-ghost"],
 			}],
-			["apps/web/src/chat/transcript.tsx", {
-				action: "Withdraw",
-				marker: 'title="Withdraw"',
-				size: "btn-icon",
-				tiers: ["btn-ghost"],
-			}],
-			["apps/web/src/chat/composer.tsx", {
-				action: "Stop Chopin",
-				marker: 'aria-label="Stop Chopin"',
-				size: "btn-icon",
-				tiers: ["btn-secondary"],
-			}],
 			["apps/web/src/chat/composer.tsx", {
 				action: "Resume Planner",
-				marker: 'aria-label="Resume Chopin"',
+				marker: "aria-label={`Resume ${PLANNER_NAME}`}",
 				size: "btn-icon",
-				tiers: ["btn-secondary"],
+				tiers: ["btn-ghost"],
 			}],
 			["packages/editor/src/send-action.tsx", {
 				action: "shared send action",

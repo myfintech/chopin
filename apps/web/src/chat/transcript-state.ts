@@ -1,3 +1,5 @@
+import { withReactions } from "./reactions";
+
 import type { Chat } from "@chopin/protocol";
 import type { CompletedWork } from "./model";
 
@@ -14,7 +16,8 @@ export type TranscriptAction =
 	| { kind: "delta"; id: string; text: string }
 	| { kind: "tool"; entryId: string; activity: Chat.Activity }
 	| { kind: "turn"; turn?: Chat.Turn }
-	| { kind: "removed"; id: string }
+	| { kind: "reactions"; id: string; reactions: Chat.Reaction[] }
+	| { kind: "removed"; ids: string[] }
 	| { kind: "responded" };
 
 /**
@@ -153,24 +156,22 @@ export function transcriptReducer(
 					: finish(state, action.turn?.entryOffset ?? state.entries.length),
 			});
 		}
+		case "reactions":
+			return state.entries.some(entry => entry.id === action.id)
+				? { ...state, entries: withReactions(state.entries, action.id, action.reactions) }
+				: state;
 		case "removed": {
-			let index = state.entries.findIndex(entry => entry.id === action.id);
-			if (index < 0) return state;
-			// Everything after it moves up one place, and the turn and the finished work that
-			// count entries from the start move with it.
-			let earlier = (offset: number) => index < offset ? offset - 1 : offset;
-			return withAnchor({
+			// A failed attempt a Retry replaced: its entries go, and with them the work it showed.
+			let gone = new Set(action.ids);
+			if (!state.entries.some(entry => gone.has(entry.id))) return state;
+			return {
 				...state,
-				entries: state.entries.filter((_, at) => at !== index),
-				turn: state.turn
-					? { ...state.turn, entryOffset: earlier(state.turn.entryOffset) }
-					: undefined,
-				completedWork: state.completedWork.map(item => ({
-					...item,
-					entryOffset: earlier(item.entryOffset),
-					endOffset: index < item.endOffset ? item.endOffset - 1 : item.endOffset,
-				})),
-			});
+				entries: state.entries.filter(entry => !gone.has(entry.id)),
+				completedWork: state.completedWork.filter(item => !gone.has(item.anchorId)),
+				...(state.activeAnchorId && gone.has(state.activeAnchorId)
+					? { activeAnchorId: undefined }
+					: {}),
+			};
 		}
 		case "responded":
 			return state.turn && !state.turn.responded

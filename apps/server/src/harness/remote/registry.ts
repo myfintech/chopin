@@ -47,6 +47,14 @@ export type RemotePlanner =
 		 * open Decision, ends with the turn instead of holding it open.
 		 */
 		hostTools?: AbortController;
+		/** The Chat message the next turn answers, taken by that turn like `hostTools`. */
+		turnMessage?: { id: string; retry?: true };
+		/** Parent session and turn to branch from when starting a thread session. */
+		forkFrom?: { session: string; turn?: string };
+		/** Set `true` when the client accepted `fork` over `session-forks`. */
+		forkedNatively?: boolean;
+		/** Reports `{ session, turn }` as each remote turn starts, so a thread can fork from it. */
+		onRemoteTurn?: (point: { session: string; turn: string }) => void;
 	};
 
 let planners = new Map<string, RemotePlanner>();
