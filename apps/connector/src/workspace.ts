@@ -652,6 +652,17 @@ export async function prepareWorkspace(
 			cwd: root,
 			timeout: 120_000,
 			env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: "0" },
+		}).catch(error => {
+			let lines = String((error as { stderr?: unknown }).stderr ?? "").trim().split("\n");
+			let detail = redacted(
+				lines.find(line => line.startsWith("fatal:")) ?? (lines.at(-1) || (error as Error).message),
+			);
+			throw new Error(
+				`Couldn't fetch commit ${input.source.commit}${
+					input.source.branch ? ` (${input.source.branch})` : ""
+				} of ${input.source.repository} to start from (${detail}).`,
+				{ cause: error },
+			);
 		});
 	}
 	let path = join(directory, "runs", attempt);
@@ -680,14 +691,25 @@ function extraWorktrees(path: string) {
 	return `${path}-worktrees`;
 }
 
+/** How a run ended, as its journal records it: its agent finished, failed and why, or was stopped. */
+export type RunOutcome =
+	| { state: "finished" }
+	/** `reason` names who stopped it in Chopin; Ctrl-C here has none. */
+	| { state: "stopped"; reason?: string }
+	/** Its agent blocked a task: which one and why. */
+	| { state: "blocked"; reason: string }
+	| { state: "failed"; error: string };
+
 /**
  * End a run's workspace: remove the extra worktrees its agent added (see `removeWorktreesIn`) and
- * mark its journal finished, which retention orders kept runs by. The run's own worktree stays
- * for inspection.
+ * mark its journal ended, which retention orders kept runs by, with `outcome` when known. Its
+ * `state` stays "finished" for every end, as retention reads it; `outcome` says which end. The
+ * run's own worktree stays for inspection.
  */
 export async function endWorkspace(
 	root: string,
 	prepared: { extras: string; journalPath: string },
+	outcome?: RunOutcome,
 ) {
 	removePlantedRedirects(root);
 	await removeWorktreesIn({ cwd: root }, prepared.extras);
@@ -695,7 +717,12 @@ export async function endWorkspace(
 		let journal = JSON.parse(await readFile(prepared.journalPath, "utf8"));
 		await writeFile(
 			prepared.journalPath,
-			JSON.stringify({ ...journal, state: "finished", finished: Date.now() }),
+			JSON.stringify({
+				...journal,
+				state: "finished",
+				finished: Date.now(),
+				...(outcome ? { outcome } : {}),
+			}),
 			{ mode: 0o600 },
 		);
 	} catch { /* A journal retention already removed has nothing left to mark. */ }

@@ -7,10 +7,11 @@ import { errorCode } from "./machine";
 import { backoff, delay, forgottenMessage, RUN_GRACE_MS, runReports } from "./reconnect";
 import { bridgeCommand } from "./bridge";
 import { gitCredentials, githubEnvironment, type GitHubToken, githubToken } from "./github-token";
-import { runAgent } from "./acp";
+import { AgentTimedOut, runAgent, timedOut } from "./acp";
 import type { AgentInfo } from "./acp";
 import { serveLocalBridge } from "./local-bridge";
 import { createOutput } from "./output";
+import { blockedText, endingOf } from "./ending";
 import type { Output } from "./output";
 import { ask, describePermission, permissionMemory } from "./permission";
 import type { Sandbox } from "./sandbox";
@@ -28,6 +29,7 @@ import {
 import type { Checkouts } from "./checkouts";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import type { RunOutcome } from "./workspace";
 import {
 	implementationPrompt,
 	liveImplementationPrompt,
@@ -71,10 +73,25 @@ type Options = {
 	githubRefused?: (message: string, repository: string) => void;
 	/** Where the agent starts: the machine's process sandbox, else plainly. */
 	sandbox?: Sandbox;
+	/** How long a build's or rebuild's agent may work, for tests; `BUILD_LIMIT_MS` by default. */
+	buildLimitMs?: number;
 };
+/** How long an investigation's or prototype's agent may work before it is stopped. */
+export const INVESTIGATION_LIMIT_MS = 60 * 60 * 1000;
+/**
+ * How long a build's agent may work through all of its tasks in one turn before it is stopped.
+ * A build of a few tasks that each verify the whole workspace can take most of an hour per task.
+ */
+export const BUILD_LIMIT_MS = 4 * 60 * 60 * 1000;
 export const STOPPED = "Stopped from the connector terminal.";
 /** A run out of reach says it is still trying at most this often. */
 const RETRY_SAID_MS = 10_000;
+
+/** A refusal's message without the code Chopin put in front of it. */
+function refusalMessage(error: unknown): string | undefined {
+	let message = error instanceof Error ? error.message.replace(/^[a-z][a-z0-9-]*:\s*/, "") : "";
+	return message.trim() || undefined;
+}
 
 function minutes(ms: number) {
 	let value = Math.round(ms / 60_000);
@@ -132,6 +149,8 @@ export async function runWork(
 	let ended: string | undefined;
 	/** Chopin forgot this connection, so the connector must stop once the run has reported. */
 	let forgotten = false;
+	/** A person stopped the build in Chopin, which says who: a stop, not a failure. */
+	let stoppedInChopin = false;
 	let now = options.now ?? Date.now;
 	/** When the terminal last said Chopin is out of reach, so retries say so at most every 10 s. */
 	let saidAt = 0;
@@ -201,6 +220,10 @@ export async function runWork(
 					continue;
 				}
 				let code = errorCode(error);
+				if (code === "build-stopped" && ended === undefined) {
+					stoppedInChopin = true;
+					ended = refusalMessage(error) ?? "Stopped in Chopin.";
+				}
 				// A build claimed before Chopin restarted is one it no longer knows.
 				ended ??= code === "server-restarted"
 					? "Chopin restarted, so it ended this run."
@@ -240,6 +263,10 @@ export async function runWork(
 			: Promise.resolve(undefined);
 	let secrets = () => [...Object.values(options.env ?? {}), ...github?.secrets() ?? []];
 	let agentStop: string | undefined;
+	/** How the run ended, for its journal; a run cut short before it ends says nothing. */
+	let outcome: RunOutcome | undefined;
+	// A build's agent works through every task in one turn, so it gets longer than an investigation.
+	let limit = implementation ? options.buildLimitMs ?? BUILD_LIMIT_MS : INVESTIGATION_LIMIT_MS;
 	try {
 		let checkout = await options.checkouts.resolve(input.source.repository, token);
 		root = checkout.root;
@@ -288,6 +315,7 @@ export async function runWork(
 		// it must use to reach Chopin, so it gets the stdio bridge, which does.
 		let stop = await runAgent({
 			...(options.onAgent ? { onInfo: options.onAgent } : {}),
+			limitMs: limit,
 			...(options.sandbox
 				? { sandbox: options.sandbox, writable: [prepared.extras], own: [path, tokenFolder(path)] }
 				: {}),
@@ -429,16 +457,28 @@ export async function runWork(
 			agentStop = stop;
 			throw new Error(`Agent stopped: ${stop}`);
 		}
-		await reports.deliver(implementation ? "report_implementation_build" : "complete_experiment", {
-			...identity,
-			...(implementation ? { state: "stopped", idempotencyKey: crypto.randomUUID() } : {}),
-		});
-		output.finished();
+		let answer = await reports.deliver(
+			implementation ? "report_implementation_build" : "complete_experiment",
+			{
+				...identity,
+				...(implementation ? { state: "stopped", idempotencyKey: crypto.randomUUID() } : {}),
+			},
+		);
+		// Chopin says how the build ended: blocked on a task, or the pull requests it opened.
+		let ending = endingOf(answer);
+		output.ended(ending);
+		outcome = ending?.kind === "blocked"
+			? { state: "blocked", reason: blockedText(ending) }
+			: { state: "finished" };
 	} catch (error) {
 		// Ctrl-C reports why before the connector disconnects, so Chopin knows at once. An agent
 		// that cancelled its own turn was interrupted too, unless the connector cancelled it.
 		let stopped = options.signal.aborted || agentStop === "cancelled" && !ended;
 		let missing = !implementation && errorCode(error) === "missing-result";
+		// An agent stopped at its time limit says so wherever the run's end shows: here, in its
+		// journal and in Chopin, never as an unexplained failure.
+		let late = error instanceof AgentTimedOut
+			|| error instanceof Error && error.message === timedOut(limit);
 		let message = stopped
 			? STOPPED
 			: ended
@@ -449,7 +489,16 @@ export async function runWork(
 			: error instanceof Error
 			? error.message
 			: "Local work failed";
+		// A person's Stop in Chopin ended the build there already: nothing failed, and nothing is
+		// left to report.
+		let chopinStop = !stopped && stoppedInChopin && ended === message;
+		outcome = stopped
+			? { state: "stopped" }
+			: chopinStop
+			? { state: "stopped", reason: message }
+			: { state: "failed", error: redacted(message, secrets()).slice(0, 2000) };
 		if (stopped) output.stopped();
+		else if (chopinStop) output.stopped(message);
 		else {
 			output.failed(
 				redacted(message, secrets()),
@@ -458,13 +507,15 @@ export async function runWork(
 		}
 		// After Ctrl-C, or out of reach for the whole grace period, the failure gets one bounded attempt.
 		let send = stopped || reports.expired() ? reports.final : reports.deliver;
-		await send(implementation ? "report_implementation_build" : "fail_experiment", {
-			...identity,
-			...(implementation ? { state: "failed", idempotencyKey: crypto.randomUUID() } : {}),
-			error: stopped || ended || !implementation
-				? message.slice(0, 2000)
-				: "Local implementation failed. Inspect the connector terminal.",
-		}).catch(() => {});
+		if (!chopinStop) {
+			await send(implementation ? "report_implementation_build" : "fail_experiment", {
+				...identity,
+				...(implementation ? { state: "failed", idempotencyKey: crypto.randomUUID() } : {}),
+				error: stopped || ended || late || !implementation
+					? message.slice(0, 2000)
+					: "Local implementation failed. Inspect the connector terminal.",
+			}).catch(() => {});
+		}
 		// Retrying cannot reach a server that forgot this connection, so the connector stops too.
 		if (forgotten && !stopped) throw new ConnectorStopped("forgotten", message);
 	} finally {
@@ -481,7 +532,7 @@ export async function runWork(
 		await issued?.then(value => value?.stop()).catch(() => {});
 		// Extra worktrees end with the run; the run's own stays for inspection.
 		if (prepared && root) {
-			await endWorkspace(root, prepared).catch(() => {});
+			await endWorkspace(root, prepared, outcome).catch(() => {});
 		}
 		beating.abort();
 		await heartbeat;

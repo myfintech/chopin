@@ -1,23 +1,15 @@
-import {
-	lazy,
-	Suspense,
-	useContext,
-	useEffect,
-	useId,
-	useLayoutEffect,
-	useRef,
-	useState,
-} from "react";
+import { useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 
-import { ChopinMark, displayName, Face, PLANNER_NAME, usePopoverDismissal } from "@chopin/editor";
+import { PLANNER_NAME, usePopoverDismissal } from "@chopin/editor";
+import { ImagePlace } from "@chopin/editor/image-place";
 import { ArrowLeftIcon, CloseIcon } from "@chopin/icons";
 import { formatForkedClock, isReplyEntry, replyCountLabel } from "@chopin/protocol/threads";
 
 import { WireLost, WireRefusal } from "../../wire";
 import { asksChopinKey, withChopinMention } from "../ask-chopin";
-import { sendFailureView } from "../failure";
+import { ErrorState } from "../error-state";
+import { failureBanner, sendFailureView, withoutFailure } from "../failure";
 import { keepFormatPreference, readFormatPreference } from "../format-preference";
-import { MessageMarkdown } from "../markdown";
 import { useDocumentPeople } from "../document-people";
 import { MentionLogins } from "../message-mentions";
 import { MentionPicker } from "../mention-picker";
@@ -31,7 +23,6 @@ import {
 	mentionTrigger,
 	mentionTriggerKey,
 } from "../mentions";
-import { displayText } from "../model";
 import {
 	referenceMenuShown,
 	referenceOptionId,
@@ -54,9 +45,10 @@ import {
 	sendFailure,
 } from "../references";
 import { runCounts, RunStack } from "../run-card";
-import { Transcript } from "../transcript";
-import { progressOf } from "../transcript-state";
+import { ThreadRoot, Transcript } from "../transcript";
+import { offersStop, progressOf, shownWork } from "../transcript-state";
 import { ThreadComposerBoundary } from "./composer-boundary";
+import { useThreadReactions } from "./thread-reactions";
 import "./thread-panel.css";
 
 import type { Chat as Wire } from "@chopin/protocol";
@@ -71,75 +63,15 @@ import type { TranscriptDecisions } from "../transcript";
 import type { ModelControl } from "../use-model-choice";
 import type { ThreadViewState } from "./thread-model";
 
-let MessageFiles = lazy(() => import("../attachments/message-files"));
-
-const LEADING_MENTION = /^\s*@chopin\b[^\S\n]*/i;
-
-function rootTime(ts: number): string {
-	return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-
-function RootMessageCard({ entry, room }: { entry: Wire.Entry; room: string }) {
-	let toPlanner = entry.to === "planner" && entry.author.kind === "member";
-	let lead = toPlanner ? LEADING_MENTION.exec(entry.text)?.[0].length ?? 0 : 0;
-	let text = toPlanner ? entry.text.slice(lead) : entry.text;
-	let references = lead
-		? entry.references?.filter(item => item.start >= lead)
-			.map(item => ({ ...item, start: item.start - lead, end: item.end - lead }))
-		: entry.references;
-	if (
-		!toPlanner && !displayText(text) && entry.author.kind === "member" && !entry.attachments?.length
-	) {
-		text = `Ask ${PLANNER_NAME}`;
-	}
-	let name = entry.author.kind === "agent"
-		? PLANNER_NAME
-		: entry.author.kind === "member"
-		? displayName(entry.author.handle)
-		: "System";
-
-	return (
-		<div className="thread-root-entry" data-thread-root-message={entry.id}>
-			{/* The root is a message like the replies under it: their 36px avatar and their name line. */}
-			<div className="w-9 shrink-0" data-chat-avatar="">
-				{entry.author.kind === "agent"
-					? <ChopinMark circle />
-					: entry.author.kind === "member"
-					? <Face decorative handle={entry.author.handle} size={36} titled={false} />
-					: null}
-			</div>
-			<div className="flex min-w-0 flex-1 flex-col gap-1 -mt-0.5">
-				<div className="flex items-baseline gap-2 text-base">
-					<span className="min-w-0 break-all font-bold">{name}</span>
-					<span className="text-xs text-text-tertiary tabular-nums">
-						{rootTime(entry.ts)}
-					</span>
-				</div>
-				{(text || toPlanner) && (
-					<div className="min-w-0" data-thread-root-text="">
-						<MessageMarkdown
-							className="break-words text-chat-body [overflow-wrap:anywhere]"
-							mention={toPlanner ? "@chopin" : undefined}
-							references={references}
-							source={text}
-						/>
-					</div>
-				)}
-				{!!entry.attachments?.length && (
-					<Suspense fallback={null}>
-						<MessageFiles channelId={room} files={entry.attachments} />
-					</Suspense>
-				)}
-			</div>
-		</div>
-	);
-}
-
 export type ThreadPanelProps = {
 	view: ThreadViewState;
+	/** The root as Chat holds it now, its reactions included; the view's own until Chat has it. */
+	root?: Wire.Entry;
 	summaryCount?: number;
 	sheet: boolean;
 	agent: boolean;
+	/** Whether this person is alone in the document, so that a reply goes to chopin. */
+	alone?: boolean;
 	offline: boolean;
 	connected: boolean;
 	readonly: boolean;
@@ -168,9 +100,11 @@ export type ThreadPanelProps = {
 export function ThreadPanel(
 	{
 		view,
+		root: liveRoot,
 		summaryCount,
 		sheet,
 		agent,
+		alone,
 		offline,
 		connected,
 		readonly,
@@ -204,6 +138,9 @@ export function ThreadPanel(
 	let [historyKey, setHistoryKey] = useState(0);
 	let [submitting, setSubmitting] = useState(false);
 	let [sendError, setSendError] = useState<SendFailure & { code?: string }>();
+	// The failure notice a Retry was pressed for, and the server's words when it refused one.
+	let [retried, setRetried] = useState<{ entry: string; refusal?: string }>();
+	let bannerId = useId();
 	let [formatting, setFormatting] = useState(() => readFormatPreference(handle));
 	let pendingCaret = useRef<number | { start: number; end: number } | undefined>(undefined);
 	let submission = useRef<object | undefined>(undefined);
@@ -456,17 +393,64 @@ export function ThreadPanel(
 		});
 	};
 
-	let counts = runCounts(view.runs);
-	let { working: workingTurn, suspended: suspendedWork } = progressOf(
-		view.transcript,
+	let root = liveRoot ?? view.root;
+	let replies = view.transcript.entries;
+	let reactable = useMemo(() => root ? [root, ...replies] : replies, [root, replies]);
+	let reactions = useThreadReactions(
+		wire,
+		view.rootId,
 		connected && view.loaded,
-		false,
+		handle,
+		reactable,
+	);
+
+	let counts = runCounts(view.runs);
+	let live = connected && view.loaded;
+	let { working: workingTurn, suspended: suspendedWork, settled: settledWork } = useMemo(
+		() => progressOf(view.transcript, live, false),
+		[view.transcript, live],
+	);
+	let completedWork = useMemo(
+		() => shownWork(view.transcript.completedWork, settledWork),
+		[view.transcript.completedWork, settledWork],
 	);
 	let replyCount = Math.max(
 		summaryCount ?? 0,
 		view.transcript.entries.filter(isReplyEntry).length,
 	);
 	let clocked = formatForkedClock(view.forkedAt);
+	// A failed reply in the thread is told, and run again, as in Chat: by its sender's Retry.
+	let failed = failureBanner(view.transcript.entries, view.transcript.turn, handle);
+	let retryTurn = failed?.retry && failed.request && wire
+		? () => {
+			let entry = failed.entry;
+			setRetried({ entry });
+			wire.ask<Wire.Retried>("chat:retry", { message: failed.request, thread: view.rootId })
+				.catch((error: Error) =>
+					setRetried(current =>
+						current?.entry !== entry
+							? current
+							: error instanceof WireRefusal
+							? { entry, refusal: error.message }
+							: undefined
+					)
+				);
+		}
+		: undefined;
+	let failureNode = failed && !sendError
+		? (
+			<ErrorState
+				detail={(retried?.entry === failed.entry ? retried.refusal : undefined) ?? failed.detail}
+				id={bannerId}
+				kind={failed.kind}
+				link={failed.link}
+				onRetry={retryTurn}
+				retryDisabled={!composerReady}
+				retrying={retried?.entry === failed.entry && retried.refusal === undefined}
+				title={failed.title}
+			/>
+		)
+		: undefined;
 	let sendErrView = sendError && !offline
 		? sendFailureView(sendError, sendError.code)
 		: undefined;
@@ -476,12 +460,27 @@ export function ThreadPanel(
 		? repliesOffNotice(offline)
 		: modelNotice;
 
+	// A thread's pictures are "in a thread in" the document, as Slack names a thread's files.
+	let outer = useContext(ImagePlace);
+	let place = outer && `a thread in ${outer}`;
 	let lead = (
 		<div className="thread-lead">
 			<p className="thread-provenance" data-thread-provenance="">
 				Forked from Chat at {clocked}. {PLANNER_NAME} remembers everything up to here.
 			</p>
-			{view.root && <RootMessageCard entry={view.root} room={room} />}
+			{root && (
+				<div data-thread-root-message={root.id}>
+					<ImagePlace.Provider value={place}>
+						<ThreadRoot
+							entry={root}
+							handle={handle}
+							intents={reactions.intents}
+							onReact={reactions.react}
+							room={room}
+						/>
+					</ImagePlace.Provider>
+				</div>
+			)}
 			{(replyCount > 0 || !!workingTurn) && (
 				<div className="thread-replies-rule" data-thread-replies-rule="">
 					<span>{replyCountLabel(Math.max(1, replyCount))}</span>
@@ -534,24 +533,28 @@ export function ThreadPanel(
 				)}
 			</header>
 
-			<Transcript
-				active
-				canEdit={composerReady}
-				compacting={view.compacting}
-				compactions={view.compactions}
-				completedWork={view.transcript.completedWork}
-				decisions={decisions}
-				entries={view.transcript.entries}
-				handle={handle}
-				lead={lead}
-				live={connected && view.loaded}
-				room={room}
-				suspendedWork={suspendedWork}
-				working={workingTurn}
-			/>
+			<ImagePlace.Provider value={place}>
+				<Transcript
+					active
+					canEdit={composerReady}
+					compacting={view.compacting}
+					compactions={view.compactions}
+					completedWork={completedWork}
+					decisions={decisions}
+					entries={withoutFailure(view.transcript.entries, failureNode ? failed?.entry : undefined)}
+					handle={handle}
+					lead={lead}
+					live={connected && view.loaded}
+					onReact={reactions.react}
+					reactionIntents={reactions.intents}
+					room={room}
+					suspendedWork={suspendedWork}
+					working={workingTurn}
+				/>
+			</ImagePlace.Provider>
 
 			{agent && !!view.runs?.length && (
-				<div className="flex shrink-0 flex-col px-2.5 pb-2" data-thread-runs="">
+				<div className="chat-runs flex shrink-0 flex-col px-2.5 pb-2" data-thread-runs="">
 					<RunStack
 						loadStages={loadStages}
 						offline={offline}
@@ -567,8 +570,10 @@ export function ThreadPanel(
 
 			<ThreadComposerBoundary
 				agent={agent}
+				alone={alone}
 				alsoDisabled={!draftable || submitting}
 				alsoToChat={view.alsoToChat}
+				banner={failureNode ? { id: bannerId, node: failureNode } : undefined}
 				chopin={agent ? { disabled: !draftable || submitting, onAsk: askChopin } : undefined}
 				draftable={draftable}
 				format={sheet
@@ -749,7 +754,7 @@ export function ThreadPanel(
 					}
 					: undefined}
 				rootRef={composerRoot}
-				run={agent && (view.busy || counts.active > 0)
+				run={agent && (offersStop(view.busy, view.transcript.turn, false) || counts.active > 0)
 					? {
 						action: "stop",
 						disabled: !composerReady,

@@ -28,6 +28,7 @@ import { laterTimers } from "../testing/decisions";
 import { expectPlainStatusLines } from "../testing/plain-words";
 import * as Chat from "./service";
 import { ReferenceService } from "./references";
+import { sessionContextOf } from "./session-context";
 import { plannerCommands } from "../harness/harnesses";
 import { attachedLink } from "../harness/remote/registry";
 import * as Question from "@chopin/question";
@@ -1342,6 +1343,72 @@ test("a command the attached client reports runs on that client as its own /name
 	});
 	expect(context.chat.entries).toHaveLength(before);
 	expect(turns).toHaveLength(ran);
+});
+
+test("each turn's fresh session gets the same instructions, and what the room said comes before its prompt, so the model's cache of the instructions holds", async () => {
+	let room = await remoteRoom();
+	let { context } = room;
+	let script = scriptedPlanner();
+	let client = await attach(room.server.url, room.channel.id, {
+		...script.handlers,
+		async turn(turn) {
+			script.turns.push(turn.message);
+			turn.emit({ type: "text-start", id: "reply" });
+			turn.emit({ type: "text-delta", id: "reply", delta: `Reply ${script.turns.length}.` });
+			turn.emit({ type: "text-end", id: "reply" });
+			finishTurn(turn);
+		},
+	});
+	cleanups.push(() => client.detach());
+
+	await room.send("we should write release notes", "room");
+	await room.send("@chopin draft the plan");
+	await context.chat.running;
+	await room.send("@chopin now the risks");
+	await context.chat.running;
+
+	let [first, second] = script.turns;
+	expect(script.turns).toHaveLength(2);
+	expect(first!.session).not.toBe(second!.session);
+	expect(second!.instructions).toBe(first!.instructions);
+	expect(first!.instructions).not.toContain("Durable conversation context");
+	let told = [first, second].map(turn => sessionContextOf(turn!.prompt));
+	expect(told[0]!.context).toStartWith("A fresh Planner session starts for each turn.");
+	expect(told[0]!.context).toContain("@rival: we should write release notes");
+	expect(told[0]!.turn).toEndWith("draft the plan");
+	expect(told[0]!.turn).not.toContain("release notes");
+	expect(told[1]!.context).toContain("Planner: Reply 1.");
+	expect(told[1]!.turn).toEndWith("now the risks");
+	expect(told[1]!.turn).not.toContain("draft the plan");
+});
+
+test("an attached Planner's reply reaches Chat as it is written, before its message or turn ends", async () => {
+	let room = await remoteRoom();
+	let { context } = room;
+	let script = scriptedPlanner();
+	let release = Promise.withResolvers<void>();
+	let client = await attach(room.server.url, room.channel.id, {
+		...script.handlers,
+		async turn(turn) {
+			turn.emit({ type: "text-start", id: "reply" });
+			turn.emit({ type: "text-delta", id: "reply", delta: "First words" });
+			await release.promise;
+			turn.emit({ type: "text-delta", id: "reply", delta: ", then the rest." });
+			turn.emit({ type: "text-end", id: "reply" });
+			finishTurn(turn);
+		},
+	});
+	cleanups.push(() => client.detach());
+
+	await room.send("@chopin draft the plan");
+	let reply = () => context.chat.entries.find(entry => entry.author.kind === "agent");
+	await until(() => reply()?.text === "First words");
+	expect(context.chat.busy).toBe(true);
+	expect(reply()!.streaming).toBe(true);
+	release.resolve();
+	await context.chat.running;
+	expect(reply()!.text).toBe("First words, then the rest.");
+	expect(reply()!.streaming).toBeUndefined();
 });
 
 test("a command is refused while the attached client reports none, and again once it has left", async () => {

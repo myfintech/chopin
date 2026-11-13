@@ -105,6 +105,20 @@ function applyInThreadFrame(
 					turn: inner.turn,
 				}),
 			};
+		case "chat:removed":
+			return {
+				...view,
+				transcript: transcriptReducer(view.transcript, { kind: "removed", ids: inner.ids }),
+			};
+		case "chat:reactions":
+			return {
+				...view,
+				transcript: transcriptReducer(view.transcript, {
+					kind: "reactions",
+					id: inner.id,
+					reactions: inner.reactions,
+				}),
+			};
 		case "chat:context":
 			return view;
 		case "chat:compaction":

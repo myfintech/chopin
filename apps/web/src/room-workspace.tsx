@@ -10,6 +10,8 @@ import {
 	useSyncExternalStore,
 } from "react";
 import { createPortal, flushSync } from "react-dom";
+import { FollowLinkProvider } from "@chopin/editor/follow-link";
+import { ImagePlace } from "@chopin/editor/image-place";
 import { rememberAvatars } from "@chopin/editor/people";
 import { documentPath } from "@chopin/protocol/document-url";
 import {
@@ -60,6 +62,7 @@ import {
 import { BuildGlyph, BuildPlanButton, useBuildPlan } from "./build-plan-button";
 import { DocumentBanner } from "./document-banner";
 import { buildBlockers } from "./build-blockers";
+import { buildRun } from "./build-model";
 import type { BuildBlocker } from "./build-blockers";
 import {
 	nextReading,
@@ -129,6 +132,7 @@ import { useDocumentWidth } from "./document-width";
 import { setDocumentFullWidth } from "./api";
 import { MenuSwitchItem } from "./menu-switch";
 import { DocumentContents } from "./document-contents";
+import { APP_LINKS, useSectionLinks } from "./section-links";
 import {
 	DocumentHistoryPanel,
 	DocumentVersionBar,
@@ -720,7 +724,9 @@ export function RoomWorkspace(
 	// Wherever this room draws a link (the document, an earlier version, Chat, a decision card), a
 	// path in the repository means a file there.
 	let linked = (children: ReactNode) => (
-		<RepositoryLinksProvider value={links}>{children}</RepositoryLinksProvider>
+		<RepositoryLinksProvider value={links}>
+			<FollowLinkProvider value={APP_LINKS}>{children}</FollowLinkProvider>
+		</RepositoryLinksProvider>
 	);
 	let researchLinks = useResearchOfferLinks(
 		wire,
@@ -846,6 +852,7 @@ export function RoomWorkspace(
 		wire,
 	});
 	let namedBuildBlockers = useMemo(() => buildBlockers(build.snapshot), [build.snapshot]);
+	let runningBuild = useMemo(() => buildRun(build.snapshot), [build.snapshot]);
 	// Touch has no tooltips, so a phone tap on Build, or on the build slot, says why it can't open.
 	let buildUnavailable = build.look.kind === "plan" && build.look.blocked
 		? build.look.blocked
@@ -872,11 +879,23 @@ export function RoomWorkspace(
 	let workspacePresentation = presentWorkspace(workspace, mode, view);
 	let chatActive = workspacePresentation.chatVisible;
 	// `loaded` once this socket's transcript arrived, so `busy` reflects the room.
-	let [chatActivity, setChatActivity] = useState({ unread: 0, busy: false, loaded: false });
+	let [chatActivity, setChatActivity] = useState({
+		unread: 0,
+		busy: false,
+		working: false,
+		loaded: false,
+	});
+	// Chat's own mark says chopin is working only for a turn people watch; a quiet one (a background
+	// job, a reply's after-answer check) still holds the document's and its decisions' state.
+	let shownChatActivity = useMemo(
+		() => ({ unread: chatActivity.unread, busy: chatActivity.working }),
+		[chatActivity.unread, chatActivity.working],
+	);
 	let onChatActivity = useCallback(
-		(event: { type: "message" | "working"; busy: boolean; history?: true }) => {
+		(event: { type: "message" | "working"; busy: boolean; working: boolean; history?: true }) => {
 			setChatActivity(current => ({
 				busy: event.busy,
+				working: event.working,
 				loaded: current.loaded || !!event.history,
 				unread: event.type === "message" && !chatActive
 					? current.unread + 1
@@ -1032,6 +1051,13 @@ export function RoomWorkspace(
 		latestSelectDestination.current("decisions");
 		setReveal({ widget: questionnaireId, token: Date.now() });
 	}, []);
+	// A link to a section brings the document forward from Decisions, Build or a phone's Chat.
+	let showDocument = useCallback(() => {
+		if (latestPlanVisible.current) return false;
+		latestSelectDestination.current("plan");
+		return true;
+	}, []);
+	useSectionLinks({ area: documentArea, reveal: showDocument, room, root: contentsRoot });
 
 	useEffect(() => {
 		setSourceDestination(undefined);
@@ -2050,7 +2076,7 @@ export function RoomWorkspace(
 		: editMode && { docked, editing: editMode === "editing", toggle: toggleEditing };
 
 	return linked(
-		<DecisionContexts document={room} page={questionPageRoot}>
+		<DecisionContexts document={room} page={questionPageRoot} title={metadata.title}>
 			<ChildPhoneChromeContext.Provider value={childChromeValue}>
 				<ChildTitleContext.Provider value={childTitleValue}>
 					<p aria-live="polite" className="sr-only" role="status">
@@ -2096,6 +2122,8 @@ export function RoomWorkspace(
 									? "You have read-only access to this document."
 									: undefined}
 								onShowDecisions={() => selectDestination("decisions")}
+								build={runningBuild}
+								onShowBuild={() => selectDestination("build")}
 								onResearch={researchEnabled ? startResearch : undefined}
 								onShowResearch={showResearchDraft}
 								people={peopleHere(members)}
@@ -2146,7 +2174,7 @@ export function RoomWorkspace(
 								wire={wire}
 							/>
 						}
-						chatActivity={chatActivity}
+						chatActivity={shownChatActivity}
 						documentActivity={documentActivity(documentWatch, chatActivity.busy)}
 						header={phone
 							? (
@@ -2342,17 +2370,23 @@ export function RoomWorkspace(
 	);
 }
 
-/** A decision's own page, and card text read as Markdown with this document's images. */
+/**
+ * A decision's own page, card text read as Markdown with this document's images, and the
+ * document's title, which the image viewer names as where its pictures are.
+ */
 function DecisionContexts(
-	{ children, document, page }: {
+	{ children, document, page, title }: {
 		children: ReactNode;
 		document: string;
 		page: QuestionPageRoot | undefined;
+		title: string;
 	},
 ) {
 	return (
 		<QuestionPageContext.Provider value={page}>
-			<QuestionMarkdownProvider document={document}>{children}</QuestionMarkdownProvider>
+			<ImagePlace.Provider value={title}>
+				<QuestionMarkdownProvider document={document}>{children}</QuestionMarkdownProvider>
+			</ImagePlace.Provider>
 		</QuestionPageContext.Provider>
 	);
 }

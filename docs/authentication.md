@@ -49,7 +49,13 @@ Metadata:        Read-only (automatic)
 
 ### Who writes to repositories
 
-The server never writes to a repository. Machines push as their owner; see
+The server never writes to a repository. A machine's builds, investigations and
+Planner push and open pull requests with a short-lived installation token the
+server mints for the one repository (`GITHUB_APP_ID` and the App's private key,
+see [Self-hosting](self-hosting.md)), so they act as the App's bot and credit the
+person who started the work. The server checks each time that this person, or the
+machine's owner for its Planner, can push there. A prototype's token only reads.
+An older connector still pushes as the machine's owner; see
 [Which GitHub account pushes](chopin-cli.md#which-github-account-pushes).
 
 ### Organization admission
@@ -311,6 +317,18 @@ token is authenticated independently and authorized with a direct repository
 lookup. An MCP-created document for a repository outside the App installation is
 not available through browser routes, WebSockets, or the hosted agent until
 the installation includes that repository. See [Local agent MCP](local-agent-mcp.md).
+
+Work on a paired machine uses `/mcp` with a Chopin credential instead: an MCP
+token (`chopin_mcp_…`) the connector mints from the launch's own credential at
+`POST /api/connector/mcp-token` and gives the launch and every process it starts
+in `CHOPIN_MCP_TOKEN_FILE`. A Planner's token acts as the machine's owner for its
+document and that document's children, and lasts as long as the Planner
+credential it was minted from. A run's token acts as the person who started the
+run, for the run's document, for an hour. Either ends at once when its Planner
+stops on the machine or its run ends. It reads the repository with the machine's
+own grant, lists only its documents, and cannot create one. `/mcp` refuses the
+launch's own Planner and run credentials, which can open the agent link or report
+the run, and GitHub App installation tokens, which reach only GitHub.
 
 `upload_image` follows the MCP rule for writing: the bearer needs push or
 administration access to the document's repository. Serving the uploaded image

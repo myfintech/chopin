@@ -125,6 +125,7 @@ import {
 	withNoticesAfter,
 } from "./references";
 import { runCounts, RunStack } from "./run-card";
+import type { BuildRun } from "../build-model";
 import { runStages } from "../api";
 import { ResizeHandle } from "../resizable-pane";
 import { WorkspaceThreadContext } from "../workspace";
@@ -135,7 +136,9 @@ import { Transcript } from "./transcript";
 let LazyThreadPanel = lazy(() => import("./threads/thread-panel"));
 import {
 	initialTranscript,
+	offersStop,
 	progressOf,
+	shownWork,
 	silentRestart,
 	transcriptReducer,
 } from "./transcript-state";
@@ -182,8 +185,14 @@ export type ChatProps = {
 	/** The room's connection is lost, catching up or just back: the offline bar's to tell. */
 	offline?: boolean;
 	active?: boolean;
-	/** `history` marks the transcript arriving, after which `busy` is known rather than assumed. */
-	onActivity?: (event: { type: "message" | "working"; busy: boolean; history?: true }) => void;
+	/**
+	 * `history` marks the transcript arriving, after which `busy` is known rather than assumed.
+	 * `working` is whether that turn is one people watch: a quiet turn (`Chat.Turn.quiet`) is busy
+	 * and not working.
+	 */
+	onActivity?: (
+		event: { type: "message" | "working"; busy: boolean; working: boolean; history?: true },
+	) => void;
 	conversationPlan?: ConversationPlan.State;
 	conversationPlanJobs?: ConversationPlan.Job[];
 	onCardLink?: (link: CardLink) => void;
@@ -199,6 +208,10 @@ export type ChatProps = {
 	sourceDestination?: ChatDestination;
 	/** Opens Decisions, where a waiting workflow's questions are. */
 	onShowDecisions?: () => void;
+	/** The document's running build, which the run strip shows first. */
+	build?: BuildRun;
+	/** Opens Build, where the running build's tasks are. */
+	onShowBuild?: () => void;
 	/**
 	 * Opens the document's research composer with this brief, when this
 	 * document offers research, and says why when it cannot.
@@ -315,6 +328,8 @@ export function Chat(
 		machine,
 		onTranscript,
 		onShowDecisions,
+		build,
+		onShowBuild,
 		onResearch,
 		onShowResearch,
 		referencesEnabled,
@@ -497,6 +512,7 @@ export function Chat(
 	let synchronized = useRef<Socket | undefined>(undefined);
 	let activity = useRef(onActivity);
 	let reportedBusy = useRef(false);
+	let reportedWorking = useRef(false);
 	activity.current = onActivity;
 	// A socket opens before its fresh transcript arrives, and reconnects reuse
 	// the same Wire. Only that transcript makes this composer current.
@@ -556,6 +572,8 @@ export function Chat(
 		? participation.state
 		: undefined;
 	let typingEnabled = composerReady && active && agent && !!participationState?.enabled;
+	// Alone in the document, everything this person sends goes to chopin, as the server decides it.
+	let alone = !!agent && !!participationState?.enabled && !!participationState.alone;
 	// A message to the machine is kept in the outbox, so it needs neither the connection nor the
 	// machine to be there when it is sent. Only a server that acknowledges sends can be asked to.
 	let outboxed = agent && sendAcknowledgements;
@@ -569,10 +587,10 @@ export function Chat(
 		submitted: draft.submission?.to,
 	});
 	let plannerBound = outboxed && askingChopin;
-	let busyRefused = askingChopin && sendError?.code === "planner-busy"
+	let busyRefused = (askingChopin || alone) && sendError?.code === "planner-busy"
 		&& (busy || counts.active > 0);
 	// An image goes where people read it, and to the Planner only if its model does.
-	let imagesAllowed = !agent || !askingChopin
+	let imagesAllowed = !agent || !(askingChopin || alone)
 		|| modelReadsImages(modelControl?.catalog, modelControl?.choice);
 	let files = useFiles({ channelId: room, limits: attachments, imagesAllowed });
 	let filesRef = useRef(files);
@@ -629,9 +647,13 @@ export function Chat(
 		!!draft.text.trim() || files.files.length > 0 || outbox.some(item => !item.acknowledged),
 	);
 	let quiet = quietRestart.current;
-	let { working: workingTurn, suspended: suspendedWork } = useMemo(
+	let { working: workingTurn, suspended: suspendedWork, settled: settledWork } = useMemo(
 		() => progressOf(transcript, transcriptReady, quiet),
 		[transcript, transcriptReady, quiet],
+	);
+	let completedWork = useMemo(
+		() => shownWork(transcript.completedWork, settledWork),
+		[transcript.completedWork, settledWork],
 	);
 	// `#` and `@` both open at the caret; the one typed nearer to it is the one being written.
 	let hashed = referencesEnabled && composerReady && !submitting
@@ -764,16 +786,26 @@ export function Chat(
 				dispatchIntents({ kind: "history", entries: frame.entries, handle });
 				setBusy(frame.busy);
 				reportedBusy.current = frame.busy;
+				reportedWorking.current = frame.busy && !frame.turn?.quiet;
 				setRuns(frame.runs);
 				setParticipation({ room, wire, state: frame.participation });
 				setParticipationKey(current => current + 1);
 				// History is not unread, but a turn already in progress still needs
 				// a signal outside a closed Chat destination.
-				activity.current?.({ type: "working", busy: frame.busy, history: true });
+				activity.current?.({
+					type: "working",
+					busy: frame.busy,
+					working: reportedWorking.current,
+					history: true,
+				});
 			}),
 			wire.on<Wire.Message>("chat:message", frame => {
 				if (loaded && !seen.has(frame.entry.id)) {
-					activity.current?.({ type: "message", busy: reportedBusy.current });
+					activity.current?.({
+						type: "message",
+						busy: reportedBusy.current,
+						working: reportedWorking.current,
+					});
 				}
 				seen.add(frame.entry.id);
 				dispatchTranscript({ kind: "message", entry: frame.entry });
@@ -804,17 +836,30 @@ export function Chat(
 				dispatchTranscript({ kind: "tool", entryId: frame.entry, activity: frame.activity });
 			}),
 			wire.on<Wire.State>("chat:state", frame => {
-				if (loaded && reportedBusy.current !== frame.busy) {
-					activity.current?.({ type: "working", busy: frame.busy });
+				let working = frame.busy && !frame.turn?.quiet;
+				if (
+					loaded
+					&& (reportedBusy.current !== frame.busy || reportedWorking.current !== working)
+				) {
+					activity.current?.({ type: "working", busy: frame.busy, working });
 				}
 				reportedBusy.current = frame.busy;
+				reportedWorking.current = working;
 				setBusy(frame.busy);
 				dispatchTranscript({ kind: "turn", turn: frame.turn });
 				setRuns(frame.runs);
 			}),
 			wire.on<Wire.ParticipationState>("chat:participation", frame => {
 				if (!loaded || synchronized.current !== wire) return;
-				setParticipation({ room, wire, state: { enabled: frame.enabled, paused: frame.paused } });
+				setParticipation({
+					room,
+					wire,
+					state: {
+						enabled: frame.enabled,
+						paused: frame.paused,
+						...(frame.alone ? { alone: true } : {}),
+					},
+				});
 			}),
 			wire.on<Wire.ThreadSummaries>("chat:threads", frame => {
 				dispatchThreads({ kind: "summaries", frame });
@@ -836,7 +881,11 @@ export function Chat(
 					loaded && frame.frame.kind === "chat:message"
 					&& frame.frame.entry.author.kind !== "system"
 				) {
-					activity.current?.({ type: "message", busy: reportedBusy.current });
+					activity.current?.({
+						type: "message",
+						busy: reportedBusy.current,
+						working: reportedWorking.current,
+					});
 				}
 				dispatchThreads({ kind: "in-thread", frame });
 			}),
@@ -1032,7 +1081,8 @@ export function Chat(
 		void wire.ask<Wire.Sent>("chat:send", payload).then(() => {
 			clearSubmittedDraft(submitted);
 			files.clear();
-			if (payload.to === "planner") setNote(undefined);
+			// Alone, a message to the room went to chopin, which took it.
+			if (payload.to === "planner" || alone) setNote(undefined);
 		}, error => {
 			// A restart cut the send off. The draft keeps its request id, so it is made again once
 			// the server is back, and the server answers one it already holds with that message.
@@ -1376,6 +1426,7 @@ export function Chat(
 			<Suspense fallback={null}>
 				<LazyThreadPanel
 					agent={!!agent}
+					alone={alone}
 					archived={archived}
 					connected={transcriptReady}
 					decisions={decisions}
@@ -1396,6 +1447,7 @@ export function Chat(
 					onShowDecisions={onShowDecisions}
 					people={people}
 					readonly={readonly}
+					root={entries.find(entry => entry.id === openThreadView.rootId)}
 					referencesEnabled={referencesEnabled}
 					repository={repository}
 					room={room}
@@ -1496,7 +1548,7 @@ export function Chat(
 			reactionIntents={intents}
 			onRetry={retryMessage}
 			quietFailures={quietFailures}
-			completedWork={transcript.completedWork}
+			completedWork={completedWork}
 			suspendedWork={suspendedWork}
 			handle={handle}
 			live={transcriptReady}
@@ -1562,9 +1614,11 @@ export function Chat(
 			{offlineBarNode && <div className="chat-offline-slot">{offlineBarNode}</div>}
 			{transcriptView}
 
-			{agent && !!runs?.length && (
-				<div className="flex shrink-0 flex-col px-2.5 pb-2" data-chat-runs="">
+			{(agent && !!runs?.length || build) && (
+				<div className="chat-runs flex shrink-0 flex-col px-2.5 pb-2" data-chat-runs="">
 					<RunStack
+						build={build}
+						onShowBuild={onShowBuild}
 						loadStages={loadStages}
 						offline={offline}
 						onPause={runId =>
@@ -1572,7 +1626,7 @@ export function Chat(
 						onResume={runId =>
 							wire?.send("chat:resume-run", { runId })}
 						onShowDecisions={onShowDecisions}
-						runs={runs}
+						runs={agent ? runs ?? [] : []}
 					/>
 				</div>
 			)}
@@ -1581,6 +1635,7 @@ export function Chat(
 				rootRef={composerRoot}
 				inputRef={textarea}
 				agent={!!agent}
+				alone={alone}
 				model={modelControl}
 				chopin={agent ? { disabled: !draftable || sending, onAsk: askChopin } : undefined}
 				banner={leadNode
@@ -1660,7 +1715,7 @@ export function Chat(
 					|| busyRefused
 					|| (connectionNotice !== "none" && !draftCommand(draft.text) && !plannerBound)}
 				onSubmit={submit}
-				run={agent && (busy || counts.active > 0)
+				run={agent && (offersStop(busy, transcript.turn, busyRefused) || counts.active > 0)
 					? {
 						action: "stop",
 						disabled: !composerReady && connectionNotice !== "none",

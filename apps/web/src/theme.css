@@ -1186,10 +1186,19 @@ body {
 
 /*
  * Split Chat is a track: its width moves the document, and Chat slides under its clip.
- * Only the width clips, so the composer's focus ring can pass the panel's bottom edge.
+ * Only the width clips, so the composer's focus ring can pass the panel's bottom edge, and at its
+ * start only beyond the frame's gutter, which Chat's rows are shaded across (workspace-sizing.css).
+ * Its top and foot are unbounded, not merely far: an image's lazy loading counts a clip path's
+ * edges, and one a screen above and below Chat kept the images further up from loading. (An
+ * overflow clip's margin would do, but Chromium draws one only where both axes clip.)
  */
 .workspace-root[data-workspace-mode="split"] .workspace-chat-panel {
-	overflow: clip visible;
+	overflow: visible;
+	clip-path: inset(
+		calc(-1px * infinity)
+		0 calc(-1px * infinity)
+		calc(-1 * (var(--spacing) * 3 + env(safe-area-inset-left)))
+	);
 	width: 0;
 	order: -1;
 	--panel-direction: -1;
@@ -2414,6 +2423,11 @@ textarea.question-written-field {
  */
 [data-focus-boundary] {
 	--focus-ring-offset: -2px;
+}
+
+/* The image viewer's controls sit on a dark ground, where petrol is under 3:1: theirs is white. */
+:is(.image-viewer-control, .image-viewer-slider) {
+	--focus-ring-color: var(--color-page);
 }
 
 :where(a, button, input, select, summary, textarea, [role="button"], [tabindex]):is(:focus-visible, [data-force-state="focus"]) {

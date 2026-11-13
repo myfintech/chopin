@@ -110,7 +110,7 @@ test("a person's message and the Planner's both show the same toolbar on hover, 
 	await expect(toolbar(message(page, PERSON.id))).toHaveCSS("opacity", "0");
 });
 
-test("hovering a message shades the whole row in the hover surface, and keeps it while the menu is open", async ({ join, seed }) => {
+test("hovering a message shades the whole row in the Chat row shade, and keeps it while the menu is open", async ({ join, seed }) => {
 	await seed("# Actions\n", { transcript: transcript() });
 	let page = await join("ana");
 	let target = message(page, PLANNER.id);
@@ -125,7 +125,7 @@ test("hovering a message shades the whole row in the hover surface, and keeps it
 	await expect.poll(async () => (await shade()).opacity).toBe("1");
 	let hoverSurface = await page.evaluate(() => {
 		let probe = document.createElement("div");
-		probe.style.backgroundColor = "var(--color-hover)";
+		probe.style.backgroundColor = "var(--color-chat-row-hover)";
 		document.body.append(probe);
 		let color = getComputedStyle(probe).backgroundColor;
 		probe.remove();
@@ -231,7 +231,8 @@ test("Copy as plain text writes the message as the page shows it", async ({ join
 		words.remove();
 		return text;
 	});
-	expect(drawn).toBe("Spaced out words and a gap.\n\nSecond paragraph with html inside.");
+	// A tag someone typed is the text they typed, on the page and in the copy.
+	expect(drawn).toBe("Spaced out words and a gap.\n\nSecond paragraph with <b>html</b> inside.");
 	let spacedMenu = await openMenu(page, spaced);
 	await spacedMenu.getByRole("menuitem", { name: "Copy as plain text" }).click();
 	await expect.poll(() => clipboard(page)).toBe(drawn);

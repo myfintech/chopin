@@ -13,6 +13,7 @@ import * as Plan from "../plan/service";
 import { finishTurn, linkAuth, linkServer, MEMBER_TOKEN } from "../testing/agent-link";
 import { configured } from "../testing/config";
 import * as Chat from "./service";
+import { sessionContextOf } from "./session-context";
 import * as Threads from "./threads";
 
 import type { ServerMessageOf } from "@chopin/agent-link";
@@ -186,8 +187,8 @@ describe("Chat threads server", () => {
 
 		// 1. Thread turn 1 sees the root message and NOT "Later main message after root."
 		expect(w.prompts).toHaveLength(1);
-		expect(w.prompts[0]!.instructions).toContain("Root: let us use PostgreSQL.");
-		expect(w.prompts[0]!.instructions).not.toContain("Later main message after root.");
+		expect(w.prompts[0]!.prompt).toContain("Root: let us use PostgreSQL.");
+		expect(w.prompts[0]!.prompt).not.toContain("Later main message after root.");
 
 		// 2. Thread turn 2 accumulates the earlier thread question & Planner reply.
 		await Threads.sendMessage(w.context, bob.ws, {
@@ -201,10 +202,10 @@ describe("Chat threads server", () => {
 		});
 		await threadChat!.running;
 		expect(w.prompts).toHaveLength(2);
-		expect(w.prompts[1]!.instructions).toContain("Root: let us use PostgreSQL.");
-		expect(w.prompts[1]!.instructions).toContain("what index do we need?");
-		expect(w.prompts[1]!.instructions).toContain("Answer to:");
-		expect(w.prompts[1]!.instructions).not.toContain("Later main message after root.");
+		expect(w.prompts[1]!.prompt).toContain("Root: let us use PostgreSQL.");
+		expect(w.prompts[1]!.prompt).toContain("what index do we need?");
+		expect(w.prompts[1]!.prompt).toContain("Answer to:");
+		expect(w.prompts[1]!.prompt).not.toContain("Later main message after root.");
 
 		// 3. Top-level Chat turn sees main messages and NONE of the thread's replies.
 		await Threads.sendMessage(w.context, alice.ws, {
@@ -217,10 +218,10 @@ describe("Chat threads server", () => {
 		});
 		await w.plan.chat.running;
 		expect(w.prompts).toHaveLength(3);
-		expect(w.prompts[2]!.instructions).toContain("Root: let us use PostgreSQL.");
-		expect(w.prompts[2]!.instructions).toContain("Later main message after root.");
-		expect(w.prompts[2]!.instructions).not.toContain("what index do we need?");
-		expect(w.prompts[2]!.instructions).not.toContain("composite keys?");
+		expect(w.prompts[2]!.prompt).toContain("Root: let us use PostgreSQL.");
+		expect(w.prompts[2]!.prompt).toContain("Later main message after root.");
+		expect(w.prompts[2]!.prompt).not.toContain("what index do we need?");
+		expect(w.prompts[2]!.prompt).not.toContain("composite keys?");
 
 		// 4. "Also send to Chat" posts into both the thread and top-level Chat (idempotent on retry).
 		let sharedReq = crypto.randomUUID();
@@ -367,6 +368,85 @@ describe("Chat threads server", () => {
 			"compacting",
 			"compacted",
 		]);
+	});
+
+	test("alone in the document, a reply in a thread goes to chopin's turn in that thread; with a second person it stays the thread's", async () => {
+		let w = await buildWorld();
+		let alice = w.makeSocket("alice", "U_alice");
+		let present = new Set(["U_alice", "U_bob"]);
+		w.context.people = () => present;
+		let rootId = crypto.randomUUID();
+		await Threads.sendMessage(w.context, alice.ws, {
+			kind: "chat:send",
+			rid: "root",
+			requestId: rootId,
+			to: "room",
+			text: "Root: let us use PostgreSQL.",
+			ts: 0,
+		});
+		let reply = (text: string) =>
+			Threads.sendMessage(w.context, alice.ws, {
+				kind: "chat:send",
+				rid: crypto.randomUUID(),
+				requestId: crypto.randomUUID(),
+				to: "room",
+				thread: rootId,
+				text,
+				ts: 0,
+			});
+		await reply("Bob, which index do we need?");
+		let threadChat = w.plan.chat.childChats?.get(rootId);
+		await threadChat!.running;
+		expect(w.prompts).toEqual([]);
+		expect(threadChat!.entries.at(-1)!.to).toBeUndefined();
+
+		present = new Set(["U_alice"]);
+		await reply("Which index do we need?");
+		await threadChat!.running;
+		expect(w.prompts).toHaveLength(1);
+		expect(sessionContextOf(w.prompts[0]!.prompt).turn).toContain("Which index do we need?");
+		let asked = threadChat!.entries.find(entry => entry.text === "Which index do we need?");
+		expect(Chat.publicEntry(asked!).to).toBe("planner");
+		expect(threadChat!.entries.at(-1)!.author.kind).toBe("agent");
+		// The thread's turn answers there, not in the document's Chat.
+		expect(w.plan.chat.entries.map(entry => entry.author.kind)).toEqual(["member"]);
+	});
+
+	test("alone, a thread reply also sent to Chat is chopin's, answered in the thread and shown in Chat", async () => {
+		let w = await buildWorld();
+		let alice = w.makeSocket("alice", "U_alice");
+		w.context.people = () => new Set(["U_alice"]);
+		let rootId = crypto.randomUUID();
+		await Threads.sendMessage(w.context, alice.ws, {
+			kind: "chat:send",
+			rid: "root",
+			requestId: rootId,
+			to: "room",
+			text: "Root: let us use PostgreSQL.",
+			ts: 0,
+		});
+		await w.plan.chat.running;
+		let prompts = w.prompts.length;
+		let replyId = crypto.randomUUID();
+		await Threads.sendMessage(w.context, alice.ws, {
+			kind: "chat:send",
+			rid: "reply",
+			requestId: replyId,
+			to: "room",
+			thread: rootId,
+			alsoToChat: true,
+			text: "Which index do we need?",
+			ts: 0,
+		});
+		let threadChat = w.plan.chat.childChats?.get(rootId);
+		await threadChat!.running;
+		expect(w.prompts).toHaveLength(prompts + 1);
+		expect(sessionContextOf(w.prompts.at(-1)!.prompt).turn).toContain("Which index do we need?");
+		// The reply and chopin's answer are in the thread and, as one entry each, in Chat.
+		let inChat = w.plan.chat.entries.filter(entry => entry.fromThread === rootId);
+		expect(inChat.map(entry => entry.author.kind)).toEqual(["member", "agent"]);
+		expect(Chat.publicEntry(inChat[0]!).to).toBe("planner");
+		expect(threadChat!.entries.at(-1)!.id).toBe(inChat[1]!.id);
 	});
 
 	test("a Retry branches the Atomic session back to before the failed attempt, and gives it no word of the attempt", async () => {
@@ -681,7 +761,7 @@ describe("Chat threads server", () => {
 		// 4. An older client without `session-forks` never receives `fork`, only `start` with transcript context.
 		await client.detach();
 		let legacyStarts: Array<ServerMessageOf<"start">> = [];
-		let legacyInstructions: string[] = [];
+		let legacyPrompts: string[] = [];
 		let legacyClient = await connectAgent({
 			url: server.url,
 			token: MEMBER_TOKEN,
@@ -692,7 +772,7 @@ describe("Chat threads server", () => {
 					legacyStarts.push(msg);
 				},
 				turn(turn) {
-					legacyInstructions.push(turn.message.instructions ?? "");
+					legacyPrompts.push(turn.message.prompt);
 					let id = crypto.randomUUID();
 					turn.emit({ type: "text-start", id });
 					turn.emit({ type: "text-delta", id, delta: "Legacy remote thread reply" });
@@ -715,6 +795,6 @@ describe("Chat threads server", () => {
 		await threadChat.running;
 		expect(legacyStarts).toHaveLength(1);
 		expect(forksReceived).toHaveLength(2);
-		expect(legacyInstructions[0]).toContain("initial remote turn");
+		expect(legacyPrompts[0]).toContain("initial remote turn");
 	});
 });

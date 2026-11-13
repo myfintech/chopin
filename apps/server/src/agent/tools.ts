@@ -28,6 +28,7 @@ import { limits, ULID } from "@chopin/dialect";
 import { READING_IN_PARTS } from "../document-reading";
 import { readingModelOutput } from "./reading-output";
 import { implementationGraphs, implementationReadiness } from "../tasks/plan-graphs";
+import { planSourceFor } from "../tasks/plan-source";
 import { documentIdentity, implementationActive } from "../plan/service";
 import { childTools, Refusal, shielded } from "./child-tools";
 import { experimentTools } from "./experiment-tools";
@@ -104,6 +105,20 @@ const GRAPH_REFUSALS: Record<string, string> = {
 	"stale-plan": "The plan changed. Call read_implementation_graph again.",
 	"stale-graph": "The graph changed. Call read_implementation_graph again.",
 };
+
+/**
+ * What a saved draft means, for the Planner to say: there is no separate approval. A first build's
+ * Build plan press approves exactly this draft and starts it. A built document's Build carries its
+ * edits onto the pull requests from the document itself, so a draft there is not what it runs.
+ */
+function draftNote(plan: { live?: unknown }): string {
+	return plan.live
+		? "Saved as a draft. This document is already built: Build carries the document's edits "
+			+ "onto its pull requests from the document itself, not from this graph, and needs no "
+			+ "approval. Don't say the draft needs approval; say that Build builds the changes."
+		: "Saved as a draft. Pressing Build plan approves exactly this draft and starts it; there "
+			+ "is no other approval step. Don't say it needs approval; say that Build plan builds it.";
+}
 
 function sameMemberRequest(
 	current: ActiveMemberRequest | undefined,
@@ -686,6 +701,8 @@ export const documentTools = {
 		description: "Read the current plan revision and implementation graph before drafting or "
 			+ "revising tasks. The returned plan_revision and graph_revision are required by "
 			+ "edit_implementation_graph; a newer plan or graph refuses the whole edit. "
+			+ "plan_source, when present, is the pushed commit holding the plan's files that a "
+			+ "build of this revision starts from. "
 			+ "When needs_revision is true, the graph is stale even if approved. Revise it "
 			+ "against plan_revision before calling it ready; replace an unchanged task if its content remains valid.",
 		inputSchema: jsonSchema({ type: "object", properties: {}, additionalProperties: false }),
@@ -693,6 +710,7 @@ export const documentTools = {
 		execute: (_raw, { context: { room: context } }) =>
 			answer("read_implementation_graph", () => {
 				let version = context.plan.graph?.versions.at(-1);
+				let planSource = planSourceFor(context.plan.planSources, context.plan.revision);
 				return {
 					plan_revision: context.plan.revision,
 					source: edit.source(context.plan),
@@ -700,6 +718,7 @@ export const documentTools = {
 					graph_plan_revision: version?.planRevision,
 					needs_revision: !!version && version.planRevision !== context.plan.revision,
 					graph: context.plan.graph,
+					...(planSource ? { plan_source: planSource } : {}),
 				};
 			}),
 	}),
@@ -709,7 +728,9 @@ export const documentTools = {
 		description: "Create or revise the draft implementation graph against the plan and graph "
 			+ "revisions from read_implementation_graph. Submit one atomic batch of add, replace, "
 			+ "reorder and remove operations. This never changes plan content. Only people may "
-			+ "approve, lock or start implementation.",
+			+ "approve, lock or start implementation: a person's Build plan press approves the saved "
+			+ "draft and starts it, so never tell people a draft still needs approval. Read the "
+			+ "result's note before you describe what happens next.",
 		inputSchema: jsonSchema({
 			type: "object",
 			properties: {
@@ -752,7 +773,7 @@ export const documentTools = {
 				let ready = implementationReadiness(context.plan, args.planRevision);
 				if (!ready.ok) return { ok: false, reason: "not-ready", blockers: ready.blockers };
 				let result = await implementationGraphs().revise(context.plan, args);
-				if (result.ok) return { ok: true, graph: result.value };
+				if (result.ok) return { ok: true, graph: result.value, note: draftNote(context.plan) };
 				let message = GRAPH_REFUSALS[result.reason];
 				return { ok: false, reason: result.reason, ...(message ? { message } : {}) };
 			}),

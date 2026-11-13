@@ -11,6 +11,7 @@ import { SQL } from "bun";
 
 import { connectAgent } from "../packages/agent-link/src/client";
 import { finishTurn } from "../apps/server/src/testing/agent-link";
+import { sessionContextOf } from "../apps/server/src/chat/session-context";
 import { chatInput, expectChatValue, fillChat } from "./chat-input";
 import { createChannel, registerTestDatabase, seedChannel } from "./database";
 import { authenticate, expect, ready, roomPath, test } from "./room";
@@ -182,20 +183,38 @@ function speak(context: Parameters<AgentHandlers["turn"]>[0], id: string, text: 
  * and `steered` what its running turns were given. Without `steers` it offers no way to take a
  * message mid-run. `release` lets a turn that was given nothing end; a Stop ends it as ever.
  */
-async function machine(room: string, options: { steers?: boolean } = { steers: true }) {
+async function machine(
+	room: string,
+	options: { steers?: boolean; holdJob?: boolean } = { steers: true },
+) {
 	let prompts: string[] = [];
+	/** When each prompt in `prompts` reached the machine. */
+	let received: number[] = [];
 	let steered: string[] = [];
 	let aborted = 0;
+	let jobs = 0;
+	let jobsStopped = 0;
+	let jobRunning = Promise.withResolvers<void>();
 	let arrived = Promise.withResolvers<void>();
 	let released = Promise.withResolvers<void>();
 	let handlers: AgentHandlers = {
 		async turn(context) {
 			// Chopin's own upkeep of the document runs through the same Planner; it is not a message.
+			// With `holdJob` the first one works until it is stopped, as a slow title would.
 			if (context.message.prompt.startsWith("[Background job")) {
 				context.emit({ type: "stream-start", modelId: "scripted" });
+				if (options.holdJob && ++jobs === 1) {
+					jobRunning.resolve();
+					await new Promise<void>(resolve =>
+						context.signal.addEventListener("abort", () => resolve(), { once: true })
+					);
+					jobsStopped++;
+					return;
+				}
 				return finishTurn(context);
 			}
 			prompts.push(context.message.prompt);
+			received.push(Date.now());
 			context.emit({ type: "stream-start", modelId: "scripted" });
 			speak(context, "first", "Reading the plan.");
 			let stopped = new Promise<void>(resolve =>
@@ -229,8 +248,12 @@ async function machine(room: string, options: { steers?: boolean } = { steers: t
 	return {
 		client,
 		prompts,
+		received,
 		steered,
 		aborted: () => aborted,
+		jobs: () => jobs,
+		jobsStopped: () => jobsStopped,
+		jobRunning: jobRunning.promise,
 		release: () => released.resolve(),
 	};
 }
@@ -330,6 +353,45 @@ test("Stop with an empty draft ends the running turn, and the draft being empty 
 	}
 });
 
+test("a message sent while Chopin writes the title starts its turn at once: the title waits and is written after", async ({ page }) => {
+	test.setTimeout(90_000);
+	let room = await open(page);
+	let planner = await machine(room, { steers: true, holdJob: true });
+	let input = chatInput(page);
+	try {
+		// The first message's turn ends, and the title job it asked for begins and keeps working.
+		planner.release();
+		await say(page, "outline the plan");
+		await expect.poll(() => planner.prompts.length).toBe(1);
+		await planner.jobRunning;
+		// The job's turn is quiet: no working row and no Stop while it keeps the title.
+		await expect(chat(page).getByRole("button", { name: "Stop generating" })).toHaveCount(0);
+		await expect(chat(page).getByText("Getting oriented")).toHaveCount(0);
+
+		let sent = Date.now();
+		await say(page, "what about the rollback?");
+		await expect.poll(() => planner.prompts.length).toBe(2);
+		let waited = planner.received[1]! - sent;
+		test.info().annotations.push({ type: "send-to-turn-ms", description: String(waited) });
+		console.log(`send to the person's turn while a title job runs: ${waited} ms`);
+		expect(planner.prompts[1]).toContain("what about the rollback?");
+		expect(planner.jobsStopped()).toBe(1);
+		await expect(chat(page).locator("[data-quiet-note]")).toHaveCount(0);
+		await expect(message(page, "what about the rollback?").locator("[data-chat-failed]"))
+			.toHaveCount(0);
+		await expectChatValue(input, "");
+
+		// Once the person's turn is over, the title job runs again, and this time finishes, quietly.
+		await expect.poll(planner.jobs).toBeGreaterThanOrEqual(2);
+		expect(planner.prompts).toHaveLength(2);
+		await expect(chat(page).getByRole("button", { name: "Stop generating" })).toHaveCount(0);
+		await expect(chat(page).getByText("Getting oriented")).toHaveCount(0);
+		await expect(chat(page).locator("[data-quiet-note]")).toHaveCount(0);
+	} finally {
+		await planner.client.detach();
+	}
+});
+
 test("a message to a machine that is away is refused with the draft kept, nothing is saved, and sending again when the machine is back answers once", async ({ page }) => {
 	test.setTimeout(90_000);
 	let room = await open(page);
@@ -362,6 +424,43 @@ test("a message to a machine that is away is refused with the draft kept, nothin
 		expect(planner.prompts).toHaveLength(1);
 		expect(planner.prompts[0]).toContain("outline the plan");
 		planner.release();
+	} finally {
+		await planner.client.detach();
+	}
+});
+
+test("alone, a message without the mention is Chopin's: refused while no machine is there, then a turn at once, and given to the turn that runs", async ({ page }) => {
+	test.setTimeout(90_000);
+	let room = await open(page);
+	let input = chatInput(page);
+	let sent = (text: string) =>
+		chat(page).locator("[data-chat-message-id]").getByText(text, { exact: true });
+	await expect(input).toHaveAttribute("data-placeholder", "Message chopin");
+
+	// With nobody else here the message is for Chopin, so no machine means the same refusal.
+	await fillChat(input, "outline the plan");
+	await input.press("Enter");
+	let refusal = chat(page).locator("[data-quiet-note]");
+	await expect(refusal).toContainText("No machine is connected, so this message wasn't sent.");
+	await expectChatValue(input, "outline the plan");
+	await expect(sent("outline the plan")).toHaveCount(0);
+
+	let planner = await machine(room);
+	try {
+		await input.press("Enter");
+		await expect(READING(page)).toBeVisible();
+		await expect(refusal).toHaveCount(0);
+		await expectChatValue(input, "");
+		expect(planner.prompts).toHaveLength(1);
+		expect(sessionContextOf(planner.prompts[0]!).turn).toContain("outline the plan");
+
+		// While its turn runs, the next one is given to that turn, as a mention's would be.
+		await fillChat(input, "and cover the rollback too");
+		await input.press("Enter");
+		await expect(nextStep(page, "and cover the rollback too")).toHaveCount(1);
+		expect(planner.steered).toEqual([`@${HANDLE}: and cover the rollback too`]);
+		expect(planner.prompts).toHaveLength(1);
+		await expect(sent("and cover the rollback too")).toHaveCount(1);
 	} finally {
 		await planner.client.detach();
 	}

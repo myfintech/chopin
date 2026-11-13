@@ -578,6 +578,169 @@
 	color: var(--color-text-tertiary);
 	transform: rotate(90deg);
 }
+
+/*
+ * The pill's Model selector, portalled out of the composer. It is never taller than the screen has
+ * room for beside the pill (Base UI's `--available-height`): the model list gives up its height
+ * and scrolls, so the search field and the Thinking row stay on screen.
+ */
+.composer-model-selector {
+	max-height: var(--available-height, none);
+}
+/*
+ * The row under the pointer, or the keyboard's active row, is one shade darker than the popover, as
+ * a row of Chopin's own menus is when it is active (`--color-selected`), with its words at AA on it;
+ * every other row lies on the popover. The copied row asks for a shade wherever cmdk sets
+ * `data-selected`, which it sets to `false` as well as `true`, so every row had the shade and the
+ * one under the pointer looked like the rest. The chosen model keeps its check.
+ */
+.composer-model-selector [data-slot="model-selector-item"] {
+	background: transparent;
+	transition: background-color var(--duration-fast) var(--ease-out);
+}
+.composer-model-selector [data-slot="model-selector-item"][data-selected="true"] {
+	background: var(--color-selected);
+}
+/*
+ * A level under the pointer takes the same shade. The chosen level is marked as the emoji picker's
+ * chosen skin tone is, the petrol wash inside a petrol edge, in primary ink and medium weight, so a
+ * level that is only pointed at never reads as chosen.
+ */
+.composer-model-effort [role="radio"] {
+	cursor: pointer;
+}
+@media (hover: hover) {
+	.composer-model-effort [role="radio"]:hover {
+		background: var(--color-selected);
+		color: var(--color-text-primary);
+	}
+}
+.composer-model-effort [role="radio"][data-checked] {
+	background: var(--color-brand-wash);
+	color: var(--color-text-primary);
+	outline: var(--edge-width) solid var(--color-brand);
+	outline-offset: calc(-1 * var(--edge-width));
+}
+/*
+ * Wrappers the list and the levels' lane are reached through, which hold each one's scrollbar
+ * (`ScrollThumb`). They draw no box of their own; the list's gives up its height as the list does.
+ */
+.composer-model-list {
+	position: relative;
+	display: flex;
+	min-height: 0;
+	flex-direction: column;
+}
+.composer-model-levels {
+	position: relative;
+	flex: none;
+}
+/*
+ * The selector's scrollbars: drawn whenever the list or the levels overflow, with no pointer over
+ * them, so a person sees there is more; gone when everything fits. Chat's thumb (6px, round, inset
+ * 2px in a 10px lane, the strongest scrollbar ink), darkening under the pointer and while dragged.
+ * A finger scrolls what is under it, as in Chat; only a pointer that hovers takes the thumb.
+ */
+.model-scroll-track {
+	position: absolute;
+	z-index: 1;
+	contain: strict;
+	pointer-events: none;
+}
+.model-scroll-track[data-idle] {
+	display: none;
+}
+.model-scroll-track[data-axis="y"] {
+	inset-inline-end: 0;
+	width: var(--scrollbar-size);
+}
+.model-scroll-track[data-axis="x"] {
+	bottom: 0;
+	height: var(--scrollbar-size);
+}
+.model-scroll-thumb {
+	border: solid transparent;
+	border-width: var(--scrollbar-inset);
+	border-radius: var(--radius-full);
+	background: var(--color-scrollbar-thumb-active) padding-box;
+	transition: background-color var(--duration-fast) var(--ease-out);
+}
+.model-scroll-track[data-axis="y"] > .model-scroll-thumb {
+	width: 100%;
+	min-height: var(--scrollbar-thumb-min);
+}
+.model-scroll-track[data-axis="x"] > .model-scroll-thumb {
+	height: 100%;
+	min-width: var(--scrollbar-thumb-min);
+}
+@media (hover: hover) and (pointer: fine) {
+	.model-scroll-thumb {
+		pointer-events: auto;
+	}
+	.model-scroll-thumb:hover,
+	.model-scroll-track[data-dragging] > .model-scroll-thumb {
+		background-color: var(--color-text-tertiary);
+	}
+}
+/* Forced colours draw no background of ours: the thumb is its edge, in the system's text colour. */
+@media (forced-colors: active) {
+	.model-scroll-thumb {
+		border-color: currentcolor;
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	.model-scroll-thumb {
+		transition: none;
+	}
+}
+/*
+ * The Thinking row keeps the label above the levels when they cannot sit beside it, and the levels
+ * are one lane that scrolls sideways when even the row's width cannot hold them. Its padding,
+ * taken back by the margin, keeps the 44px a finger aims at inside the lane on touch, and its
+ * scroll padding keeps a level brought into view clear of the fade.
+ */
+.composer-model-effort {
+	--composer-level-fade: 1.5rem;
+	flex-wrap: wrap;
+}
+/* Levels that overflow leave room under them for their scrollbar. */
+.composer-model-effort[data-more] {
+	padding-bottom: calc(var(--scrollbar-size) + 0.25rem);
+}
+.composer-model-effort > [role="radiogroup"] {
+	position: relative;
+	max-width: calc(100% + 1rem);
+	margin: -0.625rem -0.5rem;
+	padding: 0.625rem 0.5rem;
+	overflow-x: auto;
+	overflow-y: hidden;
+	overscroll-behavior-x: contain;
+	scroll-padding-inline: var(--composer-level-fade);
+	scrollbar-width: none;
+}
+.composer-model-effort > [role="radiogroup"]::-webkit-scrollbar {
+	display: none;
+}
+/* The side that still hides levels fades, as a wide table's does. */
+.composer-model-effort[data-more="end"] > [role="radiogroup"] {
+	mask-image: linear-gradient(
+		to right,
+		black calc(100% - var(--composer-level-fade)),
+		transparent
+	);
+}
+.composer-model-effort[data-more="start"] > [role="radiogroup"] {
+	mask-image: linear-gradient(to right, transparent, black var(--composer-level-fade));
+}
+.composer-model-effort[data-more="both"] > [role="radiogroup"] {
+	mask-image: linear-gradient(
+		to right,
+		transparent,
+		black var(--composer-level-fade),
+		black calc(100% - var(--composer-level-fade)),
+		transparent
+	);
+}
 /* The toolbar gives way where the pane is narrow, and on a phone, where the draft has the room. */
 @container composer (max-width: 20rem) {
 	.chat-composer .composer-format,

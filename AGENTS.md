@@ -142,7 +142,10 @@ durable.
   App installation and repository role.
 - **MCP has a different credential boundary.** `/mcp` checks its caller-supplied
   GitHub bearer directly, does not require the App installation, and can mutate
-  data for callers with push or administration access.
+  data for callers with push or administration access. Work on a paired machine
+  instead presents an MCP token minted from its launch's credential, limited to
+  that launch's documents and life (`experiments/mcp-token.ts`); `/mcp` never
+  takes a GitHub App installation token or a launch's own Planner or run credential.
 - **Planner ownership is process-bound.** The first eligible Planner or
   model-backed research request supplies its GitHub App token and Copilot
   entitlement. Server-authored turns nobody typed (re-linking decisions after a
@@ -216,7 +219,9 @@ durable.
   consents to the Planner, builds and runs of a document whose editor chose it, or made it
   their favorite and chose none, in repositories the owner can push to (checked with the machine's
   own token, as Default machine does). The
-  agent runs with the owner's GitHub account; the build records the editor as `user` and the
+  agent pushes with a GitHub App installation token for the one repository, as the App's bot,
+  crediting the editor (the server checks the editor can push; an older connector still runs with
+  the owner's GitHub account); the build records the editor as `user` and the
   owner as `machineOwner`, and only the connection it was queued on may claim or report it.
   Work Chopin starts by itself never leaves its builder's own machines. Where a document's Planner runs is
   derived from stored choices (the creator's, else an editor's whose machine can run it now),
@@ -327,7 +332,11 @@ The web composer uses `packages/protocol/address.ts` to translate `@chopin` into
 `Chat.Send.to = "planner"`; ordinary messages use `to = "room"`. A person addresses Chopin with
 an `@chopin` mention in the draft's words, typed, chosen in the `@` menu, or written at the caret
 by the composer's sparkle button or Command+J (`apps/web/src/chat/ask-chopin.ts` holds its rules);
-the composer draws no other state for it, and the message on the wire is its words. The wire
+the composer draws no other state for it, and the message on the wire is its words. A person
+alone in the document (`alone` in `apps/server/src/chat/initiative.ts`: no other writer has it
+open, spoke in the last two minutes or is typing) is talking to Chopin: the server takes their
+room message as one to the Planner, with no silence window or judgment, and their draft says
+_Message chopin_. The wire
 destination is authoritative on the server. Do not describe `@chopin` as a server
 authorization boundary: a custom write-authorized client can send an explicit
 Planner destination without a mention.
@@ -338,10 +347,18 @@ acknowledged at once and given to that turn (`PlannerSession.steer`, through the
 harness's own mid-run input: Atomic's `steer`, a `steer` frame to a remote client
 that offered `steer-turn`), which reads it at its next step as `@handle: text`, in the
 same turn. Steering takes the same write access as starting a turn: `chat:send` is
-checked before `Chat.send`, so a reader cannot steer. A harness that cannot take
-input mid-run (the Copilot SDK), or a running turn that is a background job's, refuses
-the message with `planner-busy`: "chopin can't take messages while it works on this
-machine. Stop it to ask now." (the server log names the harness). A machine that is away,
+checked before `Chat.send`, so a reader cannot steer. A background job never makes a
+person wait: a message to the Planner (or an `invoke_planner` message) while a job's turn
+runs, or while one is being handed the Chat, is acknowledged at once and the job gives way
+(`preempt` in `apps/server/src/chat/service.ts`). Its turn is stopped and starts the
+person's turn as it ends; a write its own tool has under way finishes first and stands as its
+result, and with none it goes back to pending, its attempts unspent, and runs again when that
+turn's end wakes the queue. One job (kind and target) gives way at most three times in a row;
+the next run is let finish, with the person's turn right behind it. A turn a person started, or
+one Chopin started for a Build or a comment, is never preempted. A harness that cannot take
+input mid-run (the Copilot SDK) refuses a message while a turn runs with `planner-busy`:
+"chopin can't take messages while it works on this machine. Stop it to ask now." (the server
+log names the harness). A machine that is away,
 in its hand-over window before the client resumes ("Still connecting to @mona's machine, so
 this message wasn't sent. Send it again in a moment."), or with none attached, refuses it with
 the connection's own words (`planner-not-attached`),
@@ -352,7 +369,7 @@ to be given to, and is answered as a passing trouble (`temporarily-unavailable`)
 turn ends before it can read the message, an idle Chat starts a turn for it and any other
 says plainly that Chopin did not read it. A comment note, an `invoke_planner as system` call
 and a task draft need a turn of their own, so a running turn refuses them before anything is
-saved. Only Chopin's own scheduling still waits for the running turn, in `chat.waiting`:
+saved. Only Chopin's own scheduling still waits for the running turn (or, for a job, a person's), in `chat.waiting`:
 background jobs and server-authored instructions nobody typed (initiative, an ended workflow
 run, readiness, decision follow-ups). `planner_deferred_turns` is no longer written or read;
 at start the writer-lease holder closes any row an earlier release left open

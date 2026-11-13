@@ -32,9 +32,11 @@ A person with write access can choose the model and the level of reasoning (thin
 document's Planner from the Chat composer. The choice belongs to the document: everyone who opens
 it sees it, it survives a reload and a restart (`planner_model_choices`, see
 [Storage](storage.md)), and it applies from the next turn. Until somebody chooses, the harness
-runs what it always did, so nothing changes. Choosing a model records that model, the one marked
-_Default_ included, so the document keeps it if the harness's or the client's default later
-changes; the reasoning control's _Default_ returns the level to the model's own.
+runs what it always did, so nothing changes, and the composer names that model and level. A pick
+records both halves: choosing a model records it, the agent's own included, with the level that
+runs now where the model offers it (else the agent's own level where it does), and choosing a level
+records it with the model that runs now. So the document keeps its model and level if the
+harness's or the client's default later changes, and each document keeps its own.
 
 The server owns what can be chosen, never the browser. It builds a catalog from the harness and
 sends it to the room in `chat:model` (with the stored choice) when somebody joins and when either
@@ -172,7 +174,11 @@ and does not edit prose; only people approve and start implementation.
 Saving an anchored Planner decision durably queues a scoped prose update, independently of
 conversation-analysis flags. It uses the complete saved answers affecting that passage and
 updates only its explicit target. Applied answer generations commit with the source, so an
-interrupted retry cannot write them twice. Lost or ambiguous targets refuse safely. Work waits
+interrupted retry cannot write them twice. Lost or ambiguous targets refuse safely. Edits
+elsewhere in the document between the job's read of its passage and its write, such as a
+workflow run publishing its plan or another decision's update, do not refuse the write: it
+lands when its passage, headings and saved answers are still the ones it read. A write-up that
+still fails says why on its card in plain words, beside Retry. Work waits
 for an existing authorized Planner owner; it never claims ownership from a viewer or saver.
 The same Save also hands the answer to a Planner turn, so the Planner acts on what was decided
 rather than only rewriting the passage; answers saved close together share one turn.
@@ -631,7 +637,10 @@ kept, the server writes each hold to `planner_link_holds` (see
 [Storage](storage.md#postgresql-schema)): the sessions the client holds, the questions
 it waits on, the answers it has not acknowledged and the Stops it has not heard. The next
 process rebuilds each as a suspended hold, so a client that returns and sends `resume`
-takes its sessions back. Startup's reset keeps the owner of a document whose hold names a
+takes its sessions back. No turn of the new process opened those sessions, so they reach the
+document through its room: their run reports are Chat's run cards, shown live, not stopped, when
+the document opens after the client is back, and a question asked on one after the restart is a
+Decision, for which the document is opened if nobody has it open. Startup's reset keeps the owner of a document whose hold names a
 browser sign-in that has stored credentials; a paired machine's hold names the machine
 and no login, which a restart cannot keep: the machine's backend attaches again with its
 credential, which is stored by digest and so accepted at once, and its new login takes over
@@ -943,7 +952,8 @@ prefers reduced motion.
 ## Chat context
 
 [Automatic participation](conversation-initiative.md) is enabled with the Planner and lets
-Chopin reply promptly in solo conversation and yield during human exchanges.
+Chopin reply promptly in solo conversation and yield during human exchanges. A person alone in
+a document is talking to Chopin: their every message is taken as if it named `@chopin`.
 Group turns use a bounded turn-taking judgment and a quiet window. Natural-language
 requests can invite Chopin without `@`. It uses this same Planner lifecycle, with
 a shared durable pause control; explicit `@chopin` requests remain immediate.
@@ -1153,8 +1163,19 @@ Nothing a person sends to the Planner is held for later. A message is never "wai
   does: `chat:send` is checked before it reaches Chat, so a reader cannot steer, and two people can
   steer one turn, each message read once in the order it was sent. A message with references
   carries them, and one sent from a child carries the child as focus.
+- **A background job is running** (keeping the title, writing up a decision): the message is
+  posted and acknowledged at once, and the job gives way. Its turn is stopped and the person's
+  turn starts as soon as it has ended, ahead of anything waiting. A write the job's own tool has
+  under way finishes first and is the job's result, so nothing is half written or written twice;
+  with none, the job goes back to pending with its attempts unspent and runs again when the
+  person's turn ends. A job about to be handed the Chat waits behind the person's turn instead. One
+  job (its kind and target) gives way at most three times in a row: the next run is let finish,
+  with the person's turn starting the moment it ends, so a job that keeps meeting messages still
+  completes. A newer request for the same thing that is already waiting replaces one that gave way.
+  An `invoke_planner` message does the same. A turn a person started, and one Chopin started for
+  something a person did (a Build, a comment), are never preempted.
 - **It cannot be taken:** it is refused, saves nothing and says so. With a harness that takes
-  no input mid-run (the Copilot SDK), or a running turn that is a background job's, the code is
+  no input mid-run (the Copilot SDK), the code is
   `planner-busy` and the words are "chopin can't take messages while it works on this machine. Stop
   it to ask now."; the server log names the harness. With no machine attached, or one that is away,
   the code is `planner-not-attached` with the connection's own words, mid-turn or not. For a
@@ -1182,7 +1203,9 @@ running turn like one sent in Chat, and its `settled` hook runs once that is don
 note sent to Chopin in a child document is admitted by the root's Chat in the same way.
 
 What still waits for the running turn, in memory, is Chopin's own scheduling, which nobody typed
-and which is neither saved nor shown: background jobs (such as keeping a title) and the turns the
+and which is neither saved nor shown (its turn is sent as `quiet`, which Chat draws as no turn at
+all, as it does a reply whose words are all out while its after-answer check runs): background jobs
+(such as keeping a title), which also wait behind a person's turn they gave way to, and the turns the
 server writes for itself (answers to open decisions, relinking after a build, settling a prototyped
 passage, an ended workflow run, a readiness check, an initiative proposal). They start in the
 order they were asked once the running turn ends, a job that is no longer worth running is dropped
@@ -1382,6 +1405,12 @@ implementation is therefore outside the supported product workflow. The
 supported MCP handoff can read only graphs on MCP-created documents, and no
 current production interface lets a person approve the draft. See
 [Experimental implementation lifecycle](implementation-lifecycle.md).
+
+A remote Planner's backend that writes files for a revision in its own worktree
+pushes them and records where with `record_plan_source` at `/mcp`; a build of that
+revision starts from the recorded commit rather than the builder's checkout, and
+`read_implementation_graph` returns it as `plan_source`. See
+[Plan sources](agent-connection.md#plan-sources).
 
 ## Main implementation points
 

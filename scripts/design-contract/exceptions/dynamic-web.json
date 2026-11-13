@@ -151,7 +151,7 @@
 				1
 			]
 		],
-		"sourceHash": "d5ee7ba4c923fa7fe062a9548b8f2f856e9d30d5f73f6617163f8eb5bf5cfb7b"
+		"sourceHash": "ca4c5ded6cd7aabfd0a700c2fef9a8317fce3f991948829954ac99af8d72fed8"
 	},
 	{
 		"file": "apps/web/src/terminal-alert.tsx",
@@ -186,7 +186,7 @@
 				1
 			]
 		],
-		"sourceHash": "fc9cfa9c5d8ca9222b9cfc507af3b2ce94f4e580f6d17cfd251f38409a4835a9"
+		"sourceHash": "24d937f5509a78785b590828be4c562cf420d7467ef34e653fc45c85d23043b4"
 	},
 	{
 		"file": "apps/web/src/navigation-drawer.tsx",
@@ -354,7 +354,7 @@
 				1
 			]
 		],
-		"sourceHash": "cb8d226acad5cfe0acff6ae35a46ecc5dbc610fae7f20a118c8f5f7bb2403ab5"
+		"sourceHash": "5c5cd2d87b7e3bc11c98d023b5104985b33c22151e4dae29298fbe930f9e4fb3"
 	},
 	{
 		"file": "apps/web/src/question-markdown.tsx",
@@ -368,7 +368,7 @@
 				1
 			]
 		],
-		"sourceHash": "0b2b445223037b76aa7d58c2fb907678ef605b2a5f406e4d1bab5fdb983bede2"
+		"sourceHash": "482f70b069e4b054f2742d2a70da39d292aff4061a858d27c41eb32860184e8b"
 	},
 	{
 		"file": "apps/web/src/chat/markdown.tsx",
@@ -403,7 +403,7 @@
 				1
 			]
 		],
-		"sourceHash": "ab019513e185e472cbfa9df27354adc48512dcf5e6d07496e74ad9993f756ba8"
+		"sourceHash": "2b84961aa4bf74a8bceedbf0f56bff2722bada832daf00f79c609e975fd47923"
 	},
 	{
 		"file": "apps/web/src/chat/assistant-ui/markdown-primitive.tsx",

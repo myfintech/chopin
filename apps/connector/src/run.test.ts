@@ -19,7 +19,8 @@ import { serveWork } from "./connection";
 import { createOutput } from "./output";
 import { processesIn } from "./processes";
 import { checkouts } from "./checkouts";
-import { runWork, STOPPED } from "./run";
+import { BUILD_LIMIT_MS, INVESTIGATION_LIMIT_MS, runWork, STOPPED } from "./run";
+import { timedOut } from "./acp";
 import { git } from "./workspace";
 import { ConnectorError, remote } from "./mcp";
 import { register } from "./machine";
@@ -121,6 +122,40 @@ test("the controller keeps the claimed document on every rebuild renewal and sta
 	let { documentId, sent } = await run({ kind: "rebuild" }, ["--rebuild", "--slow"]);
 	expect(sent.some(([name]) => name === "renew_implementation_build")).toBe(true);
 	for (let [, args] of sent) expect(args.documentId).toBe(documentId);
+});
+
+test("a build whose agent runs past its limit says so in Chopin, the terminal and its journal", async () => {
+	let err = "";
+	let journal: Record<string, unknown> | undefined;
+	let output = createOutput(
+		{ write: () => true } as never,
+		{ write: (text: string) => (err += text, true) } as never,
+		{ NO_COLOR: "1" },
+	);
+	let { id, calls } = await run(
+		{},
+		["--hang"],
+		() => ({}),
+		undefined,
+		{ buildLimitMs: 300, output },
+		async ({ state, id }) => {
+			journal = JSON.parse(await readFile(join(state, "runs", `${id}.json`), "utf8"));
+		},
+	);
+	let said = "Its agent ran for less than a minute, so chopin stopped it.";
+	expect(calls.filter(([name]) => name !== "renew_implementation_build").at(-1)).toEqual([
+		"report_implementation_build",
+		{ id, state: "failed", error: said },
+	]);
+	expect(err).toContain(`Failed: ${said}`);
+	expect(err).not.toContain("Investigation");
+	expect(journal).toMatchObject({ state: "finished", outcome: { state: "failed", error: said } });
+});
+
+test("a build gets hours to work, an investigation one", async () => {
+	expect(BUILD_LIMIT_MS).toBeGreaterThan(INVESTIGATION_LIMIT_MS);
+	expect(timedOut(BUILD_LIMIT_MS)).toBe("Its agent ran for 4 hours, so chopin stopped it.");
+	expect(timedOut(INVESTIGATION_LIMIT_MS)).toBe("Its agent ran for 1 hour, so chopin stopped it.");
 });
 
 test("a living document's first build gets a prompt without verification or revision", async () => {
@@ -944,6 +979,81 @@ test("a run Chopin has ended stops its agent at once", async () => {
 		state: "failed",
 		error: "Chopin ended this run (build-inactive).",
 	}]);
+});
+
+/** The run's journal, read before the run's folders are removed. */
+function journalOf(into: { value?: Record<string, unknown> }) {
+	return async ({ state, id }: { state: string; id: string }) => {
+		into.value = JSON.parse(await readFile(join(state, "runs", `${id}.json`), "utf8"));
+	};
+}
+
+test("a build a person stopped in Chopin says who stopped it, as a stop and not a failure", async () => {
+	let terminal = captured();
+	let journal: { value?: Record<string, unknown> } = {};
+	let { calls } = await run(
+		{},
+		["--hang"],
+		name => {
+			if (name === "renew_implementation_build") {
+				throw new ConnectorError("build-stopped", "build-stopped: Stopped in Chopin by @ana.");
+			}
+			return {};
+		},
+		undefined,
+		{ output: terminal.output },
+		journalOf(journal),
+	);
+	expect(terminal.out()).toContain("  ✗ Stopped in Chopin by @ana.\n");
+	expect(terminal.err()).toBe("");
+	// Chopin ended the build itself, so there is nothing to report back.
+	expect(calls.at(-1)?.[0]).toBe("renew_implementation_build");
+	expect(journal.value).toMatchObject({
+		state: "finished",
+		outcome: { state: "stopped", reason: "Stopped in Chopin by @ana." },
+	});
+});
+
+test("a build whose agent blocked a task says it is blocked and why, not Finished", async () => {
+	let terminal = captured();
+	let journal: { value?: Record<string, unknown> } = {};
+	await run(
+		{ live: true },
+		["--live"],
+		name =>
+			name === "report_implementation_build"
+				? {
+					accepted: true,
+					ending: { kind: "blocked", task: "Prove it", reason: "Missing source: the files" },
+				}
+				: {},
+		undefined,
+		{ output: terminal.output },
+		journalOf(journal),
+	);
+	expect(terminal.out()).toContain(
+		"  ✗ Blocked: “Prove it” is blocked: Missing source: the files.\n",
+	);
+	expect(terminal.out()).not.toContain("Finished");
+	expect(journal.value).toMatchObject({
+		outcome: { state: "blocked", reason: "“Prove it” is blocked: Missing source: the files" },
+	});
+});
+
+test("a build that delivered names its pull requests when it finishes", async () => {
+	let terminal = captured();
+	let url = "https://github.com/org/repo/pull/7";
+	await run(
+		{ live: true },
+		["--live"],
+		name =>
+			name === "report_implementation_build"
+				? { accepted: true, ending: { kind: "finished", pullRequests: [url], tasks: 1 } }
+				: {},
+		undefined,
+		{ output: terminal.output },
+	);
+	expect(terminal.out()).toContain(`  ✓ Finished: 1 task, ${url}\n`);
 });
 
 test("a build Chopin forgot by restarting stops saying so", async () => {

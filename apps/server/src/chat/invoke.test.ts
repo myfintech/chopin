@@ -157,7 +157,7 @@ type Seen = {
 	tools: readonly string[];
 };
 
-test("withholds a fragmented Chat question and repairs within the same Planner session", async () => {
+test("streams a fragmented Chat question, then repairs it within the same Planner session", async () => {
 	let { context, events } = await setup();
 	let prompts: string[] = [];
 	let checked: string[] = [];
@@ -192,7 +192,8 @@ test("withholds a fragmented Chat question and repairs within the same Planner s
 	};
 	context.openPlannerSession = async () => ({ ok: true, value: session });
 	await browserTurn(context, "Help me draft a new plan.");
-	expect(events.some(event => JSON.stringify(event).includes("trying to accomplish"))).toBe(false);
+	// The question was shown as it streamed; the check found it after it ended.
+	expect(events.some(event => JSON.stringify(event).includes("trying to accomplish"))).toBe(true);
 	expect(
 		context.chat.entries.filter(entry => entry.author.kind === "agent").map(entry => entry.text),
 	)
@@ -589,7 +590,13 @@ test("an invocation runs under the channel's existing owner and is attributed to
 	}
 	expect(seen.map(turn => ({ owner: turn.owner, prompt: turn.prompt }))).toEqual([
 		{ owner: owner.id, prompt: "@ana: Review" },
-		{ owner: owner.id, prompt: "@ana: Review" },
+		// The second turn's fresh session is told the first message before its own prompt.
+		{
+			owner: owner.id,
+			prompt: expect.stringMatching(
+				/^A fresh Planner session[\s\S]*@ana: Review\n\nThe conversation so far ends here\. The current turn follows\.\n\n@ana: Review$/,
+			),
+		},
 	]);
 	expect(context.chat.entries.filter(entry => entry.author.kind === "member")).toMatchObject([
 		{ author: { kind: "member", handle: "ana" }, text: "Review" },
@@ -632,10 +639,12 @@ test("the atomic harness verifies a checkout before posting and every later sess
 	await browserTurn(context, "@chopin Continue");
 	expect(await Chat.invoke(context, user, "Again", other)).toBe("checkout-unverified");
 	await browserTurn(context, "@chopin Once more");
-	let offsets = events.filter(event => event.kind === "chat:state" && event.busy)
-		.map(event => (event.turn as Wire.Turn).entryOffset);
+	let busy = events.filter(event => event.kind === "chat:state" && event.busy)
+		.map(event => event.turn as Wire.Turn);
 	// Invoked instructions post first; browser turns reserve their prompt before it is appended.
-	expect(offsets).toEqual([1, 2, 3]);
+	expect(busy.filter(turn => !turn.quiet).map(turn => turn.entryOffset)).toEqual([1, 2, 3]);
+	// Each turn goes quiet once its words are all out, the same turn at the same offset.
+	expect(busy.filter(turn => turn.quiet).map(turn => turn.entryOffset)).toEqual([1, 2, 3]);
 	expect(seen).toHaveLength(3);
 	for (let turn of seen) {
 		expect(turn.full?.cwd).toBe(matching);
@@ -895,7 +904,8 @@ test("a reply that cannot move its questions into decisions fails the turn but k
 		await tick();
 		let said = () => context.chat.entries.map(entry => entry.text);
 		expect(said().some(text => text.includes("could not move its questions"))).toBe(true);
-		expect(said()).not.toContain("Which scope should the plan cover?");
+		// Both replies were shown as they streamed; the turn says it could not move the question.
+		expect(said().filter(text => text === "Which scope should the plan cover?")).toHaveLength(2);
 		expect(planner.calls).not.toContain("destroy");
 		expect(context.chat.retained).toBeDefined();
 		expect(context.chat.runs?.map(run => run.status)).toEqual(["waiting"]);
@@ -976,7 +986,8 @@ test("a refused reply keeps a Planner that only waits on a question it asked, ho
 		await tick();
 		let said = () => context.chat.entries.map(entry => entry.text);
 		expect(said().some(text => text.includes("could not move its questions"))).toBe(true);
-		expect(said()).not.toContain("Which scope should the plan cover?");
+		// Both replies were shown as they streamed; the turn says it could not move the question.
+		expect(said().filter(text => text === "Which scope should the plan cover?")).toHaveLength(2);
 		expect(planner.calls).not.toContain("destroy");
 		expect(withdrawn.signal.aborted).toBe(false);
 		expect(context.chat.retained).toBeDefined();

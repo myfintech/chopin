@@ -143,7 +143,9 @@ test("a message the sparkle button addressed reaches the Planner, which takes a 
 	await expect.poll(() => entries.get(sent[0]!.requestId)?.to).toBe("planner");
 
 	// Nothing stays on: without the mention the message is the team's. It is in the Chat, and the
-	// Planner is not asked.
+	// Planner is not asked. A teammate is there: alone, every message would be Chopin's.
+	await join("bo");
+	await expect(draft).toHaveAttribute("data-placeholder", "Message the team, or @chopin to ask");
 	await draft.fill("thanks, both of you");
 	await draft.press("Enter");
 	await expect(chat.getByText("thanks, both of you", { exact: true })).toBeVisible();
@@ -821,10 +823,10 @@ test("images the Planner makes reach Chat as stored, generated images only reade
 	// Three images are a gallery, whose tiles carry no attribution: each image is told as generated
 	// in the lightbox, as it is shown.
 	await chat.getByRole("button", { name: `Open image: ${pictures[0]!.alt}`, exact: true }).click();
-	let box = opened.getByRole("dialog");
+	let box = opened.locator("[data-image-viewer]");
 	for (let [index, picture] of pictures.entries()) {
-		if (index > 0) await box.getByRole("button", { name: "Next image" }).click();
-		await expect(box.getByRole("status")).toHaveText(`Image ${index + 1} of ${pictures.length}`);
+		if (index > 0) await box.getByRole("button", { name: "Next", exact: true }).click();
+		await expect(box.getByRole("status")).toHaveText(`${index + 1} of ${pictures.length}`);
 		await expect(box.getByRole("img", { name: picture.alt, exact: true })).toBeVisible();
 		await expect(box.getByText("Generated", { exact: true })).toBeVisible();
 	}

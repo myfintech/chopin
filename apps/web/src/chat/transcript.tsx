@@ -15,7 +15,7 @@ import {
 	useSyncExternalStore,
 } from "react";
 import type { ReactNode } from "react";
-import { MessageForwardIcon, MessageIcon, SignInIcon } from "@chopin/icons";
+import { MessageForwardIcon, MessageIcon, SignInIcon, WrenchIcon } from "@chopin/icons";
 import { parseChildDocumentPath } from "@chopin/protocol/document-url";
 
 import { ChopinMark, Face, openCommentThread, PLANNER_NAME, useCardMeta } from "@chopin/editor";
@@ -125,6 +125,22 @@ function readyChild(text: string): string | undefined {
 	return path ? parseChildDocumentPath(path)?.childSlug : undefined;
 }
 
+/** A GitHub pull request link a build's line names as `[#12](url)`; nothing else is a link. */
+const PULL_LINK = /\[#(\d+)\]\((https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\1)\)/g;
+
+/** A system line's words, with a build's pull request links drawn as links. */
+export function systemParts(text: string): Array<string | { number: string; url: string }> {
+	let parts: Array<string | { number: string; url: string }> = [];
+	let last = 0;
+	for (let match of text.matchAll(PULL_LINK)) {
+		if (match.index > last) parts.push(text.slice(last, match.index));
+		parts.push({ number: match[1]!, url: match[2]! });
+		last = match.index + match[0].length;
+	}
+	if (last < text.length) parts.push(text.slice(last));
+	return parts;
+}
+
 function SystemEntry(
 	{ enter, item }: { enter: boolean; item: Extract<Group, { kind: "system" }> },
 ) {
@@ -156,10 +172,26 @@ function SystemEntry(
 			data-chat-system
 		>
 			<div className="mt-0.5 shrink-0">
-				<SignInIcon aria-hidden="true" size={16} />
+				{/^Build (opened|updated|finished|stopped|failed|didn’t)\b/.test(item.text)
+					? <WrenchIcon aria-hidden="true" size={16} />
+					: <SignInIcon aria-hidden="true" size={16} />}
 			</div>
 			<p className="m-0 min-w-0 break-words text-sm [overflow-wrap:anywhere]">
-				{displayText(item.text)}
+				{systemParts(displayText(item.text)).map((part, index) =>
+					typeof part === "string"
+						? part
+						: (
+							<a
+								className="link tabular-nums"
+								href={part.url}
+								key={index}
+								rel="noreferrer"
+								target="_blank"
+							>
+								#{part.number}
+							</a>
+						)
+				)}
 			</p>
 		</div>
 	);
@@ -331,8 +363,9 @@ function MessageBody(
 		<ChatImageDocument value={room}>
 			<MessageImages
 				sender={{
-					// The viewer names who sent it and when, as the row's own head does.
-					...messageSpeaker({ author: message.author, ts: message.ts }),
+					// The viewer names who sent it and how long ago, as Slack's does.
+					name: messageSpeaker({ author: message.author }).name,
+					...(message.ts === undefined ? {} : { ts: message.ts }),
 					face: message.author.kind === "agent"
 						? <ChopinMark circle />
 						: <Face decorative handle={message.author.handle} size={36} titled={false} />,
@@ -528,6 +561,38 @@ let MessageGroup = memo(function MessageGroup(
 
 let noop = () => {};
 let NO_INTENTS: readonly Intent[] = [];
+let NONE_ENTERING: ReadonlySet<string> = new Set();
+
+/**
+ * A thread's root at the head of its panel: the row Chat draws for it, with its toolbar and its
+ * reactions, and no Reply in thread, since it is that thread.
+ */
+export function ThreadRoot(
+	{ entry, handle, intents, onReact, room }: {
+		entry: Chat.Entry;
+		handle: string;
+		intents: readonly Intent[];
+		onReact: (id: string, emoji: string, on: boolean) => void;
+		room: string;
+	},
+) {
+	let item = useMemo(() => group([entry])[0], [entry]);
+	if (item?.kind !== "messages") return null;
+	return (
+		<MessageGroup
+			enter={false}
+			entering={NONE_ENTERING}
+			group={item}
+			handle={handle}
+			intents={intents}
+			onDelete={noop}
+			onReact={onReact}
+			onRetry={noop}
+			quietFailures={false}
+			room={room}
+		/>
+	);
+}
 
 /**
  * Memoized: Chat renders again with every key typed in its composer, and a long transcript is
@@ -929,7 +994,7 @@ export let Transcript = memo(function Transcript(
 
 	let view = (
 		<div
-			className="chat-scroll flex min-h-0 min-w-0 flex-1 flex-col overflow-auto px-5 pt-3 text-left"
+			className="chat-scroll flex min-h-0 min-w-0 flex-1 flex-col overflow-auto pt-3 text-left"
 			data-chat-scroll=""
 			data-focus-boundary=""
 			ref={scroller}

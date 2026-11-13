@@ -69,8 +69,9 @@ import { holdsQuestion } from "../questions/records";
 import { broadcast, fail, PASSING, reply, tell } from "../wire";
 import { introduce } from "../people";
 import { MAX_MESSAGE_BYTES } from "./limits";
-import { contributed } from "./initiative";
+import { actor, alone, contributed } from "./initiative";
 import { checkPlannerReply, PlannerReplyError, publishPlannerReplies } from "./reply-policy";
+import { withSessionContext } from "./session-context";
 import { TOOL_UNAVAILABLE, turnFailureOf } from "./turn-failure";
 import { retryTarget } from "./retry";
 import { runDuration } from "./run-duration";
@@ -340,6 +341,8 @@ export type Chat = {
 	initiative?: InitiativeSchedule<import("./initiative").Source>;
 	initiativePaused?: boolean;
 	initiativeEnabled?: boolean;
+	/** Whether at most one person is in the conversation, as Chat was last told. */
+	alone?: boolean;
 	readiness?: boolean;
 	job?: ConversationPlan.Job;
 	jobOutput?: string;
@@ -347,8 +350,29 @@ export type Chat = {
 	jobFailureCode?: "source-shape";
 	jobCalls?: Map<string, string>;
 	jobToolNames?: ReadonlySet<string>;
+	/** What a decision-followup job's turn last read of its scope (see `readScope`). */
+	jobScopeRead?: {
+		job: ConversationPlan.Job;
+		turn: Wire.Turn | undefined;
+		revision: number;
+		scope: string;
+		answersHash: string;
+		source: string;
+		context: string;
+	};
 	/** The job taken from the waiting turns while its handoff save is pending. */
 	handoffJob?: JobTurn;
+	/** The background job whose turn holds the Chat, until the next turn starts or the Chat is idle. */
+	backgroundTurn?: JobTurn;
+	/** The running job's own tool write, which a preemption lets finish so it is recorded whole. */
+	jobWriting?: Promise<unknown>;
+	/**
+	 * A person's turn that preempted a background job, started as soon as the job's turn has wound
+	 * down, ahead of anything waiting.
+	 */
+	preempting?: Parameters<typeof run>;
+	/** How often each job (by kind and target) has given way since it last finished, so it ends. */
+	preemptions?: Map<string, number>;
 	/** Reads reactions to the Planner's messages and starts the turns that answer them. */
 	reactions?: import("./reaction-reply").ReactionResponder;
 	/** The id of the running turn when it is answering a reaction. */
@@ -523,7 +547,7 @@ function now(): number {
 	return Math.floor(Date.now() / 1000);
 }
 
-function begin(handle: string, entryOffset: number): Wire.Turn {
+function begin(handle: string, entryOffset: number, quiet = false): Wire.Turn {
 	let startedAt = Date.now();
 	return {
 		id: ulid(),
@@ -532,7 +556,19 @@ function begin(handle: string, entryOffset: number): Wire.Turn {
 		entryOffset,
 		startedAt,
 		responded: false,
+		...(quiet ? { quiet: true } : {}),
 	};
+}
+
+/**
+ * Says whether what is left of the running turn is for people to watch. A reply's words are all
+ * out while its after-answer check runs; a repair step the check starts is work again.
+ */
+function quieten(chat: Chat, server: Server<SocketData>, room: string, quiet: boolean): void {
+	if (!chat.turn || !!chat.turn.quiet === quiet) return;
+	if (quiet) chat.turn.quiet = true;
+	else delete chat.turn.quiet;
+	state(chat, server, room);
 }
 
 function digest(value: string): string {
@@ -662,7 +698,11 @@ function replay(
 		return true;
 	}
 	let saved = (entry as MemberEntry).delivery;
-	if (!saved || saved.destination !== msg.to || saved.requestFingerprint !== fingerprint) {
+	// A message to the room that went to the Planner, its sender being alone, is the same message:
+	// the fingerprint holds the destination it was sent to.
+	let sameDestination = saved?.destination === msg.to
+		|| (msg.to === "room" && saved?.destination === "planner");
+	if (!saved || !sameDestination || saved.requestFingerprint !== fingerprint) {
 		fail(ws, msg.rid, "chat request id was reused with different content");
 		return true;
 	}
@@ -711,7 +751,11 @@ export function greet(chat: Chat, ws: Socket): void {
 		busy: chat.busy,
 		...(chat.turn ? { turn: chat.turn } : {}),
 		...(chat.runs ? { runs: chat.runs } : {}),
-		participation: { enabled: !!chat.initiativeEnabled, paused: false },
+		participation: {
+			enabled: !!chat.initiativeEnabled,
+			paused: false,
+			...(chat.initiativeEnabled && chat.alone ? { alone: true } : {}),
+		},
 	});
 	// After the history, which ends whatever an earlier connection was told of it.
 	if (chat.modelUnreadable) tell(ws, { kind: "chat:model-unreadable", ts: 0, unreadable: true });
@@ -768,6 +812,15 @@ export type Room = {
 	roomMessagePublished?: () => void;
 	/** Runs only after a new member entry is durably saved and its human turn reserved, or given to the one running. */
 	memberMessagePersisted?: (entry: Wire.Entry, claimantSessionId: string | undefined) => void;
+	/** Called when automatic participation stops holding a message it might reply to. */
+	initiativeSettled?: () => void;
+	/**
+	 * Who is in the document's conversation now (`people` in `./initiative`), a thread's included.
+	 * Absent where nobody is known, which is never alone.
+	 */
+	people?: () => Set<string>;
+	/** Called when who is in the conversation may have changed. */
+	peopleChanged?: () => void;
 	openPlannerSession?: typeof import("../harness/session")["openPlannerSession"];
 	/**
 	 * What the document's chosen model and thinking level come to for the next turn, checked against
@@ -810,6 +863,8 @@ export type Room = {
 	rootChannelId?: string;
 	/** Set only when this room is a child: how its comments reach the root's Chat. */
 	root?: RootChat;
+	/** Set only on a thread's room: the thread's root message id. */
+	threadRoot?: string;
 	/** Session-tree and remote fork hooks for top-level Chat and threads. */
 	sessionForks?: {
 		/** `retry`: the turn runs `currentEntryId` again, and nothing of its failed attempt is kept. */
@@ -875,7 +930,9 @@ async function rebindRetained(context: Room, retained: Retained): Promise<boolea
  * A room message appears immediately. A message to the Planner is never held: it starts a turn
  * when none is running, is posted and given to the turn that is running when its harness can take
  * input mid-run, and is refused, saying why, when it cannot. The destination, rather than its
- * prose, decides which lifecycle it takes.
+ * prose, decides which lifecycle it takes. A person alone in the conversation is talking to the
+ * Planner, so their message to the room goes to it, as if it named it, with no wait for silence
+ * and no judgment; once a second person is there, it goes to the room again.
  */
 export async function send(context: Room, ws: Socket, msg: Request<Wire.Send>): Promise<void> {
 	if (context.chat.pendingSends >= MAX_PENDING_SENDS) {
@@ -883,11 +940,13 @@ export async function send(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 		return;
 	}
 	context.chat.pendingSends++;
+	// Decided as it arrives, as automatic participation would have counted the room then.
+	let to = msg.to === "room" && alone(context, actor(ws)) ? "planner" as const : msg.to;
 	let enqueue = () => {
 		// Nothing a send throws says its message is at fault: it is answered as a passing trouble, and
 		// the browser sends it again with the same request id.
 		let process = () =>
-			processSend(context, ws, msg).catch(err => {
+			processSend(context, ws, msg, to).catch(err => {
 				console.error("[chat] a send failed before it was kept:", err);
 				fail(ws, msg.rid, "could not send message", PASSING);
 			});
@@ -898,7 +957,7 @@ export async function send(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 	};
 	// A message to the Planner waits, a bounded time, for one a machine is starting before it is
 	// checked for one, so the room's messages never wait with it.
-	if (msg.to !== "planner" || !context.plannerStarting) return enqueue();
+	if (to !== "planner" || !context.plannerStarting) return enqueue();
 	return context.plannerStarting().catch(() => {}).then(enqueue);
 }
 
@@ -911,10 +970,53 @@ function canSteer(context: Room): boolean {
 
 /** Says in the log why a message was refused while a turn runs, naming the harness that takes none. */
 function refusedWhileRunning(context: Room): void {
-	let why = context.chat.job
-		? "the running turn is a background job's"
-		: `the ${context.config.harness} harness takes no input while a turn runs`;
-	console.warn(`[chat] refused a message while a turn runs: ${why}`);
+	console.warn(
+		`[chat] refused a message while a turn runs: the ${context.config.harness} harness takes no input while a turn runs`,
+	);
+}
+
+/**
+ * How many runs in a row of one job (its kind and target) a person's message may cut short. The
+ * next run is let finish, with the person's turn starting the moment it ends, so a job that keeps
+ * meeting messages still completes.
+ */
+const MAX_PREEMPTIONS = 3;
+
+/** What a job that gave way to a person's turn reports: it goes back to wait, unchanged. */
+const PREEMPTED: JobOutcome = { status: "preempted", reason: "A person asked the Planner." };
+
+/**
+ * Whether what holds the Chat is a background job, running or being handed the Chat, which a
+ * person's message to the Planner goes ahead of. A turn a person started, or one Chopin started
+ * for something a person did (a Build, a comment, a follow-up), is never one.
+ */
+function preemptible(chat: Chat): boolean {
+	if (chat.closed || chat.preempting || startsHeld) return false;
+	if (chat.starting) return !!chat.handoffJob;
+	return chat.busy && !!chat.backgroundTurn;
+}
+
+/**
+ * Starts a person's turn ahead of the background job holding the Chat. The job's turn is stopped
+ * and starts this one as it ends; a job being handed the Chat waits behind it instead. A write the
+ * job's own tool has under way finishes first, so it is recorded whole and not made again.
+ */
+function preempt(context: Room, turn: Parameters<typeof run>): void {
+	let { chat } = context;
+	if (chat.closed) return;
+	// The job ended while the message was saved: nothing is in the way.
+	if (!chat.busy && !chat.starting) return startRun(...turn);
+	chat.preempting = turn;
+	let job = chat.backgroundTurn;
+	let controller = chat.turnController;
+	if (chat.starting || !job || job.preempted || !controller || controller.signal.aborted) return;
+	let key = `${job.job.kind}:${job.job.target}`;
+	let preemptions = chat.preemptions ??= new Map();
+	let count = preemptions.get(key) ?? 0;
+	if (count >= MAX_PREEMPTIONS) return;
+	preemptions.set(key, count + 1);
+	job.preempted = true;
+	void Promise.resolve(chat.jobWriting).catch(() => {}).then(() => controller.abort());
 }
 
 /** A message posted to the transcript for the Planner turn that is running to read. */
@@ -1065,7 +1167,9 @@ export async function invoke(
 			});
 			return undefined;
 		}
-		let running = occupied(chat);
+		// A background job gives way to a person's instruction, as to their message.
+		let preempts = preemptible(chat);
+		let running = !preempts && occupied(chat);
 		if (running && !canSteer(context)) {
 			refusedWhileRunning(context);
 			return "planner-busy" as const;
@@ -1099,7 +1203,7 @@ export async function invoke(
 			});
 			if (settled) void given.finally(settled).catch(() => {});
 		} else {
-			startRun(
+			let asked: Parameters<typeof run> = [
 				{ ...context, invokedBy: user.id },
 				user.login,
 				text,
@@ -1107,8 +1211,12 @@ export async function invoke(
 				context.claimantSessionId,
 				false,
 				{ entryId: entry.id, userId: user.id, ...(focus ? { focus } : {}) },
-			);
-			// Started here, so this promise is this turn's own (and the waiting turns it starts).
+				[],
+			];
+			if (preempts) preempt(context, asked);
+			else startRun(...asked);
+			// Started here, or by the job's turn it preempted as that ends, so this promise holds this
+			// turn (and the waiting turns it starts).
 			let turn = chat.running;
 			if (settled) {
 				if (turn) void turn.finally(settled).catch(() => {});
@@ -1197,7 +1305,12 @@ async function acceptAttachments(
 	}
 }
 
-async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): Promise<void> {
+async function processSend(
+	context: Room,
+	ws: Socket,
+	msg: Request<Wire.Send>,
+	to: Wire.Destination = msg.to,
+): Promise<void> {
 	let { chat, room, server } = context;
 	let suppliedRequestId = (msg as Request<Wire.Send> & { requestId?: unknown }).requestId;
 	if (
@@ -1210,7 +1323,7 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 	// Pre-deploy browser tabs did not send request IDs. They keep legacy at-most-once behavior.
 	let requestId = suppliedRequestId ?? crypto.randomUUID();
 	let handle = ws.data.handle;
-	let destination = msg.to;
+	let destination = to;
 	if (destination !== "room" && destination !== "planner") {
 		return fail(ws, msg.rid, "invalid message destination");
 	}
@@ -1382,12 +1495,52 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 	if (chat.closed) return refuseClosed(ws, msg.rid);
 
 	chat.initiative?.cancel();
+	if (preemptible(chat)) {
+		// A background job gives way: the person's turn starts once the job's turn has wound down.
+		let bindFailure = await bindAttachments?.();
+		if (bindFailure) return fail(ws, msg.rid, bindFailure.refusal, bindFailure.code);
+		let entry: MemberEntry = {
+			id: requestId,
+			author: { kind: "member", handle },
+			text,
+			ts: now(),
+			...(references?.length ? { references } : {}),
+			...withAttachments,
+			delivery: savedDelivery,
+		};
+		chat.entries.push(entry);
+		try {
+			await context.persist();
+		} catch {
+			chat.entries = chat.entries.filter(value => value.id !== entry.id);
+			return fail(ws, msg.rid, "could not save message", PASSING);
+		}
+		reply(ws, msg.rid, { kind: "chat:send", ts: 0, id: entry.id });
+		if (chat.closed) return;
+		announce(server, room, entry);
+		preempt(context, [
+			context,
+			handle,
+			text,
+			undefined,
+			context.claimantSessionId,
+			false,
+			{ entryId: entry.id, userId: ws.data.principalId, ...(focus ? { focus } : {}) },
+			references ?? [],
+		]);
+		context.memberMessagePersisted?.(entry, context.claimantSessionId);
+		return;
+	}
 	if (chat.busy || chat.starting) {
 		if (!canSteer(context)) {
-			// A turn that is only beginning or finishing has no session to give a message to just now:
-			// the browser sends it again in a moment, to a Planner that is then idle or working. A
-			// background job's session, or a harness that takes no input mid-run, never will.
-			if (!chat.job && !chat.closed && context.steers?.()) {
+			// A stopping process starts no turn in place of a job, and says nothing: the browser sends
+			// the message again to the next one.
+			if (startsHeld && chat.backgroundTurn) return refuseClosed(ws, msg.rid);
+			// A turn that is only beginning or finishing, or a person's turn about to start in place of
+			// a job, has no session to give a message to just now: the browser sends it again in a
+			// moment, to a Planner that is then idle or working. A harness that takes no input mid-run
+			// never will.
+			if (!chat.closed && context.steers?.()) {
 				return fail(ws, msg.rid, `${PLANNER_NAME} is between replies`, PASSING);
 			}
 			refusedWhileRunning(context);
@@ -1503,6 +1656,17 @@ export async function retry(context: Room, ws: Socket, msg: Request<Wire.Retry>)
 	return context.plannerStarting().catch(() => {}).then(enqueue);
 }
 
+/**
+ * The room's transcript as a Retry reads it. The top-level Chat leaves out what a thread's turn
+ * copied into it, which only that thread's Retry runs again.
+ */
+function ownEntries(context: Room): Wire.Entry[] {
+	let entries = context.threadRoot === undefined
+		? context.chat.entries.filter(entry => entry.fromThread === undefined)
+		: context.chat.entries;
+	return entries.map(publicEntry);
+}
+
 async function processRetry(
 	context: Room,
 	ws: Socket,
@@ -1512,7 +1676,7 @@ async function processRetry(
 	let { chat, room, server } = context;
 	if (chat.closed) return refuseClosed(ws, rid);
 	if (!context.config.agent) return fail(ws, rid, `${PLANNER_NAME} is not running here`);
-	let found = retryTarget(chat.entries.map(publicEntry), message, ws.data.handle);
+	let found = retryTarget(ownEntries(context), message, ws.data.handle);
 	if ("refusal" in found) return fail(ws, rid, found.refusal);
 	let unattached = await context.plannerNotAttached?.();
 	if (unattached) return fail(ws, rid, unattached, "planner-not-attached");
@@ -1533,7 +1697,7 @@ async function processRetry(
 	// A process that is stopping starts no turn, and says nothing: the browser may ask the next one.
 	if (startsHeld) return refuseClosed(ws, rid);
 	// Read again: the transcript may have moved on while the machine and the child were checked.
-	let target = retryTarget(chat.entries.map(publicEntry), message, ws.data.handle);
+	let target = retryTarget(ownEntries(context), message, ws.data.handle);
 	if ("refusal" in target) return fail(ws, rid, target.refusal);
 	let { request, removed } = target;
 	let gone = new Set(removed);
@@ -2055,6 +2219,24 @@ export async function restoredRuns(
 	state(chat, server, room);
 }
 
+/**
+ * The document was archived: every run its Planner held ends with it, whether the Planner was
+ * attached, disconnected with its work kept, or between two processes of a deploy, so no card is
+ * left running or waiting on a question nobody can answer now. Saved with the document.
+ */
+export async function endRuns(
+	context: Pick<Room, "chat" | "room" | "server" | "persist">,
+): Promise<void> {
+	let { chat, room, server } = context;
+	if (!chat.runs?.length) return;
+	let at = now();
+	let next = chat.runs.map(run => ENDED_RUN[run.status] ? run : stopped(run, at));
+	if (JSON.stringify(next) === JSON.stringify(chat.runs)) return;
+	await context.persist(() => ({ entries: chat.entries, runs: next }));
+	chat.runs = next;
+	state(chat, server, room);
+}
+
 /** Run cards restored with the document; no session survives a reload of the room, so live ones were stopped. */
 export function restoreRuns(runs: Wire.Run[] | undefined): Wire.Run[] | undefined {
 	return runs?.length ? mergeRuns(runs, undefined, now()) : undefined;
@@ -2071,7 +2253,7 @@ const storedStages = new WeakMap<Chat, Map<string, { ids: string[]; json: Map<st
  * than its card carries. A report that only adds and changes stages writes those; one that drops
  * or reorders stages replaces the run's.
  */
-function storeStages(context: Room, cards: Wire.Run[]): Promise<void> | undefined {
+function storeStages(context: RunsRoom, cards: Wire.Run[]): Promise<void> | undefined {
 	let known = storedStages.get(context.chat)
 		?? new Map<string, { ids: string[]; json: Map<string, string> }>();
 	storedStages.set(context.chat, known);
@@ -2120,7 +2302,7 @@ function cardWindow(run: Wire.Run): Wire.Run {
 }
 
 /** Forgets the stored stages of runs Chat no longer shows. */
-async function forgetStages(context: Room, shown: Wire.Run[] | undefined): Promise<void> {
+async function forgetStages(context: RunsRoom, shown: Wire.Run[] | undefined): Promise<void> {
 	let ids = (shown ?? []).map(run => run.id);
 	let known = storedStages.get(context.chat);
 	for (let id of known?.keys() ?? []) if (!ids.includes(id)) known!.delete(id);
@@ -2132,11 +2314,50 @@ async function forgetStages(context: Room, shown: Wire.Run[] | undefined): Promi
 }
 
 const publishing = new WeakMap<Chat, Promise<void>>();
-const owners = new WeakMap<Chat, Map<string, PlannerSession>>();
-const unsaved = new WeakMap<PlannerSession, Runs>();
-const gone = new WeakSet<PlannerSession>();
+const owners = new WeakMap<Chat, Map<string, RunsOwner>>();
+const unsaved = new WeakMap<RunsOwner, Runs>();
+const gone = new WeakSet<RunsOwner>();
 
 type Runs = { active: string[]; paused: string[]; cards?: Wire.Run[] };
+
+/** The session whose runs a card shows: a retained Planner session, or one a restart rebuilt. */
+type RunsOwner = Pick<PlannerSession, "suspended">;
+
+/** What showing and storing a session's run cards needs of the room. */
+type RunsRoom = Pick<Room, "chat" | "room" | "server" | "persist"> & {
+	auth: { storage: Pick<Room["auth"]["storage"], "runStages"> };
+};
+
+/** Stand-ins, by session id, for the sessions a restart rebuilt whose clients report runs. */
+const rebuiltOwners = new WeakMap<Chat, Map<string, { owner: RunsOwner; down: boolean }>>();
+
+/**
+ * Shows the runs reported by a Planner session a restart rebuilt and its client took back, `down`
+ * while its client's link has dropped again. No turn of this process opened that session, so
+ * nothing here retains it and its reports reach Chat only this way, as a retained session's do.
+ */
+export function rebuiltRuns(
+	context: RunsRoom,
+	session: string,
+	runs: Runs,
+	down = false,
+): Promise<void> {
+	if (context.chat.closed) return Promise.resolve();
+	let known = rebuiltOwners.get(context.chat)
+		?? new Map<string, { owner: RunsOwner; down: boolean }>();
+	rebuiltOwners.set(context.chat, known);
+	let entry = known.get(session);
+	if (!entry) {
+		let made: { owner: RunsOwner; down: boolean } = {
+			owner: { suspended: () => made.down },
+			down,
+		};
+		entry = made;
+		known.set(session, entry);
+	}
+	entry.down = down;
+	return publishRuns(context, entry.owner, runs);
+}
 
 /**
  * Show the session's runs, keeping ended ones as summary cards until the next
@@ -2145,13 +2366,13 @@ type Runs = { active: string[]; paused: string[]; cards?: Wire.Run[] };
  * it: a report or release only changes its own session's cards.
  */
 function publishRuns(
-	context: Room,
-	session: PlannerSession,
+	context: RunsRoom,
+	session: RunsOwner,
 	runs: Runs | undefined,
 	releasing = false,
-	followUp = false,
+	followUp?: (run: Wire.Run, said: string) => Promise<void>,
 ): Promise<void> {
-	let known = owners.get(context.chat) ?? new Map<string, PlannerSession>();
+	let known = owners.get(context.chat) ?? new Map<string, RunsOwner>();
 	owners.set(context.chat, known);
 	for (let run of runs?.cards ?? []) known.set(run.id, session);
 	let turn = (publishing.get(context.chat) ?? Promise.resolve()).then(() =>
@@ -2162,11 +2383,11 @@ function publishRuns(
 }
 
 async function publishReport(
-	context: Room,
-	session: PlannerSession,
+	context: RunsRoom,
+	session: RunsOwner,
 	runs: Runs | undefined,
 	releasing: boolean,
-	followUp: boolean,
+	followUp: ((run: Wire.Run, said: string) => Promise<void>) | undefined,
 ): Promise<void> {
 	let { chat, room, server } = context;
 	let at = now();
@@ -2248,7 +2469,7 @@ async function publishReport(
 	for (let entry of finished) announce(server, room, entry);
 	state(chat, server, room);
 	if (prior.some(run => !shown.has(run.id))) await forgetStages(context, next);
-	for (let { run, said } of attention) await followUpEndedRun(context, run, said);
+	for (let { run, said } of attention) await followUp?.(run, said);
 }
 
 /**
@@ -2318,7 +2539,13 @@ function retain(
 			if (chat.retained?.session !== opened.session) return;
 			let planning = chat.busy && !chat.job && chat.agent === opened.session;
 			let followUp = !planning && opened.session.followsUpRuns !== false;
-			void publishRuns(context, opened.session, next, false, followUp);
+			void publishRuns(
+				context,
+				opened.session,
+				next,
+				false,
+				followUp ? (run, said) => followUpEndedRun(context, run, said) : undefined,
+			);
 			if (next.active.length || next.paused.length) return;
 			release();
 		});
@@ -2550,46 +2777,22 @@ export function retainReferences(chat: Chat, references: Wire.Reference[]): void
 }
 
 /**
- * Post a thread reply into top-level Chat when "Also send to Chat" was selected.
- * Persists before broadcasting and enters top-level backscroll so the next top-level
- * Planner turn sees it in context.
+ * What a reply sent from a thread with Also send to Chat does in the top-level Chat once it is
+ * there, as a message said in Chat does: the room hears of it, and one to the room may draw the
+ * Planner's initiative. One to the Planner is answered in its thread, and copied here as it is.
  */
-export async function postAlsoToChat(
-	context: Room,
-	ws: Socket,
-	input: { handle: string; text: string; references?: Wire.Reference[]; focus?: string },
-): Promise<Wire.Entry | undefined> {
-	let { chat, server, room } = context;
-	if (chat.closed || context.rootChannelId) return undefined;
-	let entry: Wire.Entry = {
-		id: ulid(),
-		author: { kind: "member", handle: input.handle },
-		text: input.text,
-		ts: now(),
-		...(input.references?.length ? { references: input.references } : {}),
-	};
-	if (!context.commitRoomMessage) chat.entries.push(entry);
-	try {
-		if (context.commitRoomMessage) await context.commitRoomMessage(entry);
-		else await context.persist();
-	} catch (err) {
-		if (!context.commitRoomMessage) {
-			chat.entries = chat.entries.filter(value => value.id !== entry.id);
-		}
-		console.error("[chat] could not cross-post thread reply to Chat:", err);
-		return undefined;
-	}
-	announce(server, room, entry);
+export function copiedToChat(context: Room, ws: Socket, entry: Wire.Entry, focus?: string): void {
+	let { chat } = context;
 	context.roomMessagePublished?.();
 	context.memberMessagePersisted?.(entry, context.claimantSessionId);
+	if (entry.author.kind !== "member") return;
 	chat.backscroll = remember(chat.backscroll, {
 		entryId: entry.id,
-		handle: input.handle,
-		text: input.text,
-		...(input.references?.length ? { references: input.references } : {}),
+		handle: entry.author.handle,
+		text: entry.text,
+		...(entry.references?.length ? { references: entry.references } : {}),
 	});
-	contributed(context, ws, entry, input.focus);
-	return entry;
+	if (publicEntry(entry).to !== "planner") contributed(context, ws, entry, focus);
 }
 
 export function sessionBootstrap(
@@ -2618,6 +2821,8 @@ export function sessionBootstrap(
 			: entry.author.kind === "agent"
 			? "Planner"
 			: "System";
+		// A thread's reply also sent to Chat, and the Planner's answer to it: said in the thread.
+		if (entry.fromThread !== undefined) speaker = `${speaker} (in a thread, also sent to Chat)`;
 		return `${speaker}: ${annotatedText(entry.text, entry.references, readable)}`;
 	};
 	let selected: Wire.Entry[] = [];
@@ -2706,7 +2911,8 @@ async function repositorySession(
 	currentEntryId?: string,
 	currentReferences: Wire.Reference[] = [],
 	retry = false,
-): Promise<{ session: PlannerSession; binding: ActiveOwnerBinding }> {
+	bootstrapInPrompt = false,
+): Promise<{ session: PlannerSession; binding: ActiveOwnerBinding; bootstrap?: string }> {
 	let retained = context.chat.retained;
 	let reader = !!context.chat.reader;
 	let isolated = reader || !!context.chat.job;
@@ -2789,6 +2995,10 @@ async function repositorySession(
 			: fullBootstrap;
 		let open = context.openPlannerSession
 			?? (await import("../harness/session")).openPlannerSession;
+		// What the room said changes every turn, and a fresh session starts for each one, so it goes
+		// before the turn's prompt: the instructions stay the same from turn to turn, and the model
+		// provider can reuse its cache of them instead of reading them all again.
+		let bootstrap: string | undefined;
 		let result = await open(binding, {
 			room: documentRoom(context),
 			repository,
@@ -2797,9 +3007,11 @@ async function repositorySession(
 			instructions: reader ? READER_INSTRUCTIONS : workspace => {
 				let usedNative = !!forkSetup?.skipBootstrap
 					&& !(workspace && "remote" in workspace && workspace.forkedNatively === false);
+				let chosen = usedNative ? nativeBootstrap : fullBootstrap;
+				if (bootstrapInPrompt) bootstrap = chosen;
 				return plannerInstructions(
 					`${repository.owner}/${repository.name}`,
-					usedNative ? nativeBootstrap : fullBootstrap,
+					bootstrapInPrompt ? undefined : chosen,
 					workspace,
 					visualRouting(context),
 				);
@@ -2827,7 +3039,7 @@ async function repositorySession(
 		chat.owner = openingOwner;
 		if (!isolated) consumeBootstrapBackscroll(chat);
 		else chat.bootstrapEntries = undefined;
-		return { session: opened, binding };
+		return { session: opened, binding, ...(bootstrap ? { bootstrap } : {}) };
 	} catch (err) {
 		await opened?.destroy();
 		binding?.release();
@@ -2951,10 +3163,12 @@ async function run(
 	let skipped = false;
 	let reader = !!about?.reader;
 	let isolated = reader || !!jobTurn;
+	chat.backgroundTurn = jobTurn;
 
 	if (!reserved) {
 		chat.busy = true;
-		chat.turn = begin(handle, chat.entries.length);
+		// A background job's turn is neither saved nor shown: Chat draws nothing for it.
+		chat.turn = begin(handle, chat.entries.length, !!jobTurn);
 		chat.acting = thread;
 		chat.actingChannel = about?.threadChannel;
 		(jobTurn ? jobState : state)(chat, server, room);
@@ -3027,13 +3241,24 @@ async function run(
 			turnController.abort();
 			throw new Error("The turn is no longer authorized.");
 		}
-		opened = await repositorySession(
+		// A skill or a prompt template has to open the prompt, as a background job's header does, so
+		// their fresh sessions are told what the room said in their instructions instead.
+		let command = jobTurn || reader ? undefined : commandReference(references);
+		let { bootstrap, ...repositoryOpened } = await repositorySession(
 			context,
 			claimantSessionId,
 			member?.entryId,
 			references,
 			!!member?.retry,
+			!jobTurn && (command === undefined || command.commandKind === COMMAND_KINDS.workflow),
 		);
+		opened = repositoryOpened;
+		// Given once, with the session's first prompt.
+		let withBootstrap = (text: string) => {
+			let told = bootstrap;
+			bootstrap = undefined;
+			return withSessionContext(told, text);
+		};
 		if (about?.signal && about.spent?.()) turnController.abort();
 		if (chat.agent !== opened.session || turnController.signal.aborted) {
 			throw new Error(`${PLANNER_NAME}'s session changed before the turn started. Try again.`);
@@ -3052,7 +3277,6 @@ async function run(
 		} else {
 			// A skill or a prompt template is Atomic's own `/name args`, which has to open the prompt:
 			// what the room said and the focus line wait for the next turn instead of standing before it.
-			let command = commandReference(references);
 			let opening = command !== undefined && command.commandKind !== COMMAND_KINDS.workflow;
 			// Drained rather than copied: what the agent has been told once should
 			// not arrive again on the next turn.
@@ -3127,7 +3351,7 @@ async function run(
 							? { id: member.entryId, ...(retrying ? { retry: true as const } : {}) }
 							: undefined;
 						retrying = false;
-						let result = await session.stream(text, abort, choice, sent, answers);
+						let result = await session.stream(withBootstrap(text), abort, choice, sent, answers);
 						// Its first call is made: a message given to the turn now reaches it, and
 						// people are told the turn is running, as the machine has its prompt.
 						steered?.open(session);
@@ -3153,6 +3377,7 @@ async function run(
 						&& record.origin === "planner" && !!record.followUp && holdsQuestion(record.status)
 					).length,
 				publish: part => translate(context, part),
+				quiet: quiet => quieten(chat, server, room, quiet),
 				beginAttempt: () => {
 					chat.toolEntries = new Map();
 					if (chat.turnImages) chat.turnImages.calls = new Set();
@@ -3172,7 +3397,8 @@ async function run(
 				: { status: "done", output: chat.jobOutput };
 		}
 	} catch (err) {
-		console.error("[chat] turn failed:", err);
+		// A job that gave way to a person's turn did not fail: it runs again later.
+		if (!jobTurn?.preempted) console.error("[chat] turn failed:", err);
 		// A stop the room asked for is not a failure; an interruption is.
 		failed = !turnController.signal.aborted || !!chat.interruption;
 		// A reply the check refused ended no workflow run and answered no question.
@@ -3310,6 +3536,14 @@ async function run(
 			} else if (chat.interruption) {
 				outcome = { status: "failed", reason: jobReason(chat.interruption) };
 			}
+			if (jobTurn.preempted && !chat.closed && !persistenceError) {
+				// What its own tool wrote before it gave way is its result; with none, it runs again.
+				let output = jobTurn.output ?? (outcome?.status === "done" ? outcome.output : undefined);
+				outcome = output === undefined ? PREEMPTED : { status: "done", output };
+			}
+			if (outcome?.status !== "preempted") {
+				chat.preemptions?.delete(`${jobTurn.job.kind}:${jobTurn.job.target}`);
+			}
 		}
 
 		/*
@@ -3395,6 +3629,15 @@ async function startNext(
 	ended?: { job: boolean; outcome: JobOutcome | undefined },
 ): Promise<void> {
 	let { chat, room, server } = context;
+	// A person's turn that preempted a job goes first.
+	let preempting = chat.preempting;
+	chat.preempting = undefined;
+	if (preempting && !startsHeld) {
+		chat.starting = false;
+		if (ended) await run(...preempting);
+		else startRun(...preempting);
+		return;
+	}
 	let next = startsHeld ? undefined : pending(chat);
 	if (next) {
 		if (next.job) chat.handoffJob = next.job;
@@ -3414,6 +3657,11 @@ async function startNext(
 		}
 		if (next.job?.settled) {
 			// Settled while its handoff save was pending: it never runs, and the next one is tried.
+			return startNext(context, ended);
+		}
+		if (chat.preempting) {
+			// A person asked while it was handed the Chat: it waits behind their turn.
+			chat.waiting.unshift(next);
 			return startNext(context, ended);
 		}
 		let turnContext = { ...context };
@@ -3440,6 +3688,7 @@ async function startNext(
 	// Called with nothing running, there is nothing to settle.
 	if (!ended) return;
 	chat.busy = false;
+	chat.backgroundTurn = undefined;
 	chat.turn = undefined;
 	chat.acting = undefined;
 	chat.actingChannel = undefined;
@@ -4103,6 +4352,7 @@ export async function close(chat: Chat): Promise<void> {
 		chat.handoffJob = undefined;
 	}
 	chat.waiting = [];
+	chat.preempting = undefined;
 	chat.turnController?.abort();
 	chat.referenceCache.clear();
 	chat.bootstrapEntries = undefined;

@@ -20,6 +20,7 @@ import {
 	MarkdownText,
 } from "@/components/assistant-ui/elements/markdown-text";
 import { TooltipIconButton } from "@/components/assistant-ui/elements/tooltip-icon-button";
+import { appLink } from "../app-links";
 import { sameJson } from "../same-json";
 import { ChatCodeColour } from "./code-colour";
 import { emojiRemarkPlugin, jumbo } from "./emoji";
@@ -33,6 +34,7 @@ import {
 } from "./image-markdown";
 import { isDataImage } from "./image-state";
 import { MentionLogins, mentionRemarkPlugin } from "./message-mentions";
+import { noHtmlRemarkPlugin } from "./no-html";
 import { orderedRunsRemarkPlugin } from "./ordered-runs";
 import { referenceRemarkPlugin } from "./reference-markdown";
 import { referenceRenderModel } from "./references";
@@ -91,20 +93,29 @@ let paragraph = ({ children }: ComponentProps<"p">) => (
 	<UpstreamParagraph>{children}</UpstreamParagraph>
 );
 
-/** A link someone wrote: a path in the repository opens the file on GitHub, as in the document. */
+/**
+ * A link someone wrote: a path in the repository opens the file on GitHub, as in the document. A
+ * link to the document's own sections or to another document is the app's, followed in this tab as
+ * the document's own links are; only another site opens a new one.
+ */
 export const ChatLink = (
 	{ "aria-label": label, children, className, href }: ComponentProps<"a">,
-) => (
-	<UpstreamLink
-		aria-label={label}
-		className={className}
-		href={useLinkHref(href)}
-		rel="noopener noreferrer"
-		target="_blank"
-	>
-		{children}
-	</UpstreamLink>
-);
+) => {
+	let target = useLinkHref(href);
+	let own = target !== undefined && typeof location !== "undefined"
+		&& appLink(target, location) !== undefined;
+	return (
+		<UpstreamLink
+			aria-label={label}
+			className={className}
+			href={target}
+			rel={own ? undefined : "noopener noreferrer"}
+			target={own ? undefined : "_blank"}
+		>
+			{children}
+		</UpstreamLink>
+	);
+};
 
 export const CHAT_COMPONENTS: MarkdownComponents = {
 	a: ChatLink,
@@ -128,7 +139,8 @@ export function inlineSource(source: string): string {
 		.replace(/^>/, "\\>");
 }
 
-let NO_PLUGINS: never[] = [];
+/** A phrase reads no HTML: a `<` and what follows it are the text they were written as. */
+let PHRASE_PLUGINS = [noHtmlRemarkPlugin];
 
 /** The root of a phrase: its content and nothing around it, so the root adds no element. */
 function PhraseRoot({ children }: { children?: ReactNode }) {
@@ -137,14 +149,13 @@ function PhraseRoot({ children }: { children?: ReactNode }) {
 
 /**
  * One line of text, drawn as its own nodes with no element around them, which is how a phrase
- * sat in its heading, label or paragraph before MarkdownText. Raw HTML is dropped when
- * `skipHtml` is set, and shown as the text it was written as when it is not.
+ * sat in its heading, label or paragraph before MarkdownText. Nothing in it is read as HTML, so
+ * `Option<u64>` or `<placeholder>` shows as written.
  */
 export function MarkdownPhrase(
-	{ components, links, skipHtml, source }: {
+	{ components, links, source }: {
 		components: MarkdownComponents;
 		links: boolean;
-		skipHtml: boolean;
 		source: string;
 	},
 ) {
@@ -154,8 +165,7 @@ export function MarkdownPhrase(
 			components={components}
 			containerComponent={PhraseRoot}
 			defer={false}
-			remarkPlugins={NO_PLUGINS}
-			skipHtml={skipHtml}
+			remarkPlugins={PHRASE_PLUGINS}
 			text={inlineSource(source)}
 			unwrapDisallowed
 		/>
@@ -169,7 +179,7 @@ let INLINE_WITHOUT_LINKS = CHAT_INLINE.filter(name => name !== "a");
  * Markdown: code spans, emphasis and links. Pass `links={false}` inside another control.
  */
 export function InlineMarkdown({ links = true, source }: { links?: boolean; source: string }) {
-	return <MarkdownPhrase components={CHAT_COMPONENTS} links={links} skipHtml source={source} />;
+	return <MarkdownPhrase components={CHAT_COMPONENTS} links={links} source={source} />;
 }
 
 type MessageMarkdownProps = {
@@ -380,6 +390,7 @@ export const MessageMarkdown = memo(function MessageMarkdown(
 	let remarkPlugins = useMemo(() => {
 		let gfm = messageGfmRemarkPlugin(model.source);
 		return [
+			noHtmlRemarkPlugin,
 			...(gfm ? [gfm] : []),
 			[referenceRemarkPlugin, model],
 			[mentionRemarkPlugin, logins],
@@ -412,7 +423,6 @@ export const MessageMarkdown = memo(function MessageMarkdown(
 					: undefined}
 				defer={false}
 				remarkPlugins={remarkPlugins as MarkdownTextProps["remarkPlugins"]}
-				skipHtml
 				status={streaming ? "running" : "complete"}
 				text={model.source}
 				unwrapDisallowed

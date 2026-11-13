@@ -385,6 +385,16 @@ export function RestartIcon(props: IconProps) {
 	);
 }
 
+/** Turn a quarter: a clockwise arc, as a viewer's rotate button draws it. */
+export function RotateIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<path d="M15.25 9a6.25 6.25 0 1 1-1.83-4.42l1.83 1.82" />
+			<polyline points="15.25 2.75 15.25 6.4 11.6 6.4" />
+		</LineIcon>
+	);
+}
+
 export function MinusIcon(props: IconProps) {
 	return (
 		<LineIcon {...props}>
@@ -414,6 +424,20 @@ export function WrapIcon(props: IconProps) {
 			<path d="M2.75 9h9.75a2.125 2.125 0 0 1 0 4.25H9.25" />
 			<polyline points="10.75 11.75 9.25 13.25 10.75 14.75" />
 			<line x1="2.75" x2="6.25" y1="13.25" y2="13.25" />
+		</LineIcon>
+	);
+}
+
+/** Two columns of three dots: a block's handle, which drags it and opens its menu. */
+export function GripIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<circle cx="6.5" cy="3.75" fill="currentColor" r="1.25" stroke="none" />
+			<circle cx="6.5" cy="9" fill="currentColor" r="1.25" stroke="none" />
+			<circle cx="6.5" cy="14.25" fill="currentColor" r="1.25" stroke="none" />
+			<circle cx="11.5" cy="3.75" fill="currentColor" r="1.25" stroke="none" />
+			<circle cx="11.5" cy="9" fill="currentColor" r="1.25" stroke="none" />
+			<circle cx="11.5" cy="14.25" fill="currentColor" r="1.25" stroke="none" />
 		</LineIcon>
 	);
 }

@@ -11,6 +11,7 @@ import type {
 	HarnessV1StartOptions,
 } from "../../apps/server/src/harness/harness-v1";
 import { HEADING_TOOL_NAMES } from "../../apps/server/src/harness/tool-names";
+import { sessionContextOf } from "../../apps/server/src/chat/session-context";
 import { nameDocument } from "./fake-heading";
 import { READER_REPLY } from "./fixtures";
 import type { scopeSnapshot } from "../../apps/server/src/questions/decision-followup";
@@ -98,6 +99,8 @@ function promptText(prompt: HarnessV1PromptTurnOptions["prompt"]): string {
 	return prompt.content.map(part => part.type === "text" ? part.text : "").join("");
 }
 
+const CONTEXT_MARKER = "Durable conversation context follows:\n";
+
 function unsupported(capability: string): () => Promise<never> {
 	return async () => {
 		throw new Error(`e2e-fake harness does not support ${capability}.`);
@@ -142,10 +145,12 @@ export function createFakeHarness(
 
 				async doPromptTurn(turn: HarnessV1PromptTurnOptions): Promise<HarnessV1PromptControl> {
 					let available = new Set(turn.tools.map(spec => spec.name));
-					let prompt = promptText(turn.prompt);
+					let { context: told, turn: prompt } = sessionContextOf(promptText(turn.prompt));
+					// What the room said: before the prompt of a fresh session, or in a command's instructions.
+					let context = told || turn.instructions || "";
 					// Automatic turns carry the latest human message in the session bootstrap.
 					let requested = prompt.includes("Respond to the current source message")
-						? turn.instructions?.split("\n").findLast(line => line.startsWith("@")) ?? prompt
+						? context.split("\n").findLast(line => line.startsWith("@")) ?? prompt
 						: prompt;
 					let heading = prompt.startsWith("[Background job: heading]\n");
 					let followup = prompt.startsWith("[Background job: decision-followup]\n");
@@ -327,7 +332,7 @@ export function createFakeHarness(
 							let [, failures, marker] = RETRY_CONTEXT_PROMPT.exec(requested)!;
 							let attempt = (retryAttempts.get(marker!) ?? 0) + 1;
 							retryAttempts.set(marker!, attempt);
-							let given = `${turn.instructions ?? ""}\n${prompt}`;
+							let given = `${turn.instructions ?? ""}\n${told}\n${prompt}`;
 							let id = crypto.randomUUID();
 							try {
 								turn.emit({ type: "text-start", id });
@@ -655,11 +660,9 @@ export function createFakeHarness(
 						void (async () => {
 							try {
 								await callTool("read_plan");
-								let instructions = turn.instructions ?? "";
-								let marker = "Durable conversation context follows:\n";
-								let start = instructions.indexOf(marker);
+								let start = context.indexOf(CONTEXT_MARKER);
 								let contextBlock = start >= 0
-									? instructions.slice(start + marker.length).split("\n\n")[0] ?? ""
+									? context.slice(start + CONTEXT_MARKER.length).split("\n\n")[0] ?? ""
 									: "";
 								let contextSummary = contextBlock
 									? contextBlock.split("\n").join(" ; ")

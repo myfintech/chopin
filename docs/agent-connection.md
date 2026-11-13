@@ -643,7 +643,7 @@ level can therefore never be chosen, and a turn never carries one.
   may define their own, spelled as they like. Chopin shows
   every level exactly as written, Atomic's own included (`xhigh`, not Extra high), its case
   unchanged, so that `xhigh` and `extra high`, `ß-fast` and `SS-fast`, and `high` and `High` are
-  each two levels a person can tell apart, and the turn carries the string they saw. The composer's own first step, which returns the level to the model's own, is called Default, or Model default where the model lists a level of that name, so no level shares its label. A model with none or an empty list has no reasoning control, and the composer
+  each two levels a person can tell apart, and the turn carries the string they saw. The composer lists only the model's levels, a level named `Default` among them, with the one that will run checked. A model with none or an empty list has no reasoning control, and the composer
   hides it. An empty string is not a level: it is dropped. Chopin sends back only a level the model
   listed.
 - **`inputTypes`** is what the model reads: `text`, and `image` where it reads images, as strings
@@ -653,8 +653,10 @@ level can therefore never be chosen, and a turn never carries one.
   `inputTypes`, an empty list, or no catalog at all reads as text only, so a client from before the
   field is never sent an image. A text file does not depend on it.
 - **`models.default`** is what the client runs when a turn names no model or no level. Its `id`
-  should be one of `available`; the composer shows that model as the document's current one until
-  somebody chooses another. An operator's `MODEL` takes its place when it is set. A default with an
+  should be one of `available`; the composer shows that model, and its `thinkingLevel` where the
+  model lists it, as the document's current ones until somebody chooses others. A person's pick
+  records a model and a level together where the catalog says which level runs, so a client should
+  report the `thinkingLevel` its default model runs at. An operator's `MODEL` takes its place when it is set. A default with an
   empty `id` is ignored, and an empty `thinkingLevel` is dropped from it.
 - **`commands`** is reserved for the commands a client offers, such as skills,
   prompt templates and workflows: `name`, `description` and `kind`, a string the client defines
@@ -1352,7 +1354,9 @@ not apply to it.
   same account attaching with a client that does not resume, which includes a browser
   sign-in attaching over a paired machine's parked work, since that client cannot
   resume it. All of these withdraw the questions and show the runs as `stopped`, and a
-  later `resume` finds nothing. A server restart does not end it: see below. A person
+  later `resume` finds nothing. Archiving stops the document's run cards itself, before it
+  releases the link, so they end even when the Planner is disconnected or a deploy is handing
+  over and its link reports nothing; an archived document always opens with its runs stopped. A server restart does not end it: see below. A person
   with write access can always end a disconnected Planner by resetting it.
 
 #### When the server is restarting
@@ -1420,9 +1424,13 @@ A returning client attaches, and sends `resume` as usual:
   sent, once. An answer given before the client is back waits and is sent after `resumed`; one
   given after goes straight to it. No turn of its own follows, because the question is waited
   on. A question a client resumes without, because it no longer waits on it, is withdrawn, as
-  `input-cancel` withdraws it. Each Stop held for the client is sent first. The client's
-  `runs` for a resumed session update nothing Chat shows until a Planner turn starts a session
-  of its own.
+  `input-cancel` withdraws it. Each Stop held for the client is sent first. No turn of the new
+  process opened a resumed session, yet it is the document's as before: its `runs` are Chat's
+  run cards, and a document that opens after the client is back shows them live, never stopped,
+  with what the client last reported. A question it asks after the restart, an `input-request`
+  on the resumed session, becomes Decisions as one asked before it did, and its answer goes to
+  that request; the document is opened for it if nobody has it open, and kept open until the
+  question ends.
 - **An answer its client is never given.** When the client that asked does not come back to
   resume (it attaches with nothing to resume, or resumes without the session), an answer a
   member had given meanwhile cannot reach its request. It reaches the Planner once, as a turn of
@@ -1644,3 +1652,47 @@ the answer leaves its document out. When a document is renamed, the poll's next
 answer names it at its new address; the connector shows that address in
 `chopin status` and its output, and starts the backend there next time, without
 restarting a backend that is running.
+
+### Plan sources
+
+A backend that writes files for a document revision (a specification, a proof, a
+schema) in `CHOPIN_WORKTREE` makes them reachable by a build by committing them on a
+branch, pushing it to the document's repository, and recording where at `/mcp`,
+with the MCP token in `CHOPIN_MCP_TOKEN_FILE`:
+
+```json
+{
+	"name": "record_plan_source",
+	"arguments": {
+		"id": "<document id or URL>",
+		"revision": 12,
+		"branch": "plans/<document id>",
+		"commit": "<40 hex characters>"
+	}
+}
+```
+
+`revision` is the document revision the files belong to, such as the one
+`update_document` returned; `branch` is a branch name git accepts, without
+`refs/heads/`; `commit` is the full SHA, already pushed. Chopin asks GitHub for the
+commit with the machine's own grant and keeps one source per revision, the newest
+20 revisions, beside the document; recording another commit for a revision replaces
+it, and the same one again changes nothing. It answers
+`{ "recorded": true, "revision", "branch", "commit" }`, or an error whose `code` is
+`invalid-plan-source` (a bad branch or SHA), `plan-source-unavailable` (GitHub has
+no such commit in the repository), `revision-conflict` with the document's current
+`revision` (one it has not reached), `document-archived`, `document-unavailable` or
+`repository-forbidden`. A server without the tool answers JSON-RPC error `-32601`.
+
+A build of the tasks drafted against revision R starts from the source recorded for
+the newest revision at or before R, instead of the builder's checkout or the default
+branch: its worktree is detached at that commit. Build checks the commit again with
+the building machine's grant as it is pressed, and refuses with
+`plan-source-unavailable` when GitHub no longer has it; a connector that cannot fetch
+it fails the build naming the commit. The build records the source, the Build tab
+says _Built from plan revision 12 at plans/…@1a2b3c4_, and its run's
+`read_implementation` returns it as `planSource`. A rebuild of a built document keeps
+the base it had unless a source was recorded for a revision after the one last built,
+which the rebuild then starts from. The Planner's `read_implementation_graph` returns
+the source for the current revision as `plan_source`. A document with no recorded
+source builds as before.

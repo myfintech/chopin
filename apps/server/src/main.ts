@@ -59,6 +59,7 @@ import { plannerAttachment } from "./chat/planner-attachment";
 import * as Initiative from "./chat/initiative";
 import * as Reactions from "./chat/reactions";
 import { respond as respondToReaction } from "./chat/reaction-reply";
+import { copiedFrom, reactInThread } from "./chat/thread-reactions";
 import { createChildDocuments } from "./chat/children";
 import { createRootChat } from "./chat/root";
 import { serverInstruction as runServerInstruction } from "./chat/server-instruction";
@@ -84,6 +85,7 @@ import { DocumentHistory } from "./channels/history";
 import * as Comments from "./comments/service";
 import { clientBuild, proxy, serve } from "./client";
 import { describe, load } from "./config";
+import { GitHubAppClient } from "./github/app";
 import { GitHubClient, GitHubError } from "./github/client";
 import { plannerWorkspace } from "./harness/atomic/workspace";
 import { GitHubReferences } from "./github/references";
@@ -132,7 +134,7 @@ import * as Explore from "./questions/explore";
 import { runningFindingRefs } from "./questions/service-findings";
 import { answerTurns } from "./questions/answer-turns";
 import { decisionGeneration } from "./questions/card-actions";
-import { rejoinInput } from "./harness/atomic/human-input";
+import { createHumanInput, rejoinInput } from "./harness/atomic/human-input";
 import type { RejoinHost } from "./harness/remote/link";
 import { deterministicChannelId } from "./channels/id";
 import type { Research as ResearchWire } from "@chopin/protocol";
@@ -431,6 +433,11 @@ function documentBackend(): Service.Backend {
 		},
 		liveBuild: !!config.liveBuild,
 		onBuildStopped: id => liveSync?.stopped(id),
+		onBuildNotice: (id, notice) => {
+			announceBuildNotice(id, notice).catch(err =>
+				console.error(`[build] could not post ${notice.id} in ${id}'s Chat:`, err)
+			);
+		},
 		onEditingUnlocked: createEditingUnlocked({
 			withDocumentLock,
 			opened: id => Rooms.get(id)?.plan,
@@ -525,8 +532,34 @@ function answerDecision(channelId: string, id: string, generation: number): void
  * members again, and an answer its client can never be given becomes a turn of its own.
  */
 function plannerQuestions(plan: Service.Plan, server: Server<SocketData>): RejoinHost {
+	let live = () => !plan.persistence.closing && !plan.chat.closed;
 	return {
 		join: (asked, signal) => rejoinInput({ id: plan.id, plan, server }, asked, signal),
+		live,
+		// A session a restart rebuilt asks and reports here as a retained session of this Chat would.
+		humanInput: (hold, report) =>
+			createHumanInput(
+				{ id: plan.id, plan, server, anchors: () => Service.anchors(plan, server, plan.id) },
+				hold,
+				report,
+			),
+		runs: (session, runs, down) => {
+			if (!live()) return;
+			void Chat.rebuiltRuns(
+				{
+					chat: plan.chat,
+					room: plan.id,
+					server,
+					persist: chat => Service.persist(plan, chat),
+					auth: hostedAuth,
+				},
+				session,
+				runs,
+				down,
+			).catch(err =>
+				console.error("chopin: could not show the workflow runs a restart kept -", err)
+			);
+		},
 		unsent: decisions => {
 			for (let id of decisions) {
 				let record = plan.records.get(id);
@@ -703,6 +736,19 @@ async function plan(room: Rooms.Room, server: Server<SocketData>): Promise<Servi
 	}
 }
 
+/** Who is in a document's conversation now; readers are not (see `Initiative.people`). */
+function conversationPeople(room: Rooms.Room, opened: Service.Plan): Set<string> {
+	if (Rooms.get(room.id) !== room || room.plan !== opened) return new Set();
+	return Initiative.people(opened.chat, room.members.values());
+}
+
+/** Tells a document's Chat when one person is left in its conversation, or a second arrives. */
+function announceAlone(room: Rooms.Room): void {
+	let opened = room.plan;
+	if (!opened || opened.parentChannelId || room.closing) return;
+	Initiative.announceAlone(opened.chat, server, room.id, conversationPeople(room, opened));
+}
+
 function chat(room: Rooms.Room, ws: Socket): Chat.Room {
 	return conversation(room, ws.data.sessionId, {
 		id: ws.data.repositoryId,
@@ -738,6 +784,8 @@ function conversation(
 					&& Initiative.actor(member) === actor
 				);
 		},
+		people: () => conversationPeople(room, opened),
+		peopleChanged: () => announceAlone(room),
 		initiativeAuthorize: async (sessionId, actor) => {
 			let member = [...room.members.values()].find(member =>
 				!member.data.closed && member.data.sessionId === sessionId
@@ -1288,6 +1336,7 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 				let opened = await plan(room, server);
 				let currentChannel = await storage.channels.get(room.id);
 				if (currentChannel) applyChannelAccess(ws, currentChannel, ws.data.canManage);
+				announceAlone(room);
 				implementations?.track(room.id);
 				let parent = room.parentChannelId;
 				// Who the document names but the room does not hold, ahead of the frames that name them.
@@ -1538,7 +1587,11 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 			if (!await plannerWritable(room, ws, frame.rid, false)) return;
 			{
 				let context = chat(room, ws);
-				await Reactions.react(context, ws, frame, reacted => respondToReaction(context, reacted));
+				let thread = frame.thread ?? copiedFrom(context, frame.id);
+				if (thread !== undefined) await reactInThread(context, ws, { ...frame, thread });
+				else {
+					await Reactions.react(context, ws, frame, reacted => respondToReaction(context, reacted));
+				}
 			}
 			return;
 
@@ -2049,6 +2102,7 @@ function openRoomSocket(ws: Socket): void {
 		})().catch(err => console.error("chopin: could not start a document's Planner -", err));
 	}
 	relay(ws, { kind: "session:presence", ts: 0, members: Rooms.members(room) });
+	announceAlone(room);
 	scheduleAuthorization(ws);
 	void validateOpenedSocket(ws).catch(err => {
 		console.error("chopin: WebSocket open failed -", err);
@@ -2065,6 +2119,7 @@ function closeRoomSocket(ws: Socket): void {
 	if (room.plan) {
 		room.plan.chat.initiative?.depart(ws.data.client);
 		if (!room.members.size) room.plan.chat.initiative?.cancel();
+		announceAlone(room);
 		Service.departed(room.plan, ws);
 		Questions.away(room.plan, ws);
 		conversationRuntime.processor(room.plan)?.leaveResearch(ws.data.client);
@@ -2481,6 +2536,14 @@ async function archiveChannelLocked(channelId: string, now: Date) {
 				await stopped;
 				await conversationRuntime.interrupt(active);
 				await Service.drain(active);
+				// Its runs end with it, whatever its Planner's link is doing: attached, disconnected
+				// with its work kept, or between two processes of a deploy, which report nothing.
+				await Chat.endRuns({
+					chat: active.chat,
+					room: channelId,
+					server,
+					persist: chat => Service.persist(active, chat),
+				});
 				await Service.persist(active);
 			}
 			return storage.channels.archive({ id: channelId, now });
@@ -2673,6 +2736,32 @@ function announceResearchTerminal(channelId: string, id: string, text: string): 
 				id,
 				existing?.text ?? text,
 			);
+		} finally {
+			await Service.close(detached);
+		}
+	});
+}
+
+/**
+ * A build's line in Chat, after the change it reports was persisted. It waits for the document lock
+ * the report may still hold, then posts on the open room, or on the document opened for it.
+ */
+function announceBuildNotice(
+	channelId: string,
+	notice: { id: string; text: string },
+): Promise<void> {
+	if (cutting) return Promise.resolve();
+	return withDocumentLock(channelId, async () => {
+		let post = (plan: Service.Plan) =>
+			Chat.noticeOnce({ chat: plan.chat, plan, server, room: channelId }, notice.id, notice.text);
+		let active = Rooms.get(channelId)?.plan;
+		if (active) {
+			await post(active);
+			return;
+		}
+		let detached = await Service.open(channelId, documentBackend(), server);
+		try {
+			await post(detached);
 		} finally {
 			await Service.close(detached);
 		}
@@ -2974,6 +3063,7 @@ let machinePlanners = config.agent && config.harness === "remote"
 	? new MachinePlanners(hostedAuth)
 	: undefined;
 experiments = registerExperimentRoutes(router, hostedAuth, {
+	...(config.auth.app ? { app: new GitHubAppClient(config.auth.app) } : {}),
 	planners: machinePlanners,
 	attachments: () => plannerAttachments,
 	documentOpen: id => Rooms.all().some(room => room.id === id || room.parentChannelId === id),
@@ -3039,6 +3129,25 @@ if (config.agent && config.harness === "remote") {
 				},
 			},
 		}),
+		// A question a rebuilt hold's client asks keeps its document open until it is answered.
+		openDocument: async channelId => {
+			if (deletingChannels.has(channelId) || archivingChannels.has(channelId)) {
+				throw new Error("document is unavailable");
+			}
+			await Rooms.get(channelId)?.closing;
+			let held = Rooms.hold(channelId);
+			let release = () => {
+				held.release();
+				evict(held.room);
+			};
+			try {
+				await plan(held.room, server);
+			} catch (err) {
+				release();
+				throw err;
+			}
+			return release;
+		},
 		restoredRuns: (channelId, outcome) => {
 			let room = Rooms.get(channelId);
 			let opened = room?.plan;
@@ -3259,6 +3368,7 @@ registerMcpRoutes(router, hostedAuth, {
 			systemTurns,
 		}, input),
 	plannerNotAttached,
+	...(experiments ? { launchCaller: experiments.mcpCaller } : {}),
 	archiveChannel,
 	isChannelDeleting: channelId => deletingChannels.has(channelId),
 	onChannelRenamed: announceChannel,
@@ -3283,6 +3393,7 @@ implementations = registerImplementationRoutes(router, hostedAuth, {
 	refuseOffline: experiments.refuseOffline,
 	takers: experiments.takers,
 	mayTake: experiments.mayTake,
+	identity: experiments.identity,
 	machineChoices: experiments.machineChoices,
 	sourceFor: experiments.sourceFor,
 	busy: async connectionId =>
