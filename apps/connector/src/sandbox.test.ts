@@ -9,6 +9,7 @@ import {
 	realpathSync,
 	renameSync,
 	rmSync,
+	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -16,13 +17,16 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { sandboxLabel } from "@chopin/protocol/connector";
 import type { Host } from "./sandbox-probe";
+import { mxcRequest } from "./sandbox-policy";
 import {
 	createSandbox,
 	inspectSandbox,
+	LAUNCHER,
 	launchPolicy,
 	locateExecutor,
 	SandboxRefused,
 	sdkRoot,
+	sealedEnvironment,
 	spawnIn,
 	systemHost,
 } from "./sandbox";
@@ -697,6 +701,40 @@ test("a launch whose working directory holds the connector's state directory, as
 	}
 });
 
+test("what the owner hides with --sandbox-hide is in no grant, read or write, even inside a folder they let agents write, and is denied besides", () => {
+	let root = join(readableScratch, "hidden");
+	let home = join(root, "home");
+	let base = join(home, ".local", "state", "chopin", "connector");
+	let tool = join(home, ".tool");
+	mkdirSync(base, { recursive: true });
+	mkdirSync(join(tool, "cache"), { recursive: true });
+	writeFileSync(join(tool, "github-token"), "a sign-in of the tool's own");
+	writeFileSync(join(tool, "settings.json"), "{}");
+	mkdirSync(join(root, "work"), { recursive: true });
+	for (let platform of ["linux", "darwin"] as const) {
+		let policy = launchPolicy(
+			platform === "darwin" ? "seatbelt" : "bubblewrap",
+			{ ...systemHost(), platform },
+			{ command: ["agent", "planner"], cwd: join(root, "work"), env: {}, stdin: "ignore" },
+			{
+				directory: base,
+				home,
+				settings: { writable: [tool], hidden: [join(tool, "github-token")] },
+			},
+			"http://127.0.0.1:4000",
+			join(root, "tmp"),
+		);
+		let secret = join(tool, "github-token");
+		for (let path of [...policy.readable, ...policy.writable]) {
+			expect(secret === path || secret.startsWith(`${path}/`), `${platform}: ${path}`).toBe(false);
+		}
+		// What is beside it in the folder is still written, and it is denied as a secret is.
+		expect(policy.writable, platform).toContain(join(tool, "cache"));
+		expect(policy.writable, platform).toContain(join(tool, "settings.json"));
+		expect(policy.denied, platform).toContain(secret);
+	}
+});
+
 test("a working directory inside the state directory is read by name only where it is a clone the connector made, and not at all elsewhere in it", () => {
 	let root = join(readableScratch, "inside");
 	let base = join(root, "state");
@@ -836,4 +874,46 @@ test("the SDK package is found by walking up node_modules, never by a resolver t
 	writeFileSync(join(nested, "package.json"), "{}");
 	mkdirSync(join(scratch, "app", "src", "deep"), { recursive: true });
 	expect(sdkRoot(join(scratch, "app", "src", "deep"))).toBe(nested);
+});
+
+test("on Linux and macOS a launch's environment goes to the sandbox in a 0600 file its shell reads, never on a command line; Windows passes it as it did", () => {
+	let folder = mkdtempSync(join(scratch, "sealed-"));
+	let policy = {
+		platform: "linux" as NodeJS.Platform,
+		engine: "bubblewrap" as const,
+		command: ["agent", "--acp"],
+		cwd: folder,
+		env: {
+			PATH: "/usr/bin",
+			CHOPIN_PLANNER_TOKEN: "chopin_p_secret",
+			QUOTED: "it's",
+			HTTPS_PROXY: "http://person:password@proxy:8080",
+			"ODD.NAME": "x",
+			GONE: undefined,
+		},
+		readable: [],
+		writable: [],
+		denied: [],
+		proxy: "http://127.0.0.1:1",
+	};
+	let sealed = sealedEnvironment(policy, folder);
+	let file = join(folder, ".chopin-launch-environment");
+	expect(sealed.command).toEqual(["/bin/sh", "-c", LAUNCHER, "chopin-launch", "agent", "--acp"]);
+	// The only values left for MXC's command line: the search path, the file, and a name no shell
+	// can export.
+	expect(sealed.env).toEqual({
+		PATH: "/usr/bin",
+		CHOPIN_LAUNCH_ENVIRONMENT: file,
+		"ODD.NAME": "x",
+	});
+	expect(JSON.stringify(mxcRequest(sealed))).not.toContain("chopin_p_secret");
+	// The person's proxy neither reaches the command line nor replaces the one MXC sets.
+	expect(readFileSync(file, "utf8")).toBe(
+		"PATH='/usr/bin'\nCHOPIN_PLANNER_TOKEN='chopin_p_secret'\nQUOTED='it'\\''s'\n",
+	);
+	expect(statSync(file).mode & 0o777).toBe(0o600);
+	expect(sealedEnvironment({ ...policy, platform: "win32" }, folder)).toEqual({
+		...policy,
+		platform: "win32",
+	});
 });
