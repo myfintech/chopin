@@ -264,6 +264,90 @@
 			],
 			[
 				"color",
+				"--color-plum-1",
+				"oklch(0.2 0.012 305)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-plum-2",
+				"oklch(0.225 0.02 305)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-plum-3",
+				"oklch(0.27 0.05 305)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-plum-4",
+				"oklch(0.31 0.07 305)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-plum-5",
+				"oklch(0.35 0.08 305)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-plum-6",
+				"oklch(0.4 0.09 305)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-plum-7",
+				"oklch(0.46 0.11 304)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-plum-8",
+				"oklch(0.54 0.14 303)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-plum-9",
+				"oklch(0.64 0.17 301)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-plum-10",
+				"oklch(0.69 0.16 301)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-plum-11",
+				"oklch(0.8 0.11 302)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
+				"--color-plum-12",
+				"oklch(0.92 0.04 305)",
+				"CSS > :root[data-theme=\"dark\"]",
+				1
+			],
+			[
+				"color",
 				"--color-gray-50",
 				"oklch(0.25 0.006 95)",
 				"CSS > :root[data-theme=\"dark\"]",

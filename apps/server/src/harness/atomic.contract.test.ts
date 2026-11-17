@@ -214,15 +214,20 @@ describe("atomic HarnessV1 lifecycle", () => {
 	}
 
 	it("leaves no working directory behind when closed while its first turn is still setting up", async () => {
-		let planners = async () =>
-			new Set((await readdir(tmpdir())).filter(name => name.startsWith("chopin-atomic-planner-")));
-		let before = await planners();
-		let session = await start();
-		let turn = session.doPromptTurn({ prompt: "plain", skills: [], tools: [], emit: () => {} });
-		await session.doDestroy();
-		await expect(turn).rejects.toThrow("Atomic session is closed.");
-		let left = [...await planners()].filter(name => !before.has(name));
-		expect(left).toEqual([]);
+		let root = await mkdtemp(join(tmpdir(), "chopin-atomic-root-"));
+		try {
+			let session = await createStubAtomic({ tempRoot: root }).doStart({
+				sessionId: crypto.randomUUID(),
+				sandboxSession: {} as HarnessV1StartOptions["sandboxSession"],
+				sessionWorkDir: "/workspace",
+			});
+			let turn = session.doPromptTurn({ prompt: "plain", skills: [], tools: [], emit: () => {} });
+			await session.doDestroy();
+			await expect(turn).rejects.toThrow("Atomic session is closed.");
+			expect(await readdir(root)).toEqual([]);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("settles a pending host tool on abort and ignores a late result", async () => {
@@ -278,6 +283,53 @@ describe("atomic HarnessV1 lifecycle", () => {
 			await expect(
 				session.doContinueTurn({ skills: [], tools: [HOST_TOOL], emit: second.emit }),
 			).rejects.toBeInstanceOf(HarnessCapabilityUnsupportedError);
+		} finally {
+			await session.doDestroy();
+		}
+	});
+
+	it("gives a running turn a person's message, which the model reads as its next input", async () => {
+		stub.requests.length = 0;
+		let session = await start();
+		let first = recorder();
+		try {
+			let control = await session.doPromptTurn({
+				prompt: "tools",
+				skills: [],
+				tools: [HOST_TOOL],
+				emit: first.emit,
+			});
+			let toolCallId = await first.called;
+			// Between the step's tool call and its result: the message waits for the step to end.
+			await control.submitUserMessage!("@bo: Also say what it costs.");
+			await control.submitToolResult({ toolCallId, output: "ok" });
+			await control.done;
+		} finally {
+			await session.doDestroy();
+		}
+		expect(stub.requests.map(request => request.prompt)).toEqual([
+			"tools",
+			"@bo: Also say what it costs.",
+		]);
+		expect(stub.requests[1]!.hasPriorToolResult).toBe(true);
+	});
+
+	it("refuses a message once the turn is over, and starts no turn of its own for it", async () => {
+		stub.requests.length = 0;
+		let session = await start();
+		try {
+			let control = await session.doPromptTurn({
+				prompt: "plain",
+				skills: [],
+				tools: [],
+				emit: () => {},
+			});
+			await control.done;
+			await expect(control.submitUserMessage!("@bo: too late")).rejects.toThrow(
+				"The turn is not running.",
+			);
+			await Bun.sleep(100);
+			expect(stub.requests.map(request => request.prompt)).toEqual(["plain"]);
 		} finally {
 			await session.doDestroy();
 		}

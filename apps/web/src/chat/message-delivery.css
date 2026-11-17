@@ -1,0 +1,41 @@
+/* A person's own message: a quiet word while only this browser has it, and what a refused one says. */
+.chat-delivery {
+	flex: none;
+	font-size: var(--text-xs);
+	color: var(--color-text-tertiary);
+	/* A message the server answers at once never shows it. */
+	animation: chat-delivery-in var(--duration-fast) var(--ease-out) var(--duration-linger) both;
+}
+
+@keyframes chat-delivery-in {
+	from {
+		opacity: 0;
+	}
+}
+
+.chat-message-failed {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: flex-start;
+	gap: 0.25rem 0.5rem;
+	margin-top: 0.25rem;
+	font-size: var(--text-sm);
+	color: var(--color-text-secondary);
+}
+
+.chat-message-failed-icon {
+	flex: none;
+	--color-icon: var(--color-danger-icon);
+}
+
+.chat-message-failed-text {
+	flex: 1 1 12rem;
+	min-width: 0;
+	margin: 0;
+	overflow-wrap: anywhere;
+}
+
+.chat-message-failed-title {
+	font-weight: 600;
+	color: var(--color-destructive-ink);
+}

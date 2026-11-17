@@ -101,6 +101,51 @@ const MIGRATIONS = [{
 	id: "026_workflow_run_stages",
 	path: join(import.meta.dir, "migrations/026_workflow_run_stages.sql"),
 }, {
+	id: "027_decision_answers",
+	path: join(import.meta.dir, "migrations/027_decision_answers.sql"),
+}, {
+	id: "028_machine_sharing",
+	path: join(import.meta.dir, "migrations/028_machine_sharing.sql"),
+}, {
+	id: "029_planner_link_holds",
+	path: join(import.meta.dir, "migrations/029_planner_link_holds.sql"),
+}, {
+	id: "030_planner_credentials",
+	path: join(import.meta.dir, "migrations/030_planner_credentials.sql"),
+}, {
+	id: "031_planner_deferred_turns",
+	path: join(import.meta.dir, "migrations/031_planner_deferred_turns.sql"),
+}, {
+	id: "032_mcp_sessions",
+	path: join(import.meta.dir, "migrations/032_mcp_sessions.sql"),
+}, {
+	id: "033_planner_hold_machine_owner",
+	path: join(import.meta.dir, "migrations/033_planner_hold_machine_owner.sql"),
+}, {
+	id: "034_planner_model_choices",
+	path: join(import.meta.dir, "migrations/034_planner_model_choices.sql"),
+}, {
+	id: "035_planner_model_name",
+	path: join(import.meta.dir, "migrations/035_planner_model_name.sql"),
+}, {
+	id: "036_chat_attachments",
+	path: join(import.meta.dir, "migrations/036_chat_attachments.sql"),
+}, {
+	id: "037_chat_threads",
+	path: join(import.meta.dir, "migrations/037_chat_threads.sql"),
+}, {
+	id: "038_plan_image_sizes",
+	path: join(import.meta.dir, "migrations/038_plan_image_sizes.sql"),
+}, {
+	id: "039_plan_image_types",
+	path: join(import.meta.dir, "migrations/039_plan_image_types.sql"),
+}, {
+	id: "040_chat_attachment_originals",
+	path: join(import.meta.dir, "migrations/040_chat_attachment_originals.sql"),
+}, {
+	id: "041_document_full_width",
+	path: join(import.meta.dir, "migrations/041_document_full_width.sql"),
+}, {
 	id: "mantl_user_preferences",
 	path: join(import.meta.dir, "migrations/mantl_user_preferences.sql"),
 }, {

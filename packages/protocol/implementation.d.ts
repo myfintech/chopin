@@ -4,10 +4,18 @@ import type { Plan } from "./plan";
 type KIND<K extends string> = Frame & { kind: K };
 
 export type CheckoutContext = { repository: string; branch?: string; commit: string };
+/** Where a plan revision's files were pushed: a branch and the commit on it that holds them. */
+export type PlanSource = { revision: number; branch: string; commit: string };
 export type BuildRequest = {
 	id: string;
 	retryOf?: string;
+	/** The person who asked for the build. */
 	user: string;
+	/**
+	 * Whose machine runs it, when it is not `user`'s: the owner of the teammate's shared machine
+	 * `user` chose for the document. That machine runs the agent with its owner's GitHub account.
+	 */
+	machineOwner?: string;
 	connectionId: string;
 	/** The paired machine it runs on; builds stored before machines were recorded have none. */
 	machineId?: string;
@@ -15,6 +23,11 @@ export type BuildRequest = {
 	machineService?: true;
 	repositoryId: string;
 	checkout: CheckoutContext;
+	/**
+	 * The commit holding the plan's files that the Planner pushed for plan revision `revision`,
+	 * which `checkout` starts from; absent when the build started from the builder's checkout.
+	 */
+	planSource?: PlanSource;
 	planRevision: number;
 	graphVersion: number;
 	graphRevision: number;
@@ -29,6 +42,8 @@ export type BuildRequest = {
 	activity?: { text: string; at: string };
 	/** A human Stop suppresses automatic work for edits up through this document revision. */
 	stoppedAtRevision?: number;
+	/** The login of the person who pressed Stop in Chopin, for builds stopped since it was recorded. */
+	stoppedBy?: string;
 	/** The connector's key for the report that set `state`, so a retry of it is recognized. */
 	reportKey?: string;
 	/**
@@ -49,7 +64,13 @@ export type LiveSnapshot = {
 	/** The builder's checkout; sent only to the builder. */
 	checkout?: CheckoutContext;
 	baseRevision: number;
+	/** The pull requests builds keep up to date: open ones, as far as Chopin knows. */
 	pullRequests: string[];
+	/**
+	 * Pull requests a person closed or merged on GitHub. Builds never push to them again; their
+	 * work goes on new pull requests.
+	 */
+	closedPullRequests?: Array<{ url: string; state: "closed" | "merged"; at: string }>;
 	/** Tasks the first build stopped short of; the next rebuild finishes them. */
 	outstanding?: string[];
 	/**
@@ -97,6 +118,8 @@ export type LiveSnapshot = {
 export type BuildMachine = {
 	/** The machine's paired name, as its owner last renamed it. */
 	label: string;
+	/** Whose machine it is, when it is a teammate's shared machine the build's starter chose. */
+	owner?: string;
 	/** It ran as a background service rather than an interactive session. */
 	service: boolean;
 	/**
@@ -141,7 +164,10 @@ export type ImplementationSnapshot = {
 	blockers: string[];
 	/** Required investigations, with concrete reasons; completion still needs evidence review. */
 	buildInvestigations?: Array<{ id: string; brief: string; reason: string }>;
-	/** No unresolved decisions, accepted changes, or required investigations. */
+	/**
+	 * No accepted changes awaiting plan changes and no required investigations. Open decisions never
+	 * make it false.
+	 */
 	buildReady: boolean;
 	/** `build` is queued on a connection that starts it once its running prototype finishes. */
 	waitingForPrototype?: true;
@@ -152,7 +178,7 @@ export type ImplementationSnapshot = {
 	waitingForDocument?: { title?: string };
 	/**
 	 * A one-click Build plan is waiting for its tasks: `by` (a user id) pressed it at `revision`.
-	 * It holds through open decisions and reloads until the build starts or is cancelled.
+	 * It survives a reload, and any blocker that remains, until the build starts or is cancelled.
 	 */
 	buildRequested?: { by: string; revision: number };
 	lifecycle: Pick<Plan.Lifecycle, "execution" | "activity" | "history">;
@@ -165,7 +191,8 @@ export type ImplementationSnapshot = {
  * Opening Build asks for them. The request starts a Planner turn without a
  * member message: Chat records only a system notice of who asked, as it does
  * for an accepted comment. One request per document is live at a time;
- * asking again while it is queued or running returns it.
+ * asking again while it is running returns it. A request made while another turn runs is
+ * refused, not held.
  */
 export declare namespace Implementation {
 	export type Incoming = Request<Draft>;
@@ -185,7 +212,7 @@ export declare namespace Implementation {
 	export type Drafted = KIND<"implementation:draft"> & {
 		id: string;
 		planRevision: number;
-		state: "queued" | "running" | "ended";
+		state: "running" | "ended";
 		existing: boolean;
 	};
 
@@ -193,7 +220,7 @@ export declare namespace Implementation {
 	export type Drafting = KIND<"implementation:drafting"> & {
 		id: string;
 		planRevision: number;
-		state: "queued" | "running" | "ended";
+		state: "running" | "ended";
 	};
 
 	/** Broadcast when a document's build readiness judgement changes; read the snapshot again. */

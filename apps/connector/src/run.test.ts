@@ -11,18 +11,25 @@ import {
 	stat,
 	writeFile,
 } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { serveWork } from "./connection";
 import { createOutput } from "./output";
 import { processesIn } from "./processes";
 import { checkouts } from "./checkouts";
-import { runWork, STOPPED } from "./run";
+import { BUILD_LIMIT_MS, INVESTIGATION_LIMIT_MS, runWork, STOPPED } from "./run";
+import { timedOut } from "./acp";
 import { git } from "./workspace";
 import { ConnectorError, remote } from "./mcp";
+import { register } from "./machine";
+import { BOT, STARTER, testGitHubToken } from "./testing/github-grant";
+import { githubRefusal } from "./github-token";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 /** Run one implementation claim against a fixture repository and record connector calls. */
 async function run(
@@ -80,6 +87,7 @@ async function run(
 			url: "http://127.0.0.1:1",
 			signal,
 			heartbeatMs: 20,
+			github: request => testGitHubToken(request.folder),
 			...options,
 		});
 		await inspect?.({ root, state, id });
@@ -117,6 +125,40 @@ test("the controller keeps the claimed document on every rebuild renewal and sta
 	let { documentId, sent } = await run({ kind: "rebuild" }, ["--rebuild", "--slow"]);
 	expect(sent.some(([name]) => name === "renew_implementation_build")).toBe(true);
 	for (let [, args] of sent) expect(args.documentId).toBe(documentId);
+});
+
+test("a build whose agent runs past its limit says so in Chopin, the terminal and its journal", async () => {
+	let err = "";
+	let journal: Record<string, unknown> | undefined;
+	let output = createOutput(
+		{ write: () => true } as never,
+		{ write: (text: string) => (err += text, true) } as never,
+		{ NO_COLOR: "1" },
+	);
+	let { id, calls } = await run(
+		{},
+		["--hang"],
+		() => ({}),
+		undefined,
+		{ buildLimitMs: 300, output },
+		async ({ state, id }) => {
+			journal = JSON.parse(await readFile(join(state, "runs", `${id}.json`), "utf8"));
+		},
+	);
+	let said = "Its agent ran for less than a minute, so chopin stopped it.";
+	expect(calls.filter(([name]) => name !== "renew_implementation_build").at(-1)).toEqual([
+		"report_implementation_build",
+		{ id, state: "failed", error: said },
+	]);
+	expect(err).toContain(`Failed: ${said}`);
+	expect(err).not.toContain("Investigation");
+	expect(journal).toMatchObject({ state: "finished", outcome: { state: "failed", error: said } });
+});
+
+test("a build gets hours to work, an investigation one", async () => {
+	expect(BUILD_LIMIT_MS).toBeGreaterThan(INVESTIGATION_LIMIT_MS);
+	expect(timedOut(BUILD_LIMIT_MS)).toBe("Its agent ran for 4 hours, so chopin stopped it.");
+	expect(timedOut(INVESTIGATION_LIMIT_MS)).toBe("Its agent ran for 1 hour, so chopin stopped it.");
 });
 
 test("a living document's first build gets a prompt without verification or revision", async () => {
@@ -233,6 +275,7 @@ test.each([true, false])(
 				url: `http://127.0.0.1:${chopin.port}`,
 				signal: new AbortController().signal,
 				output: terminal.output,
+				github: request => testGitHubToken(request.folder),
 			});
 			expect(terminal.out()).toContain(
 				spike
@@ -629,6 +672,235 @@ test("a build keeps its agent through a server restart and its heartbeat is hear
 	expect(calls.at(-1)?.[1]).toMatchObject({ state: "failed", error: STOPPED });
 });
 
+test("a run out of reach says it is still trying at most every 10 seconds, then how long it was", async () => {
+	let terminal = captured();
+	let abort = new AbortController();
+	// The fake clock moves four seconds with each heartbeat.
+	let clock = 0;
+	let renewals = 0;
+	let down = false;
+	let token = "chopin_r_secretsecretsecretsecret";
+	await run(
+		{},
+		["--hang"],
+		name => {
+			if (name === "renew_implementation_build") {
+				clock += 4000;
+				renewals++;
+				// Chopin answers the first heartbeat, then nothing for eleven, then answers again.
+				down = renewals > 1 && renewals <= 12;
+				if (renewals === 11) {
+					throw new StreamableHTTPError(502, `Bad gateway for Bearer ${token}`);
+				}
+				if (renewals === 13) abort.abort();
+			}
+			if (down) throw unreachable();
+			return { accepted: true };
+		},
+		abort.signal,
+		{ random: () => 0.01, now: () => clock, output: terminal.output },
+	);
+	let lines = terminal.out().split("\n").filter(line => /Chopin/.test(line));
+	expect(lines).toEqual([
+		"  … Lost contact with Chopin. The agent keeps working; reports wait until it is back.",
+		"  … Still trying to reach Chopin (attempt 3, 12 s, ConnectionRefused), the run keeps going.",
+		"  … Still trying to reach Chopin (attempt 6, 24 s, ConnectionRefused), the run keeps going.",
+		"  … Still trying to reach Chopin (attempt 9, 36 s, HTTP 502), the run keeps going.",
+		"  ✓ Back in contact with Chopin after 44 s.",
+	]);
+	expect(terminal.out() + terminal.err()).not.toContain(token);
+});
+
+/**
+ * A build served as `chopin connect` serves it, each connection registering this machine and
+ * then opening MCP, against a fake Chopin whose tools may take as long as they like. `gateway`
+ * answers a request instead of Chopin when it returns a response, as a proxy in front of a Chopin
+ * that went away does. Serving ends when `abort` aborts; work polls after the first offer go to
+ * `tool` and then wait.
+ */
+async function connected(options: {
+	tool: (name: string, args: Record<string, unknown>) => unknown;
+	gateway?: (request: Request, name?: string) => Response | undefined;
+	flags: string[];
+	/** More of the claim, such as `live` for a living document's first build. */
+	claim?: Record<string, unknown>;
+	abort: AbortController;
+	runOptions?: Partial<Parameters<typeof runWork>[3]>;
+}) {
+	let root = await mkdtemp(join(tmpdir(), "chopin-connected-"));
+	let state = await mkdtemp(join(tmpdir(), "chopin-connected-state-"));
+	let id = crypto.randomUUID();
+	let offered = false;
+	let registrations = 0;
+	let terminal = captured();
+	let server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch(request) {
+			let message = await request.clone().json().catch(() => undefined) as
+				| { params?: { name?: string } }
+				| undefined;
+			let answer = options.gateway?.(request, message?.params?.name);
+			if (answer) return answer;
+			if (new URL(request.url).pathname === "/api/connector/connections") {
+				return Response.json({ token: `connection-${++registrations}` });
+			}
+			let mcp = new Server({ name: "fake-chopin", version: "1" }, { capabilities: { tools: {} } });
+			mcp.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [] }));
+			mcp.setRequestHandler(CallToolRequestSchema, async request => {
+				let name = request.params.name;
+				let args = request.params.arguments ?? {};
+				// The work poll offers the build once, then hears of any later poll and waits.
+				let value: unknown = name === "wait_for_work"
+					? offered
+						? (await options.tool(name, args), await new Promise(() => {}))
+						: (offered = true, { id, kind: "implementation" })
+					: name === "claim_implementation_build"
+					? {
+						build: {
+							id,
+							repositoryId: "R_repo",
+							checkout: { repository: "org/repo", commit: git(root, "rev-parse", "HEAD") },
+						},
+						documentId: "document",
+						runToken: "run-token",
+						...options.claim,
+					}
+					: await options.tool(name, args);
+				return { content: [{ type: "text", text: JSON.stringify(value ?? {}) }] };
+			});
+			let transport = new WebStandardStreamableHTTPServerTransport({
+				sessionIdGenerator: undefined,
+				enableJsonResponse: true,
+			});
+			await mcp.connect(transport);
+			return transport.handleRequest(request);
+		},
+	});
+	let url = `http://127.0.0.1:${server.port}`;
+	try {
+		git(root, "init");
+		git(root, "config", "user.name", "Fixture");
+		git(root, "config", "user.email", "fixture@example.test");
+		git(root, "remote", "add", "origin", "git@github.com:org/repo.git");
+		await writeFile(join(root, "source.txt"), "committed");
+		git(root, "add", ".");
+		git(root, "commit", "-m", "fixture");
+		let signal = options.abort.signal;
+		await serveWork({
+			connect: async signal => {
+				let registration = await register(
+					url,
+					"machine-token",
+					{ label: "box", checkouts: [] },
+					signal,
+				);
+				return remote(url, registration.token, signal);
+			},
+			signal,
+			output: terminal.output,
+			random: () => 0.01,
+			run: (api, kind, claim) =>
+				runWork(api, kind, claim, {
+					checkouts: checkouts({ directory: state, registered: { "org/repo": root } }),
+					directory: state,
+					command: [
+						process.execPath,
+						new URL("./testing/fake-implementer.ts", import.meta.url).pathname,
+						...options.flags,
+					],
+					url,
+					signal,
+					output: terminal.output,
+					heartbeatMs: 20,
+					random: () => 0.01,
+					github: request => testGitHubToken(request.folder),
+					...options.runOptions,
+				}),
+		});
+		return { registrations, out: terminal.out };
+	} finally {
+		await server.stop(true);
+		await rm(root, { recursive: true, force: true });
+		await rm(state, { recursive: true, force: true });
+	}
+}
+
+// The outage waits for the agent's session, which a busy runner can be slow to start.
+test(
+	"a run behind a gateway answering 502 with no body says HTTP 502 while it retries",
+	async () => {
+		let abort = new AbortController();
+		// The fake clock moves four seconds with each request the gateway refuses.
+		let clock = 0;
+		let reported = false;
+		let refused = 0;
+		let down = false;
+		let { out } = await connected({
+			flags: ["--hang"],
+			abort,
+			runOptions: { now: () => clock },
+			tool(name) {
+				if (name === "report_implementation_build") reported = true;
+				if (name !== "renew_implementation_build") return {};
+				// Chopin goes away only once it has heard the agent's session, so every request it
+				// refuses is a heartbeat's: a session report retried during the outage would move the
+				// clock too. Once it is back the run ends.
+				if (refused) abort.abort();
+				else if (reported) down = true;
+				return { accepted: true };
+			},
+			// A proxy such as Caddy answers for a Chopin that went away with 502 and Content-Length
+			// 0, both the heartbeat on the open connection and each registration that follows.
+			gateway(request, name) {
+				let registering = new URL(request.url).pathname === "/api/connector/connections";
+				if (!down || !registering && name !== "renew_implementation_build") return;
+				clock += 4000;
+				if (++refused === 8) down = false;
+				return new Response(null, { status: 502 });
+			},
+		});
+		let lines = out().split("\n").filter(line => /Chopin/.test(line));
+		expect(lines).toEqual([
+			"  … Lost the connection to Chopin during a run (HTTP 502). Registering this machine again; "
+			+ "the agent keeps working.",
+			"  … Lost contact with Chopin. The agent keeps working; reports wait until it is back.",
+			"  … Still trying to reach Chopin (attempt 3, 12 s, HTTP 502), the run keeps going.",
+			"  … Still trying to reach Chopin (attempt 6, 24 s, HTTP 502), the run keeps going.",
+			"  ✓ Registered this machine with Chopin again; the run goes on.",
+			"  ✓ Back in contact with Chopin after 28 s.",
+		]);
+	},
+	10_000,
+);
+
+test("a heartbeat in flight when a run finishes is cancelled without losing the connection", async () => {
+	let abort = new AbortController();
+	let heartbeat = Promise.withResolvers<void>();
+	let { registrations, out } = await connected({
+		flags: ["--live"],
+		claim: { live: true },
+		abort,
+		tool(name, args) {
+			// Chopin is slow to answer a heartbeat, which is still in flight as the run finishes.
+			if (name === "renew_implementation_build") {
+				heartbeat.resolve();
+				return new Promise(() => {});
+			}
+			if (name === "report_implementation_build" && args.state === "stopped") {
+				return heartbeat.promise.then(() => ({ accepted: true }));
+			}
+			// The connector polls for its next work once the run is over.
+			if (name === "wait_for_work") abort.abort();
+			return {};
+		},
+	});
+	let lines = out().split("\n").filter(line => /Chopin|Finished/.test(line));
+	expect(lines).toEqual(["  ✓ Finished"]);
+	// The next poll went over the same connection rather than registering this machine again.
+	expect(registrations).toBe(1);
+});
+
 test("a run out of reach for its whole grace period stops its agent", async () => {
 	let { id, calls } = await run(
 		{},
@@ -712,6 +984,81 @@ test("a run Chopin has ended stops its agent at once", async () => {
 		state: "failed",
 		error: "Chopin ended this run (build-inactive).",
 	}]);
+});
+
+/** The run's journal, read before the run's folders are removed. */
+function journalOf(into: { value?: Record<string, unknown> }) {
+	return async ({ state, id }: { state: string; id: string }) => {
+		into.value = JSON.parse(await readFile(join(state, "runs", `${id}.json`), "utf8"));
+	};
+}
+
+test("a build a person stopped in Chopin says who stopped it, as a stop and not a failure", async () => {
+	let terminal = captured();
+	let journal: { value?: Record<string, unknown> } = {};
+	let { calls } = await run(
+		{},
+		["--hang"],
+		name => {
+			if (name === "renew_implementation_build") {
+				throw new ConnectorError("build-stopped", "build-stopped: Stopped in Chopin by @ana.");
+			}
+			return {};
+		},
+		undefined,
+		{ output: terminal.output },
+		journalOf(journal),
+	);
+	expect(terminal.out()).toContain("  ✗ Stopped in Chopin by @ana.\n");
+	expect(terminal.err()).toBe("");
+	// Chopin ended the build itself, so there is nothing to report back.
+	expect(calls.at(-1)?.[0]).toBe("renew_implementation_build");
+	expect(journal.value).toMatchObject({
+		state: "finished",
+		outcome: { state: "stopped", reason: "Stopped in Chopin by @ana." },
+	});
+});
+
+test("a build whose agent blocked a task says it is blocked and why, not Finished", async () => {
+	let terminal = captured();
+	let journal: { value?: Record<string, unknown> } = {};
+	await run(
+		{ live: true },
+		["--live"],
+		name =>
+			name === "report_implementation_build"
+				? {
+					accepted: true,
+					ending: { kind: "blocked", task: "Prove it", reason: "Missing source: the files" },
+				}
+				: {},
+		undefined,
+		{ output: terminal.output },
+		journalOf(journal),
+	);
+	expect(terminal.out()).toContain(
+		"  ✗ Blocked: “Prove it” is blocked: Missing source: the files.\n",
+	);
+	expect(terminal.out()).not.toContain("Finished");
+	expect(journal.value).toMatchObject({
+		outcome: { state: "blocked", reason: "“Prove it” is blocked: Missing source: the files" },
+	});
+});
+
+test("a build that delivered names its pull requests when it finishes", async () => {
+	let terminal = captured();
+	let url = "https://github.com/org/repo/pull/7";
+	await run(
+		{ live: true },
+		["--live"],
+		name =>
+			name === "report_implementation_build"
+				? { accepted: true, ending: { kind: "finished", pullRequests: [url], tasks: 1 } }
+				: {},
+		undefined,
+		{ output: terminal.output },
+	);
+	expect(terminal.out()).toContain(`  ✓ Finished: 1 task, ${url}\n`);
 });
 
 test("a build Chopin forgot by restarting stops saying so", async () => {
@@ -858,6 +1205,7 @@ test("a run whose connection a restarted server forgot stops its agent and the c
 					url: server.url,
 					signal,
 					output,
+					github: request => testGitHubToken(request.folder),
 					heartbeatMs: 20,
 					random: () => 0.01,
 					forgetMs: 300,
@@ -872,33 +1220,124 @@ test("a run whose connection a restarted server forgot stops its agent and the c
 	}
 });
 
+/**
+ * A machine whose own GitHub setup is all decoys, as design calls for: a HOME with gh logged in as
+ * two other accounts, a credential helper, SSH rewrites, an identity and signing of its own, an SSH
+ * key; GH_TOKEN, GITHUB_TOKEN and an SSH agent in the environment; and a `gh` and `ssh` first on
+ * PATH that note it when anything reaches them other than through the launch's own gh
+ * configuration. Restores everything on `restore`.
+ */
+async function decoyMachine(scratch: string) {
+	let home = join(scratch, "home");
+	let tripwire = join(scratch, "tripwire");
+	await mkdir(join(home, ".config", "gh"), { recursive: true });
+	await writeFile(
+		join(home, ".config", "gh", "hosts.yml"),
+		"github.com:\n    users:\n        decoy-active:\n            oauth_token: decoy-active-token\n"
+			+ "        decoy-other:\n            oauth_token: decoy-other-token\n"
+			+ "    oauth_token: decoy-active-token\n    user: decoy-active\n",
+	);
+	await mkdir(join(home, ".ssh"));
+	await writeFile(join(home, ".ssh", "id_ed25519"), "decoy key\n", { mode: 0o600 });
+	await writeFile(
+		join(home, ".gitconfig"),
+		[
+			"[user]",
+			"\tname = Decoy Person",
+			"\temail = decoy@example.test",
+			"[commit]",
+			"\tgpgsign = true",
+			"[gpg]",
+			"\tprogram = /bin/false",
+			"[credential]",
+			`\thelper = "!f() { echo helper >> '${tripwire}'; echo password=decoy-helper; }; f"`,
+			'[url "git@github.com:"]',
+			"\tinsteadOf = https://github.com/",
+			"\tpushInsteadOf = https://github.com/",
+			"",
+		].join("\n"),
+	);
+	let bin = join(scratch, "bin");
+	await mkdir(bin);
+	// gh as an agent runs it: a call through the launch's configuration records the token it holds
+	// and its arguments; anything else is a call that reached the machine's own gh.
+	await writeFile(
+		join(bin, "gh"),
+		`#!/bin/sh
+if [ -n "$GH_TOKEN$GITHUB_TOKEN" ] || [ -z "$GH_CONFIG_DIR" ] || [ "$GH_CONFIG_DIR" = "${home}/.config/gh" ]; then
+	echo "gh $*" >> '${tripwire}'; exit 1
+fi
+token=$(sed -n 's/^    oauth_token: "\\(.*\\)"$/\\1/p' "$GH_CONFIG_DIR/hosts.yml")
+printf '%s\\n' "$token" "$@" > '${join(scratch, "gh")}'
+`,
+		{ mode: 0o755 },
+	);
+	await writeFile(join(bin, "ssh"), `#!/bin/sh\necho "ssh $*" >> '${tripwire}'\nexit 255\n`, {
+		mode: 0o755,
+	});
+	let names = [
+		"HOME",
+		"PATH",
+		"GH_TOKEN",
+		"GITHUB_TOKEN",
+		"SSH_AUTH_SOCK",
+		"GIT_CONFIG_GLOBAL",
+		"GIT_ASKPASS",
+	] as const;
+	let saved = Object.fromEntries(names.map(name => [name, process.env[name]]));
+	process.env.HOME = home;
+	process.env.PATH = `${bin}:${process.env.PATH}`;
+	process.env.GH_TOKEN = "decoy-env";
+	process.env.GITHUB_TOKEN = "decoy-env";
+	process.env.SSH_AUTH_SOCK = join(scratch, "agent.sock");
+	process.env.GIT_CONFIG_GLOBAL = join(home, ".gitconfig");
+	process.env.GIT_ASKPASS = join(bin, "ssh");
+	return {
+		home,
+		/** What reached the machine's own gh, credential helper or SSH, one line each. */
+		tripped: async () => existsSync(tripwire) ? (await readFile(tripwire, "utf8")).trim() : "",
+		restore() {
+			for (let [name, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		},
+	};
+}
+
+/** A Chopin that issues a GitHub App installation token for runs, and a token for its tools. */
+function issuingChopin(token: string, answer?: () => Response) {
+	let asked: unknown[] = [];
+	let server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch(request) {
+			let { pathname } = new URL(request.url);
+			if (pathname === "/api/connector/mcp-token") {
+				return Response.json({ token: "chopin_mcp_run", expiresAt: Date.now() + 3_600_000 });
+			}
+			if (pathname !== "/api/connector/github-token") return new Response(null, { status: 404 });
+			asked.push(await request.json());
+			return answer?.() ?? Response.json({
+				token,
+				expiresAt: Date.now() + 3_600_000,
+				kind: "installation",
+				identity: BOT,
+				starter: STARTER,
+			});
+		},
+	});
+	return { url: `http://127.0.0.1:${server.port}`, asked, stop: () => server.stop(true) };
+}
+
 test.skipIf(process.platform === "win32")(
-	"a build's agent pushes and opens draft pull requests with the machine's GitHub token, gone when the run ends",
+	"a build's agent reaches GitHub only with the token Chopin issued for it, commits as Chopin's App for the person who started it, and nothing of the machine's own GitHub setup is used",
 	async () => {
-		let token = `ghu_${"R".repeat(36)}`;
-		let chopin = Bun.serve({
-			hostname: "127.0.0.1",
-			port: 0,
-			async fetch(request) {
-				if (new URL(request.url).pathname !== "/api/connector/github-token") {
-					return new Response(null, { status: 404 });
-				}
-				expect(await request.json()).toEqual({ repository: "org/repo" });
-				return Response.json({ token, expiresAt: Date.now() + 8 * 3_600_000 });
-			},
-		});
+		let token = `ghs_${"R".repeat(36)}`;
+		let chopin = issuingChopin(token);
 		let scratch = await mkdtemp(join(tmpdir(), "chopin-github-run-"));
-		let bin = join(scratch, "bin");
-		await mkdir(bin);
-		// gh as the agent runs it: it records the token it was given and its arguments.
-		await writeFile(
-			join(bin, "gh"),
-			`#!/bin/sh\nprintf '%s\\n' "$GH_TOKEN" "$@" > "${join(scratch, "gh")}"\n`,
-		);
-		await chmod(join(bin, "gh"), 0o755);
+		let machine = await decoyMachine(scratch);
 		let seen = join(scratch, "github.json");
-		let path = process.env.PATH;
-		process.env.PATH = `${bin}:${path}`;
 		process.env.CHOPIN_TEST_GITHUB = seen;
 		let written = "";
 		let capture = {
@@ -908,22 +1347,43 @@ test.skipIf(process.platform === "win32")(
 			},
 		};
 		try {
-			await run({}, ["--github"], undefined, undefined, {
-				url: `http://127.0.0.1:${chopin.port}`,
+			let { id, documentId } = await run({}, ["--github"], undefined, undefined, {
+				url: chopin.url,
 				machine: `chopin_m_${"M".repeat(43)}`,
+				github: undefined,
 				output: createOutput(capture, capture, {}),
-			}, async ({ state, id }) => {
-				// The token file was the run's alone, and goes with it.
+			}, async ({ state }) => {
+				// The tokens were the run's alone, and go with it.
 				let runs = join(state, "runs");
-				expect((await readdir(runs)).filter(name => name.includes("github"))).toEqual([]);
-				expect(id).toBeTruthy();
+				let left = await readdir(runs);
+				for (let name of left.filter(name => name.endsWith(".tokens"))) {
+					expect(await readdir(join(runs, name))).toEqual([]);
+				}
 			});
+			expect(chopin.asked).toEqual([{
+				repository: "org/repo",
+				purpose: "run",
+				run: id,
+				document: documentId,
+			}]);
 			let github = JSON.parse(await readFile(seen, "utf8"));
+			let bot = `${BOT.name} <${BOT.email}>`;
 			expect(github).toEqual({
-				GH_TOKEN: token,
-				GITHUB_TOKEN: token,
+				GH_TOKEN: null,
+				GITHUB_TOKEN: null,
+				SSH_AUTH_SOCK: null,
+				GIT_SSH_COMMAND: "false",
+				starter: [STARTER.login, STARTER.name, STARTER.email],
+				githubFile: token,
+				mcpFile: "chopin_mcp_run",
+				// Made as the App, and not signed, whatever the machine's Git configuration says.
+				commit: `${bot}|${bot}|N`,
 				credential: `protocol=https\nhost=github.com\nusername=x-access-token\npassword=${token}\n`,
 				gh: 0,
+				// The checkout's origin is an SSH address, and the machine rewrites https to SSH too:
+				// the agent's fetches and pushes still go over https, where the token is used.
+				fetch: "https://github.com/org/repo.git",
+				push: "https://github.com/org/repo.git",
 			});
 			expect((await readFile(join(scratch, "gh"), "utf8")).split("\n")).toEqual([
 				token,
@@ -934,43 +1394,203 @@ test.skipIf(process.platform === "win32")(
 				"Task one",
 				"",
 			]);
+			expect(await machine.tripped()).toBe("");
 			expect(written).not.toContain(token);
 		} finally {
-			process.env.PATH = path;
+			machine.restore();
 			delete process.env.CHOPIN_TEST_GITHUB;
-			await chopin.stop(true);
+			chopin.stop();
 			await rm(scratch, { recursive: true, force: true });
 		}
 	},
 );
 
 test.skipIf(process.platform === "win32")(
-	"without a GitHub token from Chopin, a build's agent keeps its own login",
+	"a run Chopin refuses a GitHub token never starts its agent, says why naming the repository, and never falls back to the machine's own login",
 	async () => {
+		for (let code of ["repository-forbidden", "app-cannot-push", "starter-cannot-push"]) {
+			let chopin = issuingChopin(
+				"unused",
+				() => Response.json({ error: code, message: "refused" }, { status: 403 }),
+			);
+			let scratch = await mkdtemp(join(tmpdir(), "chopin-github-refused-"));
+			let machine = await decoyMachine(scratch);
+			let started = join(scratch, "started");
+			let terminal = captured();
+			try {
+				let { id, calls } = await run({}, [], undefined, undefined, {
+					url: chopin.url,
+					machine: `chopin_m_${"M".repeat(43)}`,
+					github: undefined,
+					output: terminal.output,
+					command: ["/bin/sh", "-c", `touch '${started}'`],
+				});
+				expect(existsSync(started)).toBe(false);
+				let failed = calls.find(([name, args]) =>
+					name === "report_implementation_build" && args.state === "failed"
+				);
+				expect(failed).toEqual(["report_implementation_build", {
+					id,
+					state: "failed",
+					error: githubRefusal(code, "org/repo"),
+				}]);
+				expect(githubRefusal(code, "org/repo")).toContain("org/repo");
+				expect(terminal.err()).toContain(githubRefusal(code, "org/repo"));
+				expect(await machine.tripped()).toBe("");
+			} finally {
+				machine.restore();
+				chopin.stop();
+				await rm(scratch, { recursive: true, force: true });
+			}
+		}
+	},
+);
+
+test.skipIf(process.platform === "win32")(
+	"a prototype run in a registered checkout fetches its commit with the machine's token, for that fetch alone: the person's credential helper never runs and the agent is given no token",
+	async () => {
+		let token = `ghu_${"S".repeat(36)}`;
 		let chopin = Bun.serve({
 			hostname: "127.0.0.1",
 			port: 0,
-			fetch: () => Response.json({ error: "not-found" }, { status: 404 }),
+			async fetch(request) {
+				if (new URL(request.url).pathname !== "/api/connector/github-token") {
+					return new Response(null, { status: 404 });
+				}
+				expect(await request.json()).toMatchObject({ repository: "org/repo", purpose: "run" });
+				return Response.json({ token, expiresAt: Date.now() + 8 * 3_600_000, identity: BOT });
+			},
 		});
-		let scratch = await mkdtemp(join(tmpdir(), "chopin-github-none-"));
-		let seen = join(scratch, "github.json");
-		process.env.CHOPIN_TEST_GITHUB = seen;
-		let { GH_TOKEN, GITHUB_TOKEN } = process.env;
+		let scratch = await mkdtemp(join(tmpdir(), "chopin-spike-token-"));
+		let state = join(scratch, "state");
+		let real = Bun.which("git")!;
+		let plain = (cwd: string, ...args: string[]) => {
+			let result = spawnSync(real, [
+				"-c",
+				"user.name=Fixture",
+				"-c",
+				"user.email=fixture@example.test",
+				"-c",
+				"commit.gpgsign=false",
+				...args,
+			], { cwd, encoding: "utf8" });
+			if (result.status !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
+			return result.stdout.trim();
+		};
+		// The repository's private remote, which has a commit the person's checkout has not fetched.
+		let upstream = join(scratch, "upstream");
+		let root = join(scratch, "checkout");
+		await mkdir(upstream);
+		plain(upstream, "init", "-q", "-b", "main");
+		await writeFile(join(upstream, "source.txt"), "one");
+		plain(upstream, "add", ".");
+		plain(upstream, "commit", "-qm", "one");
+		plain(scratch, "clone", "-q", upstream, root);
+		plain(root, "remote", "set-url", "origin", "git@github.com:org/repo.git");
+		await writeFile(join(upstream, "source.txt"), "two");
+		plain(upstream, "commit", "-qam", "two");
+		let commit = plain(upstream, "rev-parse", "HEAD");
+		expect(spawnSync(real, ["cat-file", "-e", commit], { cwd: root }).status).not.toBe(0);
+		// A git that stands in for GitHub's private HTTPS remote: a fetch of origin succeeds only
+		// when the credentials Git would send are the machine's token, as a 401 would otherwise
+		// refuse it, and it records what it was shown.
+		let bin = join(scratch, "bin");
+		await mkdir(bin);
+		let shown = join(scratch, "shown");
+		await writeFile(
+			join(bin, "git"),
+			`#!/bin/sh
+if [ "$1" = fetch ] && [ "$2" = origin ]; then
+	filled=$(printf 'protocol=https\nhost=github.com\n\n' | "${real}" credential fill 2>/dev/null) || {
+		echo "fatal: could not read Username for 'https://github.com': terminal prompts disabled" >&2
+		exit 128
+	}
+	printf '%s\n' "$filled" > "${shown}"
+	case "$filled" in
+		*"password=${token}"*) ;;
+		*) echo "fatal: Authentication failed for 'https://github.com/org/repo.git/'" >&2; exit 128 ;;
+	esac
+	shift 2
+	GIT_ALLOW_PROTOCOL=file exec "${real}" fetch "${upstream}" "$@"
+fi
+exec "${real}" "$@"
+`,
+			{ mode: 0o755 },
+		);
+		// The person's own credential helper, which a connector's git must never run.
+		let helper = join(scratch, "helper-ran");
+		let global = join(scratch, "gitconfig");
+		await writeFile(
+			global,
+			`[credential]\n\thelper = "!f() { touch '${helper}'; echo username=person; echo password=theirs; }; f"\n`,
+		);
+		let seen = join(scratch, "agent");
+		let saved = {
+			GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL,
+			PATH: process.env.PATH,
+			GH_TOKEN: process.env.GH_TOKEN,
+			GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+		};
+		process.env.GIT_CONFIG_GLOBAL = global;
+		process.env.PATH = `${bin}:${process.env.PATH}`;
 		delete process.env.GH_TOKEN;
 		delete process.env.GITHUB_TOKEN;
+		let terminal = captured();
+		let calls: string[] = [];
+		let api = {
+			call: async (name: string) => {
+				calls.push(name);
+				return {};
+			},
+		} as unknown as Awaited<ReturnType<typeof remote>>;
 		try {
-			await run({}, ["--github"], undefined, undefined, {
+			await runWork(api, "experiment", {
+				spike: true,
+				passage: "We are not sure a CSS-only fade-in on the heading works without JavaScript.",
+				generation: 1,
+				runToken: "run-token",
+				input: {
+					id: crypto.randomUUID(),
+					documentId: crypto.randomUUID(),
+					brief: "Prototype the passage",
+					source: { repositoryId: "R_repo", repository: "org/repo", commit },
+					context: "",
+					requester: "a",
+					authorizer: "a",
+				},
+			}, {
+				checkouts: checkouts({ directory: state, registered: { "org/repo": root } }),
+				directory: state,
+				// What the agent has when it starts: its environment, and the folder its tokens are in.
+				command: [
+					"/bin/sh",
+					"-c",
+					`{ printf 'GH_TOKEN=%s\\nGITHUB_TOKEN=%s\\n' "$GH_TOKEN" "$GITHUB_TOKEN"; `
+					+ `printf 'tokens=%s\\n' "$(ls "$PWD.tokens" | tr '\\n' ' ')"; } > "$0"; exec "$1" "$2" --no-result`,
+					seen,
+					process.execPath,
+					new URL("./testing/fake-agent.ts", import.meta.url).pathname,
+				],
 				url: `http://127.0.0.1:${chopin.port}`,
 				machine: `chopin_m_${"M".repeat(43)}`,
+				signal: new AbortController().signal,
+				output: terminal.output,
 			});
-			expect(JSON.parse(await readFile(seen, "utf8"))).toMatchObject({
-				GH_TOKEN: null,
-				GITHUB_TOKEN: null,
-			});
+			expect(terminal.err()).toBe("");
+			expect(calls.filter(name => name !== "renew_experiment")).toEqual(["complete_experiment"]);
+			// The commit is in the person's checkout now, fetched with what Git was shown.
+			expect(spawnSync(real, ["cat-file", "-e", commit], { cwd: root }).status).toBe(0);
+			expect((await readFile(shown, "utf8")).split("\n")).toEqual(
+				expect.arrayContaining(["username=x-access-token", `password=${token}`]),
+			);
+			expect(existsSync(helper)).toBe(false);
+			// The agent never pushes and is given no token: not in its environment, nor on disk.
+			expect(await readFile(seen, "utf8")).toBe("GH_TOKEN=\nGITHUB_TOKEN=\ntokens=\n");
 		} finally {
-			if (GH_TOKEN !== undefined) process.env.GH_TOKEN = GH_TOKEN;
-			if (GITHUB_TOKEN !== undefined) process.env.GITHUB_TOKEN = GITHUB_TOKEN;
-			delete process.env.CHOPIN_TEST_GITHUB;
+			for (let [name, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
 			await chopin.stop(true);
 			await rm(scratch, { recursive: true, force: true });
 		}

@@ -1,3 +1,5 @@
+import type { PLANNER_NAME as NAME } from "@chopin/protocol/planner-name";
+
 export type FaceProfile = { name: string; avatar: string };
 
 const DEMO_PREFIX = "demo:";
@@ -13,9 +15,56 @@ export function isDemoHandle(handle: string): boolean {
 	return handle.startsWith(DEMO_PREFIX);
 }
 
-/** What a person is called: a roster name for a demo actor, otherwise the handle. */
+/**
+ * The Planner's name wherever it takes part, acts or is addressed; `@chopin/protocol/planner-name`
+ * is its source, and the type holds this copy to it. It is written here rather than re-exported
+ * because this module is in the page's first script, and a re-export would give the name a chunk of
+ * its own that every lazy surface naming the agent loads first.
+ */
+export const PLANNER_NAME: typeof NAME = "chopin";
+
+/** What a person is called: a roster name for a demo actor, otherwise the handle as written. */
 export function personName(handle: string): string {
 	let profile = profiles.get(handle);
 	if (profile) return profile.name;
 	return isDemoHandle(handle) ? handle.slice(DEMO_PREFIX.length) || handle : handle;
+}
+
+/**
+ * The pictures GitHub gave real people, which the server stored when they signed in, by login.
+ *
+ * One map for the whole page, filled from every place the server names a person, so any face for
+ * any login finds its picture without asking. It only ever grows: a person who left the room is
+ * still the author of what they said. Logins compare case-insensitively, as GitHub's do. A demo
+ * actor is never here; its picture is the roster's.
+ */
+const avatars = new Map<string, string>();
+const listeners = new Set<() => void>();
+
+/** A person as the server names them; a login with no stored picture teaches nothing. */
+export type KnownPerson = { login: string; avatarUrl?: string | null | undefined };
+
+export function rememberAvatars(people: readonly KnownPerson[]): void {
+	let learned = false;
+	for (let { login, avatarUrl } of people) {
+		if (!avatarUrl || isDemoHandle(login)) continue;
+		let key = login.toLowerCase();
+		if (avatars.get(key) === avatarUrl) continue;
+		avatars.set(key, avatarUrl);
+		learned = true;
+	}
+	if (learned) { for (let listener of listeners) listener(); }
+}
+
+/** The picture the server stored for this login, if it has told this page. */
+export function avatarOf(login: string): string | undefined {
+	return avatars.get(login.toLowerCase());
+}
+
+/** For `useSyncExternalStore`: called whenever a picture is learned or replaced. */
+export function subscribeAvatars(listener: () => void): () => void {
+	listeners.add(listener);
+	return () => {
+		listeners.delete(listener);
+	};
 }

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { HarnessAgent } from "@ai-sdk/harness/agent";
 import { tool } from "ai";
 import { z } from "zod";
@@ -9,14 +9,21 @@ import {
 	LINK_CLOSE,
 	MAX_LINK_MESSAGE_BYTES,
 } from "@chopin/agent-link";
-import { AgentRefused } from "@chopin/agent-link/client";
+import { AgentRefused, connectAgent } from "@chopin/agent-link/client";
 
 import { GitHubError } from "../../github/client";
 import * as Store from "../../questions/store";
 import * as Plan from "../../plan/service";
 import * as Edit from "../../plan/edit";
 import * as Room from "../../plan/room";
-import { createPlannerAgent } from "../agents";
+import { documentTools } from "../../agent/tools";
+import { readingOutput } from "../../agent/reading-output";
+import { fieldNotes, reading } from "../../document-reading.test-fixtures";
+import { openPlan } from "../../testing/plan";
+import { expectPlainStatus } from "../../testing/plain-words";
+import { createPlannerAgent, createResearchAgent } from "../agents";
+import { withModelOutput } from "../model-output";
+import { openWorkerSession } from "../../jobs/worker-session";
 import { createHumanInput } from "../atomic/human-input";
 import { openPlannerSession } from "../session";
 import { untilUnpaused } from "../atomic/full";
@@ -39,12 +46,16 @@ import {
 	upgradeRequest,
 	VIEWER_TOKEN,
 } from "../../testing/agent-link";
+import { refusedChoice } from "@chopin/protocol/model-choice";
+
+import { remoteCatalog } from "../catalog";
 import { createRemoteAdapter } from "./adapter";
 import { admitAgent } from "./endpoint";
 import { remotePlanner } from "./registry";
 
-import type { AgentClient, AgentHandlers } from "@chopin/agent-link/client";
+import type { AgentClient, AgentHandlers, TurnContext } from "@chopin/agent-link/client";
 import type { ActiveOwnerBinding } from "../../agent/active-owner";
+import type { PlannerTurn } from "../turn-level";
 import type { RemotePlanner } from "./registry";
 
 let cleanups: Array<() => unknown> = [];
@@ -256,6 +267,7 @@ describe("Agent connection ownership", () => {
 		let raw = await rawLink(url, token);
 		raw.send({ type: "attach", version: AGENT_VERSION, document });
 		let refusal = await raw.next("refused");
+		expectPlainStatus(String(refusal.message), "a refusal to a client");
 		return { code: refusal.code, message: refusal.message, close: (await raw.closed).code };
 	}
 
@@ -295,8 +307,8 @@ describe("Agent connection ownership", () => {
 		for (let token of [RIVAL_TOKEN, MEMBER_TOKEN]) {
 			expect(await refused(server.url, channel.id, token)).toEqual({
 				code: "planner-attached",
-				message: "member is attached as this document's Planner. "
-					+ "A document has one Planner at a time.",
+				message: "member is connected to this document. "
+					+ "A document has one agent connected at a time.",
 				close: LINK_CLOSE.attached,
 			});
 		}
@@ -310,14 +322,14 @@ describe("Agent connection ownership", () => {
 		cleanups.push(server.stop);
 		expect(await refused(server.url, channel.id, VIEWER_TOKEN)).toEqual({
 			code: "repository-forbidden",
-			message: "Attaching as this document's Planner needs push or administration access to "
+			message: "Connecting to this document needs push or administration access to "
 				+ "octo-org/score.",
 			close: LINK_CLOSE.forbidden,
 		});
 		expect(await refused(server.url, channel.id, GUEST_TOKEN)).toEqual({
 			code: "sign-in-required",
-			message: "Sign in to Chopin at https://chopin.test in a browser as guest, then attach "
-				+ "again. The Planner's repository tools act with that sign-in.",
+			message: "Sign in to Chopin at https://chopin.test in a browser as guest, then connect "
+				+ "again. Repository tools act with that sign-in.",
 			close: LINK_CLOSE.unauthorized,
 		});
 		expect((await owner(storage, channel.id))?.ownerSessionId).toBeUndefined();
@@ -335,7 +347,10 @@ describe("Agent connection ownership", () => {
 		let refusal = await refused(server.url, channel.id, RIVAL_TOKEN);
 		expect(refusal).toMatchObject({ code: "planner-attached", close: LINK_CLOSE.attached });
 		expect(refusal.message).toStartWith(
-			"member detached from this document's Planner and holds it until ",
+			"member disconnected from this document and keeps it until ",
+		);
+		expect(refusal.message).toEndWith(
+			" unless they connect again. A document has one agent connected at a time.",
 		);
 
 		let dropped = await rawLink(server.url);
@@ -404,9 +419,9 @@ describe("Agent connection ownership", () => {
 		expect(await raw.next("refused")).toEqual({
 			type: "refused",
 			code: "sign-in-required",
-			message: "The Chopin browser sign-in that made member this document's Planner ended, so "
-				+ "the Planner was released. Sign in to Chopin at https://chopin.test in a browser as "
-				+ "member, then attach again.",
+			message: "The Chopin browser sign-in that connected member to this document ended, so "
+				+ "the connection was released. Sign in to Chopin at https://chopin.test in a browser as "
+				+ "member, then connect again.",
 		});
 		expect((await raw.closed).code).toBe(LINK_CLOSE.unauthorized);
 		expect(server.attachments.attached(channel.id)).toBe(false);
@@ -441,7 +456,7 @@ describe("Agent connection ownership", () => {
 		clock.skewMs = 31 * 24 * 60 * 60 * 1_000;
 		expect(await raw.next("refused")).toMatchObject({
 			code: "sign-in-required",
-			message: expect.stringContaining("The Chopin browser sign-in that made member"),
+			message: expect.stringContaining("The Chopin browser sign-in that connected member"),
 		});
 		expect((await raw.closed).code).toBe(LINK_CLOSE.unauthorized);
 		expect(server.attachments.attached(channel.id)).toBe(false);
@@ -497,8 +512,8 @@ describe("Agent connection ownership", () => {
 		expect(await raw.next("refused")).toEqual({
 			type: "refused",
 			code: "access-revoked",
-			message: "A repository writer reset this document's Planner, so member is no longer "
-				+ "attached. Attach again to resume.",
+			message: "A repository writer reset this document's connection, so member is no longer "
+				+ "connected. Connect again to resume.",
 		});
 		expect((await raw.closed).code).toBe(LINK_CLOSE.forbidden);
 		expect(server.attachments.attached(channel.id)).toBe(false);
@@ -514,7 +529,7 @@ describe("Agent connection ownership", () => {
 		resume();
 		expect(await raw.next("refused")).toMatchObject({
 			code: "sign-in-required",
-			message: expect.stringContaining("The Chopin browser sign-in that made member"),
+			message: expect.stringContaining("The Chopin browser sign-in that connected member"),
 		});
 		expect((await raw.closed).code).toBe(LINK_CLOSE.unauthorized);
 		expect(server.attachments.attached(channel.id)).toBe(false);
@@ -552,8 +567,8 @@ describe("Agent connection ownership", () => {
 		expect(await raw.next("refused")).toEqual({
 			type: "refused",
 			code: "sign-in-required",
-			message: "Sign in to Chopin at https://chopin.test in a browser as member, then attach "
-				+ "again. The Planner's repository tools act with that sign-in.",
+			message: "Sign in to Chopin at https://chopin.test in a browser as member, then connect "
+				+ "again. Repository tools act with that sign-in.",
 		});
 		expect(await raw.closed).toEqual({ code: LINK_CLOSE.unauthorized, reason: "sign-in-required" });
 		expect(server.attachments.attached(channel.id)).toBe(false);
@@ -592,8 +607,8 @@ describe("Agent connection ownership", () => {
 		expect(await raw.next("refused")).toEqual({
 			type: "refused",
 			code: "access-revoked",
-			message: "A repository writer reset this document's Planner, so member is no longer "
-				+ "attached. Attach again to resume.",
+			message: "A repository writer reset this document's connection, so member is no longer "
+				+ "connected. Connect again to resume.",
 		});
 		expect((await raw.closed).code).toBe(LINK_CLOSE.forbidden);
 		expect(server.attachments.attached(channel.id)).toBe(false);
@@ -612,8 +627,8 @@ describe("Agent connection ownership", () => {
 		expect(await raw.next("refused")).toEqual({
 			type: "refused",
 			code: "access-revoked",
-			message: "This document's Planner ownership was released, so member is no longer "
-				+ "attached. Attach again to resume.",
+			message: "This document's connection was released, so member is no longer "
+				+ "connected. Connect again to resume.",
 		});
 		expect((await raw.closed).code).toBe(LINK_CLOSE.forbidden);
 		expect(server.attachments.attached(channel.id)).toBe(false);
@@ -673,7 +688,10 @@ describe("Agent connection ownership", () => {
 			let refusal = await refused(server.url, channel.id, RIVAL_TOKEN);
 			expect(refusal).toMatchObject({ code: "planner-attached", close: LINK_CLOSE.attached });
 			expect(refusal.message).toStartWith(
-				"member detached from this document's Planner and holds it until ",
+				"member disconnected from this document and keeps it until ",
+			);
+			expect(refusal.message).toEndWith(
+				" unless they connect again. A document has one agent connected at a time.",
 			);
 			for (let deadline = Date.now() + 3_000; Date.now() < deadline;) {
 				if (!(await owner(storage, channel.id))?.ownerSessionId) break;
@@ -936,6 +954,7 @@ describe("Agent connection protocol", () => {
 				["run-stage-deltas", ["run-stage-deltas"]],
 				["future-thing, run-stage-deltas", ["run-stage-deltas"]],
 				["future-thing", []],
+				["resumable-sessions, restart-notice", ["resumable-sessions", "restart-notice"]],
 			] as const
 		) {
 			let raw = await rawLink(server.url, undefined, header);
@@ -948,9 +967,92 @@ describe("Agent connection protocol", () => {
 		}
 	});
 
+	it("offers upload_plan_image only to a client that asked for decision-option-previews", async () => {
+		let { server, channel } = await setup();
+		let both = new HarnessAgent({
+			harness: adapterFor(server, { channelId: channel.id, isolated: false }),
+			tools: {
+				read_plan: tool({ inputSchema: z.object({}), execute: async () => "the plan" }),
+				upload_plan_image: tool({ inputSchema: z.object({}), execute: async () => "stored" }),
+			},
+			activeTools: ["read_plan", "upload_plan_image"],
+			permissionMode: "allow-reads",
+		});
+		for (
+			let [header, offered] of [
+				[undefined, ["read_plan"]],
+				["run-stage-deltas", ["read_plan"]],
+				["decision-option-previews", ["read_plan", "upload_plan_image"]],
+				["run-stage-deltas, decision-option-previews", ["read_plan", "upload_plan_image"]],
+			] as const
+		) {
+			let raw = await rawLink(server.url, undefined, header);
+			raw.send({ type: "attach", version: 1, document: channel.id });
+			await raw.next("attached");
+			let started = raw.next("start").then(start => {
+				raw.send({ type: "started", session: start.session });
+				return raw.next("turn");
+			});
+			let session = await both.createSession({ sandboxSession });
+			cleanups.push(() => session.destroy());
+			let outcome = (async () => {
+				let result = await both.stream({ session, prompt: "look" });
+				for await (let _part of result.fullStream);
+			})();
+			let turn = await started;
+			expect(turn.tools.map((item: { name: string }) => item.name)).toEqual(offered);
+			raw.send({ type: "turn-end", session: turn.session, turn: turn.turn, status: "finished" });
+			await outcome;
+			raw.send({ type: "detach" });
+			await raw.closed;
+		}
+	});
+
+	it("names a turn's message, and a retry of it, only to a client that asked for retry-turn", async () => {
+		let { server, channel } = await setup();
+		for (
+			let [header, answers, sent] of [
+				[undefined, { id: "msg-1", retry: true }, {}],
+				["steer-turn", { id: "msg-1", retry: true }, {}],
+				["retry-turn", { id: "msg-1" }, { message: "msg-1" }],
+				["retry-turn", { id: "msg-1", retry: true }, { message: "msg-1", retry: true }],
+				["retry-turn", undefined, {}],
+			] as const
+		) {
+			let planner: RemotePlanner = { channelId: channel.id, isolated: false };
+			let agent = agentFor(adapterFor(server, planner));
+			let raw = await rawLink(server.url, undefined, header);
+			raw.send({ type: "attach", version: 1, document: channel.id });
+			await raw.next("attached");
+			let started = raw.next("start").then(start => {
+				raw.send({ type: "started", session: start.session });
+				return raw.next("turn");
+			});
+			let session = await agent.createSession({ sandboxSession });
+			cleanups.push(() => session.destroy());
+			planner.turnMessage = answers ? { ...answers } : undefined;
+			let outcome = (async () => {
+				let result = await agent.stream({ session, prompt: "@ana: hello" });
+				for await (let _part of result.fullStream);
+			})();
+			let turn = await started;
+			expect({ message: turn.message, retry: turn.retry }).toEqual({
+				message: undefined,
+				retry: undefined,
+				...sent,
+			});
+			// Taken by its turn: the next one names nothing unless it is told again.
+			expect(planner.turnMessage).toBeUndefined();
+			raw.send({ type: "turn-end", session: turn.session, turn: turn.turn, status: "finished" });
+			await outcome;
+			raw.send({ type: "detach" });
+			await raw.closed;
+		}
+	});
+
 	it("merges stage deltas into a run's stages, and a full card replaces them", async () => {
 		let { server, channel, client } = await setup({});
-		expect(client.features).toEqual(["run-stage-deltas"]);
+		expect(client.features).toEqual(["run-stage-deltas", "decision-option-previews"]);
 		let planner: RemotePlanner = { channelId: channel.id, isolated: false };
 		let session = await adapterFor(server, planner).doStart({
 			sessionId: "deltas",
@@ -1099,12 +1201,58 @@ describe("Agent connection protocol", () => {
 		expect(planner.activeTools).toEqual(["read_plan", "bash"]);
 		expect(reports).toEqual([["own-1", "the plan", "done"]]);
 		let undeclared = await streamTurn(adapterFor(server, planner), "undeclared");
-		expect(undeclared.errors.join("\n")).toContain("Planner tool boundary failure: bash");
+		expect(undeclared.errors.join("\n")).toContain("Chopin's tool boundary failure: bash");
 		let isolated = await streamTurn(
 			adapterFor(server, { channelId: channel.id, isolated: true }),
 			"declared",
 		);
 		expect(isolated.errors.join("\n")).toContain("An isolated Planner turn cannot offer bash");
+	});
+
+	it("sends the attached client read_plan as paged text, the way its model is to read it", async () => {
+		let seen: Array<{ output: unknown; isError: boolean }> = [];
+		let { server, channel } = await setup({
+			async turn(context) {
+				seen.push(await context.callHostTool("read_plan", { offset: 1 }));
+				finishTurn(context);
+			},
+		});
+		let fixture = await openPlan(fieldNotes(60_000));
+		cleanups.push(() => Plan.close(fixture.plan));
+		let agent = new HarnessAgent({
+			harness: withModelOutput(
+				adapterFor(server, { channelId: channel.id, isolated: false }),
+				readingOutput,
+			),
+			tools: { read_plan: documentTools.read_plan },
+			activeTools: ["read_plan"],
+			toolsContext: {
+				read_plan: {
+					room: {
+						id: fixture.plan.id,
+						plan: fixture.plan,
+						server: fixture.server,
+						persist: () => Plan.persist(fixture.plan),
+						exclusive: action => Plan.exclusive(fixture.plan, action),
+						publish: async () => {},
+						anchors: () => {},
+						changes: () => {},
+					},
+				},
+			},
+			permissionMode: "allow-reads",
+		});
+		let session = await agent.createSession({ sandboxSession });
+		cleanups.push(() => session.destroy());
+		let outcome = await streamOn(agent as never, session as never, "read");
+		expect(outcome.errors).toEqual([]);
+		expect(seen).toHaveLength(1);
+		let text = seen[0]!.output as string;
+		expect(seen[0]!.isError).toBe(false);
+		expect(text).not.toStartWith("{");
+		expect(Buffer.byteLength(text)).toBeLessThanOrEqual(16_000);
+		expect(reading(text).fields.document).toBe(fixture.plan.id);
+		expect(reading(text).next).toBeDefined();
 	});
 
 	it("gives the server and the client the same error when a host result cannot cross the link", async () => {
@@ -1222,7 +1370,11 @@ describe("Agent connection protocol", () => {
 		});
 		cleanups.push(() => session.doDestroy());
 		await planner.control!("stop", "run-1");
-		await expect(planner.control!("resume")).rejects.toThrow("nothing to resume");
+		// Bun 1.4.4's pending `.rejects` matcher makes Bun.serve close a valid socket as
+		// fragmented (oven-sh/bun#45805), so the refusal is awaited before it is asserted.
+		let refusal = await planner.control!("resume").catch((error: unknown) => error);
+		expect(refusal).toBeInstanceOf(Error);
+		expect((refusal as Error).message).toContain("nothing to resume");
 		expect(controls).toEqual([{ type: "stop", run: "run-1" }, { type: "resume", run: undefined }]);
 		await session.doDestroy();
 		expect(planner.control).toBeUndefined();
@@ -1416,6 +1568,570 @@ describe("Agent connection protocol", () => {
 	});
 });
 
+describe("Agent connection steering", () => {
+	/** A turn that hangs until it is aborted, on a session of its own. */
+	async function hanging(handlers: Partial<AgentHandlers>) {
+		let running = Promise.withResolvers<void>();
+		let fixture = await setup({
+			async turn(context) {
+				context.emit({ type: "stream-start", modelId: "scripted" });
+				running.resolve();
+				await new Promise(resolve => context.signal.addEventListener("abort", resolve));
+			},
+			...handlers,
+		});
+		let harness = adapterFor(fixture.server, { channelId: fixture.channel.id, isolated: false });
+		let agent = agentFor(harness);
+		let session = await agent.createSession({ sandboxSession });
+		cleanups.push(() => session.destroy());
+		let abort = new AbortController();
+		let result = await agent.stream({ session, prompt: "turn", abortSignal: abort.signal });
+		let drained = (async () => {
+			for await (let _part of result.fullStream);
+		})();
+		await running.promise;
+		return {
+			...fixture,
+			harness,
+			session,
+			end: async () => {
+				abort.abort();
+				await drained.catch(() => {});
+			},
+		};
+	}
+
+	it("reaches the running turn of a client that offered steer-turn, which answers it", async () => {
+		let heard: Array<{ turn: string; prompt: string }> = [];
+		let { session, server, channel, harness, end } = await hanging({
+			steer(message) {
+				heard.push({ turn: message.turn, prompt: message.prompt });
+			},
+		});
+		expect(server.links.at(-1)!.steers).toBe(true);
+		expect(harness.steers(channel.id)).toBe(true);
+		await session.experimental_steerTurn("@bo: Also say what it costs.");
+		expect(heard).toHaveLength(1);
+		expect(heard[0]!.prompt).toBe("@bo: Also say what it costs.");
+		await end();
+	});
+
+	it("is offered only to a client that asked for steer-turn, and says so for its document", async () => {
+		let { server, channel, harness, session, end } = await hanging({});
+		expect(server.links.at(-1)!.steers).toBe(false);
+		expect(harness.steers(channel.id)).toBe(false);
+		await expect(session.experimental_steerTurn("@bo: hello")).rejects.toThrow(
+			/does not support steering/,
+		);
+		await end();
+	});
+
+	it("tells the sender when the client could not take it", async () => {
+		let { session, end } = await hanging({
+			steer() {
+				throw new Error("The model is between steps.");
+			},
+		});
+		await expect(session.experimental_steerTurn("@bo: hello")).rejects.toThrow(
+			"The model is between steps.",
+		);
+		await end();
+	});
+
+	it("is refused once the turn has ended, without a frame going to the client", async () => {
+		let heard: string[] = [];
+		let { session, end } = await hanging({
+			steer(message) {
+				heard.push(message.prompt);
+			},
+		});
+		await end();
+		await expect(session.experimental_steerTurn("@bo: too late")).rejects.toThrow();
+		expect(heard).toEqual([]);
+	});
+});
+
+describe("Agent connection capability catalog", () => {
+	let catalog = {
+		models: {
+			available: [
+				{ id: "acme/large", name: "Large", thinkingLevels: ["off", "high"] },
+				{ id: "acme/small", name: "Small" },
+			],
+			default: { id: "acme/small" },
+		},
+	};
+
+	it("holds what the client last reported and tells the document each time, replacing it whole", async () => {
+		let { auth, channel } = await linkAuth();
+		let changed: string[] = [];
+		let server = linkServer(auth, 300, undefined, undefined, undefined, undefined, {
+			catalogChanged: id => changed.push(id),
+		});
+		cleanups.push(server.stop);
+		let raw = await rawLink(server.url, undefined, "capability-catalog");
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		expect((await raw.next("attached")).features).toEqual(["capability-catalog"]);
+		let link = server.links.at(-1)!;
+		expect(link.catalog).toBeUndefined();
+		raw.send({ type: "capabilities", catalog });
+		await until(() => link.catalog !== undefined, 1_000);
+		expect(link.catalog).toEqual(catalog);
+		let next = { models: { available: [{ id: "acme/other", name: "Other" }] } };
+		raw.send({ type: "capabilities", catalog: next });
+		await until(() => link.catalog?.models?.available[0]?.id === "acme/other", 1_000);
+		expect(link.catalog).toEqual(next);
+		raw.send({ type: "capabilities", catalog: {} });
+		await until(() => link.catalog?.models === undefined, 1_000);
+		expect(link.catalog).toEqual({});
+		expect(changed).toEqual([channel.id, channel.id, channel.id]);
+		raw.send({ type: "detach" });
+		await raw.closed;
+	});
+
+	it("has nothing to wait for from a client that never offered the catalog, and waits for one that did until it reports, withdrawing included", async () => {
+		let { auth, channel } = await linkAuth();
+		let server = linkServer(auth, 300);
+		cleanups.push(server.stop);
+		let older = await rawLink(server.url);
+		older.send({ type: "attach", version: 1, document: channel.id });
+		await older.next("attached");
+		expect(server.links.at(-1)!.catalogPending).toBe(false);
+		older.send({ type: "detach" });
+		await older.closed;
+
+		let raw = await rawLink(server.url, undefined, "capability-catalog");
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		let link = server.links.at(-1)!;
+		expect(link.catalogPending).toBe(true);
+		raw.send({ type: "capabilities", catalog: {} });
+		await until(() => link.catalog !== undefined, 1_000);
+		// Withdrawing everything is a report: what the client offers is known, and it is nothing.
+		expect(link.catalogPending).toBe(false);
+		raw.send({ type: "detach" });
+		await raw.closed;
+	});
+
+	it("stops waiting for a catalog its client offered once a turn has run without it, and takes the report if it comes", async () => {
+		let { auth, channel } = await linkAuth();
+		let server = linkServer(auth, 300);
+		cleanups.push(server.stop);
+		let raw = await rawLink(server.url, undefined, "capability-catalog");
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		let link = server.links.at(-1)!;
+		expect(link.catalogPending).toBe(true);
+		link.settleWithoutCatalog();
+		expect(link.catalogPending).toBe(false);
+		// It is still no catalog: the client has offered nothing, and may yet.
+		expect(link.catalog).toBeUndefined();
+		raw.send({ type: "capabilities", catalog });
+		await until(() => link.catalog !== undefined, 1_000);
+		expect(link.catalog).toEqual(catalog);
+		expect(link.catalogPending).toBe(false);
+		raw.send({ type: "detach" });
+		await raw.closed;
+
+		// A client of its own is waited for afresh: the earlier link's turn does not settle it.
+		let next = await rawLink(server.url, undefined, "capability-catalog");
+		next.send({ type: "attach", version: 1, document: channel.id });
+		await next.next("attached");
+		expect(server.links.at(-1)!.catalogPending).toBe(true);
+		next.send({ type: "detach" });
+		await next.closed;
+	});
+
+	it("keeps a report of more models than a person picks from, and a field it has no use for, and stays attached", async () => {
+		let { auth, channel } = await linkAuth();
+		let server = linkServer(auth, 300);
+		cleanups.push(server.stop);
+		let raw = await rawLink(server.url, undefined, "capability-catalog");
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		let link = server.links.at(-1)!;
+		let grown = {
+			models: {
+				available: Array.from({ length: 710 }, (_, index) => ({
+					id: `p/m${index}`,
+					name: `M ${index}`,
+					price: { input: 1 },
+				})),
+			},
+			commands: [{ name: "release-notes", kind: "skill", description: "d".repeat(925) }],
+			attachments: { images: true },
+		};
+		raw.send({ type: "capabilities", catalog: grown });
+		await until(() => link.catalog !== undefined, 2_000);
+		expect(link.catalog).toEqual(grown);
+		raw.send({ type: "detach" });
+		expect((await raw.closed).code).toBe(1000);
+	});
+
+	it("is reported by the test client after attached, behind a resumable link's resume", async () => {
+		let { server, channel, script } = await setup();
+		for (let resumable of [false, true]) {
+			let client = await connectAgent({
+				url: server.url,
+				token: MEMBER_TOKEN,
+				document: channel.id,
+				handlers: script.handlers,
+				resumable,
+				capabilities: catalog,
+			});
+			let link = server.links.at(-1)!;
+			await until(() => link.catalog !== undefined, 1_000);
+			expect(link.catalog).toEqual(catalog);
+			expect(client.features).toContain("capability-catalog");
+			// A later report replaces it, and one a server never offered is not sent.
+			expect(client.report({ commands: [{ name: "notes", kind: "skill" }] })).toBe(true);
+			await until(() => link.catalog?.models === undefined, 1_000);
+			expect(link.catalog).toEqual({ commands: [{ name: "notes", kind: "skill" }] });
+			await client.detach();
+		}
+		let quiet = await attach(server.url, channel.id, script.handlers);
+		expect(quiet.report(catalog)).toBe(false);
+		await quiet.detach();
+	});
+
+	it("reaches the client in the turns of a real Planner session, one turn at a time, and only if it offered the feature", async () => {
+		for (let offered of [true, false]) {
+			let f = await hostInputRoom();
+			cleanups.push(f.close);
+			let linked = await linkAuth(f.room.id);
+			let server = linkServer(linked.auth, 300);
+			cleanups.push(server.stop);
+			let seen: Array<{ model?: string; thinkingLevel?: string }> = [];
+			let client = await connectAgent({
+				url: server.url,
+				token: MEMBER_TOKEN,
+				document: f.room.id,
+				resumable: false,
+				...(offered ? { capabilities: catalog } : {}),
+				handlers: {
+					async turn(context) {
+						seen.push({
+							...(context.message.model ? { model: context.message.model } : {}),
+							...(context.message.thinkingLevel
+								? { thinkingLevel: context.message.thinkingLevel }
+								: {}),
+						});
+						finishTurn(context);
+					},
+				},
+			});
+			cleanups.push(() => client.detach());
+			let agent = createPlannerAgent(
+				createRemoteAdapter(sessionId => ({
+					link: server.links.at(-1)!,
+					planner: remotePlanner(sessionId)!,
+				})),
+			);
+			let owner = {
+				channelId: f.room.id,
+				token: "test-token",
+				repository: { id: "R_test", owner: "org", name: "repo", defaultBranch: "main" },
+				signal: new AbortController().signal,
+				currentToken: () => "test-token",
+				revalidate: async () => true,
+				release() {},
+			} as unknown as ActiveOwnerBinding;
+			let opened = await openPlannerSession(owner, {
+				room: f.room,
+				repository: owner.repository,
+				instructions: "Plan.",
+				harness: "remote",
+			}, {
+				githubTools: async () => ({ ok: true, value: {} }),
+				createSandbox: async () => sandboxSession,
+				registerCredential: () => () => {},
+				agent,
+			});
+			if (!opened.ok) throw new Error("Planner unavailable");
+			let session = opened.value;
+			cleanups.push(() => session.destroy());
+			let run = async (choice?: { model?: string; thinkingLevel?: string }) => {
+				let result = await session.stream("go", new AbortController().signal, choice);
+				for await (let _part of result.fullStream);
+			};
+			await run({ model: "acme/large", thinkingLevel: "high" });
+			await run();
+			await run({ thinkingLevel: "low" });
+			expect(seen).toEqual(
+				offered
+					? [{ model: "acme/large", thinkingLevel: "high" }, {}, { thinkingLevel: "low" }]
+					: [{ model: "acme/large" }, {}, {}],
+			);
+		}
+	});
+
+	it("carries a message's images and files to a client that offered attachments, and as words to one that did not", async () => {
+		let png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
+		let notes = new TextEncoder().encode("# Notes\n");
+		let files = {
+			readsImages: true,
+			attachments: [
+				{ name: "shot.png", kind: "image" as const, mimeType: "image/png", bytes: png },
+				{ name: "notes.md", kind: "file" as const, mimeType: "text/plain", bytes: notes },
+			],
+		};
+		for (let offered of [true, false]) {
+			let f = await hostInputRoom();
+			cleanups.push(f.close);
+			let linked = await linkAuth(f.room.id);
+			let server = linkServer(linked.auth, 300);
+			cleanups.push(server.stop);
+			let seen: Array<{ prompt: string; attachments?: unknown }> = [];
+			let client = await connectAgent({
+				url: server.url,
+				token: MEMBER_TOKEN,
+				document: f.room.id,
+				resumable: false,
+				attachments: offered,
+				handlers: {
+					async turn(context) {
+						seen.push({
+							prompt: context.message.prompt,
+							...(context.message.attachments ? { attachments: context.message.attachments } : {}),
+						});
+						finishTurn(context);
+					},
+				},
+			});
+			cleanups.push(() => client.detach());
+			expect(client.features.includes("attachments")).toBe(offered);
+			let agent = createPlannerAgent(
+				createRemoteAdapter(sessionId => ({
+					link: server.links.at(-1)!,
+					planner: remotePlanner(sessionId)!,
+				})),
+			);
+			let owner = {
+				channelId: f.room.id,
+				token: "test-token",
+				repository: { id: "R_test", owner: "org", name: "repo", defaultBranch: "main" },
+				signal: new AbortController().signal,
+				currentToken: () => "test-token",
+				revalidate: async () => true,
+				release() {},
+			} as unknown as ActiveOwnerBinding;
+			let opened = await openPlannerSession(owner, {
+				room: f.room,
+				repository: owner.repository,
+				instructions: "Plan.",
+				harness: "remote",
+			}, {
+				githubTools: async () => ({ ok: true, value: {} }),
+				createSandbox: async () => sandboxSession,
+				registerCredential: () => () => {},
+				agent,
+			});
+			if (!opened.ok) throw new Error("Planner unavailable");
+			let session = opened.value;
+			cleanups.push(() => session.destroy());
+			let run = async (sent?: typeof files) => {
+				let result = await session.stream(
+					"@ana: What is this?",
+					new AbortController().signal,
+					undefined,
+					sent,
+				);
+				for await (let _part of result.fullStream);
+			};
+			await run(files);
+			await run();
+			if (offered) {
+				expect(seen[0]!.prompt).toBe("@ana: What is this?");
+				expect(seen[0]!.attachments).toEqual([
+					{
+						id: expect.any(String),
+						name: "shot.png",
+						kind: "image",
+						mediaType: "image/png",
+						size: png.byteLength,
+						data: Buffer.from(png).toString("base64"),
+					},
+					{
+						id: expect.any(String),
+						name: "notes.md",
+						kind: "file",
+						mediaType: "text/plain",
+						size: notes.byteLength,
+						data: Buffer.from(notes).toString("base64"),
+					},
+				]);
+			} else {
+				// Nothing a client did not ask for reaches it: its files are in the prompt, as words.
+				expect(seen[0]).not.toHaveProperty("attachments");
+				expect(seen[0]!.prompt).toBe(
+					"@ana: What is this?\n\n(An image, shot.png, was sent with this message, but this client can't be given images.)\n\n"
+						+ '<file name="notes.md">\n# Notes\n\n</file>',
+				);
+			}
+			// A turn with no files is the turn it always was.
+			expect(seen[1]).toEqual({ prompt: "@ana: What is this?" });
+		}
+	});
+
+	it("is a protocol violation from a client that did not offer the feature", async () => {
+		let { server, channel } = await setup();
+		for (let header of [undefined, "run-stage-deltas"]) {
+			let raw = await rawLink(server.url, undefined, header);
+			raw.send({ type: "attach", version: 1, document: channel.id });
+			await raw.next("attached");
+			raw.send({ type: "capabilities", catalog });
+			expect(await raw.next("error")).toMatchObject({ code: "protocol" });
+			expect((await raw.closed).code).toBe(LINK_CLOSE.malformed);
+		}
+	});
+
+	it("takes a catalog with odd entries as written and keeps the link, so one model cannot take the Planner offline", async () => {
+		let { server, channel } = await setup();
+		let raw = await rawLink(server.url, undefined, "capability-catalog");
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		let link = server.links.at(-1)!;
+		let odd = {
+			models: {
+				available: [
+					{ id: "usable", name: "Usable" },
+					{
+						id: `acme/${"x".repeat(300)}`,
+						name: "n".repeat(129),
+						description: "d".repeat(4_001),
+						thinkingLevels: ["extra high", "deep thought", "\u4f4e"],
+					},
+				],
+			},
+			commands: [{ name: "x", kind: "slash command" }],
+		};
+		raw.send({ type: "capabilities", catalog: odd });
+		await until(() => link.catalog !== undefined, 1_000);
+		expect(link.catalog).toEqual(odd);
+		// Still attached: the next report is read, and a detach ends it as the client chose.
+		raw.send({ type: "capabilities", catalog: catalog });
+		await until(() => link.catalog?.models?.available.length === 2, 1_000);
+		raw.send({ type: "detach" });
+		expect((await raw.closed).code).toBe(LINK_CLOSE.detached);
+	});
+
+	it("skips a model reported with no id and an empty level, keeps the rest and the link, and says so in the log", async () => {
+		let { server, channel } = await setup();
+		let raw = await rawLink(server.url, undefined, "capability-catalog");
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		let link = server.links.at(-1)!;
+		let warned: string[] = [];
+		let warn = spyOn(console, "warn").mockImplementation((...line) => {
+			warned.push(line.join(" "));
+		});
+		cleanups.push(() => warn.mockRestore());
+		raw.send({
+			type: "capabilities",
+			catalog: {
+				models: {
+					available: [
+						{ id: "", name: "Blank", thinkingLevels: [""] },
+						{ id: "valid", name: "Valid", thinkingLevels: ["", "low", "high"] },
+						{ id: "other", name: "Other", description: "Plain." },
+					],
+					default: { id: "valid", thinkingLevel: "" },
+				},
+				commands: [{ name: "notes", kind: "skill" }],
+			},
+		});
+		await until(() => link.catalog !== undefined, 1_000);
+		// Only the malformed entry and the empty level are left out: the siblings stay, in order.
+		expect(link.catalog).toEqual({
+			models: {
+				available: [
+					{ id: "valid", name: "Valid", thinkingLevels: ["low", "high"] },
+					{ id: "other", name: "Other", description: "Plain." },
+				],
+				default: { id: "valid" },
+			},
+			commands: [{ name: "notes", kind: "skill" }],
+		});
+		expect(warned.join("\n")).toContain('the model named "Blank" has no id');
+		expect(warned.join("\n")).toContain("valid lists an empty thinking level");
+		// So the room is offered neither, and a choice of either is refused as one nobody can make.
+		let offered = remoteCatalog(link.catalog, undefined);
+		expect(offered?.models.map(model => model.id)).toEqual(["valid", "other"]);
+		expect(refusedChoice(offered, { model: "" })).toBe("That model isn't available.");
+		expect(refusedChoice(offered, { model: "valid", thinkingLevel: "" })).toBe(
+			"That model doesn't offer that level of reasoning.",
+		);
+		// The link is still attached: a report of nothing but a malformed model offers no choice at all.
+		raw.send({
+			type: "capabilities",
+			catalog: { models: { available: [{ id: "", name: "Only" }] } },
+		});
+		await until(() => link.catalog?.models?.available.length === 0, 1_000);
+		expect(remoteCatalog(link.catalog, undefined)).toBeUndefined();
+		raw.send({ type: "detach" });
+		expect((await raw.closed).code).toBe(LINK_CLOSE.detached);
+	});
+
+	it("closes the link on a catalog of the wrong type, and keeps the last good one before it", async () => {
+		let { server, channel } = await setup();
+		let raw = await rawLink(server.url, undefined, "capability-catalog");
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		let link = server.links.at(-1)!;
+		raw.send({ type: "capabilities", catalog });
+		await until(() => link.catalog !== undefined, 1_000);
+		raw.send({
+			type: "capabilities",
+			catalog: { models: { available: [{ id: "x", name: "X", thinkingLevels: "high" }] } },
+		});
+		expect(await raw.next("error")).toMatchObject({ code: "malformed-message" });
+		expect((await raw.closed).code).toBe(LINK_CLOSE.malformed);
+		expect(link.catalog).toEqual(catalog);
+	});
+
+	it("carries a person's model and level in the next turn only to a client that offered the feature", async () => {
+		let { server, channel } = await setup();
+		for (
+			let [header, sent] of [
+				[undefined, false],
+				["run-stage-deltas", false],
+				["capability-catalog", true],
+			] as const
+		) {
+			let raw = await rawLink(server.url, undefined, header);
+			raw.send({ type: "attach", version: 1, document: channel.id });
+			await raw.next("attached");
+			let planner: RemotePlanner = { channelId: channel.id, isolated: false };
+			let opening = adapterFor(server, planner).doStart({
+				sessionId: `chosen-${header}`,
+				sandboxSession,
+				sessionWorkDir: "/tmp",
+			});
+			let start = await raw.next("start");
+			raw.send({ type: "started", session: start.session });
+			let opened = await opening;
+			cleanups.push(() => opened.doDestroy());
+			let turns: unknown[] = [];
+			let running = opened.doPromptTurn({
+				prompt: "go",
+				skills: [],
+				tools: [],
+				model: "acme/large",
+				thinkingLevel: "high",
+				emit: part => turns.push(part),
+			} as PlannerTurn);
+			let turn = await raw.next("turn");
+			expect(turn.model).toBe("acme/large");
+			expect("thinkingLevel" in turn).toBe(sent);
+			if (sent) expect(turn.thinkingLevel).toBe("high");
+			raw.send({ type: "turn-end", session: turn.session, turn: turn.turn, status: "finished" });
+			await (await running).done.then(() => {}, () => {});
+			raw.send({ type: "detach" });
+			await raw.closed;
+		}
+	});
+});
+
 describe("Agent connection questions", () => {
 	async function questions(options: { isolated?: boolean } = {}) {
 		let f = await hostInputRoom();
@@ -1459,7 +2175,7 @@ describe("Agent connection questions", () => {
 			header: "Choice",
 			question: "  Which store?  ",
 			options: [
-				{ label: " Postgres ", description: "  durable  \n\ncreate table" },
+				{ label: " Postgres ", description: "  durable  ", preview: "create table" },
 				{ label: "Memory", description: "fast" },
 			],
 		});
@@ -1760,7 +2476,7 @@ describe("Agent connection questions", () => {
 	}
 
 	it("stops a host ask, withdraws its Decision and fails the turn when the link drops mid-tool", async () => {
-		let disconnected = ["Error: The attached Planner disconnected during the turn."];
+		let disconnected = ["Error: The machine disconnected during the turn."];
 		expect(await askingTurn("detach")).toEqual(disconnected);
 		expect(await askingTurn("violation")).toEqual(disconnected);
 	});
@@ -1768,5 +2484,75 @@ describe("Agent connection questions", () => {
 	it("stops a host ask and withdraws its Decision when its turn ends before the tool does", async () => {
 		expect(await askingTurn("turn-end")).toEqual(["Error: The client gave up."]);
 		await askingTurn("destroy");
+	});
+});
+
+describe("Agent connection background workers", () => {
+	it("runs a document's research worker in its attached client as an isolated session", async () => {
+		let starts: string[] = [];
+		let turns: TurnContext["message"][] = [];
+		let searched: unknown[] = [];
+		let { channel } = await setup({
+			start: message => void starts.push(message.mode),
+			async turn(context) {
+				turns.push(context.message);
+				context.emit({ type: "stream-start", modelId: "scripted" });
+				let search = await context.callHostTool("web_search", { query: "axum rate limiting" });
+				let evidence = {
+					findings: [`Searched: ${String(search.output)}`],
+					sources: [{ title: "tower-governor", url: "https://docs.rs/tower_governor" }],
+				};
+				context.emit({ type: "text-start", id: "result" });
+				context.emit({ type: "text-delta", id: "result", delta: JSON.stringify(evidence) });
+				context.emit({ type: "text-end", id: "result" });
+				finishTurn(context);
+			},
+		});
+		let agent = createResearchAgent(createRemoteAdapter());
+		let worker = await openWorkerSession(agent, {
+			channelId: channel.id,
+			token: () => MEMBER_TOKEN,
+			maxAiCredits: 1,
+			aborted: new Promise<never>(() => {}),
+			openSandbox: async () => sandboxSession,
+		});
+		cleanups.push(() => worker.close());
+
+		let result = await agent.generate({
+			session: worker.session,
+			prompt: JSON.stringify({ material: { query: "axum rate limiting" } }),
+			options: {
+				model: "",
+				instructions: "Research only public web evidence.",
+				webSearch: tool({
+					inputSchema: z.object({ query: z.string() }),
+					execute: async input => {
+						searched.push(input);
+						return "results";
+					},
+				}),
+			},
+		});
+
+		expect(starts).toEqual(["isolated"]);
+		expect(turns.map(turn => turn.tools.map(spec => spec.name))).toEqual([["web_search"]]);
+		expect(turns[0]!.responseFormat?.type).toBe("json");
+		expect(searched).toEqual([{ query: "axum rate limiting" }]);
+		expect(result.output).toEqual({
+			findings: ["Searched: results"],
+			sources: [{ title: "tower-governor", url: "https://docs.rs/tower_governor" }],
+		});
+	});
+
+	it("refuses a worker for a document with no attached Planner", async () => {
+		let { channel } = await setup();
+		let agent = createResearchAgent(createRemoteAdapter());
+		await expect(openWorkerSession(agent, {
+			channelId: channel.id,
+			token: () => MEMBER_TOKEN,
+			maxAiCredits: 1,
+			aborted: new Promise<never>(() => {}),
+			openSandbox: async () => sandboxSession,
+		})).rejects.toThrow("No machine is connected to this document.");
 	});
 });

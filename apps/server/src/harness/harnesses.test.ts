@@ -3,7 +3,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { workflowJournal } from "./atomic/workspace";
-import { harnesses, harnessFor, registerCredential, shutdownHarnesses } from "./harnesses";
+import {
+	harnesses,
+	harnessFor,
+	plannerCatalog,
+	plannerCommands,
+	plannerOfferIncoming,
+	plannerOfferKnown,
+	plannerRanWithoutOffer,
+	plannerSteers,
+	registerCredential,
+	shutdownHarnesses,
+} from "./harnesses";
+import { attachLink } from "./remote/registry";
+
+import type { AgentLink } from "./remote/link";
 
 // A developer's .env can select HARNESS=atomic; agents.ts then constructs and
 // caches that harness at import time in an earlier test file. Reset before
@@ -15,6 +29,30 @@ it("selects the tested Copilot SDK, Atomic, and remote harnesses", () => {
 	expect(Object.keys(harnesses)).toEqual(["copilot-sdk", "atomic", "remote"]);
 	expect(harnessFor({ harness: "copilot-sdk" }).harnessId).toBe("copilot-sdk");
 	expect(() => harnessFor({ harness: "not-installed" })).toThrow("Unknown harness: not-installed");
+});
+
+it("takes a message while a turn runs on Atomic, and on a remote client only if it offered steer-turn", () => {
+	expect(plannerSteers("doc")).toBe(false);
+	harnessFor({ harness: "atomic", harnessAuth: "ai-gateway", host: "127.0.0.1" });
+	expect(plannerSteers("doc")).toBe(true);
+	shutdownHarnesses();
+});
+
+it("refuses a message while a turn runs on the Copilot SDK, which names no way to take one", () => {
+	harnessFor({ harness: "copilot-sdk" });
+	expect(plannerSteers("doc")).toBe(false);
+});
+
+it("takes a message for a remote Planner only while its attached client offered steer-turn", () => {
+	harnessFor({ harness: "remote" });
+	expect(plannerSteers("doc")).toBe(false);
+	let release = attachLink("doc", { steers: false } as unknown as AgentLink);
+	expect(plannerSteers("doc")).toBe(false);
+	release();
+	release = attachLink("doc", { steers: true } as unknown as AgentLink);
+	expect(plannerSteers("doc")).toBe(true);
+	expect(plannerSteers("another")).toBe(false);
+	release();
 });
 
 it("refuses host-login fallback on public binds but accepts it on loopback", () => {
@@ -121,4 +159,162 @@ it("registers credentials per session without reuse or rewriting", () => {
 	}
 	let again = registerCredential("session-id", () => token);
 	again();
+});
+
+it("offers no choice of model where the harness cannot honor one", async () => {
+	// copilot-sdk takes a model per turn but reports no catalog and has no thinking level; no
+	// harness chosen yet and an unknown one offer nothing either.
+	harnessFor({ harness: "copilot-sdk" });
+	expect(await plannerCatalog("copilot-sdk", "channel", "gpt-5")).toBeUndefined();
+	expect(await plannerCatalog("not-installed", "channel", undefined)).toBeUndefined();
+	await shutdownHarnesses();
+	expect(await plannerCatalog("atomic", "channel", "stub/model")).toBeUndefined();
+});
+
+it("offers a remote Planner only what the client attached to the document reported", async () => {
+	let reported: { models?: { available: Array<{ id: string; name: string }> } } | undefined;
+	let link = {
+		get catalog() {
+			return reported;
+		},
+	} as unknown as AgentLink;
+	// Nothing is attached, or a client from before the catalog is: no picker.
+	expect(await plannerCatalog("remote", "doc-a", undefined)).toBeUndefined();
+	let detach = attachLink("doc-a", link);
+	expect(await plannerCatalog("remote", "doc-a", undefined)).toBeUndefined();
+	reported = { models: { available: [{ id: "acme/large", name: "Large" }] } };
+	expect(await plannerCatalog("remote", "doc-a", undefined)).toEqual({
+		models: [{ id: "acme/large", name: "Large" }],
+	});
+	// Another document's client is not this document's.
+	expect(await plannerCatalog("remote", "doc-b", undefined)).toBeUndefined();
+	detach();
+	expect(await plannerCatalog("remote", "doc-a", undefined)).toBeUndefined();
+});
+
+it("offers a remote Planner's commands only from the client attached to that document, and none once it leaves", async () => {
+	let repository = { owner: "acme", name: "plans" };
+	let reportedByA: { commands?: Array<{ name: string; kind: string; description?: string }> } = {
+		commands: [
+			{ name: "skill:notes", kind: "skill", description: "Take notes" },
+			{ name: "review", kind: "prompt" },
+			{ name: "review", kind: "prompt" },
+		],
+	};
+	let machineA = {
+		get catalog() {
+			return reportedByA;
+		},
+	} as unknown as AgentLink;
+	let machineB = {
+		get catalog() {
+			return { models: { available: [] } };
+		},
+	} as unknown as AgentLink;
+	expect(await plannerCommands("remote", "doc-a", repository)).toBeUndefined();
+	let detachA = attachLink("doc-a", machineA);
+	// Exactly as the client reported them, a repeated entry included.
+	expect(await plannerCommands("remote", "doc-a", repository)).toEqual([
+		{ name: "skill:notes", kind: "skill", description: "Take notes" },
+		{ name: "review", kind: "prompt" },
+		{ name: "review", kind: "prompt" },
+	]);
+	// Another document's machine is not this document's.
+	expect(await plannerCommands("remote", "doc-b", repository)).toBeUndefined();
+	detachA();
+	expect(await plannerCommands("remote", "doc-a", repository)).toBeUndefined();
+	// A different machine takes the document over: it never inherits the first one's commands.
+	let detachB = attachLink("doc-a", machineB);
+	expect(await plannerCommands("remote", "doc-a", repository)).toBeUndefined();
+	detachB();
+	// An older client reports no commands at all.
+	let older = attachLink("doc-a", { catalog: undefined } as unknown as AgentLink);
+	expect(await plannerCommands("remote", "doc-a", repository)).toBeUndefined();
+	older();
+	// A harness that reports none offers none.
+	harnessFor({ harness: "copilot-sdk" });
+	expect(await plannerCommands("copilot-sdk", "doc-a", repository)).toBeUndefined();
+	await shutdownHarnesses();
+});
+
+it("knows what a remote Planner offers only from an attached client that has reported, or never will", () => {
+	let pending = true;
+	let link = {
+		get catalogPending() {
+			return pending;
+		},
+	} as unknown as AgentLink;
+	// Nobody is attached, or the client has yet to say: nothing can be said of a saved choice.
+	expect(plannerOfferKnown("remote", "doc-a")).toBe(false);
+	let detach = attachLink("doc-a", link);
+	expect(plannerOfferKnown("remote", "doc-a")).toBe(false);
+	pending = false;
+	expect(plannerOfferKnown("remote", "doc-a")).toBe(true);
+	// Another document's client is not this document's.
+	expect(plannerOfferKnown("remote", "doc-b")).toBe(false);
+	detach();
+	expect(plannerOfferKnown("remote", "doc-a")).toBe(false);
+	// Every other harness knows what it offers, which may be nothing.
+	for (let harness of ["copilot-sdk", "atomic", "not-installed"]) {
+		expect(plannerOfferKnown(harness, "doc-a")).toBe(true);
+	}
+});
+
+it("says a remote Planner's models are on their way only while a machine may be starting it or its client has yet to report them, never while it is held away", () => {
+	let pending = true;
+	let link = {
+		get catalogPending() {
+			return pending;
+		},
+	} as unknown as AgentLink;
+	// Nobody holds it and nobody is attached: a machine may be starting it.
+	expect(plannerOfferIncoming("remote", "doc-a", false)).toBe(true);
+	// Held while its client is away (a deploy's hand-over window): what it offered was already told.
+	expect(plannerOfferIncoming("remote", "doc-a", true)).toBe(false);
+	let detach = attachLink("doc-a", link);
+	// Attached, it is the client's word: on their way until it reports, then not.
+	expect(plannerOfferIncoming("remote", "doc-a", true)).toBe(true);
+	pending = false;
+	expect(plannerOfferIncoming("remote", "doc-a", true)).toBe(false);
+	expect(plannerOfferIncoming("remote", "doc-a", false)).toBe(false);
+	detach();
+	for (let harness of ["copilot-sdk", "atomic"]) {
+		expect(plannerOfferIncoming(harness, "doc-a", false)).toBe(false);
+	}
+});
+
+it("settles a remote Planner's wait for a catalog when a turn ran without it, for that document's client alone", () => {
+	let pending = true;
+	let link = {
+		get catalogPending() {
+			return pending;
+		},
+		settleWithoutCatalog() {
+			pending = false;
+		},
+	} as unknown as AgentLink;
+	// Nothing is attached: nothing to settle, and nothing becomes known.
+	expect(plannerRanWithoutOffer("remote", "doc-a")).toBe(false);
+	expect(plannerOfferKnown("remote", "doc-a")).toBe(false);
+	let detach = attachLink("doc-a", link);
+	expect(plannerRanWithoutOffer("remote", "doc-b")).toBe(false);
+	expect(plannerOfferKnown("remote", "doc-a")).toBe(false);
+	expect(plannerRanWithoutOffer("remote", "doc-a")).toBe(true);
+	expect(plannerOfferKnown("remote", "doc-a")).toBe(true);
+	// The client leaves: what it fell back on goes with it.
+	detach();
+	expect(plannerOfferKnown("remote", "doc-a")).toBe(false);
+	// Every other harness knew what it offers all along, so there is nothing to settle.
+	for (let harness of ["copilot-sdk", "atomic", "not-installed"]) {
+		expect(plannerRanWithoutOffer(harness, "doc-a")).toBe(false);
+	}
+});
+
+it("offers an Atomic Planner the models of its own runtime, once the harness is selected", async () => {
+	harnessFor({ harness: "atomic", harnessAuth: "ai-gateway", host: "127.0.0.1" });
+	let catalog = await plannerCatalog("atomic", "channel", undefined);
+	expect(catalog).toBeDefined();
+	// Gateway authentication offers only the gateway's models, and none has a default here.
+	expect(catalog!.models.every(model => model.provider?.id === "vercel-ai-gateway")).toBe(true);
+	expect(catalog!.default).toBeUndefined();
 });

@@ -11,12 +11,12 @@
 }
 
 /* The strip takes its row above the scroller rather than covering the first line. */
-.plan-document:has(> .authorship-strip) {
+.plan-document[data-authorship-strip] {
 	display: flex;
 	flex-direction: column;
 }
 
-.plan-document:has(> .authorship-strip) > [data-plan-scroll] {
+.plan-document[data-authorship-strip] > [data-plan-scroll] {
 	flex: 1;
 	height: auto;
 	min-height: 0;

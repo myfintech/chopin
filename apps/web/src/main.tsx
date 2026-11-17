@@ -9,6 +9,7 @@ import { isDesignAuditRoute } from "./design-audit/route";
 import { isDiagramGalleryRoute } from "./diagram-gallery/route";
 import { useFocusInput } from "./focus-input";
 import { useMotionInput } from "./motion-input";
+import { watchPreloadErrors } from "./preload-recovery";
 import { watchScrollbarStyle } from "./scrollbars";
 import { useVisualViewport } from "./viewport";
 
@@ -33,11 +34,12 @@ bootColorTheme();
 let root = document.getElementById("root");
 if (!root) throw new Error("missing #root");
 watchScrollbarStyle();
+watchPreloadErrors();
 
 function Root() {
 	useFocusInput();
 	useMotionInput();
-	useVisualViewport();
+	useVisualViewport(root!);
 	return <App />;
 }
 

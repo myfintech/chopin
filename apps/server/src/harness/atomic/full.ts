@@ -6,6 +6,7 @@ import type {
 	WorkflowActivitySubscription,
 	WorkflowLifecycleEvent,
 	WorkflowRootActivity,
+	WorkflowStageStatus,
 	WorkflowToolNodeStatus,
 } from "@bastani/atomic";
 import type { Chat as Wire } from "@chopin/protocol";
@@ -36,6 +37,12 @@ export type FullPlanner = {
 	 * its model step ends, so this is how the chat sees them as they happen.
 	 */
 	toolReport?: (id: string, output: unknown, state: "running" | "done" | "failed") => void;
+	/** Serialized Atomic `FileEntry[]` (`[header, ...entries]`) to restore before running a turn. */
+	sessionEntries?: unknown[];
+	/** Entry id to branch from (`SessionManager.branch`) before prompting; `null` resets to root. */
+	branchLeafId?: string | null;
+	/** Called as Atomic appends entries so fork points and session trees stay durable. */
+	onSessionEntries?: (entries: unknown[], leafId: string | null) => void;
 };
 
 let planners = new Map<string, FullPlanner>();
@@ -52,6 +59,30 @@ export async function pauseOwnedRuns(workflows: SessionWorkflows): Promise<void>
 /** Resumes every paused run the session owns. */
 export async function resumeOwnedRuns(workflows: SessionWorkflows): Promise<void> {
 	for (let run of await workflows.listRuns({ status: "paused" })) await workflows.resume(run.runId);
+}
+
+/**
+ * Waits until Atomic has written the ending of each run that finished, failed or
+ * was stopped to the workflow journal, so a session disposed right after a run
+ * ends never leaves it `running` there. Live, paused and blocked runs are not
+ * waited on; disposing the session stops them. A run whose ending could not be
+ * journaled is logged, and the session still goes.
+ */
+export async function settleEndedRuns(
+	workflows: Pick<SessionWorkflows, "waitForSettled">,
+	runs: PlannerRuns | undefined,
+): Promise<void> {
+	let ended = (runs?.cards ?? []).filter(card =>
+		(card.status === "finished" || card.status === "failed" || card.status === "stopped")
+		&& !runs!.active.includes(card.id) && !runs!.paused.includes(card.id)
+	);
+	await Promise.all(
+		ended.map(card =>
+			workflows.waitForSettled(card.id).catch(error =>
+				console.error(`[agent] workflow run ${card.id} ended without its ending journaled:`, error)
+			)
+		),
+	);
 }
 
 /**
@@ -138,6 +169,19 @@ const TOOL_STEP: Record<WorkflowToolNodeStatus, Wire.RunStage["status"]> = {
 	cancelled: "skipped",
 };
 
+const STAGE_STEP: Record<WorkflowStageStatus | "waiting", Wire.RunStage["status"]> = {
+	pending: "pending",
+	running: "running",
+	awaiting_input: "awaiting_input",
+	paused: "paused",
+	blocked: "blocked",
+	suspended: "running",
+	waiting: "running",
+	completed: "completed",
+	failed: "failed",
+	skipped: "skipped",
+};
+
 /** Records one stage or tool step, in the order the run first reached it. */
 function foldStep(
 	card: Card,
@@ -194,7 +238,13 @@ export function foldLifecycle(
 			card.ended = seconds;
 		} else delete card.ended;
 	} else if (target.kind === "stage") {
-		foldStep(card, `${target.runId}:${target.stageId}`, target.stageName, target.status, seconds);
+		foldStep(
+			card,
+			`${target.runId}:${target.stageId}`,
+			target.stageName,
+			STAGE_STEP[target.status],
+			seconds,
+		);
 	} else if (target.kind === "tool") {
 		foldStep(
 			card,

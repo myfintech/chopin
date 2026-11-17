@@ -5,6 +5,7 @@
  */
 
 import type {
+	CapabilityCatalog,
 	ClientMessage,
 	ClientMessageOf,
 	InputCall,
@@ -26,15 +27,28 @@ export const WIRE = {
 	/** The upgrade request header asking for optional features, and the ones this client knows. */
 	featuresHeader: "chopin-agent-features",
 	runStageDeltas: "run-stage-deltas",
+	decisionOptionPreviews: "decision-option-previews",
+	resumableSessions: "resumable-sessions",
+	restartNotice: "restart-notice",
+	capabilityCatalog: "capability-catalog",
+	attachments: "attachments",
+	sessionForks: "session-forks",
+	steerTurn: "steer-turn",
+	retryTurn: "retry-turn",
+	/** How often a client retries a `resume` refused with `retry`, after a `restarting` notice. */
+	restartResumeRetryMs: 250,
 } as const;
 
 export class AgentRefused extends Error {
 	readonly code: RefusalCode;
+	/** Whether Chopin could not decide, so the same resumption may be tried again. */
+	readonly retry: boolean;
 
-	constructor(code: RefusalCode, message: string) {
+	constructor(code: RefusalCode, message: string, retry = false) {
 		super(message);
 		this.name = "AgentRefused";
 		this.code = code;
+		this.retry = retry;
 	}
 }
 
@@ -61,11 +75,22 @@ export type HostToolResult = { output: unknown; isError: boolean };
 export type AgentHandlers = {
 	/** Throw to refuse the session. */
 	start?(message: ServerMessageOf<"start">): void | Promise<void>;
+	/**
+	 * With `session-forks`: branch `message.session` from `message.from`. Throw to refuse the
+	 * fork (`start-failed`), such as when the source session is no longer held.
+	 */
+	fork?(message: ServerMessageOf<"fork">): void | Promise<void>;
 	/** Ends the turn as finished when it resolves without calling `end`, failed when it rejects. */
 	turn(context: TurnContext): void | Promise<void>;
 	destroy?(message: ServerMessageOf<"destroy">): void;
 	/** Stop or resume the session's workflow runs; throw to report that it could not. */
 	control?(message: ServerMessageOf<"stop"> | ServerMessageOf<"resume">): void | Promise<void>;
+	/**
+	 * Gives a person's message to the turn that is running, to read at its next step. Throw to say
+	 * the turn could not take it. Having it asks for `steer-turn`; a turn that has already ended is
+	 * answered without calling it.
+	 */
+	steer?(message: ServerMessageOf<"steer">): void | Promise<void>;
 };
 
 export type AgentOptions = {
@@ -78,9 +103,73 @@ export type AgentOptions = {
 	checkout?: ClientMessageOf<"attach">["checkout"];
 	handlers: AgentHandlers;
 	version?: number;
+	/**
+	 * Asks for `resumable-sessions`, unless `false`: when the link drops unexpectedly, questions
+	 * still waiting on an answer stay pending instead of ending, Chopin keeps the sessions' runs
+	 * and open Decisions however long the client is away, and `resumption` says what to hand the
+	 * next `connectAgent` as `resume`. A client that sets `false` ends everything when its link
+	 * drops, as the earlier protocol always did.
+	 */
+	resumable?: boolean;
+	/** What a dropped link of this client held, from its `resumption`; implies `resumable`. */
+	resume?: Resumption;
+	/**
+	 * Asks for `capability-catalog` and reports what this client offers (its models with their
+	 * thinking levels) as soon as the link is attached, after any `resume`. Without it the
+	 * document's composer offers no choice of model. `AgentClient.report` replaces it later.
+	 */
+	capabilities?: CapabilityCatalog;
+	/**
+	 * Asks for `attachments`: a turn then carries the images and text files sent with the message
+	 * that began it (`TurnContext.message.attachments`), which a client that does not ask is never
+	 * sent.
+	 */
+	attachments?: boolean;
+	/**
+	 * Asks for `session-forks` when `handlers.fork` is supplied, unless `false`.
+	 */
+	sessionForks?: boolean;
+	/**
+	 * Asks for `retry-turn`: a turn then names the Chat message it answers
+	 * (`TurnContext.message.message`), and one that runs a failed message again carries `retry`, so
+	 * the client can drop what the earlier turns for that message left in what it keeps.
+	 */
+	retryTurns?: boolean;
 };
 
-export type LinkClosed = { code: number; reason: string };
+/** A question this client asked and still waits on, which a later link may carry on. */
+type PendingAsk = {
+	session: string;
+	settle: (message: ServerMessageOf<"input-result">) => void;
+	/** Where a cancellation goes; moves to the new link when the question resumes there. */
+	route: { send: (message: ClientMessage) => boolean };
+	/**
+	 * Whether its caller withdrew it. The server may not have heard, as the link it was sent on
+	 * can be gone, so a resumed link does not name it, which withdraws it there.
+	 */
+	withdrawn?: true;
+};
+
+/**
+ * The sessions a link that dropped unexpectedly held, and the questions each still waited on. It
+ * is only a token: give it to `connectAgent` as `resume`.
+ */
+export type Resumption = {
+	readonly sessions: ReadonlySet<string>;
+	readonly asks: ReadonlyMap<string, PendingAsk>;
+};
+
+export type LinkClosed = {
+	code: number;
+	reason: string;
+	/**
+	 * Set when the server said, with `restarting` before it closed the link, that it is restarting
+	 * and a new process is expected within this many milliseconds. Connect again at once, and retry
+	 * a `resume` refused with `retry` every `WIRE.restartResumeRetryMs` until this time has passed,
+	 * then go back to the client's own backoff.
+	 */
+	reconnectWithinMs?: number;
+};
 
 export type InputOptions = {
 	workflowRunId?: string;
@@ -98,6 +187,11 @@ export type AgentClient = {
 	readonly document: ServerMessageOf<"attached">["document"];
 	/** The optional features the server accepts from this client, from `attached`. */
 	readonly features: readonly string[];
+	/**
+	 * Settles when the link closes: with what a resumable link held when it dropped unexpectedly,
+	 * or undefined when the link ended any other way, which ends every question it held.
+	 */
+	readonly resumption: Promise<Resumption | undefined>;
 	/** Asks the document's members through Decisions. */
 	ask(
 		session: string,
@@ -109,6 +203,11 @@ export type AgentClient = {
 	 * report too large for one frame is sent as several, splitting the delta cards' stages.
 	 */
 	reportRuns(session: string, runs: { active: string[]; paused: string[]; cards: LinkRun[] }): void;
+	/**
+	 * Reports a changed catalog, replacing the earlier one whole. False when the server did not
+	 * accept `capability-catalog` or the link is no longer open.
+	 */
+	report(catalog: CapabilityCatalog): boolean;
 	/** Sends one message; false when the link is no longer open. */
 	send(message: ClientMessage): boolean;
 	detach(): Promise<LinkClosed>;
@@ -151,9 +250,30 @@ type HeaderWebSocket = new(
  * A socket to the link URL offering the subprotocol and carrying the bearer; browsers cannot
  * send one. The socket fails to open unless the server echoes the subprotocol.
  */
-export function linkSocket(url: URL, token: string): WebSocket {
+export function linkSocket(
+	url: URL,
+	token: string,
+	resumable = false,
+	catalog = false,
+	attachments = false,
+	sessionForks = false,
+	steering = false,
+	retryTurns = false,
+): WebSocket {
 	return new (WebSocket as unknown as HeaderWebSocket)(url, {
-		headers: { authorization: `Bearer ${token}`, [WIRE.featuresHeader]: WIRE.runStageDeltas },
+		headers: {
+			authorization: `Bearer ${token}`,
+			[WIRE.featuresHeader]: [
+				WIRE.runStageDeltas,
+				WIRE.decisionOptionPreviews,
+				...(resumable ? [WIRE.resumableSessions, WIRE.restartNotice] : []),
+				...(catalog ? [WIRE.capabilityCatalog] : []),
+				...(attachments ? [WIRE.attachments] : []),
+				...(sessionForks ? [WIRE.sessionForks] : []),
+				...(steering ? [WIRE.steerTurn] : []),
+				...(retryTurns ? [WIRE.retryTurn] : []),
+			].join(", "),
+		},
 		protocols: [WIRE.subprotocol],
 	});
 }
@@ -161,6 +281,118 @@ export function linkSocket(url: URL, token: string): WebSocket {
 type RunsReport = { active: string[]; paused: string[]; cards: LinkRun[] };
 
 const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+function decodedBytes(data: string): number {
+	let clean = data.replace(/\s+/g, "").replace(/={1,2}$/, "");
+	return Math.max(1, Math.floor(clean.length * 3 / 4));
+}
+
+type ImageAt = { index: number; data: string; mimeType: unknown };
+
+/** A tool result's content blocks and how to put changed ones back into its message. */
+function imageBlocks(message: ClientMessageOf<"part">) {
+	let { part } = message;
+	if (part.type !== "tool-result") return undefined;
+	let asText = typeof part.result === "string";
+	let result: unknown = part.result;
+	if (typeof result === "string") {
+		try {
+			result = JSON.parse(result);
+		} catch {
+			return undefined;
+		}
+	}
+	let content = (result as { content?: unknown } | null)?.content;
+	if (!result || typeof result !== "object" || !Array.isArray(content)) return undefined;
+	let blocks: unknown[] = [...content];
+	let images: ImageAt[] = blocks.flatMap((block, index) => {
+		let { type, data, mimeType } = (block ?? {}) as Record<string, unknown>;
+		return type === "image" && typeof data === "string" ? [{ index, data, mimeType }] : [];
+	}).sort((a, b) => b.data.length - a.data.length || b.index - a.index);
+	let rebuild = (next: unknown[]): ClientMessageOf<"part"> => {
+		let sent = { ...result as object, content: next };
+		return {
+			...message,
+			part: { ...part, result: asText ? JSON.stringify(sent) : sent } as typeof part,
+		};
+	};
+	return { blocks, images, rebuild };
+}
+
+/** Whether a part over a frame would fit once its images were made smaller or left out. */
+function fitsWithoutImages(message: ClientMessageOf<"part">): boolean {
+	if (bytes(message) <= WIRE.maxMessageBytes) return true;
+	let found = imageBlocks(message);
+	if (!found?.images.length) return false;
+	let stripped = found.blocks.map(block =>
+		found.images.some(image => found.blocks[image.index] === block)
+			? { ...block as object, data: "", tooLarge: Number.MAX_SAFE_INTEGER }
+			: block
+	);
+	return bytes(found.rebuild(stripped)) <= WIRE.maxMessageBytes;
+}
+
+/** The image made small enough to be `budget` bytes, where this runtime can decode it (Bun). */
+async function smaller(
+	data: string,
+	mimeType: unknown,
+	budget: number,
+): Promise<{ data: string; mimeType: string } | undefined> {
+	let Image = (globalThis as { Bun?: { Image?: typeof Bun.Image } }).Bun?.Image;
+	if (!Image || budget <= 0) return undefined;
+	let jpeg = mimeType === "image/jpeg";
+	try {
+		let bytes = new Uint8Array(Buffer.from(data, "base64"));
+		let { width, height } = await new Image(bytes).metadata();
+		for (
+			let side = Math.min(Math.max(width, height), 4096);
+			side >= 128;
+			side = Math.floor(side * 0.75)
+		) {
+			let resized = new Image(bytes, { maxPixels: 268_402_689 }).resize(side, side, {
+				fit: "inside",
+				withoutEnlargement: true,
+			});
+			let out = await (jpeg ? resized.jpeg({ quality: 80 }) : resized.webp({ quality: 80 }))
+				.bytes();
+			if (out.byteLength <= budget) {
+				return {
+					data: Buffer.from(out).toString("base64"),
+					mimeType: jpeg ? "image/jpeg" : "image/webp",
+				};
+			}
+		}
+	} catch {}
+	return undefined;
+}
+
+/**
+ * A tool result that fits one frame. An image too large for it is sent as a smaller copy of
+ * itself (Chat stores and shows that copy), and only where none can be made is its data left out
+ * and `tooLarge` said instead, largest first.
+ */
+export async function fitImages(
+	message: ClientMessageOf<"part">,
+): Promise<ClientMessageOf<"part">> {
+	if (bytes(message) <= WIRE.maxMessageBytes) return message;
+	let found = imageBlocks(message);
+	if (!found) return message;
+	let { blocks, images, rebuild } = found;
+	for (let { index, data, mimeType } of images) {
+		let without = rebuild(
+			blocks.map((block, at) => at === index ? { ...block as object, data: "" } : block),
+		);
+		// What is left of the frame, less the encoding's own overhead, in decoded bytes.
+		let budget = Math.floor((WIRE.maxMessageBytes - bytes(without) - 1024) * 3 / 4);
+		let copy = await smaller(data, mimeType, budget);
+		blocks[index] = copy
+			? { ...blocks[index] as object, ...copy }
+			: { ...blocks[index] as object, data: "", tooLarge: decodedBytes(data) };
+		let fitted = rebuild(blocks);
+		if (bytes(fitted) <= WIRE.maxMessageBytes) return fitted;
+	}
+	return message;
+}
 
 /**
  * `runs` messages that each fit a frame: every one a complete report, with the delta cards'
@@ -204,10 +436,19 @@ type TurnState = {
 	controller: AbortController;
 	ended: boolean;
 	calls: Map<string, (result: HostToolResult) => void>;
+	/** A part being made to fit a frame, which what the turn sends next waits for. */
+	outbox?: Promise<unknown>;
 };
 
 function hostFailure(message: string): HostToolResult {
 	return { output: { error: message }, isError: true };
+}
+
+/** Settles each question as cancelled: the link that held it is gone and nothing will answer it. */
+function cancelAsks(held: Iterable<[string, PendingAsk]>): void {
+	for (let [request, ask] of held) {
+		ask.settle({ type: "input-result", request, status: "cancelled", message: LINK_CLOSED });
+	}
 }
 
 /** Text cut to the wire's limit for `message` and error fields. */
@@ -226,12 +467,32 @@ function settleCalls(turn: TurnState, message: string): void {
 
 /** Attaches to one document as its Planner and serves the server's requests. */
 export function connectAgent(options: AgentOptions): Promise<AgentClient> {
-	let socket = linkSocket(agentUrl(options.url), options.token);
+	let resumable = options.resumable !== false || options.resume !== undefined;
+	let sessionForks = options.sessionForks ?? options.handlers.fork !== undefined;
+	let socket = linkSocket(
+		agentUrl(options.url),
+		options.token,
+		resumable,
+		options.capabilities !== undefined,
+		options.attachments === true,
+		sessionForks,
+		options.handlers.steer !== undefined,
+		options.retryTurns === true,
+	);
 	let turns = new Map<string, TurnState>();
-	let asks = new Map<string, (message: ServerMessageOf<"input-result">) => void>();
+	let asks = new Map<string, PendingAsk>();
+	let sessions = new Set<string>();
 	let closing = Promise.withResolvers<LinkClosed>();
+	let resumption = Promise.withResolvers<Resumption | undefined>();
 	let attaching = Promise.withResolvers<AgentClient>();
 	let attached = false;
+	/** Whether the client is attached for good: `attached`, or `resumed` when it resumes. */
+	let ready = false;
+	/** Whether this link ended by choice or by the server's decision, so there is nothing to resume. */
+	let ended = false;
+	/** What the server said, just before closing, about when it expects to be back. */
+	let restartWithin: number | undefined;
+	let route = { send: (message: ClientMessage) => send(message) };
 
 	function send(message: ClientMessage): boolean {
 		let encoded = JSON.stringify(message);
@@ -258,12 +519,30 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 			signal: state.controller.signal,
 			emit: part => {
 				if (state.ended) return;
-				send({
+				let made: ClientMessageOf<"part"> = {
 					type: "part",
 					session: message.session,
 					turn: message.turn,
 					part: part.type === "error" ? { ...part, error: note(part.error) } : part,
-				});
+				};
+				if (!state.outbox && !fitsWithoutImages(made)) {
+					// Too large even without its images: it fails here, as it always has.
+					send(made);
+					return;
+				}
+				if (!state.outbox && bytes(made) <= WIRE.maxMessageBytes) {
+					send(made);
+					return;
+				}
+				// Made smaller off this call, so the parts after it wait their turn behind it.
+				let outbox: Promise<unknown> = (state.outbox ?? Promise.resolve())
+					.then(() => fitImages(made))
+					.then(send)
+					.catch(() => {})
+					.finally(() => {
+						if (state.outbox === outbox) state.outbox = undefined;
+					});
+				state.outbox = outbox;
 			},
 			offerTools: names =>
 				send({
@@ -275,6 +554,9 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 			callHostTool: (toolName, input) => {
 				if (state.ended || state.controller.signal.aborted) {
 					return Promise.resolve(hostFailure("The turn has ended."));
+				}
+				if (state.outbox) {
+					return state.outbox.then(() => context.callHostTool(toolName, input));
 				}
 				let toolCallId = `host-${++calls}-${crypto.randomUUID()}`;
 				let result = Promise.withResolvers<HostToolResult>();
@@ -304,13 +586,16 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 				state.ended = true;
 				turns.delete(key);
 				settleCalls(state, "The turn has ended.");
-				send({
-					type: "turn-end",
-					session: message.session,
-					turn: message.turn,
-					status,
-					...(text === undefined ? {} : { message: note(text) }),
-				});
+				let finish = () =>
+					send({
+						type: "turn-end",
+						session: message.session,
+						turn: message.turn,
+						status,
+						...(text === undefined ? {} : { message: note(text) }),
+					});
+				if (state.outbox) void state.outbox.then(finish).catch(() => {});
+				else finish();
 			},
 		};
 		Promise.resolve()
@@ -321,11 +606,39 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 			);
 	}
 
+	/**
+	 * The server refused or failed the link before it was ready. What a resumption holds ends with
+	 * it, except when the refusal says Chopin could not decide (`retry`): the same resumption can
+	 * succeed later, so its questions stay pending for the caller to try again.
+	 */
+	function failAttach(retry: boolean, error: Error): void {
+		ended = true;
+		if (!ready && !retry) cancelAsks(options.resume?.asks ?? []);
+		attaching.reject(error);
+	}
+
 	async function serve(message: ServerMessage): Promise<void> {
 		switch (message.type) {
 			case "start":
 				try {
 					await options.handlers.start?.(message);
+					sessions.add(message.session);
+					send({ type: "started", session: message.session });
+				} catch (error) {
+					send({
+						type: "start-failed",
+						session: message.session,
+						message: reason(error),
+					});
+				}
+				return;
+			case "fork":
+				try {
+					if (!options.handlers.fork) {
+						throw new Error("This Planner does not support session forks.");
+					}
+					await options.handlers.fork(message);
+					sessions.add(message.session);
 					send({ type: "started", session: message.session });
 				} catch (error) {
 					send({
@@ -340,6 +653,27 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 			case "abort":
 				turns.get(`${message.session}/${message.turn}`)?.controller.abort();
 				return;
+			case "steer": {
+				let running = turns.get(`${message.session}/${message.turn}`);
+				try {
+					if (
+						!options.handlers.steer || !running || running.ended
+						|| running.controller.signal.aborted
+					) {
+						throw new Error("The turn has ended.");
+					}
+					await options.handlers.steer(message);
+					send({ type: "control-result", request: message.request, ok: true });
+				} catch (error) {
+					send({
+						type: "control-result",
+						request: message.request,
+						ok: false,
+						message: reason(error),
+					});
+				}
+				return;
+			}
 			case "host-tool-result": {
 				let calls = turns.get(`${message.session}/${message.turn}`)?.calls;
 				calls?.get(message.toolCallId)?.({
@@ -350,8 +684,15 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 				return;
 			}
 			case "input-result":
-				asks.get(message.request)?.(message);
+				asks.get(message.request)?.settle(message);
 				asks.delete(message.request);
+				// Settled now or before: either way Chopin may stop keeping the result for this client.
+				if (features.includes(WIRE.resumableSessions)) {
+					send({ type: "input-received", request: message.request });
+				}
+				return;
+			case "restarting":
+				restartWithin = message.reconnectWithinMs;
 				return;
 			case "stop":
 			case "resume":
@@ -369,14 +710,43 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 				}
 				return;
 			case "destroy":
+				sessions.delete(message.session);
 				for (let [key, turn] of turns) {
 					if (key.startsWith(`${message.session}/`)) turn.controller.abort();
 				}
 				options.handlers.destroy?.(message);
 				return;
-			case "attached":
 			case "refused":
+				return failAttach(
+					message.retry === true,
+					new AgentRefused(message.code, message.message, message.retry === true),
+				);
 			case "error":
+				return failAttach(false, new Error(message.message));
+			case "resumed": {
+				// What the server gave back resumes here; what it did not give back has ended there.
+				let held = options.resume;
+				let returned = new Set(message.sessions.map(item => item.session));
+				for (let { session, requests } of message.sessions) {
+					sessions.add(session);
+					for (let request of requests) {
+						let ask = held?.asks.get(request);
+						if (!ask) continue;
+						ask.route = route;
+						asks.set(request, ask);
+						// Withdrawn while this link was being resumed, so its first cancel went nowhere.
+						if (ask.withdrawn) send({ type: "input-cancel", request });
+					}
+				}
+				cancelAsks([...held?.asks ?? []].filter(([request]) => !asks.has(request)));
+				for (let session of held?.sessions ?? []) {
+					if (!returned.has(session)) options.handlers.destroy?.({ type: "destroy", session });
+				}
+				ready = true;
+				attaching.resolve(client);
+				return;
+			}
+			case "attached":
 				return;
 		}
 	}
@@ -399,7 +769,8 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 				});
 			if (signal?.aborted) return withdrawn("The question was withdrawn before it was asked.");
 			let answered = Promise.withResolvers<ServerMessageOf<"input-result">>();
-			asks.set(request, answered.resolve);
+			let pending: PendingAsk = { session, settle: answered.resolve, route };
+			asks.set(request, pending);
 			let sent: boolean;
 			try {
 				sent = send({ type: "input-request", request, session, ...workflow, input });
@@ -411,13 +782,26 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 				asks.delete(request);
 				return withdrawn(LINK_CLOSED);
 			}
-			let cancel = () => send({ type: "input-cancel", request });
+			let cancel = () => {
+				pending.withdrawn = true;
+				// A link that is down cannot carry the cancellation: the ask ends here, and the next
+				// link does not name it, which withdraws it in Chopin as a cancellation would.
+				if (!pending.route.send({ type: "input-cancel", request })) {
+					pending.settle({
+						type: "input-result",
+						request,
+						status: "cancelled",
+						message: "The question was withdrawn while the connection was down.",
+					});
+				}
+			};
 			signal?.addEventListener("abort", cancel, { once: true });
 			return answered.promise.finally(() => signal?.removeEventListener("abort", cancel));
 		},
 		get features() {
 			return features;
 		},
+		resumption: resumption.promise,
 		reportRuns(session, runs) {
 			if (
 				!features.includes(WIRE.runStageDeltas) && runs.cards.some(card => "stagesDelta" in card)
@@ -426,8 +810,13 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 			}
 			for (let part of splitRuns(session, runs)) send(part);
 		},
+		report(catalog) {
+			if (!features.includes(WIRE.capabilityCatalog)) return false;
+			return send({ type: "capabilities", catalog });
+		},
 		send,
 		detach() {
+			ended = true;
 			send({ type: "detach" });
 			return closing.promise;
 		},
@@ -442,18 +831,27 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 		});
 	});
 	let released = false;
-	function release(closed: LinkClosed): void {
+	function release(reported: LinkClosed): void {
 		if (released) return;
 		released = true;
+		let closed = restartWithin === undefined
+			? reported
+			: { ...reported, reconnectWithinMs: restartWithin };
 		for (let turn of turns.values()) {
 			settleCalls(turn, LINK_CLOSED);
 			turn.controller.abort();
 		}
 		turns.clear();
-		for (let [request, resolve] of asks) {
-			resolve({ type: "input-result", request, status: "cancelled", message: LINK_CLOSED });
+		if (resumable && attached && !ended && features.includes(WIRE.resumableSessions)) {
+			// Unexpected: the questions stay pending for the next link to carry on. One withdrawn
+			// meanwhile ended with its caller's wait; the next link just does not name it.
+			cancelAsks([...asks].filter(([, ask]) => ask.withdrawn));
+			resumption.resolve({ sessions: new Set(sessions), asks: new Map(asks) });
+		} else {
+			cancelAsks(asks);
+			resumption.resolve(undefined);
 		}
-		asks.clear();
+		asks = new Map();
 		attaching.reject(
 			new Error(`The agent connection closed before attaching (${closed.code} ${closed.reason}).`),
 		);
@@ -464,6 +862,9 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 		let message = serverMessage(event.data);
 		if (!message) {
 			let closed = { code: WIRE.malformedClose, reason: "malformed-message" };
+			// A link that sends what cannot be read ends for good, whatever it kept.
+			ended = true;
+			if (!ready) cancelAsks(options.resume?.asks ?? []);
 			socket.close(closed.code, closed.reason);
 			release(closed);
 			return;
@@ -473,9 +874,33 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 				attached = true;
 				attachedDocument = message.document;
 				features = message.features ?? [];
-				attaching.resolve(client);
+				if (features.includes(WIRE.resumableSessions)) {
+					// The first message of a resumable link: what this client still holds.
+					let held = options.resume;
+					let requests = new Map<string, string[]>();
+					for (let [request, ask] of held?.asks ?? []) {
+						if (ask.withdrawn) continue;
+						requests.set(ask.session, [...requests.get(ask.session) ?? [], request]);
+					}
+					send({
+						type: "resume",
+						sessions: [...held?.sessions ?? []].map(session => ({
+							session,
+							requests: requests.get(session) ?? [],
+						})),
+					});
+				} else {
+					cancelAsks(options.resume?.asks ?? []);
+					ready = true;
+					attaching.resolve(client);
+				}
+				// After the `resume`, which must be a resumable link's first message.
+				if (options.capabilities) client.report(options.capabilities);
 			} else if (message.type === "refused") {
-				attaching.reject(new AgentRefused(message.code, message.message));
+				failAttach(
+					message.retry === true,
+					new AgentRefused(message.code, message.message, message.retry === true),
+				);
 			}
 			return;
 		}

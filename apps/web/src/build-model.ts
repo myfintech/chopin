@@ -1,3 +1,4 @@
+import { PLANNER_NAME } from "@chopin/editor/people";
 import type { BuildRequest, ImplementationSnapshot } from "@chopin/protocol/implementation";
 
 type Snapshot = ImplementationSnapshot;
@@ -10,7 +11,7 @@ export type BuildPhase =
 	/** Tasks are missing, out of date or were returned; `draft` is the Planner request to send. */
 	| { kind: "drafting"; draft: "prepare" | "revise" | "returned" }
 	/** `stale` when there are no tasks for the current revision to show beneath the blockers. */
-	| { kind: "blocked"; decisions: boolean; comments: boolean; stale: boolean }
+	| { kind: "blocked"; comments: boolean; stale: boolean }
 	| { kind: "review" }
 	| { kind: "building" }
 	/** The build ended before it claimed the tasks; a retry is safe. */
@@ -141,6 +142,42 @@ function quote(raw: string): string {
  * disconnecting, its agent going quiet while the machine stayed connected, or Chopin restarting.
  * Other failures keep the phase's own words.
  */
+/** How a connector says it stopped an agent that ran past its time limit; see the connector's `timedOut`. */
+const AGENT_TIMED_OUT = /^Its agent ran for (.{1,40}), so chopin stopped it\.$/;
+
+/**
+ * What a built document's card says besides its pull requests: rebuilds' commits since, pull
+ * requests a person closed or merged, and an agent that was stopped after its last task. A build
+ * that delivered every task is built, but its agent's end is not hidden.
+ */
+export function builtDetail(snapshot: Snapshot | undefined): string | undefined {
+	if (!snapshot) return;
+	let notes: string[] = [];
+	let commits = snapshot.live?.commits.length ?? 0;
+	if (commits > 0) notes.push(`${plural(commits, "commit", "commits")} since first build`);
+	let closed = snapshot.live?.closedPullRequests ?? [];
+	if (closed.length) {
+		let numbers = closed.map(item => {
+			let number = pullRequestNumber(item.url);
+			return number === undefined ? "A pull request" : `#${number}`;
+		});
+		let merged = closed.every(item => item.state === "merged");
+		notes.push(
+			`${numbers.join(", ")} ${
+				merged ? "merged" : "closed"
+			} on GitHub, so builds open new pull requests instead`,
+		);
+	}
+	let build = snapshot.build;
+	let ran = build?.state === "failed" && build.error
+		? AGENT_TIMED_OUT.exec(build.error)
+		: undefined;
+	if (ran) {
+		notes.push(`Every task finished, then its agent ran for ${ran[1]} and chopin stopped it`);
+	}
+	return notes.length ? notes.join(". ") : undefined;
+}
+
 export function endedReason(build: { error?: string } | undefined): string | undefined {
 	let error = build?.error;
 	if (error === "Stopped from the connector terminal.") {
@@ -155,10 +192,55 @@ export function endedReason(build: { error?: string } | undefined): string | und
 	if (error === "Chopin restarted, so this build ended.") {
 		return "Build stopped — Chopin restarted.";
 	}
+	let ran = error && AGENT_TIMED_OUT.exec(error);
+	if (ran) return `Build stopped — its agent ran for ${ran[1]}.`;
 	// Builds that ended before Chopin told these apart.
 	if (error?.startsWith("Workspace disconnected")) {
 		return "Build stopped — your local agent disconnected or stopped responding.";
 	}
+}
+
+const AGAIN = "Build plan builds it again.";
+const UNFINISHED = "The build stopped before it finished.";
+
+/** `text` as a sentence, ending with one full stop unless it ends a sentence already. */
+function said(text: string): string {
+	let trimmed = text.replace(/\s+/g, " ").trim();
+	return /[.?!…]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+/**
+ * The Build view's card for a first build whose run ended with it: who stopped it in Chopin and
+ * when, the task its agent blocked and why, why it failed, or that its agent or a reviewer
+ * returned it for changes. Each says what Chat's end line and the machine's terminal say.
+ */
+export function endedCard(snapshot: Snapshot): { title: string; detail: string } {
+	let build = snapshot.build;
+	let run = latestRun(snapshot);
+	if (build?.stoppedBy) {
+		let at = build.finishedAt
+			? new Date(build.finishedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+			: undefined;
+		return { title: `Stopped by @${build.stoppedBy}`, detail: at ? `At ${at}. ${AGAIN}` : AGAIN };
+	}
+	let blocked = build?.state === "stopped"
+		? run?.progress.tasks.find(task => task.state === "blocked" && task.blocker?.trim())
+		: undefined;
+	// The blocked task's row, open beneath, names it; the card's one line leads with why.
+	if (blocked?.blocker) {
+		return { title: "Blocked", detail: `${said(blockerText(blocked.blocker))} ${AGAIN}` };
+	}
+	if (build?.state === "failed" && build.error === "Stopped from the connector terminal.") {
+		return { title: "Stopped from the connector terminal", detail: AGAIN };
+	}
+	if (build?.state === "failed") {
+		return { title: "Build failed", detail: build.error ? `${said(build.error)} ${AGAIN}` : AGAIN };
+	}
+	let reason = run?.outcome.kind === "revision_requested" ? run.outcome.reason : undefined;
+	if (!reason || reason === UNFINISHED) {
+		return { title: "Stopped before it finished", detail: AGAIN };
+	}
+	return { title: "Returned for changes", detail: `${said(reason)} ${AGAIN}` };
 }
 
 /**
@@ -271,6 +353,21 @@ export function buildAgo(
 	return at ? ago(at, now) : undefined;
 }
 
+/**
+ * Where a build's code started when the Planner pushed the plan's files for it: the plan revision
+ * and the branch at the commit's short SHA.
+ */
+export function planSourceLine(
+	build: Pick<BuildRequest, "state" | "planSource"> | undefined,
+): string | undefined {
+	if (!build?.planSource) return;
+	let source = build.planSource;
+	let active = ["queued", "starting", "running"].includes(build.state);
+	return `${
+		active ? "Building" : "Built"
+	} from plan revision ${source.revision} at ${source.branch}@${source.commit.slice(0, 7)}`;
+}
+
 function latestRun(snapshot: Snapshot) {
 	let graph = snapshot.graph;
 	return snapshot.lifecycle.history.findLast(item =>
@@ -303,7 +400,6 @@ export function buildPhase(snapshot: Snapshot | undefined): BuildPhase {
 	if (snapshot.blockers.length > 0) {
 		return {
 			kind: "blocked",
-			decisions: snapshot.blockers.includes("unanswered questionnaires"),
 			comments: snapshot.blockers.includes("accepted comments awaiting plan changes"),
 			stale: !snapshot.graph || snapshot.graph.planRevision !== snapshot.planRevision,
 		};
@@ -344,6 +440,17 @@ export function taskStateLabel(state: TaskState, noChange: boolean): string {
 	return state === "completed" && noChange ? "done, no change needed" : TASK_STATE_LABEL[state];
 }
 
+/**
+ * A task row's accessible name: the title as shown (`inlineText`), then its state. Given as a
+ * label, since a name read from the row's content gains a space before the comma: browsers set
+ * a visually hidden, absolutely positioned state apart from the title with one.
+ */
+export function taskRowName(title: string, state: TaskState, noChange: boolean): string {
+	let text = title.replace(/\s+/g, " ").trim();
+	let label = taskStateLabel(state, noChange);
+	return text ? `${text}, ${label}` : label;
+}
+
 /** Active and blocked rows start open; so does a linked task. */
 export function taskStartsOpen(state: TaskState, linked: boolean): boolean {
 	return linked || state === "in_progress" || state === "blocked";
@@ -361,22 +468,39 @@ export function startedBy(snapshot: Snapshot | undefined, userId: string): strin
 }
 
 /**
+ * Why Build plan waits when no machine can draft the tasks, in words that speak of a machine as
+ * the machine button does. The first one also opens how to connect one, so the button keys on it.
+ */
+export const CONNECT_MACHINE_TO_BUILD = "Connect a machine to this document to build";
+const RECONNECT_MACHINE_TO_BUILD = "Reconnect the machine to build";
+
+/**
  * Plain copy for a refusal the server explains, or `undefined` for one it does
  * not, which reads as Chopin failing to draft.
  */
 export function draftRefusalCopy(message: string, code?: string): string | undefined {
-	if (code === "planner-not-attached" || /No Planner is attached/.test(message)) {
-		return "Connect a Planner to this document to build.";
+	if (/ is offline, so this message wasn't sent/.test(message)) {
+		return `${RECONNECT_MACHINE_TO_BUILD}.`;
 	}
-	if (/unanswered questionnaires/.test(message)) return "Answer the open decisions first.";
+	if (message.startsWith("Still connecting to ")) {
+		return message.replace(
+			/, so this message wasn't sent\. Send it again in a moment\.$/,
+			". Try again in a moment.",
+		);
+	}
+	if (code === "planner-not-attached" || /Connect a machine to get a reply/.test(message)) {
+		return `${CONNECT_MACHINE_TO_BUILD}.`;
+	}
 	if (/accepted comments/.test(message)) {
 		return "Update the document for accepted comments first.";
 	}
 	if (/implementation is already active/.test(message)) return "A build is already running.";
 	if (/queue is full|too many/.test(message)) {
-		return "Chopin is busy with other requests. Try again shortly.";
+		return `${PLANNER_NAME} is busy with other requests. Try again shortly.`;
 	}
-	if (/Planner is not running/.test(message)) return "Chopin isn’t running for this document.";
+	if (/(?:Planner|Chopin) is not running/i.test(message)) {
+		return `${PLANNER_OFF}.`;
+	}
 	if (/write access|authorization expired/.test(message)) {
 		return "You need write access to this repository to build.";
 	}
@@ -398,6 +522,10 @@ export function buildRefusalCopy(message: string): string {
 	if (/offline or busy/.test(message)) return "Your local agent is offline or busy with other work";
 	if (/nothing to build/.test(message)) return "There are no changes to build";
 	if (/busy/i.test(message)) return "Your local agent is busy with another document";
+	if (message === "plan-source-unavailable") {
+		return "The plan’s commit isn’t on GitHub. Ask chopin to push it again";
+	}
+	if (/plan source has changed/.test(message)) return "The plan’s files changed. Try again";
 	if (/reviewed graph has changed|reviewed build has changed|stale/.test(message)) {
 		return "The tasks changed. Try again";
 	}
@@ -480,8 +608,8 @@ export function advanceFirstBuild(state: FirstBuild, event: FirstBuildEvent): Fi
 			return {
 				stage: "failed",
 				message: event.changed
-					? "The document changed while Chopin was breaking it into tasks."
-					: "Chopin couldn’t break the plan into tasks.",
+					? `The document changed while ${PLANNER_NAME} was breaking it into tasks.`
+					: `${PLANNER_NAME} couldn’t break the plan into tasks.`,
 			};
 		case "draft-refused":
 			return state.stage === "drafting" ? { stage: "failed", message: event.message } : state;
@@ -506,7 +634,7 @@ export function advanceFirstBuild(state: FirstBuild, event: FirstBuildEvent): Fi
  *
  * Once pressed it reads as `working` until the build runs or the attempt ends;
  * `reset` hands any later state back to the snapshot. A draft that raises a
- * decision does not drop the press: it reads `waiting` until the blockers
+ * blocker does not drop the press: it reads `waiting` until the blockers
  * clear, then drafts again if the tasks are stale and starts them. The server
  * keeps the press (`buildRequested`), so a reload `resume`s it. A build that
  * failed before it claimed its tasks starts again from the same tasks.
@@ -585,8 +713,9 @@ export type BuildContext = {
 	 * drafting needs one: starting drafted tasks, Retry and rebuilds do not.
 	 */
 	plannerDetached?: boolean;
+	/** The Planner is attached to this document but its connection dropped; it must reconnect. */
+	plannerDisconnected?: boolean;
 	hasContent: boolean;
-	unanswered: number;
 };
 
 /** Tasks of the current build that have a pull request, out of all of them. */
@@ -596,37 +725,33 @@ function progressCount(snapshot: Snapshot): { done: number; total: number } {
 	return { done: tasks.filter(task => task.state === "completed").length, total };
 }
 
-/** The open decisions or accepted comments that hold any build, or nothing. */
-function blockerReason(snapshot: Snapshot, unanswered: number): string | undefined {
+/** The required investigations or accepted comments that hold any build, or nothing. */
+function blockerReason(snapshot: Snapshot): string | undefined {
 	let investigations = snapshot.buildInvestigations?.length ?? 0;
-	let decisions = snapshot.blockers.includes("unanswered questionnaires")
-		? Math.max(1, unanswered)
-		: 0;
-	if (decisions || investigations) {
-		let waiting = [
-			decisions && plural(decisions, "decision", "decisions"),
-			investigations && plural(investigations, "investigation", "investigations"),
-		].filter(Boolean);
-		return `Waiting on ${waiting.join(" and ")}`;
+	if (investigations) {
+		return `Waiting on ${plural(investigations, "investigation", "investigations")}`;
 	}
 	if (snapshot.blockers.includes("accepted comments awaiting plan changes")) {
 		return "Update the document for accepted comments first";
 	}
 }
 
+/** Why Build plan cannot be pressed while the document has no Planner. */
+export const PLANNER_OFF = `${PLANNER_NAME} isn’t running for this document`;
+
 /** Why Build plan cannot be pressed yet, or nothing when it can. */
 function planBlocker(snapshot: Snapshot | undefined, context: BuildContext): string | undefined {
 	if (!context.hasContent) return "Write the document first";
 	if (!context.connected || !snapshot) return "Chopin isn’t connected";
 	let phase = buildPhase(snapshot);
-	let reason = blockerReason(snapshot, context.unanswered);
+	let reason = blockerReason(snapshot);
 	if (reason) return reason;
 	if (phase.kind === "blocked") return "This document can’t be built yet";
 	if (phase.kind === "drafting" && !context.planner) {
-		return "Chopin isn’t running for this document";
+		return PLANNER_OFF;
 	}
 	if (phase.kind === "drafting" && context.plannerDetached) {
-		return "Connect a Planner to this document to build";
+		return context.plannerDisconnected ? RECONNECT_MACHINE_TO_BUILD : CONNECT_MACHINE_TO_BUILD;
 	}
 }
 
@@ -669,7 +794,7 @@ export function buildLook(snapshot: Snapshot | undefined, context: BuildContext)
 			};
 		}
 		let act = context.canEdit && context.connected;
-		let blocked = act ? blockerReason(snapshot, context.unanswered) : undefined;
+		let blocked = act ? blockerReason(snapshot) : undefined;
 		if (sync.reason === "failed") {
 			return {
 				kind: "failed",
@@ -738,7 +863,7 @@ export function buildLook(snapshot: Snapshot | undefined, context: BuildContext)
 	}
 	if (step.view === "working") return { kind: "tasks", tip: "Breaking the document into tasks" };
 	if (step.view === "waiting") {
-		return { kind: "plan", blocked: blockerReason(snapshot, context.unanswered) };
+		return { kind: "plan", blocked: blockerReason(snapshot) };
 	}
 	let retry = context.canEdit && context.connected;
 	if (context.state.stage === "failed" && context.state.agent) {
@@ -812,4 +937,65 @@ export function retryAction(look: BuildLook): "Retry" | undefined {
 /** Build opens once there is a build, or a press under way, to show. */
 export function buildTabReady(snapshot: Snapshot | undefined, look: BuildLook): boolean {
 	return look.kind !== "plan" || !!snapshot && hasBuilt(snapshot);
+}
+
+/** A running build as Chat's run strip shows it, beside the workflow runs. */
+export type BuildRun = {
+	id: string;
+	/** A first build works through its tasks; a rebuild carries edits onto its pull requests. */
+	kind: "build" | "rebuild";
+	state: "queued" | "building";
+	done: number;
+	total: number;
+	/** The task being built now, by title. */
+	task?: string;
+	/** The coding agent's latest activity. */
+	activity?: string;
+	/** When it was asked for, as an ISO time. */
+	started: string;
+	/** Pull requests it has opened or is updating, newest last. */
+	pullRequests: string[];
+};
+
+/**
+ * The build Chat's run strip shows while one runs, or nothing. It is read from the same snapshot
+ * as Build, so the strip and Build never disagree; once the build ends the strip lets it go and
+ * Chat's line about how it ended stays.
+ */
+export function buildRun(snapshot: Snapshot | undefined): BuildRun | undefined {
+	if (!snapshot) return;
+	let rebuild = snapshot.live?.rebuild;
+	if (rebuild && RUNNING.has(rebuild.state)) {
+		return {
+			id: rebuild.id,
+			kind: "rebuild",
+			state: rebuild.state === "queued" ? "queued" : "building",
+			done: 0,
+			total: 0,
+			...(rebuild.activity ? { activity: rebuild.activity.text } : {}),
+			started: rebuild.createdAt,
+			pullRequests: [...snapshot.live!.pullRequests],
+		};
+	}
+	let build = snapshot.build;
+	if (!build || !RUNNING.has(build.state)) return;
+	let progress = snapshot.lifecycle.activity?.tasks ?? [];
+	let tasks = snapshot.graph?.definition.tasks ?? [];
+	let state = (id: string) => progress.find(task => task.id === id)?.state ?? "queued";
+	let current = tasks.find(task => state(task.id) === "in_progress")
+		?? tasks.find(task => state(task.id) === "queued");
+	let { done, total } = progressCount(snapshot);
+	return {
+		id: build.id,
+		kind: "build",
+		state: build.state === "queued" ? "queued" : "building",
+		done,
+		total,
+		...(current && build.state !== "queued" ? { task: current.title } : {}),
+		...(build.activity ? { activity: build.activity.text } : {}),
+		started: build.createdAt,
+		pullRequests: [
+			...new Set(progress.flatMap(task => task.pullRequest ? [task.pullRequest.url] : [])),
+		],
+	};
 }

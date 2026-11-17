@@ -20,13 +20,19 @@ import { GitHubHoverCards } from "./github-hover";
 import { GitHubReferencesPlugin } from "./github-references";
 import { MarkdownPastePlugin } from "./markdown-paste";
 import { QuestionnaireObserver } from "./questionnaires";
+import { RepositoryLinksPlugin } from "./repository-links";
 import { ResolvedLayer } from "./resolved-layer";
 import { TableChrome } from "./table/chrome";
 import { ThreadObserver } from "./threads";
 import { Toolbar } from "./toolbar";
 import {
+	BlockHandlePlugin,
+	BlockKeysPlugin,
+	BlockSelectionPlugin,
 	CalloutPlugin,
 	CardGapPlugin,
+	CodeKeysPlugin,
+	CodePaintPlugin,
 	ColumnsPlugin,
 	DecisionDeletionPlugin,
 	DecoratorSelectionPlugin,
@@ -66,12 +72,18 @@ export const widgetsPlugin = realmPlugin<WidgetOptions>({
 			realm.pub(addComposerChild$, () => <ChangeObserver store={store} />);
 		}
 		realm.pub(addComposerChild$, GitHubReferencesPlugin);
+		realm.pub(addComposerChild$, RepositoryLinksPlugin);
 		realm.pub(addComposerChild$, GitHubHoverCards);
 		realm.pub(addComposerChild$, TabsPlugin);
 		realm.pub(addComposerChild$, ColumnsPlugin);
 		realm.pub(addComposerChild$, DiscardedNavigationPlugin);
 		realm.pub(addComposerChild$, CardGapPlugin);
 		realm.pub(addComposerChild$, PreviewPlugin);
+		realm.pub(addComposerChild$, CodePaintPlugin);
+		realm.pub(addComposerChild$, CodeKeysPlugin);
+		realm.pub(addComposerChild$, BlockKeysPlugin);
+		realm.pub(addComposerChild$, BlockSelectionPlugin);
+		realm.pub(addComposerChild$, BlockHandlePlugin);
 		realm.pub(addComposerChild$, CalloutPlugin);
 		realm.pub(addComposerChild$, DocumentTitlePlugin);
 		realm.pub(addComposerChild$, EnterPlugin);

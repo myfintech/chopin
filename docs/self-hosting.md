@@ -15,16 +15,22 @@ that origin.
 - The application, API, MCP endpoint, and WebSocket share one origin and one
   internal port.
 - One active Chopin process may write to a database. Horizontal application
-  scaling and zero-downtime rolling deployment are not supported.
+  scaling is not supported. A second process can start beside the holder and take
+  over when it stops, which is how a deploy can be invisible; see
+  [Deploys nobody can see](zero-downtime-deploys.md).
 - PostgreSQL 17 is the version used by the repository and browser tests. Other
   versions are not covered by the project test suite.
 - Database migrations are forward-only. There is no automated schema rollback.
-- Restarting the application signs every browser out and releases hosted agent
-  ownership. Documents, transcripts, decisions, background jobs and artifacts,
-  research request staging, child documents, and implementation state remain.
-  In local mode (see below), the returning browser can restore the same login
-  without repeating device-flow sign-in; it still gets a new session and does
-  not reclaim Planner ownership.
+- Restarting the application releases hosted agent ownership, except for a remote
+  Planner that was connected when the process stopped, which keeps its place for
+  a short window (see [Deploys nobody can see](zero-downtime-deploys.md#a-remote-planner-and-its-machine)).
+  Documents, transcripts, decisions, background jobs and artifacts, research
+  request staging, child documents and implementation state remain. A Planner request
+  that had not started does not: nothing is held for a Planner, and a message sent
+  while the process stops is sent again by its browser to the next one. A hosted browser's login is restored when its
+  cookie reaches the new process. In local mode (see below), the returning
+  browser can restore the same login without repeating device-flow sign-in; it
+  still gets a new session and does not reclaim Planner ownership.
 
 ## Choose the access policy first
 
@@ -75,7 +81,21 @@ each owner's GitHub App user token and does not consume `HARNESS_AUTH`;
 setting `auto` on loopback passes the startup guard but does not enable host
 login in that adapter.
 
-`HARNESS=atomic` runs Atomic 0.9.40 in the Chopin server process through its
+Under `HARNESS=copilot-sdk` the Copilot CLI runs with a minimal environment of
+its own, not the server's. Behind an HTTP or HTTPS proxy, set these on the
+server process and the CLI receives them unchanged: `HTTPS_PROXY`,
+`HTTP_PROXY`, `NO_PROXY` and their lowercase forms, and the certificate
+variables a proxy that re-signs TLS needs, `NODE_EXTRA_CA_CERTS`,
+`SSL_CERT_FILE` and `SSL_CERT_DIR`. A variable the server has not set is not
+passed, and one set to an empty string is passed as empty. The CLI also gets
+`COPILOT_PLUGIN_DIR_ONLY=true` and the variables the Copilot SDK itself sets;
+nothing else from the server's environment reaches it, including tokens and
+`COPILOT_ENABLE_BUILTIN_GITHUB_MCP`. If the host reaches GitHub only through a
+proxy that the server learns some other way, such as a system setting, set
+these variables on the server process too: otherwise the CLI connects directly,
+and a Planner turn fails with "The Planner stream failed."
+
+`HARNESS=atomic` runs Atomic 0.9.87 in the Chopin server process through its
 headless SDK (`createAgentSession()`). It does not spawn the `atomic` CLI or use
 RPC mode.
 
@@ -143,6 +163,14 @@ Atomic caveats:
 - Harness-level compaction, suspending a turn, and supplied harness skills are
   unsupported. A Planner session's own resource discovery does load Atomic
   skills. Atomic's automatic retries remain on.
+- Since Atomic 0.9.42 a provider's rate limit is shared by the whole server
+  process. After one request gets a 429, every Atomic session in the server,
+  Planner turns and workers alike, waits for that provider's cooldown (its
+  `Retry-After`, otherwise backoff of up to 60 seconds) before sending its next
+  request, instead of each hitting the limit in turn. A turn waiting there shows
+  no output yet; stopping it ends the wait without sending the request. Chopin
+  sets no request budget (`configureProviderRequestBudget()`) or
+  `resourceAdmission` of its own.
 - Under `auto`, refreshing an OAuth token in memory can rotate the refresh token
   stored by the host CLI, which may then ask the operator to sign in again.
   `auto` also runs `!command` API-key entries in `auth.json` to resolve them.
@@ -157,6 +185,37 @@ Atomic caveats:
   [Full Atomic Planner](hosted-agent.md#full-atomic-planner)). The Docker image
   sets `XDG_STATE_HOME=/var/lib/chopin`; mount a volume there to keep runs
   and those directories when the container is replaced.
+- Local workflow worker pools stay off unless the operator's Atomic settings
+  set `workflows.localWorkers`. Since Atomic 0.9.44 a pool runs as one
+  coordinator process per root run, started by the Chopin server process, with
+  the worker processes under it; it uses the same journal, and if the server
+  exits, the coordinator and its workers exit with it. Atomic keeps each
+  worker's standard error in `worker-logs/` beside the journal, so under
+  `$XDG_STATE_HOME/chopin/atomic/worker-logs/<run id>/`, inside the directory
+  Chopin creates for the journal with access for the server's user only. It
+  deletes a log when its worker shuts down normally but keeps the logs of
+  workers that failed; remove them yourself. A child whose worker dies is
+  replayed on a new worker, up to three attempts; after that the run fails and
+  its card in Chat says so. The settings `workflows.localWorkers.startupTimeoutMs`
+  and `leaseMs` set how long a worker may take to start and how long an
+  unresponsive one keeps its child; Chopin sets neither. A pool runs children
+  once one worker is ready and fails to start only when none is. Since Atomic
+  0.9.45 an unset `startupTimeoutMs` is no longer a flat 30 seconds: it is 30
+  seconds times the worker count plus the one-minute load average, divided by
+  the CPU cores, at least 30 seconds and at most 10 minutes, so a large pool on
+  a busy Chopin host waits longer. A run whose workers still miss it fails with
+  `Local worker startup timed out`, and its card in Chat says so; raise the
+  setting or use fewer workers.
+- Since Atomic 0.9.44 a workflow runs up to 1000 of its stages at once unless
+  it says otherwise (`defaultConcurrency`, 3 before), nests child workflows at
+  most three levels deep (`maxDepth`, 4 before), and a stage's `subagent` tool
+  runs up to 1000 children at once (`parallel.concurrency` and
+  `parallel.runningCapacity`, 3 and 4 before). Without a pool, all of them run
+  in the Chopin server process and share its memory and the provider rate
+  limit above. To throttle a server, lower `defaultConcurrency` in
+  `extensions/workflow/config.json` and the `parallel` limits in
+  `extensions/subagent/config.json` under the Atomic agent directory, which
+  Planner sessions read; Chopin sets none of these itself.
 - Atomic depends on `typebox` 1.3.27 while Chopin pins 1.3.7. Host tool schemas
   pass to Atomic as plain JSON Schema, so the two versions never meet.
 
@@ -215,17 +274,21 @@ goes to a client attached to the document over the agent connection at
 member's machine, while the document, Decisions, and every room write stay in
 this server. The server needs no `MODEL` (one that is set is passed to the
 client as the turn's requested model) and accepts no `HARNESS_AUTH`, so it may
-bind to a public interface. Startup refuses `HARNESS_AUTH` and requires
-`BACKGROUND_JOBS=off`, because the summary and research workers would have no
-model. The route exists only with `AGENT` on and `HARNESS=remote`.
+bind to a public interface. Startup refuses `HARNESS_AUTH`. Summary and
+research workers run as isolated sessions on the client attached to their
+document, and wait while none is attached; set `BACKGROUND_JOBS=off` to keep
+them off the attached clients entirely, which also turns off `/research`. The
+route exists only with `AGENT` on and `HARNESS=remote`.
 
 The trust boundary moves to whoever attaches. A client authenticates with a
 GitHub token bearer, checked like hosted MCP, and needs push or administration
 access to the document's repository, rechecked before every session and turn and
 every 5 minutes while it stays attached. The same account must have signed in to
 this server in a browser: attaching makes that login the document's Planner
-owner, one client per document, and a detached or dropped connection keeps it for
-`PLANNER_ATTACH_GRACE_MS` so the same account can reattach. The server pings
+owner, one client per document, and a detached connection, or one that dropped with
+nothing to keep, holds it for `PLANNER_ATTACH_GRACE_MS` so the same account can
+reattach. A dropped `resumable-sessions` connection with runs or open questions
+holds it, and them, until it returns or something explicit ends them. The server pings
 every connection and counts one that answers nothing for `AGENT_CONNECTION_TIMEOUT_MS` as
 dropped, so a client whose network silently went away does not stay attached.
 A queue of frames draining toward the client puts that off, but never past
@@ -245,8 +308,8 @@ receives what a Planner turn sees, including repository reads made with that
 owner's token, and decides what the Planner writes during turns writers start;
 its run reports never start a turn. The server never runs the client's tools and
 gains no shell or filesystem access from this harness. Without an attached
-client, `@chopin` and `invoke_planner` are refused with `planner-not-attached`
-and instructions to attach one. See
+client, `@chopin` and `invoke_planner` are saved and wait for one, under
+`AUTH_MODE=local` as well. See
 [Remote Planner](hosted-agent.md#remote-planner) for the behaviour and
 [Agent connection](agent-connection.md) for the wire format. The connection shares the
 application's origin and port with `/ws` and `/mcp`, so a TLS-terminating proxy
@@ -256,7 +319,7 @@ headers.
 
 ## Prerequisites
 
-- Docker for the application image, or Bun 1.4.2 for a source deployment.
+- Docker for the application image, or Bun 1.4.4 for a source deployment.
 - A reachable PostgreSQL database and credentials with schema migration access.
 - A stable DNS name with TLS termination and WebSocket proxying.
 - Outbound HTTPS access to GitHub and the selected harness's model provider
@@ -271,6 +334,10 @@ headers.
 - For `copilot-sdk`, an active Copilot entitlement for each user who may own a
   hosted agent session. For `atomic`, model credentials for the chosen
   `HARNESS_AUTH` mode instead.
+- For public web research (`/research` with `WEB_RESEARCH` on), GitHub's Copilot
+  MCP endpoint must offer its `web_search` tool to each user's App user access
+  token. GitHub does not document that tool's requirements, so verify it on your
+  deployment; see [Troubleshooting](#troubleshooting).
 
 ## Register the GitHub App
 
@@ -306,6 +373,10 @@ Metadata:        Read-only (automatic)
 Organization admission also needs
 [one organization permission](authentication.md#organization-admission).
 
+7. If people will pair machines, give the server the App's ID and a private key
+   by following [GitHub App identity](github-app-identity.md). Work on a machine
+   pushes as the App's bot; without the key, that work doesn't start.
+
 ## Runtime configuration
 
 Store production values in the deployment's secret manager or an owner-readable
@@ -317,9 +388,13 @@ the image.
 | `STORAGE_DRIVER`                  | `postgres`              | Storage adapter. `postgres` is currently the only accepted value.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `DATABASE_URL`                    | required                | `postgres:` or `postgresql:` connection URL. It is not printed by Chopin.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `APP_ORIGIN`                      | required                | Exact public origin, without credentials, path, query, fragment, or trailing slash. HTTPS is required unless the host is loopback.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `PREVIOUS_ORIGINS`                | empty                   | Comma-separated origins this deployment was served from before `APP_ORIGIN`, each validated like `APP_ORIGIN`. Paired machines, browser logins, Origin checks, and document links from those origins keep working; see [Moving to a new origin](#moving-to-a-new-origin).                                                                                                                                                                                                                                                                                                                                                                                         |
 | `GITHUB_APP_SLUG`                 | required                | Lowercase slug from the App's public URL.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `GITHUB_APP_CLIENT_ID`            | required                | OAuth client ID, not the numeric GitHub App ID.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `GITHUB_APP_CLIENT_SECRET`        | required (hosted)       | OAuth client secret used for user-token exchange and refresh. Unused when `AUTH_MODE=local`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `GITHUB_APP_ID`                   | empty                   | The App ID, a number on the App's General settings page, for paired machines' tokens. Needs one of the two key variables below. See [GitHub App identity](github-app-identity.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `GITHUB_APP_PRIVATE_KEY_FILE`     | empty                   | Path of the App's private key (`.pem`), mode 0600. Read at startup.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `GITHUB_APP_PRIVATE_KEY`          | empty                   | The key's PEM text, with line breaks as `\n`, for platforms without secret files. Not with `GITHUB_APP_PRIVATE_KEY_FILE`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `GITHUB_ALLOWED_USERS`            | empty                   | Comma-separated admitted GitHub logins.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `GITHUB_ALLOWED_ORGANIZATIONS`    | empty                   | Comma-separated organizations whose active members are admitted.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `SESSION_ENCRYPTION_KEY`          | required                | Exactly 64 hexadecimal characters. Encrypts the hosted OAuth attempt cookie and derives a separate key for session credentials in PostgreSQL. Keep stable across releases and outside the database; replacing it invalidates hosted logins. Local mode requires the configured key but uses separate unpredictable, HttpOnly attempt and browser-binding cookies.                                                                                                                                                                                                                                                                                                 |
@@ -331,15 +406,28 @@ the image.
 | `MODEL`                           | `gpt-6.1-sol`           | Model requested for hosted agent sessions. Required under `HARNESS=atomic`, where it must be `provider/model` from Atomic's catalog. Optional under `HARNESS=remote`, where the attached client chooses its model and a set value is only passed along as the turn's request.                                                                                                                                                                                                                                                                                                                                                                                     |
 | `HISTORY_MODEL`                   | `MODEL`                 | Model for History's one-line summaries of editing sessions, written when someone opens History on a document with a Planner owner. A small, fast model suits it. Resolved like `MODEL` by the configured harness.                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `HARNESS`                         | `copilot-sdk`           | Adapter name selected from Chopin's harness map (`copilot-sdk`, `atomic`, or `remote`). An unknown name refuses at startup. `remote` runs Planner turns in a client attached at `/api/v1/agent`; see [The remote Planner](#the-remote-planner). `atomic` gives every Planner session shell and filesystem access as the server process's user, hosted instances included; see [Choose and trust a harness](#choose-and-trust-a-harness).                                                                                                                                                                                                                          |
-| `PLANNER_ATTACH_GRACE_MS`         | `120000`                | Under `HARNESS=remote`, how long a detached or dropped agent connection keeps the document's Planner ownership so the same account can reattach, in milliseconds, an integer between 0 and 3600000.                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `PLANNER_ATTACH_GRACE_MS`         | `120000`                | Under `HARNESS=remote`, how long a detached agent connection, or one that dropped with nothing to keep, holds the document's Planner ownership so the same account can reattach, in milliseconds, an integer between 0 and 3600000. It is an ownership lease, not a timeout on active work: a dropped `resumable-sessions` connection with runs or open questions keeps them with no deadline until it returns or something explicit ends them.                                                                                                                                                                                                                   |
 | `AGENT_CONNECTION_PING_MS`        | `15000`                 | Under `HARNESS=remote`, how often the server sends each agent connection a WebSocket protocol ping, in milliseconds, an integer between 1000 and 600000.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `AGENT_CONNECTION_TIMEOUT_MS`     | `120000`                | Under `HARNESS=remote`, how long an agent connection may send nothing, not even a pong, before the server closes it as dropped, in milliseconds, an integer between 1000 and 600000 and longer than `AGENT_CONNECTION_PING_MS`. A whole frame must arrive within it: 2 MiB in 120 seconds is about 17 KiB/s of client upload.                                                                                                                                                                                                                                                                                                                                     |
 | `AGENT_CONNECTION_MAX_SILENCE_MS` | `900000`                | Under `HARNESS=remote`, how long an agent connection may send nothing at all, not even a pong, before the server closes it as dropped, however much of what the server queued for it drains meanwhile, in milliseconds, an integer between 1000 and 3600000 and at least `AGENT_CONNECTION_TIMEOUT_MS`. A draining queue defers the timeout only up to this, since a proxy can drain it while the client reads nothing. The 15-minute default lets a client reading at about 19 KiB/s drain the full 16 MiB the server may queue for it and answer a ping; lower it to release a client that stopped reading behind a proxy sooner, or raise it for slower links. |
+| `MAX_STORED_IMAGE_BYTES`          | `10485760`              | The most bytes Chat stores of an image a tool made, decoded, an integer between 1048576 (1 MiB) and 268435456 (256 MiB), for every harness (`copilot-sdk`, `atomic` and `remote`). A larger image is stored as a smaller copy of itself that fits, never refused. Chat shows every stored image from copies at Slack's thumbnail widths, made on first read and kept in memory.                                                                                                                                                                                                                                                                                   |
+| `HANDOVER`                        | unset                   | Set exactly `wait` to let this process start beside another one that holds the database's writer lease. It then listens at once in standby, answers `GET /api/health/live` with `200 standby` and `GET /api/health/ready` with `503 standby`, serves the built client's files, holds every other request and WebSocket upgrade for up to `HANDOVER_HOLD_MS`, and reads the lease every 100 ms until the holder releases it or it expires, then takes it. Unset or `off`, a process that finds the lease held exits 1. Any other value refuses at startup.                                                                                                         |
+| `HANDOVER_TURN_WAIT_MS`           | `10000`                 | When this process is stopped (SIGTERM or SIGINT), how long it keeps serving while Planner turns already running finish, in milliseconds, an integer between 0 and 600000. A turn still running then is cut off, with a notice in its Chat, and is never run again. The turn wait, the unready window, the request wait and about three seconds to commit must fit inside the platform's stop grace period.                                                                                                                                                                                                                                                        |
+| `HANDOVER_UNREADY_MS`             | `300`                   | How long `GET /api/health/ready` answers `503 draining` before the listener stops, in milliseconds, an integer between 0 and 60000. Set it to the proxy's active health-check interval plus a margin. The process serves every request through the window. It logs how many readiness checks it answered not ready in it, and a window in which none came as a risk to the hand-over.                                                                                                                                                                                                                                                                             |
+| `HANDOVER_REQUEST_WAIT_MS`        | `1000`                  | After the listener stops, how long requests already running may finish before their connections are closed without an answer, in milliseconds, an integer between 0 and 60000. Each request closed this way is logged.                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `HANDOVER_PLANNER_WINDOW_MS`      | `10000`                 | How long after the cut a remote Planner is expected to be back, in milliseconds, an integer between 0 and 600000. It is the `reconnectWithinMs` of the `restarting` notice and of `session:restarting`.                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `HANDOVER_HOLD_MS`                | `20000`                 | How long a process in standby holds a request or WebSocket upgrade that needs the writer lease before it answers `503` with `Retry-After: 1`, in milliseconds, an integer between 0 and 120000.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `CLIENT_DIR`                      | `apps/web/dist`         | Directory of the built web client. A process is ready only when `index.html` exists there, unless `DEV_CLIENT` is set.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `HARNESS_AUTH`                    | unset                   | Auth mode forwarded to the selected adapter. For `copilot-sdk`, `direct` and `ai-gateway` are allowed on any bind and `auto` requires a loopback-only `SERVER_HOST`; the adapter does not otherwise consume it. For `atomic`, it is required and must be `auto`, which requires a loopback-only `SERVER_HOST`, or `ai-gateway`; every other value is refused. For `remote`, any value is refused.                                                                                                                                                                                                                                                                 |
 | `HARNESS_EXTENSIONS`              | unset                   | Extension or package paths every atomic Planner session loads, as Atomic's `--extension` flag would, separated by the platform path delimiter (`:`, or `;` on Windows). A package's extensions, skills, and workflows all register. Each path must be absolute and exist; any other harness refuses the variable at startup. Background workers never load them. The code runs in the server process as its user.                                                                                                                                                                                                                                                 |
 | `AGENT`                           | on                      | Set exactly `off` to prevent hosted agent turns, disable the entire background-job runner, and avoid Copilot CLI startup.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `BACKGROUND_JOBS`                 | on                      | Set exactly `off` to disable background job scheduling. `AGENT=off` disables the entire runner. `HARNESS=remote` requires `off`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `BACKGROUND_JOBS`                 | on                      | Set exactly `off` to disable background job scheduling. `AGENT=off` disables the entire runner. Under `HARNESS=remote`, workers run on the document's attached client.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `WEB_RESEARCH`                    | on                      | Set exactly `off` to disable new public-web research while retaining durable requests, artifacts, and other jobs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `CHAT_ATTACHMENT_MAX_BYTES`       | `1048576`               | The most one image or text file sent with a Chat message may be, in bytes, a whole number from 1 to 16777216. The browser checks it before uploading and the server again on arrival, by reading the bytes. Under `HARNESS=remote` it is never more than 1048576, which is what a turn's files may total in one agent connection message.                                                                                                                                                                                                                                                                                                                         |
+| `CHAT_ATTACHMENT_MAX_COUNT`       | `5`                     | The most files one Chat message may carry, a whole number from 0 to 20. `0` turns files in Chat off: the composer offers none and the upload routes answer 404.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `CHAT_ATTACHMENT_MAX_TOTAL_BYTES` | `4194304`               | The most the files of one Chat message may total, in bytes, a whole number from 1 to 67108864 that is at least `CHAT_ATTACHMENT_MAX_BYTES`. Under `HARNESS=remote` it is never more than 1048576.                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `TRANSCRIPTION_MODEL`             | off                     | `off`, or `openai/<model>` such as `openai/gpt-transcribe`, OpenAI's current transcription model. Where it is set, every person dictates through it, in every browser, and the browser's own speech recognition is never used: the composer records on their device and, when they stop, sends the recording to this server, which sends it to OpenAI with `OPENAI_API_KEY` and sends the words back as OpenAI writes them (every model but `whisper-1` streams them). Where it is off no audio is ever accepted or sent anywhere, and the microphone button is offered only to browsers that recognize speech on the device. Needs `OPENAI_API_KEY`.             |
+| `TRANSCRIPTION_MAX_BYTES`         | `5242880`               | The longest recording the server takes for `TRANSCRIPTION_MODEL`, in bytes, a whole number from 1 to 26214400. The composer stops recording by itself before it reaches this, transcribes what it has and says so; the default is several minutes of speech. A recording is kept only as long as the provider takes to answer.                                                                                                                                                                                                                                                                                                                                    |
 | `RESEARCH_EVIDENCE_TIMEOUT_MS`    | `600000`                | Deadline of one public-web research evidence attempt in milliseconds, an integer between 120000 and 1800000. Web search calls take up to about two minutes each; the attempt budgets at most four calls against what remains of this deadline. The job retries once after a failed attempt.                                                                                                                                                                                                                                                                                                                                                                       |
 | `COPILOT_CLI_PATH`                | automatic               | Advanced override for the Copilot CLI executable. Applies only to the `copilot-sdk` adapter.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `CONVERSATION_PLAN`               | off                     | Set exactly `on` to enable experimental conversation-derived cards. Interpretation runs independently of `AGENT`; Planner jobs still obey the agent and job settings.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
@@ -350,6 +438,7 @@ the image.
 | `JEV_API_KEY`                     | unset                   | TypeSafe API key for `typesafe/jev-latest`. Server-only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `CONNECTOR_VERSION`               | the bundled connector's | The `chopin` release this server recommends: `chopin update` installs it by default, and a refused connector is told to run `chopin update <version>` with it. Defaults to the version in `apps/connector/package.json`. A `cli-v` or `v` prefix is dropped; anything but a version like `0.2.0` fails startup.                                                                                                                                                                                                                                                                                                                                                   |
 | `CHOPIN_SETUP_AGENTS`             | unset                   | Setups the Machines page offers before the built-in coding agents, as a JSON array. See [Setup agents](#setup-agents). The supplied Compose file forwards it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `CHOPIN_BUILD_RESUME_MS`          | `600000`                | How long after it starts the server waits for a paired machine to come back and carry on with a build it was running before a restart or deploy, in milliseconds, an integer between 1000 and 3600000. Until then the build stays running and its agent's calls are answered `unavailable`; after it, a build no machine took back ends as disconnected. A machine that registered again without its build has one minute, whatever this is. The connector stops an agent after 10 minutes without reaching Chopin, so a much longer window mostly keeps a build nobody will resume showing as running.                                                           |
 
 [Automatic participation](conversation-initiative.md) is part of the enabled Planner,
 with no separate feature flag. The shared Chat control pauses automatic replies per
@@ -474,6 +563,19 @@ Build an image from a reviewed commit:
 docker build --tag chopin:local .
 ```
 
+A page left open across a deploy still asks for the files of the build it loaded. The
+image keeps the hashed files of the last two builds before it, for 30 days at most, in
+`apps/web/kept-assets`, and the server answers for them from there; a file it does not
+have is a 404, never the page. To keep them, give the build the image that runs now:
+
+```bash
+docker build --build-arg PREVIOUS_IMAGE="$(docker inspect --format '{{.Image}}' chopin)"   --tag chopin:next .
+```
+
+With `docker compose`, set `PREVIOUS_IMAGE` in the environment of the build. Without it
+the build keeps nothing and only its own files are served. The first build after this
+step lands keeps only the image before it, which kept nothing itself.
+
 Create an environment file such as `/etc/chopin/chopin.env`:
 
 ```dotenv
@@ -518,8 +620,16 @@ The proxy must:
 - proxy WebSocket upgrades on `/ws`, and on `/api/v1/agent` under `HARNESS=remote`;
 - proxy `/mcp` and the `/api/v1/agent` upgrade without removing their
   `Authorization` header, nor the upgrade's `Sec-WebSocket-Protocol` header;
+- pass the upgrade's `Sec-WebSocket-Extensions` headers both ways, so the browser and
+  Chopin agree on per-message deflate (Caddy's default `reverse_proxy` does). Without
+  it the socket still works, but opening a large document sends about six times the
+  bytes;
+- pass Chopin's response headers through unchanged, so a browser can tell Chopin's
+  refusal of a WebSocket handshake (`x-chopin-refusal: 1`) from the proxy's own
+  4xx while no upstream answers;
 - serve Chopin at `/`, not below a path prefix; and
-- redirect alternate hosts to the canonical origin before application traffic.
+- redirect alternate hosts to the canonical origin before application traffic,
+  except the paths a [moved deployment](#moving-to-a-new-origin) keeps serving.
 
 Chopin derives OAuth callbacks from `APP_ORIGIN`, never from incoming `Host` or
 forwarded headers. A proxy cannot repair a mismatched configuration after the
@@ -626,12 +736,37 @@ After the first deployment:
    entitlement for `copilot-sdk`, or the `HARNESS_AUTH` credentials for
    `atomic`)
    and the hosted agent runtime.
-8. Connect a local coding agent and call `list_documents` if MCP is part of the
+8. Run `/research` with a short brief to verify public web search. It reaches
+   GitHub's Copilot MCP endpoint with the signed-in user's App user access
+   token, a separate check from step 7.
+9. Connect a local coding agent and call `list_documents` if MCP is part of the
    deployment's intended surface.
 
-The image health check calls `/api/session`. It confirms HTTP liveness but does
-not prove that a browser bundle is present, a new database transaction can
-complete, GitHub is reachable, or the Planner can start.
+The image health check calls `/api/health/live`. It confirms HTTP liveness, and
+passes for a process waiting in standby too, but does not prove that a browser
+bundle is present, a new database transaction can complete, GitHub is reachable,
+or the Planner can start; readiness (below) covers the first two.
+
+Two unauthenticated endpoints answer with a status word and nothing else, for a
+proxy or platform that routes on them:
+
+- `GET /api/health/live` answers `200 live` while the process runs, and
+  `200 standby` while a process started with `HANDOVER=wait` waits for the
+  writer lease.
+- `GET /api/health/ready` answers `200 ready` once the process holds the writer
+  lease, has finished startup recovery, a database transaction has completed
+  and the built client's `index.html` exists. It answers `503 standby` while it
+  waits for the lease, `503 starting` before it is ready, and `503 draining`
+  from the start of a shutdown's cut, not from SIGTERM: a stopping process keeps
+  answering `200 ready` and keeps serving while running Planner turns finish
+  (`HANDOVER_TURN_WAIT_MS`). It decides this once, when it becomes ready, so a
+  check runs no query.
+
+Send new connections only to a ready process. Readiness does not check that
+GitHub is reachable or that a model answers. Both endpoints answer `HEAD` the
+same way.
+A proxy that routes on them, and the deploy that overlaps two processes, are described
+in [Deploys nobody can see](zero-downtime-deploys.md).
 
 ## Operations
 
@@ -654,18 +789,111 @@ Browser sessions and Planner ownership are cleared at startup.
    migrations before serving.
 4. Repeat the first-start checks after migrations or authentication changes.
 
+This stops the old process before it starts the new one, so there is a gap in which nothing
+listens, and a tab shows its notice if the gap outlasts its quiet period (below). To make a
+deploy invisible instead, start the new process beside the old one with `HANDOVER=wait`
+and stop the old one once the new one is waiting, behind a proxy that holds requests for
+that moment: see [Deploys nobody can see](zero-downtime-deploys.md). Migrations must then be
+expand-only.
+
+A stop signal makes Chopin close every WebSocket with code 1012 (service
+restart) before it exits, rather than the 1001 that stopping the listener
+sends. An open browser tab takes that as a restart: it reconnects after a
+random moment of up to a second and goes on retrying about once a second, says
+nothing about it for the first 5 seconds, and keeps its unacknowledged edits,
+drafts and answers to send once connected. In those 5 seconds the connection
+reports no outage, so the notice for a lost connection does not wait on a
+shorter count, and the attempts that fail meanwhile are not counted towards
+the backoff or towards offering Retry. A restart that lasts longer is then
+treated as any other lost connection, with the same moment of grace before
+the notice. A refusal Chopin makes of a handshake carries
+`x-chopin-refusal: 1`, and a tab stops retrying on a 4xx only when it does (a
+401 still asks for a sign-in). Without it the 4xx is a proxy's and the tab keeps
+retrying. This is the client half of a restart that stops the old process before it
+starts the new one, and it does not make the gap between them any shorter. It
+adds a random moment before the first attempt so that tabs do not all return
+together, and keeps a restart quiet for 5 seconds rather than 1.5, because that
+kind of restart takes longer than 1.5 seconds. A deploy that overlaps two
+processes behind a proxy that holds requests ends well inside 1.5 seconds; see
+[Deploys nobody can see](zero-downtime-deploys.md).
+
+A tab opened before an upgrade asks for the hashed `/assets/*` files of its own
+build, which the new image carries only if it was built with `PREVIOUS_IMAGE`. Chopin answers a missing file under `/assets/` with 404 and never with the
+app's HTML. When a part of the page fails to load for that reason (Vite's
+`vite:preloadError`), the tab reloads to fetch the new build, but only while the
+server answers with a page of another build than the one running (it asks for the
+page and compares the entry script, so a failure with the server away, or with no
+upgrade behind it, is left to the page's own recovery) and it holds nothing the
+server has not taken: no unacknowledged edit, unsent message, answer or draft.
+Otherwise it leaves the failure as it was and a later one reloads it, and a reload
+that did not cure the failure is not repeated within ten seconds. A build given the
+image that runs now (`PREVIOUS_IMAGE`, above) keeps the previous builds' files, so
+such a tab usually carries on without reloading.
+
 Migration files are checksummed once applied. Never edit an applied migration.
 Because migrations are forward-only, returning to an older application image
 may require restoring the pre-upgrade database rather than merely changing the
 image tag.
 
+### Moving to a new origin
+
+Paired machines' GitHub authorizations and browser logins are encrypted for the
+origin they were stored under, so changing `APP_ORIGIN` alone signs everyone out
+and makes every machine run `chopin pair` again. To move a deployment from
+`https://old.example.com` to `https://new.example.com` instead:
+
+1. Add `https://new.example.com/auth/github/callback` to the GitHub App's
+   callback URLs, keeping the old one, and point its Homepage and Setup URLs at
+   the new origin.
+2. Serve the new name, and keep serving the old one. On the old name, keep
+   proxying `/mcp`, `/api`, `/connector*`, `/auth/github/callback`, and
+   `/auth/github/setup` to Chopin, because paired machines, MCP clients, and
+   GitHub still use it; redirect browsers on other paths to the new name.
+3. Restart with `APP_ORIGIN=https://new.example.com` and
+   `PREVIOUS_ORIGINS=https://old.example.com`.
+
+A machine or browser login stored under a previous origin is re-encrypted under
+`APP_ORIGIN` the first time it is used, and the server logs once per kind that
+it moved one. Browser cookies belong to a host, so people sign in once on the
+new name. Origin and WebSocket checks accept the previous origins, and document
+links on them resolve to the same documents; Chopin itself only writes links on
+`APP_ORIGIN`. A sign-in that was in progress when the deployment restarted has
+to start again.
+
+Remove `PREVIOUS_ORIGINS` once machines have reconnected and you stop serving
+the old name. Never list an origin you no longer control: its pages would pass
+Chopin's Origin checks.
+
+### Machines and the connector sandbox
+
+`chopin connect` runs agents and Planner commands in the operating system's
+process sandbox where the machine has one (see
+[Sandbox](chopin-cli.md#sandbox)). Nothing to configure here: the server only
+keeps what each connector says about its own sandbox, in three additive request
+headers (`chopin-connector-sandbox`, `-reason` and `-fix`), and the Machines page
+shows it as **Sandboxed** or **Not sandboxed**, with the reason and the one fix
+for a machine that has none. An older connector sends none, and an older server
+ignores them.
+
+The sandbox lets agents reach your instance's origin, GitHub, the model
+providers and the npm, PyPI and crates registries, and nothing else. A
+self-hosted deployment whose agents also need an internal registry, a Git mirror
+or another model endpoint adds each host on the machine, with
+`chopin connect --sandbox-host <host>`, and runs `chopin service install` again
+for a service. An instance behind another origin needs nothing: the connector
+allows the origin it connected to. `--require-sandbox` refuses runs on a machine
+with no sandbox, which an operator may want to ask of the people who share
+machines.
+
 ### Writer lease
 
 The database holds one renewable `chopin:writer` lease. A second application
-process refuses startup. If the active process loses the lease, it drains and
-stops; fencing prevents an expired process from committing collaboration state.
-Allow the previous lease to expire before treating a failed host as safely
-replaced.
+process refuses startup, unless it was started with `HANDOVER=wait`, which makes it
+wait in standby until the holder releases the lease (see
+[Deploys nobody can see](zero-downtime-deploys.md)). If the active process loses the
+lease, it drains and stops; fencing prevents an expired process from committing
+collaboration state. Allow the previous lease to expire (30 seconds after its last
+renewal) before treating a failed host as safely replaced.
 
 ## Troubleshooting
 
@@ -682,7 +910,9 @@ Members read access, the organization approved it, and the user has active
 membership. GitHub outages and rate limits fail closed for new checks.
 
 **A second process refuses startup.** Another holder owns the database writer
-lease. Do not run two application instances against one database.
+lease. Do not run two application instances against one database. To start a
+process beside the holder on purpose, set `HANDOVER=wait`; it waits in standby and
+serves nothing until the holder stops.
 
 **The process refuses startup with an unknown-harness or auth-mode error.**
 `HARNESS` names an adapter that is not in Chopin's harness map, or
@@ -698,6 +928,45 @@ entitlement, the model, App permissions, repository write access, and Copilot
 CLI startup logs. Planner and research request execution validate these
 dependencies lazily.
 
+**Public web research fails before it searches.** `/research` finds public sources through
+the `web_search` tool of GitHub's Copilot MCP endpoint (`https://api.githubcopilot.com/mcp/`).
+It authorizes with the signed-in user's App user access token (`ghu_`), the same credential the
+Planner's pull request tools send to that endpoint. When setup fails, the research card says
+which of three things happened and the server log names the step and the cause:
+
+- `web-search-credential-rejected`: "GitHub refused the credential from this sign-in for public
+  web search." The endpoint answered HTTP 401 or 403 while connecting or listing tools.
+- `web-search-not-offered`: "GitHub did not offer public web search to this sign-in." The endpoint
+  accepted the connection, but its tool list had no `web_search`.
+- `web-search-unavailable`: "The public web-search service was unavailable." Any other setup
+  failure, such as a network error, an HTTP 5xx, or a JSON-RPC error.
+
+The log line names the step (`connect` or `tools`), a classification with any HTTP status and
+JSON-RPC code, how long setup ran, the type of credential Chopin sent, and the client's error
+with tokens and `Bearer` values masked and clipped to one short line. It never contains the token
+or the `Authorization` header:
+
+```text
+chopin: web_search unavailable at connect - local:connect:mcp-client:http:401 in 180ms; credential: GitHub App user access token (ghu_); MCPClientError: ...
+```
+
+The `elapsedMs` on the `connecting-web` progress line records when that phase began, not when it
+failed; read the duration from the failure line.
+
+Chopin cannot tell from these responses why the endpoint refused the credential or withheld the
+tool. GitHub's Copilot SDK documentation lists GitHub App user access tokens (`ghu_`) as supported
+for Copilot requests, but GitHub documents no token requirement for this endpoint's `web_search`
+tool, and the tool is not part of GitHub's open-source MCP server. A deployment that signs in
+through its own GitHub App reported this step failing while a classic OAuth token (`gho_`) for the
+same account was accepted by the endpoint's `initialize` request. Whether the endpoint refuses
+App user access tokens for `web_search` is unconfirmed.
+
+Check the log line first, then the account's Copilot entitlement and the settings that gate web
+search and MCP servers for the user and, in an organization, its Copilot policies. No Chopin
+setting sends a different credential to this endpoint. If setup keeps failing, set
+`WEB_RESEARCH=off` to stop offering public web research until you have verified it, and report
+the log line, which holds no token.
+
 **MCP returns 401 or 403.** A 401 indicates an invalid or expired bearer. A 403
 indicates failed instance admission or a supplied Origin that differs from
 `APP_ORIGIN`. Repository authorization failures normally arrive as an MCP tool
@@ -707,6 +976,7 @@ error with reason `repository-forbidden`. See
 ## Related references
 
 - [Authentication](authentication.md)
+- [GitHub App identity](github-app-identity.md)
 - [Hosted agent (Planner)](hosted-agent.md)
 - [Local agent MCP](local-agent-mcp.md)
 - [Storage](storage.md)

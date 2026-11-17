@@ -9,6 +9,9 @@ import {
 	CONNECTOR_HOST_HEADER,
 	CONNECTOR_PLATFORM_HEADER,
 	CONNECTOR_PROTOCOL_HEADER,
+	CONNECTOR_SANDBOX_FIX_HEADER,
+	CONNECTOR_SANDBOX_HEADER,
+	CONNECTOR_SANDBOX_REASON_HEADER,
 	CONNECTOR_SERVICE_HEADER,
 	CONNECTOR_UPDATE_REQUIRED,
 	CONNECTOR_VERSION_HEADER,
@@ -21,6 +24,9 @@ import type { GitHub } from "../github/client";
 import { Router } from "../http/router";
 import { MemoryStorage } from "../storage/memory/adapter";
 import { CONNECTOR_PROTOCOLS, registerExperimentRoutes } from "./routes";
+import type { GitHubApp } from "../github/app";
+import { hosted, locateDocument } from "../mcp/hosted";
+import { credentialDigest } from "./mcp-token";
 import { Connections } from "./connections";
 import type { ImplementationConnector } from "../tasks/connector";
 
@@ -44,6 +50,7 @@ async function setup(
 		implementations?: () => ImplementationConnector | undefined;
 		/** Whether machines hold their own GitHub authorization, as everywhere but AUTH_MODE=local. */
 		durable?: boolean;
+		app?: GitHubApp;
 	} = {},
 ) {
 	let storage = shared?.storage ?? new MemoryStorage();
@@ -83,6 +90,14 @@ async function setup(
 			let id = owners.get(token) ?? "alice";
 			return { id, login: id, avatarUrl: "" };
 		},
+		repository: async (_token: string, owner: string, name: string) => ({
+			id: name,
+			owner,
+			name,
+			fullName: `${owner}/${name}`,
+			defaultBranch: "main",
+			permissions: { pull: true, push: name !== "readonly", admin: false },
+		}),
 		repositoryAccess: async (token: string, owner: string, name: string) => {
 			checked.push(token);
 			let push = name !== "readonly";
@@ -95,6 +110,18 @@ async function setup(
 				permissions: { pull: true, push, admin: false },
 			};
 		},
+		/** The App is installed on every repository and may write; `readonly` is only read. */
+		installedRepository: async (_token: string, owner: string, name: string) => ({
+			repository: {
+				id: name,
+				owner,
+				name,
+				fullName: `${owner}/${name}`,
+				defaultBranch: "main",
+				permissions: { pull: true, push: name !== "readonly", admin: false },
+			},
+			installation: { id: "1", writable: { contents: true, pullRequests: true } },
+		}),
 		/** Each repository's default branch is at a commit of its name's first letter. */
 		branchHead: async (_token: string, _owner: string, name: string) =>
 			(/^[a-f]/.test(name) ? name[0]! : "c").repeat(40),
@@ -266,6 +293,7 @@ async function setup(
 		clock,
 		lock,
 		runtime,
+		auth,
 	};
 }
 
@@ -893,6 +921,46 @@ test("a connection tells the owner its machine's host, platform and agent", asyn
 	expect(config).toBeDefined();
 });
 
+test("a connection tells the owner whether its agents run in the system's sandbox, and why not", async () => {
+	let { alice, router, request, pair } = await setup();
+	let paired = await pair(alice.cookie);
+	let listed = async () =>
+		(await (await request("/api/connector/machines", undefined, alice.cookie)).json()).machines;
+	let connect = async (extra: Record<string, string>) => {
+		let opened = new Request("https://chopin.test/api/connector/connections", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: `Bearer ${paired.machineToken}`,
+				...CURRENT,
+				...extra,
+			},
+			body: JSON.stringify({ repository: "org/repo", commit: "a".repeat(40), label: "Laptop" }),
+		});
+		await router.handle(opened, new URL(opened.url));
+		return (await listed())[0].sandbox;
+	};
+	// A connector from before the sandbox says nothing, and is shown as saying nothing.
+	expect(await connect({})).toBeNull();
+	expect(await connect({ [CONNECTOR_SANDBOX_HEADER]: "bubblewrap" })).toEqual({
+		engine: "bubblewrap",
+	});
+	expect(
+		await connect({
+			[CONNECTOR_SANDBOX_HEADER]: "none",
+			[CONNECTOR_SANDBOX_REASON_HEADER]: "slirp4netns isn't installed.",
+			[CONNECTOR_SANDBOX_FIX_HEADER]: "sudo apt-get install -y slirp4netns",
+		}),
+	).toEqual({
+		engine: "none",
+		reason: "slirp4netns isn't installed.",
+		fix: "sudo apt-get install -y slirp4netns",
+	});
+	// An engine this server doesn't know, or a refusal with no reason, is dropped.
+	expect(await connect({ [CONNECTOR_SANDBOX_HEADER]: "firecracker" })).toBeNull();
+	expect(await connect({ [CONNECTOR_SANDBOX_HEADER]: "none" })).toBeNull();
+});
+
 test("an owner renames a paired machine, which chopin status then reads", async () => {
 	let { alice, bob, request, pair } = await setup();
 	let paired = await pair(alice.cookie);
@@ -1078,6 +1146,26 @@ test("a key minted with automatic work on pairs a machine with it on, as the pai
 	expect(listed.machines).toMatchObject([{ label: "Laptop", autoRun: true }]);
 	let wrong = await request("/api/connector/pairing-keys", { autoRun: "yes" }, alice.cookie);
 	expect(await wrong.json()).toEqual({ error: "invalid-request" });
+});
+
+test("a key minted shared pairs a machine shared with teammates, and its owner can stop sharing it", async () => {
+	let { alice, request, authorizeKeys } = await setup();
+	authorizeKeys("alice");
+	let minted = await (await request("/api/connector/pairing-keys", { shared: true }, alice.cookie))
+		.json();
+	expect((await request("/api/connector/pairings", { ...CHECKOUT, key: minted.key })).status)
+		.toBe(200);
+	let listed = await (await request("/api/connector/machines", undefined, alice.cookie)).json();
+	expect(listed.machines).toMatchObject([{ label: "Laptop", shared: true, autoRun: false }]);
+	let id = listed.machines[0].id;
+	let stopped = await request(
+		`/api/connector/machines/${id}/shared`,
+		{ shared: false },
+		alice.cookie,
+	);
+	expect(await stopped.json()).toEqual({ shared: false });
+	listed = await (await request("/api/connector/machines", undefined, alice.cookie)).json();
+	expect(listed.machines).toMatchObject([{ shared: false }]);
 });
 
 test("two machines racing with one pairing key: exactly one pairs", async () => {
@@ -1907,4 +1995,249 @@ test("a favorite that cannot be read refuses the work rather than guess", async 
 	fault.locked = false;
 	expect((await (await restarted.request(path, undefined, restarted.alice.cookie)).json()).favorite)
 		.toBe(desk.machine);
+});
+
+test("stopping the waits wakes every connector that waits for work, and none waits again", async () => {
+	let connections = new Connections(() => 0);
+	let machine = { id: "machine", owner: "alice", login: "alice", autoRun: false };
+	let { connection } = connections.open(machine, "Laptop", [
+		{ repository: "org/repo", repositoryId: "repo", commit: "a".repeat(40) },
+	]);
+	let controller = new AbortController();
+	let waiting = connections.wait(connection, controller.signal);
+	let ended = false;
+	void waiting.then(() => ended = true);
+	await Bun.sleep(5);
+	expect(ended).toBe(false);
+	connections.stopWaiting();
+	await waiting;
+	let started = Date.now();
+	await connections.wait(connection, controller.signal);
+	expect(Date.now() - started).toBeLessThan(100);
+});
+
+/** A GitHub App installed on org/repo that can push, whose bot is `test[bot]`, and who may push. */
+function fakeApp(pushers = new Set(["alice"])) {
+	let minted: Record<string, string>[] = [];
+	let app: GitHubApp = {
+		installation: async (owner, name) =>
+			`${owner}/${name}` === "org/repo"
+				? {
+					id: "7",
+					suspended: false,
+					permissions: { contents: "write", pull_requests: "write", metadata: "read" },
+				}
+				: undefined,
+		token: async (_installation, _name, permissions) => {
+			minted.push(permissions);
+			return { token: `ghs_${minted.length}`, expiresAt: Date.now() + 3_600_000, permissions };
+		},
+		revoke: async () => {},
+		account: async (_token, login) =>
+			login === "test[bot]"
+				? { login, id: 900, nodeId: "BOT" }
+				: { login, id: login === "alice" ? 11 : 12, nodeId: login },
+		canPush: async (_token, _owner, _name, login) => pushers.has(login),
+	};
+	return { app, minted };
+}
+
+test("a protocol 7 connector gets the App's token for the run it claimed, as the bot", async () => {
+	let { app, minted } = fakeApp();
+	let { alice, documentId, request, tool, pair } = await setup(undefined, { app });
+	let connection = await pair(alice.cookie);
+	let id = crypto.randomUUID();
+	await request(`/api/documents/${documentId}/experiments`, { id, brief: "Measure" }, alice.cookie);
+	await request(`/api/documents/${documentId}/experiments/${id}/run`, {}, alice.cookie);
+	text(await tool(connection.token, "claim_experiment", { id }));
+	let token = (body: unknown) =>
+		request("/api/connector/github-token", body, undefined, connection.machineToken);
+	let issued = await token({ repository: "org/repo", purpose: "run", run: id });
+	expect(issued.status).toBe(200);
+	expect(await issued.json()).toMatchObject({
+		token: "ghs_1",
+		kind: "installation",
+		permissions: { contents: "write", pull_requests: "write" },
+		identity: { login: "test[bot]", email: "900+test[bot]@users.noreply.github.com" },
+		starter: { login: "alice", email: "11+alice@users.noreply.github.com" },
+	});
+	let unknown = await token({ repository: "org/repo", purpose: "run", run: crypto.randomUUID() });
+	expect(unknown.status).toBe(409);
+	expect(await unknown.json()).toMatchObject({ error: "run-unknown" });
+	let elsewhere = await token({ repository: "org/other", purpose: "run", run: id });
+	expect(await elsewhere.json()).toMatchObject({ error: "run-unknown" });
+	expect(await (await token({ repository: "org/repo", purpose: "check" })).json()).toEqual({
+		ok: true,
+	});
+	expect(minted).toHaveLength(1);
+	// A run names what it is for; one with no purpose is an older connector's, which names nothing.
+	expect(await (await token({ repository: "org/repo", run: id })).json()).toEqual({
+		error: "invalid-request",
+	});
+});
+
+test("a build's token goes only to the build's machine, for whoever asked for it", async () => {
+	let { app } = fakeApp(new Set(["bob"]));
+	let builds = new Map<string, { repository: string; starter: string; machineId?: string }>();
+	let { alice, request, pair } = await setup(undefined, {
+		app,
+		implementations: () =>
+			({
+				build: async (document: string, id: string) => builds.get(`${document} ${id}`),
+			}) as unknown as ImplementationConnector,
+	});
+	let connection = await pair(alice.cookie);
+	builds.set("D bob-build", {
+		repository: "org/repo",
+		starter: "bob",
+		machineId: connection.machine,
+	});
+	builds.set("D alice-build", { repository: "org/repo", starter: "alice" });
+	builds.set("D other-build", { repository: "org/repo", starter: "bob", machineId: "M_other" });
+	let token = (run: string, document?: string) =>
+		request(
+			"/api/connector/github-token",
+			{ repository: "org/repo", purpose: "run", run, ...(document ? { document } : {}) },
+			undefined,
+			connection.machineToken,
+		).then(response => response.json());
+	expect(await token("bob-build", "D")).toMatchObject({ starter: { login: "bob" } });
+	expect(await token("bob-build")).toMatchObject({ error: "run-unknown" });
+	expect(await token("other-build", "D")).toMatchObject({ error: "run-unknown" });
+	expect(await token("alice-build", "D")).toMatchObject({
+		error: "starter-cannot-push",
+		message: "alice can't push to org/repo, so their run there gets no token.",
+	});
+});
+
+test("an older connector still gets its owner's token, marked legacy; without the App's key, no-grant", async () => {
+	let { alice, request, pair } = await setup();
+	let connection = await pair(alice.cookie);
+	let token = (body: unknown) =>
+		request("/api/connector/github-token", body, undefined, connection.machineToken)
+			.then(response => response.json());
+	expect(await token({ repository: "org/repo" })).toMatchObject({
+		token: expect.stringMatching(/^ghu_machine_/),
+		legacy: true,
+	});
+	expect(await token({ repository: "org/repo", purpose: "planner" })).toEqual({
+		error: "no-grant",
+		message: "This Chopin has no GitHub App key, so it gives no machine a token for org/repo.",
+	});
+});
+
+test("a launch's MCP token reaches Chopin's tools only for its own documents, while it lasts", async () => {
+	let { alice, documentId, document, request, tool, pair, runtime, storage, auth } = await setup();
+	let connection = await pair(alice.cookie);
+	let other = await document();
+	let child = crypto.randomUUID();
+	await storage.channels.create({
+		id: child,
+		repositoryId: "repo",
+		repositoryOwner: "org",
+		repositoryName: "repo",
+		title: "A child",
+		createdBy: "alice",
+		parentChannelId: documentId,
+		now: new Date(),
+	} as never);
+	let adapter = hosted(auth as never, undefined, { launchCaller: runtime.mcpCaller });
+	let caller = (bearer: string) =>
+		adapter.caller(
+			new Request("https://chopin.test/mcp", { headers: { authorization: `Bearer ${bearer}` } }),
+		);
+	let mint = (from: unknown) =>
+		request("/api/connector/mcp-token", from, undefined, connection.machineToken)
+			.then(response => response.json());
+	let reaches = async (bearer: string, id: string) =>
+		typeof await locateDocument(auth as never, (await caller(bearer))!, id) === "object";
+
+	// A Planner's: the machine's owner, for its document and that document's children.
+	let credential = "chopin_p_" + "a".repeat(43);
+	await storage.plannerCredentials.put({
+		digest: credentialDigest(credential),
+		machineId: connection.machine,
+		channelId: documentId,
+		expiresAt: new Date(Date.now() + 900_000),
+	});
+	let planner = await mint({ planner: credential });
+	expect(planner.token).toStartWith("chopin_mcp_");
+	expect((await caller(planner.token))?.user).toMatchObject({ id: "alice", login: "alice" });
+	expect(await reaches(planner.token, documentId)).toBe(true);
+	expect(await reaches(planner.token, child)).toBe(true);
+	expect(await reaches(planner.token, other)).toBe(false);
+	let listed = await adapter.documents.list((await caller(planner.token))!, "org/repo");
+	expect((listed as { id: string }[]).map(value => value.id).sort()).toEqual(
+		[documentId, child].sort(),
+	);
+	expect(
+		await adapter.create!.create(
+			(await caller(planner.token))!,
+			{ repository: "org/repo" } as never,
+		),
+	).toEqual({ kind: "forbidden" });
+	// The Planner stopped on the machine: its credential is gone, and so is the token's reach.
+	await storage.plannerCredentials.deleteForMachine(connection.machine, documentId);
+	expect(await caller(planner.token)).toBeUndefined();
+	expect(await mint({ planner: credential })).toMatchObject({ error: "credential-invalid" });
+
+	// A run's: who started it, for the run's document only, until the run ends.
+	let id = crypto.randomUUID();
+	await request(`/api/documents/${documentId}/experiments`, { id, brief: "Measure" }, alice.cookie);
+	await request(`/api/documents/${documentId}/experiments/${id}/run`, {}, alice.cookie);
+	let claim = text(await tool(connection.token, "claim_experiment", { id }));
+	let run = await mint({ run: claim.runToken });
+	expect(run.expiresAt).toBeGreaterThan(Date.now() + 59 * 60_000);
+	expect((await caller(run.token))?.user).toMatchObject({ id: "alice" });
+	expect(await reaches(run.token, documentId)).toBe(true);
+	expect(await reaches(run.token, child)).toBe(false);
+	expect(await reaches(run.token, other)).toBe(false);
+	await tool(connection.token, "fail_experiment", {
+		id,
+		generation: claim.generation,
+		error: "Stopped.",
+	});
+	expect(await caller(run.token)).toBeUndefined();
+	expect(await mint({ run: claim.runToken })).toMatchObject({ error: "run-unknown" });
+
+	// Neither the launch's own credentials nor a GitHub App token reach Chopin's tools; a person's
+	// GitHub token still does.
+	expect(await caller(credential)).toBeUndefined();
+	expect(await caller(`chopin_r_${"b".repeat(60)}`)).toBeUndefined();
+	expect(await caller("ghs_installationtoken")).toBeUndefined();
+	expect((await caller("token"))?.user).toMatchObject({ login: "alice" });
+});
+
+test("a build's MCP token acts as whoever asked for it, on the build's machine, until it ends", async () => {
+	let builds = new Map<string, { repository: string; starter: string; machineId?: string }>();
+	let { alice, documentId, request, pair, runtime, auth } = await setup(undefined, {
+		implementations: () =>
+			({
+				build: async (document: string, id: string) => builds.get(`${document} ${id}`),
+			}) as unknown as ImplementationConnector,
+	});
+	let connection = await pair(alice.cookie);
+	let id = crypto.randomUUID();
+	builds.set(`${documentId} ${id}`, {
+		repository: "org/repo",
+		starter: "bob",
+		machineId: connection.machine,
+	});
+	let runToken = runtime.connections.runToken(connection.id, documentId, id, 1, "implementation");
+	let minted = await (await request(
+		"/api/connector/mcp-token",
+		{ run: runToken },
+		undefined,
+		connection.machineToken,
+	)).json();
+	let adapter = hosted(auth as never, undefined, { launchCaller: runtime.mcpCaller });
+	let caller = () =>
+		adapter.caller(
+			new Request("https://chopin.test/mcp", {
+				headers: { authorization: `Bearer ${minted.token}` },
+			}),
+		);
+	expect((await caller())?.user).toMatchObject({ id: "bob", login: "bob" });
+	builds.delete(`${documentId} ${id}`);
+	expect(await caller()).toBeUndefined();
 });

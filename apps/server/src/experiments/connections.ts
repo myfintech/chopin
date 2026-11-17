@@ -1,5 +1,6 @@
 import { createHmac, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Source } from "@chopin/experiment";
+import type { SandboxReport } from "@chopin/protocol/connector";
 import { fail, fingerprint } from "./service";
 
 /** What a connector says about itself when it asks to pair; a checkout is optional. */
@@ -27,6 +28,12 @@ export type Connection = {
 	 * Stored with the machine, so a reconnect keeps it.
 	 */
 	autoRun?: boolean;
+	/**
+	 * Its owner shares the machine with teammates, who may choose it for a document's work; Default
+	 * machine may also run the Planner of a document whose creator has no machine that can. Stored
+	 * with the machine.
+	 */
+	shared?: boolean;
 	/** The chopin release that opened it, when it said; known only while it is connected. */
 	version?: string;
 	/**
@@ -47,12 +54,15 @@ export type About = {
 	/** It has a Planner command, so it can run the Planner of a document it is chosen for. */
 	plannerCommand?: boolean;
 	agent?: { name: string; version?: string };
+	/** Whether the connector runs agents in the system's process sandbox, and if not, why. */
+	sandbox?: SandboxReport;
 };
 /** The browser's approval of a pairing, waiting for GitHub to authorize the machine. */
 export type Approval = {
 	owner: string;
 	login: string;
 	autoRun: boolean;
+	shared?: boolean;
 	repositoryId?: string;
 };
 type Pending = {
@@ -84,6 +94,11 @@ export const ANY_REPOSITORY_PROTOCOL = 5;
  * that restarted can find the build again and its machine can carry on with it.
  */
 export const RESUME_PROTOCOL = 6;
+/**
+ * A connector from this protocol on takes the GitHub App's installation tokens, so its builds push
+ * as the App's bot and credit the person who asked.
+ */
+export const APP_TOKEN_PROTOCOL = 7;
 
 /** A build's run, as its durable credential names it. */
 export type DurableRun = { id: string; documentId: string; kind: "implementation" | "rebuild" };
@@ -131,7 +146,10 @@ export class Connections {
 	#runs = new Map<string, string>();
 	/** When each connection that ended in the last hour ended, by id. */
 	#ended = new Map<string, number>();
+	/** When each live connection opened, by id. */
+	#opened = new Map<string, number>();
 	#waiters = new Map<string, Set<() => void>>();
+	#released = false;
 	#builds = new Map<string, string>();
 	/** Documents whose builds wait behind a connection's current one, first queued first. */
 	#queued = new Map<string, string[]>();
@@ -258,6 +276,7 @@ export class Connections {
 			owner: string;
 			login: string;
 			autoRun: boolean;
+			shared?: boolean;
 			version?: string;
 			protocol?: number;
 		},
@@ -287,21 +306,46 @@ export class Connections {
 			anyRepository,
 			expiresAt: this.now() + CONNECTION_MS,
 			autoRun: machine.autoRun,
+			...(machine.shared ? { shared: true } : {}),
 			...(machine.version ? { version: machine.version } : {}),
 			...(machine.protocol !== undefined ? { protocol: machine.protocol } : {}),
 			about,
 		};
 		let token = randomBytes(32).toString("base64url");
 		this.#connections.set(connection.id, connection);
+		this.#opened.set(connection.id, this.now());
 		this.#about.set(machine.id, about);
 		this.#tokens.set(fingerprint(token), { connectionId: connection.id });
 		return { connection, token };
+	}
+	/** Its owner shared a machine with teammates or stopped: its live connections follow at once. */
+	share(machineId: string, shared: boolean) {
+		for (let connection of this.machine(machineId)) {
+			if (shared) connection.shared = true;
+			else delete connection.shared;
+		}
+	}
+	/**
+	 * Live connections of machines their owners share with teammates, other than `owner`'s, that
+	 * serve a repository: each owner's favorite first, then the most recently heard from.
+	 */
+	shared(repositoryId: string, owner: string) {
+		return this.list(repositoryId).filter(value => value.shared && value.owner !== owner)
+			.sort((a, b) =>
+				Number(this.#favorites.get(b.owner) === b.machineId)
+				- Number(this.#favorites.get(a.owner) === a.machineId)
+			);
 	}
 	/** Live connections of one paired machine. */
 	machine(machineId: string) {
 		return [...this.#connections.values()].filter(value =>
 			value.machineId === machineId && value.expiresAt > this.now()
 		);
+	}
+	/** Since when a paired machine has been connected: its oldest live connection's opening. */
+	connectedSince(machineId: string) {
+		let opened = this.machine(machineId).map(value => this.#opened.get(value.id) ?? this.now());
+		return opened.length ? Math.min(...opened) : undefined;
 	}
 	/** What a machine last said about itself while this server ran, connected or not. */
 	about(machineId: string): About | undefined {
@@ -412,11 +456,54 @@ export class Connections {
 				|| Number(b.id === last) - Number(a.id === last)
 			);
 	}
-	/** Whether a connection may take its owner's work on `documentId`, as candidates() decides. */
-	allows(documentId: string, connection: Connection) {
+	/**
+	 * The live connections of the teammate's shared machine `machineId`, for `owner`. Whether its
+	 * owner can push to the repository is checked where work is queued and claimed.
+	 */
+	#sharedOn(repositoryId: string, owner: string, machineId: string | undefined) {
+		return !machineId || !this.#choicesRead
+			? []
+			: this.list(repositoryId).filter(value =>
+				value.machineId === machineId && value.owner !== owner && value.shared
+			);
+	}
+	/** The live connections of the teammate's shared machine `owner` chose for `documentId`. */
+	chosenShared(repositoryId: string, owner: string, documentId: string) {
+		return this.#sharedOn(repositoryId, owner, this.chosen(documentId, owner));
+	}
+	/**
+	 * The live connections of the teammate's shared machine that is `owner`'s favorite, while they
+	 * chose no machine for `documentId`: Automatic prefers it where it serves the repository.
+	 */
+	favoriteShared(repositoryId: string, owner: string, documentId: string) {
+		return this.chosen(documentId, owner)
+			? []
+			: this.#sharedOn(repositoryId, owner, this.#favorites.get(owner));
+	}
+	/**
+	 * The connections that may take the work `owner` asks for on `documentId`: a teammate's shared
+	 * machine that is their favorite, then those candidates() offers, then the teammate's shared
+	 * machine they chose. Never for work Chopin starts by itself, which stays on its own owner's
+	 * machines.
+	 */
+	requested(repositoryId: string, owner: string, documentId: string) {
+		return [
+			...this.favoriteShared(repositoryId, owner, documentId),
+			...this.candidates(repositoryId, owner, documentId),
+			...this.chosenShared(repositoryId, owner, documentId),
+		];
+	}
+	/**
+	 * Whether a connection may take `person`'s work on `documentId` (its owner's unless said), as
+	 * candidates() decides. A teammate's machine takes only the work of someone who chose it, or,
+	 * where they chose none, made it their favorite.
+	 */
+	allows(documentId: string, connection: Connection, person = connection.owner) {
 		if (!this.#choicesRead) return false;
-		let chosen = this.chosen(documentId, connection.owner);
-		return chosen === undefined || connection.machineId === chosen;
+		let chosen = this.chosen(documentId, person);
+		return connection.owner === person
+			? chosen === undefined || connection.machineId === chosen
+			: connection.machineId === (chosen ?? this.#favorites.get(person));
 	}
 	/**
 	 * Whether the stored choices have been read. Until they are, no connection takes anyone's
@@ -472,7 +559,13 @@ export class Connections {
 	/** A revoked machine is nobody's choice, or favorite, any more. */
 	unchoose(machineId: string) {
 		for (let [key, value] of this.#choices) if (value === machineId) this.#choices.delete(key);
-		for (let [key, value] of this.#favorites) if (value === machineId) this.#favorites.delete(key);
+		this.unfavor(machineId);
+	}
+	/** Forget everyone's favorite of a machine, except `keep`'s: its owner's own stays. */
+	unfavor(machineId: string, keep?: string) {
+		for (let [owner, value] of this.#favorites) {
+			if (value === machineId && owner !== keep) this.#favorites.delete(owner);
+		}
 	}
 	runToken(
 		connectionId: string,
@@ -538,6 +631,7 @@ export class Connections {
 	revoke(id: string) {
 		let connection = this.#connections.get(id);
 		this.#connections.delete(id);
+		this.#opened.delete(id);
 		if (connection) this.#ended.set(id, this.now());
 		this.#builds.delete(id);
 		this.#queued.delete(id);
@@ -575,6 +669,14 @@ export class Connections {
 			for (let resolve of this.#waiters.get(key) ?? []) resolve();
 		}
 	}
+	/**
+	 * The server is about to stop listening: every connector waiting for work is woken to its
+	 * ordinary empty answer, and none waits again. It asks again, and reaches the next process.
+	 */
+	stopWaiting() {
+		this.#released = true;
+		for (let waiters of this.#waiters.values()) for (let resolve of waiters) resolve();
+	}
 	/** Wake the connectors that wait on what this connection serves. */
 	wakeConnection(connection: Connection) {
 		if (connection.anyRepository) this.wake(ANY);
@@ -582,6 +684,7 @@ export class Connections {
 	}
 	/** Wait, at most 20 seconds, for work this connection may take. */
 	wait(connection: Connection, signal: AbortSignal) {
+		if (this.#released) return Promise.resolve();
 		let keys = connection.anyRepository
 			? [ANY]
 			: connection.checkouts.map(checkout => checkout.repositoryId);

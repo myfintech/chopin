@@ -1,16 +1,28 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, open, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import {
+	mkdir,
+	open,
+	readdir,
+	readFile,
+	realpath,
+	rename,
+	rm,
+	stat,
+	writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve, sep, win32 } from "node:path";
-import { execFile, spawnSync } from "node:child_process";
-import { promisify } from "node:util";
+import { basename, join, sep, win32 } from "node:path";
 import type { RunInput } from "@chopin/experiment";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { redacted } from "./connection";
+import { gitAsync, gitSync, type Repository, repositoryAt } from "./git-host";
+import { removePlantedRedirects } from "./git-directories";
 import { CONNECTOR_PROTOCOL, VERSION } from "./version";
 
 export function git(cwd: string, ...args: string[]): string {
-	let result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 120_000 });
+	let result = gitSync(args, { cwd, timeout: 120_000 });
 	if (result.status !== 0) {
 		throw new Error(`Git ${args[0]} failed: ${result.stderr || result.error?.message}`);
 	}
@@ -77,6 +89,37 @@ export function stateDirectory() {
 		);
 }
 
+/**
+ * Where a run's or a Planner's tokens are kept: `<worktree>.tokens`, a folder of that launch alone.
+ * A sandbox is given the folder, not the files in it, because a token is renewed by replacing its
+ * file and only a folder shows the new one.
+ */
+export function tokenFolder(worktree: string) {
+	return `${worktree}${TOKENS}`;
+}
+
+/** What `tokenFolder` adds to a worktree's path. */
+const TOKENS = ".tokens";
+
+/**
+ * Whether `name`, a folder beside worktrees, is the token folder `tokenFolder` makes for one
+ * rather than a worktree: a worktree's name is a segment of a document or attempt id, which never
+ * ends so.
+ */
+function isTokenFolder(name: string) {
+	return name.length > TOKENS.length && name.endsWith(TOKENS);
+}
+
+/**
+ * The token files an earlier release kept beside a worktree, before tokens had a folder of their
+ * own: `<worktree>.github-token` and, for a Planner, `<worktree>.planner-token`. A run's was named
+ * for its attempt, which is its worktree's name. This release never writes them, and a machine
+ * upgraded from that one has them until their run is removed.
+ */
+function legacyTokenFiles(worktree: string) {
+	return [`${worktree}.github-token`, `${worktree}.planner-token`];
+}
+
 /** A path segment made only of characters safe in any file system, never `.` or `..`. */
 export function segment(value: string) {
 	let safe = value.replace(/[^A-Za-z0-9._-]/g, "_");
@@ -84,17 +127,113 @@ export function segment(value: string) {
 }
 
 /**
- * Where a document's Planner command keeps its own git worktree of the checkout:
- * `<base>/planners/<owner>/<repo>/<document id>`, by the checkout's GitHub repository, so a
- * Planner started again finds it there. The folders above it are made private (0700); the
- * worktree itself is the Planner's to make, and nothing here ever removes it.
+ * The folder of a repository's Planner worktrees, `<base>/planners/<owner>/<repo>`, made private
+ * (0700) as it is asked for.
  */
-export async function plannerWorktree(directory: string, repository: string, document: string) {
+export async function plannerFolder(directory: string, repository: string) {
 	let [owner = "", name = ""] = repository.toLowerCase().split("/");
 	let parent = join(directory, "planners", segment(owner), segment(name));
 	// Never fatal here: a Planner that can't make its worktree says why itself.
 	await mkdir(parent, { recursive: true, mode: 0o700 }).catch(() => {});
-	return join(parent, segment(document));
+	return parent;
+}
+
+/** The name of a spare Planner's slot beside the worktrees: `spare-` and 12 hex digits. */
+export const SPARE_SLOT = /^spare-[0-9a-f]{12}$/;
+
+/** The file that says which spare slot became a document's worktree: `<document id>.worktree`. */
+function slotRecord(parent: string, document: string) {
+	return join(parent, `${segment(document)}.worktree`);
+}
+
+/** The slot `<document id>.worktree` names, when it names one that is there. */
+async function assignedSlot(parent: string, document: string) {
+	let slot = (await readFile(slotRecord(parent, document), "utf8").catch(() => "")).trim();
+	return SPARE_SLOT.test(slot) && existsSync(join(parent, slot)) ? slot : undefined;
+}
+
+/**
+ * Where a document's Planner command keeps its own git worktree of the checkout:
+ * `<base>/planners/<owner>/<repo>/<document id>`, by the checkout's GitHub repository, so a
+ * Planner started again finds it there; or, for a document whose Planner started on a spare, the
+ * spare's slot, which stays its worktree for good (see `assignSlot`). The folders above it are made
+ * private (0700); the worktree itself is the Planner's to make, and nothing here ever removes it.
+ */
+export async function plannerWorktree(directory: string, repository: string, document: string) {
+	let parent = await plannerFolder(directory, repository);
+	let slot = await assignedSlot(parent, document);
+	return join(parent, slot ?? segment(document));
+}
+
+/**
+ * Record that a spare's `slot` is `document`'s worktree from now on, so every later launch of its
+ * Planner, a cold one too, runs in it and finds its own state there. Written whole, through a
+ * temporary file and a rename.
+ */
+export async function assignSlot(
+	directory: string,
+	repository: string,
+	document: string,
+	slot: string,
+) {
+	let parent = await plannerFolder(directory, repository);
+	let path = slotRecord(parent, document);
+	let temporary = `${path}.${process.pid}.tmp`;
+	await writeFile(temporary, `${basename(slot)}\n`, { mode: 0o600 });
+	await rename(temporary, path);
+}
+
+/** The spare slots in a repository's Planner folder that became a document's worktree, by slot. */
+export async function assignedSlots(parent: string) {
+	let names = await readdir(parent).catch(() => [] as string[]);
+	let found = new Map<string, string>();
+	for (let name of names.filter(name => name.endsWith(".worktree"))) {
+		let slot = (await readFile(join(parent, name), "utf8").catch(() => "")).trim();
+		if (SPARE_SLOT.test(slot)) found.set(slot, name.slice(0, -".worktree".length));
+	}
+	return found;
+}
+
+/**
+ * A sandboxed Planner's own worktree of its checkout, made on the host before its backend starts:
+ * a linked worktree of `checkout` at `worktree`, detached at the checkout's HEAD, unless there is
+ * one there already, which stays as it is. A sandbox can't let the backend make it: that needs
+ * `worktrees` in the checkout's git directory written, which would let it alter every worktree
+ * of the person's, so the backend finds it made, as it must on every launch after the first,
+ * and the sandbox lets it write that worktree's own git directory alone. It is made with no
+ * filter run, whoever defined it (a Git LFS checkout's own are the person's, and a repository's
+ * `.gitattributes` may select any): its files are as git stores them, an LFS pointer for an LFS
+ * file, which the backend's own git converts, in its sandbox, as it needs. Resolves with whether
+ * `worktree` is a linked worktree of `checkout` now: a folder with something in it that is
+ * none is left alone.
+ */
+export async function preparePlannerWorktree(checkout: string, worktree: string): Promise<boolean> {
+	removePlantedRedirects(checkout);
+	let same = async (path: string) => (await realpath(path).catch(() => path));
+	let wanted = await same(worktree);
+	let listed = await gitAsync(["worktree", "list", "--porcelain"], { cwd: checkout })
+		.then(({ stdout }) => String(stdout));
+	let registered = false;
+	for (let line of listed.split("\n")) {
+		if (line.startsWith("worktree ") && await same(line.slice("worktree ".length)) === wanted) {
+			registered = true;
+		}
+	}
+	let present = await stat(worktree).then(info => info.isDirectory(), () => false);
+	if (registered && present) {
+		repositoryAt(worktree);
+		return true;
+	}
+	// Registered, but its folder is gone: git would refuse to make it again until it forgets it.
+	if (registered) await gitAsync(["worktree", "prune"], { cwd: checkout });
+	if (present && (await readdir(worktree)).length > 0) return false;
+	await gitAsync(["worktree", "add", "--detach", worktree], {
+		cwd: checkout,
+		timeout: 120_000,
+		noFilters: true,
+	});
+	repositoryAt(worktree);
+	return true;
 }
 
 /** When a process started: `id` differs for each process that held a pid, `at` is in ms. */
@@ -250,6 +389,7 @@ export async function lockWorkspace(
 		await rm(path.replace(/\.lock$/, ".failures.json"), { force: true });
 		await rm(path.replace(/\.lock$/, ".chosen.json"), { force: true });
 		await rm(path.replace(/\.lock$/, ".github.json"), { force: true });
+		await rm(path.replace(/\.lock$/, ".spares.json"), { force: true });
 	};
 }
 
@@ -330,27 +470,37 @@ export function chosenPlanners(directory: string, root: string) {
 export type ChosenPlanners = ReturnType<typeof chosenPlanners>;
 
 /**
- * The repositories Chopin said its GitHub App can't push to, so the machine's processes use its
- * own GitHub login for them, kept for `chopin status` in a file beside the connector's lock.
- * `record` is true only the first time for each, so the connector says it once.
+ * A repository's spare Planner, as `chopin status` shows it: `starting`, `ready` (`since` it
+ * printed ready), `unsupported` when the Planner command never took spare mode (`since` it was
+ * found so), or `off` (`--no-planner-spare`). `command` names the Planner command's program.
  */
-export function githubFallback(directory: string, root: string) {
-	let path = join(directory, `${lockId(root)}.github.json`);
-	// A connector that crashed may have left its note behind.
+export type SpareState = {
+	repository: string;
+	state: "starting" | "ready" | "unsupported" | "off";
+	since: number;
+	command?: string;
+};
+
+/**
+ * A connector's spare Planners, kept for `chopin status` in a file beside its lock. `record`
+ * replaces the list.
+ */
+export function spareStates(directory: string, root: string) {
+	let path = join(directory, `${lockId(root)}.spares.json`);
 	let writing = rm(path, { force: true }).catch(() => {});
-	let recorded: string[] = [];
 	return {
-		record(repository: string) {
-			if (recorded.some(value => value.toLowerCase() === repository.toLowerCase())) return false;
-			recorded.push(repository);
-			let repositories = [...recorded];
+		record(states: SpareState[]) {
 			writing = writing.then(() =>
-				writeFile(path, JSON.stringify({ repositories }), { mode: 0o600 })
+				states.length
+					? writeFile(path, JSON.stringify(states), { mode: 0o600 })
+					: rm(path, { force: true })
 			).catch(() => {});
-			return true;
+			return writing;
 		},
 	};
 }
+
+export type SpareStates = ReturnType<typeof spareStates>;
 
 /** Whether no process `pid` exists; EPERM means it exists but belongs to someone else. */
 function gone(pid: number) {
@@ -416,8 +566,8 @@ export type RunningConnector = {
 	started?: number;
 	/** How its agent or Planner backends last failed to start, while it runs. */
 	failures?: StartFailure[];
-	/** The repositories its GitHub App can't push to, so its machine uses its own login there. */
-	githubCannotPush?: string[];
+	/** Its spare Planners, by repository, while it runs. */
+	spares?: SpareState[];
 };
 
 /**
@@ -457,17 +607,11 @@ export async function connectors(
 				.then(text => JSON.parse(text))
 				.catch(() => undefined)
 			: undefined;
-		let github: unknown = running
-			? await readFile(join(directory, name.replace(/\.lock$/, ".github.json")), "utf8")
-				.then(text => {
-					let value = JSON.parse(text) as { repository?: unknown; repositories?: unknown };
-					return Array.isArray(value.repositories) ? value.repositories : [value.repository];
-				})
+		let spares: unknown = running
+			? await readFile(join(directory, name.replace(/\.lock$/, ".spares.json")), "utf8")
+				.then(text => JSON.parse(text))
 				.catch(() => undefined)
 			: undefined;
-		let refused = Array.isArray(github)
-			? github.filter((value): value is string => typeof value === "string")
-			: [];
 		found.push({
 			pid: pid as number,
 			...(typeof root === "string" ? { root } : {}),
@@ -487,7 +631,7 @@ export async function connectors(
 			...(typeof protocol === "number" ? { protocol } : {}),
 			...(typeof started === "number" ? { started } : {}),
 			...(Array.isArray(failures) && failures.length ? { failures } : {}),
-			...(refused.length ? { githubCannotPush: refused } : {}),
+			...(Array.isArray(spares) && spares.length ? { spares: spares as SpareState[] } : {}),
 		});
 	}
 	return found;
@@ -498,33 +642,44 @@ export async function connectors(
  * tree fails: each remote URL is rewritten to a scheme Git cannot push to. A spike runs under it,
  * so its throwaway branch never leaves the laptop even if the agent tries.
  */
-export function noPushEnvironment(): Record<string, string> {
+export function noPushEnvironment(more: Array<[string, string]> = []): Record<string, string> {
 	let prefixes = ["https://", "http://", "ssh://", "git@", "git://", "file://", "/", "."];
-	let env: Record<string, string> = { GIT_CONFIG_COUNT: String(prefixes.length) };
-	prefixes.forEach((prefix, index) => {
-		env[`GIT_CONFIG_KEY_${index}`] = "url.chopin-spike-never-pushes://.pushInsteadOf";
-		env[`GIT_CONFIG_VALUE_${index}`] = prefix;
+	let entries: Array<[string, string]> = [
+		...prefixes.map(prefix =>
+			["url.chopin-spike-never-pushes://.pushInsteadOf", prefix] as [string, string]
+		),
+		...more,
+	];
+	let env: Record<string, string> = { GIT_CONFIG_COUNT: String(entries.length) };
+	entries.forEach(([key, value], index) => {
+		env[`GIT_CONFIG_KEY_${index}`] = key;
+		env[`GIT_CONFIG_VALUE_${index}`] = value;
 	});
 	return env;
 }
 
 /** Remove a finished spike's worktree and throwaway branch; its screenshots were uploaded. */
 export async function discardWorkspace(root: string, path: string, branch: string) {
+	removePlantedRedirects(root);
 	try {
-		await promisify(execFile)("git", ["-C", root, "worktree", "remove", "--force", path], {
+		// Twice --force removes a locked worktree too, which a `locked` file an agent made in its own
+		// git entry would otherwise leave, and its branch, behind.
+		await gitAsync(["worktree", "remove", "--force", "--force", path], {
+			cwd: root,
 			timeout: 60_000,
 		});
 	} catch {
 		await rm(path, { recursive: true, force: true });
-		await promisify(execFile)("git", ["-C", root, "worktree", "prune"]).catch(() => {});
+		await gitAsync(["worktree", "prune"], { cwd: root }).catch(() => {});
 	}
-	await promisify(execFile)("git", ["-C", root, "branch", "-D", branch]).catch(() => {});
+	await gitAsync(["branch", "-D", branch], { cwd: root }).catch(() => {});
 }
 
 /**
  * Accept a run: write its journal in `<base>/runs`, then add its detached worktree there. The
- * journal names this process, so retention never removes a run still going, and `extras`, the
- * folder beside the worktree where its agent may add extra worktrees, which end with the run.
+ * journal names this process, so retention never removes a run still going, the checkout it was
+ * made from, which is how retention finds that repository again, and `extras`, the folder beside
+ * the worktree where its agent may work, which ends with the run.
  */
 export async function prepareWorkspace(
 	root: string,
@@ -535,6 +690,18 @@ export async function prepareWorkspace(
 	/** Credential configuration for git, through the environment, to fetch the run's commit. */
 	env: Record<string, string> = {},
 ) {
+	// A `commondir` made in the checkout's git directory by an agent of an earlier release would
+	// send git to configuration it wrote. The connector's git doesn't look at it, but nothing else
+	// that runs there is spared, so it is removed and this run is refused, so its owner hears of it;
+	// sent again, the run goes ahead.
+	let planted = removePlantedRedirects(root);
+	if (planted.length) {
+		throw new Error(
+			`Not run: an agent had made ${planted.join(", ")} in ${root}'s git directory, where `
+				+ "only a linked worktree has one, and it sends git there to configuration the agent wrote. "
+				+ "It has been removed; run this again.",
+		);
+	}
 	let current = await workspace(root);
 	if (current.repository.toLowerCase() !== input.source.repository.toLowerCase()) {
 		throw new Error("Repository differs from the authorized run.");
@@ -556,6 +723,7 @@ export async function prepareWorkspace(
 			id: input.id,
 			generation,
 			source: input.source,
+			root,
 			state: "accepted",
 			pid: process.pid,
 			...(started ? { processStart: started.id } : {}),
@@ -567,21 +735,31 @@ export async function prepareWorkspace(
 	try {
 		git(root, "cat-file", "-e", `${input.source.commit}^{commit}`);
 	} catch {
-		await promisify(execFile)("git", ["-C", root, "fetch", "origin", input.source.commit], {
+		await gitAsync(["fetch", "origin", input.source.commit], {
+			cwd: root,
 			timeout: 120_000,
 			env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: "0" },
+		}).catch(error => {
+			let lines = String((error as { stderr?: unknown }).stderr ?? "").trim().split("\n");
+			let detail = redacted(
+				lines.find(line => line.startsWith("fatal:")) ?? (lines.at(-1) || (error as Error).message),
+			);
+			throw new Error(
+				`Couldn't fetch commit ${input.source.commit}${
+					input.source.branch ? ` (${input.source.branch})` : ""
+				} of ${input.source.repository} to start from (${detail}).`,
+				{ cause: error },
+			);
 		});
 	}
 	let path = join(directory, "runs", attempt);
-	await promisify(execFile)("git", [
-		"-C",
-		root,
-		"worktree",
-		"add",
-		"--detach",
-		path,
-		input.source.commit,
-	], { timeout: 120_000 });
+	await gitAsync(["worktree", "add", "--detach", path, input.source.commit], {
+		cwd: root,
+		timeout: 120_000,
+	});
+	// Where the worktree's git directories are is settled now, before its agent starts, and not
+	// asked of the files in it afterwards.
+	repositoryAt(path);
 	let extras = extraWorktrees(path);
 	await mkdir(extras, { recursive: true, mode: 0o700 });
 	return { path, journalPath, extras };
@@ -600,21 +778,38 @@ function extraWorktrees(path: string) {
 	return `${path}-worktrees`;
 }
 
+/** How a run ended, as its journal records it: its agent finished, failed and why, or was stopped. */
+export type RunOutcome =
+	| { state: "finished" }
+	/** `reason` names who stopped it in Chopin; Ctrl-C here has none. */
+	| { state: "stopped"; reason?: string }
+	/** Its agent blocked a task: which one and why. */
+	| { state: "blocked"; reason: string }
+	| { state: "failed"; error: string };
+
 /**
  * End a run's workspace: remove the extra worktrees its agent added (see `removeWorktreesIn`) and
- * mark its journal finished, which retention orders kept runs by. The run's own worktree stays
- * for inspection.
+ * mark its journal ended, which retention orders kept runs by, with `outcome` when known. Its
+ * `state` stays "finished" for every end, as retention reads it; `outcome` says which end. The
+ * run's own worktree stays for inspection.
  */
 export async function endWorkspace(
 	root: string,
 	prepared: { extras: string; journalPath: string },
+	outcome?: RunOutcome,
 ) {
-	await removeWorktreesIn(["-C", root], prepared.extras);
+	removePlantedRedirects(root);
+	await removeWorktreesIn({ cwd: root }, prepared.extras);
 	try {
 		let journal = JSON.parse(await readFile(prepared.journalPath, "utf8"));
 		await writeFile(
 			prepared.journalPath,
-			JSON.stringify({ ...journal, state: "finished", finished: Date.now() }),
+			JSON.stringify({
+				...journal,
+				state: "finished",
+				finished: Date.now(),
+				...(outcome ? { outcome } : {}),
+			}),
 			{ mode: 0o600 },
 		);
 	} catch { /* A journal retention already removed has nothing left to mark. */ }
@@ -622,15 +817,18 @@ export async function endWorkspace(
 
 const exec = promisify(execFile);
 
+/** Where git runs for a repository: in its checkout, or on a record of its git directories. */
+type Where = { cwd: string; repository?: undefined } | { repository: Repository; cwd?: undefined };
+
 /**
- * Remove every worktree inside `folder` of the repository `repository` names (Git's `-C <dir>` or
- * `--git-dir <dir>`), uncommitted changes included, as their pull requests were pushed; then the
- * folder, and prune what Git still lists. Their branches stay.
+ * Remove every worktree inside `folder` of the repository `where` names, uncommitted changes
+ * included, as their pull requests were pushed; then the folder, and prune what Git still lists.
+ * Their branches stay.
  */
-async function removeWorktreesIn(repository: string[], folder: string) {
+async function removeWorktreesIn(where: Where, folder: string) {
 	let inside = await realpath(folder).catch(() => undefined);
 	if (inside) {
-		let listed = await exec("git", [...repository, "worktree", "list", "--porcelain"])
+		let listed = await gitAsync(["worktree", "list", "--porcelain"], where)
 			.then(({ stdout }) => String(stdout))
 			.catch(() => "");
 		for (let line of listed.split("\n")) {
@@ -639,24 +837,26 @@ async function removeWorktreesIn(repository: string[], folder: string) {
 			let real = await realpath(path).catch(() => path);
 			if (!real.startsWith(inside + sep)) continue;
 			// Twice --force removes a locked worktree too.
-			await exec("git", [...repository, "worktree", "remove", "--force", "--force", path], {
+			await gitAsync(["worktree", "remove", "--force", "--force", path], {
+				...where,
 				timeout: 60_000,
 			}).catch(() => {});
 		}
 	}
 	await rm(folder, { recursive: true, force: true });
-	await exec("git", [...repository, "worktree", "prune"]).catch(() => {});
+	await gitAsync(["worktree", "prune"], where).catch(() => {});
 }
 
-/** The repository a run's worktree belongs to, as `--git-dir <dir>`; undefined when it has none. */
-async function worktreeRepository(path: string) {
-	// Only a linked worktree has a .git file; a plain folder would name whatever repository holds it.
-	let link = await readFile(join(path, ".git"), "utf8").catch(() => "");
-	if (!link.startsWith("gitdir:")) return undefined;
-	let common = await exec("git", ["-C", path, "rev-parse", "--git-common-dir"])
-		.then(({ stdout }) => resolve(path, String(stdout).trim()))
-		.catch(() => undefined);
-	return common ? ["--git-dir", common] : undefined;
+/**
+ * The repository of a run whose journal doesn't name its checkout, as one written before the
+ * connector recorded it doesn't: what the worktree's `.git` file leads to, which a run of that
+ * release, with no sandbox, could have written as well as git did.
+ */
+function legacyRepository(path: string): Where | undefined {
+	let record = repositoryAt(path);
+	return record
+		? { repository: { gitDir: record.commonDir, commonDir: record.commonDir } }
+		: undefined;
 }
 
 /**
@@ -712,17 +912,26 @@ export async function pruneRuns(
 		}
 		let path = join(folder, entry.attempt);
 		let extras = extraWorktrees(path);
-		let repository = await worktreeRepository(path);
-		if (repository) {
-			await removeWorktreesIn(repository, extras);
-			await exec("git", [...repository, "worktree", "remove", "--force", "--force", path], {
+		// The checkout the run was made from, as its journal recorded it when it was accepted.
+		let journal = await readFile(join(folder, `${entry.attempt}.json`), "utf8").then(
+			text => JSON.parse(text) as { root?: unknown },
+			() => ({} as { root?: unknown }),
+		);
+		let root = typeof journal.root === "string" ? journal.root : undefined;
+		if (root) removePlantedRedirects(root);
+		let where: Where | undefined = root ? { cwd: root } : legacyRepository(path);
+		if (where) {
+			await removeWorktreesIn(where, extras);
+			await gitAsync(["worktree", "remove", "--force", "--force", path], {
+				...where,
 				timeout: 60_000,
 			}).catch(() => {});
 		}
 		await rm(extras, { recursive: true, force: true });
 		await rm(path, { recursive: true, force: true });
-		if (repository) await exec("git", [...repository, "worktree", "prune"]).catch(() => {});
-		await rm(join(folder, `${entry.attempt}.github-token`), { force: true });
+		if (where) await gitAsync(["worktree", "prune"], where).catch(() => {});
+		await rm(tokenFolder(path), { recursive: true, force: true });
+		for (let file of legacyTokenFiles(path)) await rm(file, { force: true });
 		await rm(join(folder, `${entry.attempt}.json`), { force: true });
 		removed.push(entry.attempt);
 	}
@@ -731,7 +940,8 @@ export async function pruneRuns(
 
 /**
  * The Planner worktrees in `<base>/planners/<owner>/<repo>/<document id>`: each folder a Planner
- * command made there.
+ * command made there, not the token folder (`tokenFolder`) kept beside each, and each spare slot
+ * that became a document's worktree, under that document.
  */
 export async function plannerWorktrees(directory: string) {
 	let found: Array<{ path: string; repository: string; document: string }> = [];
@@ -741,12 +951,15 @@ export async function plannerWorktrees(directory: string) {
 	let base = join(directory, "planners");
 	for (let owner of await folders(base)) {
 		for (let name of await folders(join(base, owner))) {
-			for (let document of await folders(join(base, owner, name))) {
-				found.push({
-					path: join(base, owner, name, document),
-					repository: `${owner}/${name}`,
-					document,
-				});
+			let parent = join(base, owner, name);
+			// A spare's slot is listed under the document it became the worktree of; one still waiting
+			// for a document is a spare, not a document's worktree.
+			let slots = await assignedSlots(parent);
+			for (let folder of await folders(parent)) {
+				if (isTokenFolder(folder)) continue;
+				let document = SPARE_SLOT.test(folder) ? slots.get(folder) : folder;
+				if (document === undefined) continue;
+				found.push({ path: join(parent, folder), repository: `${owner}/${name}`, document });
 			}
 		}
 	}

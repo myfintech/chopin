@@ -12,10 +12,23 @@ import { ReadinessReviews } from "./tasks/readiness-review";
  * needs to know which mode it is in.
  */
 
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { displayTitle, parse, ulid } from "@chopin/dialect";
 
-import { harnessFor, shutdownHarnesses } from "./harness/harnesses";
+import {
+	harnessFor,
+	plannerCatalog,
+	plannerCommands,
+	plannerOfferIncoming,
+	plannerOfferKnown,
+	plannerRanWithoutOffer,
+	plannerSteers,
+	shutdownHarnesses,
+} from "./harness/harnesses";
+import { chooseModel, publishModelState, turnModel, turnReadsImages } from "./chat/model-choice";
+import type { ModelChoiceDeps } from "./chat/model-choice";
+import * as Threads from "./chat/threads";
 import {
 	admitAgent,
 	AGENT_UPGRADE_HEADERS,
@@ -33,17 +46,29 @@ import { documentUrl } from "./channels/document-url";
 import { ActiveOwnerBindings } from "./agent/active-owner";
 import { registerAuthRoutes } from "./auth/routes";
 import { registerExperimentRoutes } from "./experiments/routes";
+import { attachmentLimits } from "./attachments/limits";
+import { registerAttachmentRoutes } from "./attachments/routes";
 import { registerImageRoutes } from "./images/routes";
+import { openaiTranscriber } from "./transcription/openai";
+import { registerTranscriptionRoutes } from "./transcription/routes";
 import type { ExperimentRuntime } from "./experiments/routes";
 import type { Instruction, ServerInstructionDeps } from "./chat/server-instruction";
 import { fingerprint } from "./experiments/service";
 import * as Chat from "./chat/service";
+import { answerWake } from "./chat/wake";
+import { plannerAttachment } from "./chat/planner-attachment";
 import * as Initiative from "./chat/initiative";
+import * as Reactions from "./chat/reactions";
+import { respond as respondToReaction } from "./chat/reaction-reply";
+import { copiedFrom, reactInThread } from "./chat/thread-reactions";
 import { createChildDocuments } from "./chat/children";
 import { createRootChat } from "./chat/root";
 import { serverInstruction as runServerInstruction } from "./chat/server-instruction";
 import { CHAT_CAPABILITIES, incomingFrame, sidebarFrame } from "./chat/incoming";
+import { registerMentionRoutes } from "./chat/mention-routes";
 import { ReferenceService } from "./chat/references";
+import { RepositoryFiles } from "./chat/repository-files";
+import { RepositoryPeople } from "./chat/repository-people";
 import { createConversationRuntime } from "./conversation-plan/runtime";
 import { createEditingUnlocked } from "./plan/editing-unlocked";
 import { researchBriefDefinition } from "./jobs/research-brief";
@@ -59,11 +84,19 @@ import { startAcceptedResearch } from "./conversation-plan/accepted-research";
 import { registerChannelRoutes } from "./channels/routes";
 import { DocumentHistory } from "./channels/history";
 import * as Comments from "./comments/service";
-import { proxy, serve } from "./client";
+import { clientBuild, proxy, serve } from "./client";
 import { describe, load } from "./config";
+import { GitHubAppClient } from "./github/app";
 import { GitHubClient, GitHubError } from "./github/client";
+import { plannerWorkspace } from "./harness/atomic/workspace";
 import { GitHubReferences } from "./github/references";
+import { builders, named, pictures, present } from "./people";
 import { registerConnectorScript } from "./http/connector-script";
+import { cut } from "./handover/cut";
+import { acquireWhenFree } from "./handover/lease-wait";
+import { abandonable, Requests } from "./handover/requests";
+import { finishTurns } from "./handover/turns";
+import { Readiness, registerHealthRoutes } from "./http/health";
 import { registerMachinesPath } from "./http/machines-path";
 import { Router } from "./http/router";
 import { JobExecutionError, JobRegistry } from "./jobs/registry";
@@ -87,6 +120,7 @@ import { createVisualAdmission } from "./agent/visual-admission";
 import { locksEditing, requestBuild } from "./tasks/builds";
 import { pendingLinks, relinkInstruction } from "./tasks/relink";
 import { BuildReadiness } from "./tasks/readiness";
+import { MCP_SESSION_IDLE_MS } from "./mcp/hosted";
 import { registerMcpRoutes } from "./mcp/routes";
 import { registerNavigationRoutes } from "./navigation/routes";
 import { registerPreferenceRoutes } from "./user-preferences/routes";
@@ -100,6 +134,9 @@ import * as Questions from "./questions/service";
 import * as Explore from "./questions/explore";
 import { runningFindingRefs } from "./questions/service-findings";
 import { answerTurns } from "./questions/answer-turns";
+import { decisionGeneration } from "./questions/card-actions";
+import { createHumanInput, rejoinInput } from "./harness/atomic/human-input";
+import type { RejoinHost } from "./harness/remote/link";
 import { deterministicChannelId } from "./channels/id";
 import type { Research as ResearchWire } from "@chopin/protocol";
 import { investigationFinding } from "./experiments/document";
@@ -113,7 +150,7 @@ import {
 } from "./research/service";
 import { placeResearchReference as placeResearch } from "./research/placement";
 import * as Rooms from "./rooms";
-import { admit, admitSidebar } from "./socket/admission";
+import { admit, admitSidebar, refused } from "./socket/admission";
 import { refreshAuthorization } from "./socket/authorization";
 import {
 	recheckDecisionWatch,
@@ -124,13 +161,27 @@ import {
 	watchDecisions,
 	watchRequest,
 } from "./socket/decision-watch";
+import { OpenSockets } from "./socket/open-sockets";
 import { SessionSockets } from "./socket/session-sockets";
 import { StorageError } from "./storage/errors";
 import { createStorage } from "./storage/registry";
 import { WriterLease } from "./storage/writer-lease";
-import { broadcast, fail, relay, reply, repositoryTopic, tell, topic } from "./wire";
+import {
+	broadcast,
+	broadcastRepository,
+	DEFLATE,
+	fail,
+	PASSING,
+	relay,
+	reply,
+	repositoryTopic,
+	tell,
+	topic,
+} from "./wire";
 
 import { AGENT_PATH, LINK_CLOSE } from "@chopin/agent-link";
+import { SERVICE_RESTART } from "@chopin/protocol/restart";
+import { PLANNER_NAME } from "@chopin/protocol/address";
 
 import type { Server, ServerWebSocket } from "bun";
 import type { AgentSocketData } from "./harness/remote/endpoint";
@@ -138,7 +189,7 @@ import type { RepositoryAuthorizer, WatchTopics } from "./socket/decision-watch"
 import type { DocumentSummaryInput } from "./jobs/document-summary";
 import type { JobDefinition } from "./jobs/registry";
 import type { InvestigationPlacement } from "./plan/room";
-import type { ChannelRecord } from "./storage/model";
+import type { ChannelRecord, Lease, PlannerLinkHold } from "./storage/model";
 import type {
 	AuthorizationResult,
 	SidebarSocket,
@@ -150,6 +201,8 @@ import type {
 type ResearchRequestView = ResearchWire.RequestView;
 
 const config = load();
+/** What a message may carry in force now; none where the server takes no files. */
+const chatAttachmentLimits = attachmentLimits(config);
 /** The one decisions boundary, checked against Atomic's registry before anything starts. */
 const decide = await openDecisions(config);
 const visualAdmission = createVisualAdmission(decide);
@@ -159,7 +212,9 @@ const documentHistory = new DocumentHistory(storage);
 const router = new Router();
 
 /** Where the built client lands. Used only when there is no dev client. */
-const CLIENT = join(import.meta.dir, "../../web/dist");
+const CLIENT = config.clientDir ?? join(import.meta.dir, "../../web/dist");
+/** What `session:hello` names as this server's client build; none in development. */
+const CLIENT_BUILD = clientBuild(CLIENT);
 
 /**
  * How long an empty room is kept before its document is released.
@@ -172,6 +227,8 @@ const LEASE_TTL_MS = 30_000;
 const LEASE_RENEW_MS = 10_000;
 const LEASE_SAFETY_MS = 5_000;
 const LEASE_RETRY_MS = 1_000;
+/** How often a process waiting for the writer lease reads it. */
+const LEASE_POLL_MS = 100;
 const SESSION_CLEANUP_MS = 5 * 60_000;
 const ACCESS_RECHECK_MS = 60_000;
 const RESEARCH_RECOVERY_RETRY_MS = 10_000;
@@ -184,7 +241,21 @@ const writerLease = new WriterLease(storage.leases, {
 	renewMs: LEASE_RENEW_MS,
 	safetyMs: LEASE_SAFETY_MS,
 	retryMs: LEASE_RETRY_MS,
-}, () => signal());
+}, () => abandon());
+const readiness = new Readiness(() => writerLease.held !== undefined, {
+	standby: config.handover.wait,
+});
+/** The paths that need no lease, so a process waiting for it answers them at once. */
+const HEALTH_PATHS = new Set(["/api/health/live", "/api/health/ready"]);
+const requests = new Requests({
+	holdMs: config.handover.holdMs,
+	exempt: async (request, url) => {
+		if (HEALTH_PATHS.has(url.pathname)) return true;
+		if (request.method !== "GET" && request.method !== "HEAD") return false;
+		if (url.pathname === "/" || url.pathname.startsWith("/assets/")) return !config.devClient;
+		return !config.devClient && await Bun.file(join(CLIENT, url.pathname)).exists();
+	},
+});
 let experiments: ExperimentRuntime | undefined;
 let implementations: ReturnType<typeof registerImplementationRoutes> | undefined;
 let experimentTimer: ReturnType<typeof setInterval> | undefined;
@@ -196,11 +267,48 @@ let plannerAttachments: PlannerAttachments | undefined;
 let systemTurns = new SystemTurns();
 /** Browser sockets by login, so a login that ends closes them before another broadcast. */
 let sessionSockets = new SessionSockets(sessionId => hostedAuth.sessions.isLive(sessionId));
+const openSockets = new OpenSockets();
 let jobRunner: JobRunner | undefined;
 let researchService: ResearchWorkspaceService | undefined;
 let researchRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
 let recoveringResearch: Promise<void> | undefined;
 let referenceService: ReferenceService | undefined;
+/**
+ * The files a person can mention: a checkout the Planner works in, where the document has one,
+ * and else what GitHub lists for the default branch, read as the person's own session.
+ */
+const repositoryFiles = new RepositoryFiles({
+	checkout: async (channelId, repository) => {
+		if (config.harness !== "atomic") return undefined;
+		let workspace = await plannerWorkspace(channelId, repository);
+		return workspace.checkout ? workspace.cwd : undefined;
+	},
+	remote: async (sessionId, repository) => {
+		let github = hostedAuth.github;
+		if (!(github instanceof GitHubClient)) return undefined;
+		let session = await hostedAuth.sessions.resolve(sessionId);
+		if (!session) return undefined;
+		let { value } = await hostedAuth.sessions.use(
+			session,
+			token =>
+				github.repositoryFiles(token, repository.owner, repository.name, repository.defaultBranch),
+		);
+		return value;
+	},
+});
+const repositoryPeople = new RepositoryPeople({
+	remote: async (sessionId, repository) => {
+		let github = hostedAuth.github;
+		if (!github.repositoryCollaborators) return undefined;
+		let session = await hostedAuth.sessions.resolve(sessionId);
+		if (!session) return undefined;
+		let { value } = await hostedAuth.sessions.use(
+			session,
+			token => github.repositoryCollaborators!(token, repository.owner, repository.name),
+		);
+		return value;
+	},
+});
 let summaryCoordinator: DocumentSummaryCoordinator | undefined;
 let liveSync: LiveSyncCoordinator | undefined;
 let buildReadiness: BuildReadiness | undefined;
@@ -217,7 +325,7 @@ let readinessReviews = new ReadinessReviews({
 			current => {
 				if (Service.implementationActive(current) || current.chat?.busy) return;
 				return {
-					handle: "Chopin",
+					handle: PLANNER_NAME,
 					said: "Checking decisions and investigations needed before building",
 					text: READINESS_INSTRUCTION,
 					about,
@@ -239,6 +347,11 @@ let conversationRuntime = createConversationRuntime({
 	unavailable: id => archivingChannels.has(id) || deletingChannels.has(id),
 	researchJobs: () => researchBriefJobs,
 });
+
+function heldLease(): Lease {
+	if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+	return writerLease.held;
+}
 
 function withDocumentLock<T>(channelId: string, action: () => Promise<T>): Promise<T> {
 	let previous = documentLocks.get(channelId) ?? Promise.resolve();
@@ -299,6 +412,9 @@ function presence(server: Server<SocketData>, room: Rooms.Room): void {
 function documentBackend(): Service.Backend {
 	return {
 		documentTitles: true,
+		plannerKeepsRuns: id => plannerAttachments?.restoredWork(id),
+		rejoinPlannerQuestions: (plan, server) =>
+			plannerAttachments?.rejoinInputs(plan.id, plannerQuestions(plan, server)),
 		onChannelRenamed: announceChannel,
 		storage,
 		lease: () => {
@@ -307,7 +423,7 @@ function documentBackend(): Service.Backend {
 		},
 		fatal: err => {
 			console.error("chopin: plan persistence failed -", err);
-			signal();
+			abandon();
 		},
 		onDocumentPersisted: target => {
 			void documentHistory.record(target);
@@ -318,6 +434,11 @@ function documentBackend(): Service.Backend {
 		},
 		liveBuild: !!config.liveBuild,
 		onBuildStopped: id => liveSync?.stopped(id),
+		onBuildNotice: (id, notice) => {
+			announceBuildNotice(id, notice).catch(err =>
+				console.error(`[build] could not post ${notice.id} in ${id}'s Chat:`, err)
+			);
+		},
 		onEditingUnlocked: createEditingUnlocked({
 			withDocumentLock,
 			opened: id => Rooms.get(id)?.plan,
@@ -340,7 +461,7 @@ async function relinkDecisions(channelId: string): Promise<void> {
 		let pending = pendingLinks(current);
 		if (pending.length === 0) return;
 		return {
-			handle: "Chopin",
+			handle: PLANNER_NAME,
 			text: relinkInstruction(pending),
 			said: "Linking decisions to the document after the build",
 		};
@@ -378,11 +499,13 @@ const spikeSettlement = spikeSettler({
 });
 
 /**
- * Hand a saved answer to a decision the Planner left open to the Planner, as a turn it acts on.
- * Like other server-authored turns it runs only under the existing owner, and under the remote
- * harness only while a Planner is attached; one that found no Planner starts once one is.
+ * Hand saved answers to decisions the Planner left open to the Planner, as one turn it acts on
+ * for the answers saved close together. Like other server-authored turns it runs only under the
+ * existing owner, and under the remote harness only while a Planner is attached; answers that
+ * found no Planner wait in storage and start once one is, after a restart too.
  */
 const decisionAnswers = answerTurns({
+	store: storage.decisionAnswers,
 	start: async (channelId, compose) => {
 		if (!config.agent) return "drop";
 		let channel = await storage.channels.get(channelId);
@@ -390,12 +513,62 @@ const decisionAnswers = answerTurns({
 		if (plannerAttachments && !await plannerAttachments.confirmed(channelId)) return false;
 		return serverInstruction(channelId, compose);
 	},
+	// Answers saved while a Planner turn runs or waits join the turn after it.
+	busy: channelId => {
+		let chat = Rooms.get(channelId)?.plan?.chat;
+		if (!chat || chat.closed || (!chat.busy && chat.waiting.length === 0)) return undefined;
+		return chat.running ?? Bun.sleep(1_000);
+	},
 });
 
 function answerDecision(channelId: string, id: string, generation: number): void {
 	void decisionAnswers.answered(channelId, id, generation).catch(err =>
-		console.error("chopin: could not hand a saved decision to the Planner -", err)
+		console.error("chopin: could not keep a saved decision for the Planner -", err)
 	);
+}
+
+/**
+ * What a remote Planner's rebuilt hold needs from a document that has opened, to wait again for
+ * the answers to the questions its client left open before a restart: it asks them of the
+ * members again, and an answer its client can never be given becomes a turn of its own.
+ */
+function plannerQuestions(plan: Service.Plan, server: Server<SocketData>): RejoinHost {
+	let live = () => !plan.persistence.closing && !plan.chat.closed;
+	return {
+		join: (asked, signal) => rejoinInput({ id: plan.id, plan, server }, asked, signal),
+		live,
+		// A session a restart rebuilt asks and reports here as a retained session of this Chat would.
+		humanInput: (hold, report) =>
+			createHumanInput(
+				{ id: plan.id, plan, server, anchors: () => Service.anchors(plan, server, plan.id) },
+				hold,
+				report,
+			),
+		runs: (session, runs, down) => {
+			if (!live()) return;
+			void Chat.rebuiltRuns(
+				{
+					chat: plan.chat,
+					room: plan.id,
+					server,
+					persist: chat => Service.persist(plan, chat),
+					auth: hostedAuth,
+				},
+				session,
+				runs,
+				down,
+			).catch(err =>
+				console.error("chopin: could not show the workflow runs a restart kept -", err)
+			);
+		},
+		unsent: decisions => {
+			for (let id of decisions) {
+				let record = plan.records.get(id);
+				if (record?.status !== "answered" || record.origin !== "planner") continue;
+				answerDecision(plan.id, id, decisionGeneration(record));
+			}
+		},
+	};
 }
 
 function settlePendingSpikes(channelId: string): void {
@@ -492,7 +665,7 @@ function scheduleResearchRecovery(deferred: number): void {
 			},
 			err => {
 				console.error("chopin: research reference recovery failed -", err);
-				signal();
+				abandon();
 			},
 		).finally(() => {
 			recoveringResearch = undefined;
@@ -564,6 +737,19 @@ async function plan(room: Rooms.Room, server: Server<SocketData>): Promise<Servi
 	}
 }
 
+/** Who is in a document's conversation now; readers are not (see `Initiative.people`). */
+function conversationPeople(room: Rooms.Room, opened: Service.Plan): Set<string> {
+	if (Rooms.get(room.id) !== room || room.plan !== opened) return new Set();
+	return Initiative.people(opened.chat, room.members.values());
+}
+
+/** Tells a document's Chat when one person is left in its conversation, or a second arrives. */
+function announceAlone(room: Rooms.Room): void {
+	let opened = room.plan;
+	if (!opened || opened.parentChannelId || room.closing) return;
+	Initiative.announceAlone(opened.chat, server, room.id, conversationPeople(room, opened));
+}
+
 function chat(room: Rooms.Room, ws: Socket): Chat.Room {
 	return conversation(room, ws.data.sessionId, {
 		id: ws.data.repositoryId,
@@ -580,7 +766,7 @@ function conversation(
 	repository: Chat.Room["repository"],
 ): Chat.Room {
 	let opened = room.plan!;
-	return conversationRuntime.bind({
+	let context: Chat.Room = conversationRuntime.bind({
 		chat: opened.chat,
 		plan: opened,
 		server,
@@ -599,6 +785,8 @@ function conversation(
 					&& Initiative.actor(member) === actor
 				);
 		},
+		people: () => conversationPeople(room, opened),
+		peopleChanged: () => announceAlone(room),
 		initiativeAuthorize: async (sessionId, actor) => {
 			let member = [...room.members.values()].find(member =>
 				!member.data.closed && member.data.sessionId === sessionId
@@ -607,6 +795,18 @@ function conversation(
 			if (!member || await refreshAccess(member, true) !== "allowed") return false;
 			return !member.data.closed && member.data.canEdit
 				&& room.members.get(member.data.client) === member
+				&& Rooms.get(room.id) === room && room.plan === opened && !room.closing
+				&& !archivingChannels.has(room.id) && !deletingChannels.has(room.id);
+		},
+		reactionAuthorize: async (sessionId, actor) => {
+			let member = [...room.members.values()].find(member =>
+				!member.data.closed && member.data.sessionId === sessionId
+				&& Initiative.actor(member) === actor
+			);
+			// Read access is enough: this only keeps a reader's reaction from being answered after the
+			// reader has left or lost it. It starts nothing and grants nothing.
+			if (!member || await refreshAccess(member, true) !== "allowed") return false;
+			return !member.data.closed && room.members.get(member.data.client) === member
 				&& Rooms.get(room.id) === room && room.plan === opened && !room.closing
 				&& !archivingChannels.has(room.id) && !deletingChannels.has(room.id);
 		},
@@ -625,6 +825,8 @@ function conversation(
 			}
 			: undefined,
 		plannerStarting: plannerAttachments ? () => plannerStarting(room.id) : undefined,
+		// A message sent while a turn runs reaches it only where the harness takes input mid-run.
+		steers: () => plannerSteers(room.id),
 		persist: chat => Service.persist(opened, chat),
 		...(room.parentChannelId
 			? {
@@ -640,6 +842,10 @@ function conversation(
 					withChildPlan,
 				}),
 			}),
+		modelChoice: () => turnModel(modelChoices, room.id),
+		commands: () => modelChoices.commands?.(room.id) ?? Promise.resolve(undefined),
+		fileExists: (path, sessionId) => repositoryFiles.has(room.id, repository, sessionId, path),
+		readsImages: () => turnReadsImages(modelChoices, room.id),
 		activeOwner: () => ownerBindings!.resolve(room.id),
 		ownerAvailable: () => ownerAvailable(room.id),
 		jobs: config.backgroundJobs ? jobService : undefined,
@@ -843,6 +1049,23 @@ function conversation(
 			}
 			: undefined,
 	});
+	return Threads.bindTopLevel(context);
+}
+
+/**
+ * A message an earlier release held for a machine is left as an ordinary posted message: nothing
+ * is held now, so it is never taken by a Planner, and its row is closed. Only the holder of the
+ * writer lease changes it, so an old process serving beside this one is never changed under it.
+ */
+async function retireHeldMessages(): Promise<void> {
+	let lease = writerLease.held;
+	if (!lease) return;
+	let retired = await storage.deferredTurns.retire(lease, new Date());
+	if (retired > 0) {
+		console.log(
+			`chopin: ${retired} message(s) an earlier release held for a Planner were left as ordinary messages`,
+		);
+	}
 }
 
 /**
@@ -929,8 +1152,10 @@ async function closeRoom(room: Rooms.Room, force = false): Promise<void> {
  * still starting it, or how to get one.
  */
 async function plannerNotAttached(channelId: string, url: string, repository: string) {
+	let unavailable = plannerAttachments?.unavailable(channelId);
+	if (unavailable) return unavailable;
 	let starting = await experiments?.plannerStarting(channelId);
-	if (starting) return startingMessage(starting.login);
+	if (starting) return startingMessage(starting.login, starting.failure);
 	return notAttachedMessage(url, repository, !!experiments?.plannerMachines);
 }
 
@@ -939,7 +1164,9 @@ async function plannerNotAttached(channelId: string, url: string, repository: st
  * Planner if none runs it, and the request waits a bounded time for it to attach.
  */
 async function plannerStarting(channelId: string): Promise<void> {
+	// A Planner a cut closed is shown as attached through its window and is on its way back.
 	if (!plannerAttachments || plannerAttachments.attached(channelId) || !experiments) return;
+	if (plannerAttachments.status(channelId).state === "attached") return;
 	await experiments.plannerUsed(channelId);
 	if (await experiments.plannerStarting(channelId)) {
 		await plannerAttachments.attachedWithin(channelId, PLANNER_START_MS);
@@ -950,8 +1177,52 @@ async function plannerStarting(channelId: string): Promise<void> {
 async function plannerStatus(channelId: string): Promise<PlannerAttachment> {
 	let status = plannerAttachments!.status(channelId);
 	if (status.state !== "none") return status;
-	let starting = await experiments?.plannerStarting(channelId);
-	return starting ? { state: "starting", login: starting.login } : status;
+	return plannerAttachment(status, await experiments?.plannerStarting(channelId));
+}
+
+/**
+ * A document's Planner model choice: the catalog its harness reports (an attached client's own
+ * under `HARNESS=remote`) and the choice stored for it. Nothing is offered with `AGENT=off`.
+ */
+const modelChoices: ModelChoiceDeps = {
+	catalog: async channelId =>
+		config.agent ? plannerCatalog(config.harness, channelId, config.model || undefined) : undefined,
+	commands: async channelId => {
+		if (!config.agent) return undefined;
+		let channel = await storage.channels.get(channelId);
+		if (!channel) return undefined;
+		return plannerCommands(config.harness, channelId, {
+			owner: channel.repositoryOwner,
+			name: channel.repositoryName,
+		});
+	},
+	known: channelId => plannerOfferKnown(config.harness, channelId),
+	incoming: channelId =>
+		plannerOfferIncoming(
+			config.harness,
+			channelId,
+			(plannerAttachments?.status(channelId).state ?? "none") !== "none",
+		),
+	fellBack: channelId => {
+		if (plannerRanWithoutOffer(config.harness, channelId)) announceModel(channelId);
+	},
+	storage,
+	lease: () => {
+		if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+		return writerLease.held;
+	},
+};
+
+/**
+ * Tell everyone in the document what its Planner can be set to run and what it is set to. It goes
+ * through the same order as a choice, so it never tells the room an older choice after a newer one.
+ */
+function announceModel(channelId: string): void {
+	let room = Rooms.get(channelId);
+	if (!room || room.parentChannelId || cutting) return;
+	void publishModelState(modelChoices, channelId, state => {
+		if (server && !cutting) broadcast(server, channelId, state);
+	}).catch(err => console.error("chopin: could not announce a document's model choice -", err));
 }
 
 /** Each document's latest status announcement, so an earlier one that resolves later is dropped. */
@@ -965,7 +1236,7 @@ function announcePlanner(channelId: string): void {
 	void plannerStatus(channelId).then(planner => {
 		if (plannerAnnouncements.get(channelId) !== turn) return;
 		plannerAnnouncements.delete(channelId);
-		if (server && !draining) {
+		if (server && !cutting) {
 			broadcast(server, channelId, { kind: "session:planner", ts: 0, planner });
 		}
 	}, err => {
@@ -998,15 +1269,16 @@ async function plannerWritable(
 	room: Rooms.Room,
 	ws: Socket,
 	rid: string,
+	write = true,
 ): Promise<boolean> {
 	let opened = await readyPlan(room);
 	if (!opened) {
-		fail(ws, rid, "document is unavailable");
+		fail(ws, rid, "document is unavailable", deletingChannels.has(room.id) ? undefined : PASSING);
 		return false;
 	}
 	let access = await refreshAccess(ws);
 	if (access === "unavailable") {
-		fail(ws, rid, "authorization is temporarily unavailable");
+		fail(ws, rid, "authorization is temporarily unavailable", PASSING);
 		return false;
 	}
 	if (access === "denied") {
@@ -1014,7 +1286,7 @@ async function plannerWritable(
 		ws.close(4403, "authorization expired");
 		return false;
 	}
-	if (!ws.data.canEdit) {
+	if (write && !ws.data.canEdit) {
 		fail(ws, rid, "repository write access is required");
 		return false;
 	}
@@ -1024,7 +1296,9 @@ async function plannerWritable(
 		|| ws.data.closed || ws.data.room !== room.id
 		|| room.members.get(ws.data.client) !== ws
 	) {
-		fail(ws, rid, "document is unavailable");
+		// An archived or deleted document is final; a room that is only being replaced is not.
+		let final = archivingChannels.has(room.id) || deletingChannels.has(room.id);
+		fail(ws, rid, "document is unavailable", final ? undefined : PASSING);
 		return false;
 	}
 	return true;
@@ -1033,6 +1307,9 @@ async function plannerWritable(
 async function receive(ws: Socket, raw: string): Promise<void> {
 	let frame = incomingFrame(raw);
 	if (!frame) return;
+	// The cut has begun: an edit, a message or a request is neither applied nor answered. The
+	// client keeps what it sent until a server acknowledges it, and sends it to the next one.
+	if (cutting && frame.kind !== "session:ping") return;
 
 	let room = Rooms.get(ws.data.room);
 	if (!room) return;
@@ -1043,7 +1320,7 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 	if (!VIEWER_ALLOWED.has(frame.kind)) {
 		let access = await refreshAccess(ws);
 		if (access === "unavailable") {
-			if (frame.rid) fail(ws, frame.rid, "authorization is temporarily unavailable");
+			if (frame.rid) fail(ws, frame.rid, "authorization is temporarily unavailable", PASSING);
 			return;
 		}
 		if (access === "denied") {
@@ -1066,8 +1343,18 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 				let opened = await plan(room, server);
 				let currentChannel = await storage.channels.get(room.id);
 				if (currentChannel) applyChannelAccess(ws, currentChannel, ws.data.canManage);
+				announceAlone(room);
 				implementations?.track(room.id);
 				let parent = room.parentChannelId;
+				// Who the document names but the room does not hold, ahead of the frames that name them.
+				let people = await pictures(storage.users, {
+					logins: named(opened),
+					ids: builders(opened),
+				}).catch(err => {
+					console.error("chopin: could not read the pictures of a document's people -", err);
+					return [];
+				});
+				if (!ws.data.closed && room.members.get(ws.data.client) === ws) present(ws, people);
 				await greetJoinedPlan(
 					opened,
 					ws,
@@ -1083,6 +1370,21 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 						? { working: thread => Chat.workingFor(Rooms.get(parent)?.plan?.chat, thread, room.id) }
 						: undefined,
 				);
+				// Thread summaries and session context/compaction state follow the history.
+				if (
+					!parent && !ws.data.closed && room.members.get(ws.data.client) === ws
+					&& room.plan === opened
+				) {
+					await Threads.greetThreads(chat(room, ws), ws).catch(err =>
+						console.error("chopin: could not send thread summaries -", err)
+					);
+				}
+				// What the Planner can be set to run, and what it is set to, for the composer.
+				if (!parent) {
+					void publishModelState(modelChoices, room.id, state => {
+						if (!ws.data.closed && room.members.get(ws.data.client) === ws) tell(ws, state);
+					}).catch(err => console.error("chopin: could not send a model choice -", err));
+				}
 				// A reload while the room stays open settles a finding whose event was missed.
 				if (!parent) {
 					void Explore.sweep(opened, server, room.id, exploreDeps)
@@ -1100,6 +1402,12 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 
 		case "plan:awareness":
 			if (room.plan) Service.awareness(room.plan, ws, frame);
+			return;
+
+		case "plan:titling":
+			if (room.plan && typeof frame.active === "boolean") {
+				Service.titling(room.plan, ws, { active: frame.active, edited: frame.edited === true });
+			}
 			return;
 
 		case "plan:close":
@@ -1122,13 +1430,92 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 			await Initiative.setParticipation(chat(room, ws), ws, frame);
 			return;
 
+		case "chat:model":
+			if (!await plannerWritable(room, ws, frame.rid)) return;
+			await chooseModel(modelChoices, {
+				server,
+				ws,
+				channelId: room.id,
+				userId: ws.data.principalId,
+				child: !!room.plan?.parentChannelId,
+			}, frame);
+			return;
+
+		case "chat:thread": {
+			let opened = await readyPlan(room);
+			if (!opened) {
+				fail(
+					ws,
+					frame.rid,
+					"document is unavailable",
+					deletingChannels.has(room.id) ? undefined : PASSING,
+				);
+				return;
+			}
+			let access = await refreshAccess(ws);
+			if (access === "unavailable") {
+				fail(ws, frame.rid, "authorization is temporarily unavailable", PASSING);
+				return;
+			}
+			if (access === "denied") {
+				fail(ws, frame.rid, "authorization expired");
+				ws.close(4403, "authorization expired");
+				return;
+			}
+			if (
+				Rooms.get(room.id) !== room || room.plan !== opened || room.closing
+				|| deletingChannels.has(room.id) || ws.data.closed || ws.data.room !== room.id
+				|| room.members.get(ws.data.client) !== ws
+			) {
+				fail(ws, frame.rid, "document is unavailable", PASSING);
+				return;
+			}
+			await Threads.openThread(
+				chat(room, ws),
+				ws,
+				frame,
+				ws.data.canEdit && !ws.data.channelArchivedAt && !archivingChannels.has(room.id),
+			);
+			return;
+		}
+
 		case "chat:send":
 			try {
 				if (!await plannerWritable(room, ws, frame.rid)) return;
-				await Chat.send(chat(room, ws), ws, frame);
+				await Threads.sendMessage(chat(room, ws), ws, frame);
 			} catch (error) {
-				fail(ws, frame.rid, error instanceof Error ? error.message : "cannot send message");
+				// Nothing it threw says the message is at fault: it is sent again.
+				fail(
+					ws,
+					frame.rid,
+					error instanceof Error ? error.message : "cannot send message",
+					PASSING,
+				);
 			}
+			return;
+
+		case "chat:retry":
+			try {
+				if (!await plannerWritable(room, ws, frame.rid)) return;
+				await Threads.retryMessage(chat(room, ws), ws, frame);
+			} catch (error) {
+				fail(
+					ws,
+					frame.rid,
+					error instanceof Error ? error.message : "cannot retry the reply",
+					PASSING,
+				);
+			}
+			return;
+
+		case "chat:wake":
+			await answerWake(
+				ws,
+				frame.rid,
+				room.plan!,
+				() => plannerWritable(room, ws, frame.rid),
+				{ attachments: plannerAttachments, experiments },
+			);
 			return;
 
 		case "implementation:draft":
@@ -1188,16 +1575,31 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 		case "chat:resume":
 		case "chat:pause-run":
 		case "chat:resume-run":
-		case "chat:unqueue":
 			if (!room.plan) return;
 			if (room.plan.parentChannelId) {
 				if (frame.rid) fail(ws, frame.rid, "this document's Chat is on its root document");
 				return;
 			}
-			if (frame.kind === "chat:abort") await Chat.abort(chat(room, ws), ws);
-			else if (frame.kind === "chat:resume") await Chat.resume(chat(room, ws), ws);
-			else if (frame.kind === "chat:unqueue") Chat.unqueue(chat(room, ws), ws, frame);
-			else await Chat.controlRun(chat(room, ws), ws, frame);
+			await Threads.controlMessage(chat(room, ws), ws, frame);
+			return;
+
+		case "chat:react":
+			if (!room.plan) return;
+			if (room.plan.parentChannelId) {
+				fail(ws, frame.rid, "this document's Chat is on its root document");
+				return;
+			}
+			// A reader may react; the access check that other requests get on arrival is made here,
+			// since a viewer-allowed frame skips it.
+			if (!await plannerWritable(room, ws, frame.rid, false)) return;
+			{
+				let context = chat(room, ws);
+				let thread = frame.thread ?? copiedFrom(context, frame.id);
+				if (thread !== undefined) await reactInThread(context, ws, { ...frame, thread });
+				else {
+					await Reactions.react(context, ws, frame, reacted => respondToReaction(context, reacted));
+				}
+			}
 			return;
 
 		case "conversation-plan:correct":
@@ -1398,8 +1800,10 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 
 const VIEWER_ALLOWED = new Set([
 	"session:ping",
+	"chat:react",
 	"plan:open",
 	"plan:close",
+	"chat:thread",
 	"job:list",
 	"job:get",
 	"conversation-plan:research-link",
@@ -1478,7 +1882,7 @@ async function watchSidebarDecisions(
 	try {
 		authorize = await sidebarRepositoryReader(ws);
 	} catch {
-		return fail(ws, rid, "authorization is temporarily unavailable");
+		return fail(ws, rid, "authorization is temporarily unavailable", PASSING);
 	}
 	if (!authorize) {
 		fail(ws, rid, "authorization expired");
@@ -1560,6 +1964,7 @@ function applyChannelAccess(
 			...(description ? { description } : {}),
 			canManage,
 			...(archivedAt ? { archivedAt } : {}),
+			...(channel.fullWidth ? { fullWidth: true } : {}),
 		});
 	}
 	if ((canEdit !== data.canEdit || canManage !== data.canManage) && !data.closed && publish) {
@@ -1571,6 +1976,8 @@ function applyChannelAccess(
 	data.channelDescription = description;
 	data.channelDescriptionRevision = descriptionRevision;
 	data.channelArchivedAt = archivedAt;
+	if (channel.fullWidth) data.channelFullWidth = true;
+	else delete data.channelFullWidth;
 	data.canEdit = canEdit;
 	data.canManage = canManage;
 }
@@ -1675,20 +2082,20 @@ function openRoomSocket(ws: Socket): void {
 		...(ws.data.channelDescription
 			? { description: ws.data.channelDescription }
 			: {}),
-		you: {
-			handle: ws.data.handle,
-			client: ws.data.client,
-			...(ws.data.actor
-				? { actor: { name: ws.data.actor.name, avatar: ws.data.actor.avatar } }
-				: {}),
-		},
+		you: Rooms.member(ws),
 		members: Rooms.members(room),
 		canEdit: ws.data.canEdit,
 		canManage: ws.data.canManage,
 		...(ws.data.channelArchivedAt ? { archivedAt: ws.data.channelArchivedAt } : {}),
+		...(ws.data.channelFullWidth ? { fullWidth: true } : {}),
 		backgroundJobs: config.backgroundJobs,
 		webResearch: config.webResearch,
 		...CHAT_CAPABILITIES,
+		...(chatAttachmentLimits ? { attachments: chatAttachmentLimits } : {}),
+		...(config.transcription
+			? { transcription: { provider: "OpenAI", maxBytes: config.transcription.maxBytes } }
+			: {}),
+		...(CLIENT_BUILD && !config.devClient ? { build: CLIENT_BUILD } : {}),
 	});
 	if (plannerAttachments) {
 		tell(ws, { kind: "session:planner", ts: 0, planner: plannerAttachments.status(room.id) });
@@ -1702,6 +2109,7 @@ function openRoomSocket(ws: Socket): void {
 		})().catch(err => console.error("chopin: could not start a document's Planner -", err));
 	}
 	relay(ws, { kind: "session:presence", ts: 0, members: Rooms.members(room) });
+	announceAlone(room);
 	scheduleAuthorization(ws);
 	void validateOpenedSocket(ws).catch(err => {
 		console.error("chopin: WebSocket open failed -", err);
@@ -1718,6 +2126,7 @@ function closeRoomSocket(ws: Socket): void {
 	if (room.plan) {
 		room.plan.chat.initiative?.depart(ws.data.client);
 		if (!room.members.size) room.plan.chat.initiative?.cancel();
+		announceAlone(room);
 		Service.departed(room.plan, ws);
 		Questions.away(room.plan, ws);
 		conversationRuntime.processor(room.plan)?.leaveResearch(ws.data.client);
@@ -1747,53 +2156,64 @@ function upgraded(
 	return new Response("upgrade failed", { status: 400 });
 }
 
+async function route(
+	req: Request,
+	self: Server<SocketData | SidebarSocketData | AgentSocketData>,
+	abandoned: AbortSignal,
+): Promise<Response | undefined> {
+	let url = new URL(req.url);
+
+	if (url.pathname === "/ws") {
+		let outcome = await admit(req, url, hostedAuth, {
+			deleting: channelId => deletingChannels.has(channelId),
+			readOnly: channelId => archivingChannels.has(channelId),
+		});
+		if ("status" in outcome) return refused(outcome);
+		return upgraded(req, self, outcome.data);
+	}
+	if (url.pathname === AGENT_PATH) {
+		let outcome = await admitAgent(
+			req,
+			hostedAuth,
+			!!plannerAttachments,
+			machinePlanners,
+		);
+		if (outcome instanceof Response) return outcome;
+		return upgraded(req, self, outcome, AGENT_UPGRADE_HEADERS);
+	}
+	if (url.pathname === "/ws/sidebar") {
+		let outcome = await admitSidebar(req, hostedAuth);
+		if ("status" in outcome) return refused(outcome);
+		return upgraded(req, self, outcome.data);
+	}
+	// An MCP call stops its tool work when its caller goes away; a request the cut abandons is
+	// the same to it.
+	let routed = await router.handle(
+		url.pathname === "/mcp" ? abandonable(req, abandoned) : req,
+		url,
+	);
+	if (routed) return routed;
+	// No other path takes a WebSocket; the web client's fallback page is no answer to one.
+	if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+		return new Response("not found", { status: 404 });
+	}
+
+	return config.devClient ? proxy(req, url, config.devClient) : serve(url, CLIENT);
+}
+
 function listen(): Server<SocketData> {
 	return Bun.serve<SocketData | SidebarSocketData | AgentSocketData>({
 		hostname: config.host,
 		port: config.port,
 
-		async fetch(req, self) {
-			let url = new URL(req.url);
-
-			if (url.pathname === "/ws") {
-				let outcome = await admit(req, url, hostedAuth, {
-					deleting: channelId => deletingChannels.has(channelId),
-					readOnly: channelId => archivingChannels.has(channelId),
-				});
-				if ("status" in outcome) {
-					return new Response(outcome.reason, { status: outcome.status });
-				}
-				return upgraded(req, self, outcome.data);
-			}
-			if (url.pathname === AGENT_PATH) {
-				let outcome = await admitAgent(
-					req,
-					hostedAuth,
-					!!plannerAttachments,
-					machinePlanners,
-				);
-				if (outcome instanceof Response) return outcome;
-				return upgraded(req, self, outcome, AGENT_UPGRADE_HEADERS);
-			}
-			if (url.pathname === "/ws/sidebar") {
-				let outcome = await admitSidebar(req, hostedAuth);
-				if ("status" in outcome) {
-					return new Response(outcome.reason, { status: outcome.status });
-				}
-				return upgraded(req, self, outcome.data);
-			}
-			let routed = await router.handle(req, url);
-			if (routed) return routed;
-			// No other path takes a WebSocket; the web client's fallback page is no answer to one.
-			if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
-				return new Response("not found", { status: 404 });
-			}
-
-			return config.devClient ? proxy(req, url, config.devClient) : serve(url, CLIENT);
+		fetch(req, self) {
+			return requests.handle(req, abandoned => route(req, self, abandoned));
 		},
 
 		websocket: {
+			perMessageDeflate: DEFLATE,
 			open(ws: AnySocket) {
+				openSockets.opened(ws);
 				if (isAgentSocket(ws)) {
 					if (!plannerAttachments) return ws.close(LINK_CLOSE.failed, "unavailable");
 					openAgentSocket(ws, hostedAuth, {
@@ -1802,6 +2222,7 @@ function listen(): Server<SocketData> {
 						pingEveryMs: config.agentConnectionPingMs,
 						pongTimeoutMs: config.agentConnectionTimeoutMs,
 						maxSilenceMs: config.agentConnectionMaxSilenceMs,
+						catalogChanged: announceModel,
 					});
 					return;
 				}
@@ -1831,6 +2252,7 @@ function listen(): Server<SocketData> {
 			},
 
 			close(ws: AnySocket) {
+				openSockets.closed(ws);
 				if (isAgentSocket(ws)) {
 					ws.data.alive?.stop();
 					return ws.data.link?.disconnected();
@@ -1845,8 +2267,37 @@ function listen(): Server<SocketData> {
 
 /** Nothing in memory is worth losing to a Ctrl-C. */
 let draining: Promise<void> | undefined;
+/**
+ * The cut has begun: the process no longer announces changes, admits edits or answers a message,
+ * because everything it still holds is being committed for the next process.
+ */
+let cutting = false;
+/** What the cut took from each remote Planner hold, for the next process to rebuild. */
+let frozenHolds: PlannerLinkHold[] = [];
+/** Startup's session reset, which replaces the held writer lease with a re-fenced one. */
+let resettingLease: Promise<unknown> | undefined;
+/** Ends the wait for the writer lease, if this process is still in it. */
+let leaseWait: AbortController | undefined;
 
-function drain(): Promise<void> {
+/**
+ * What a person reads when a restart ends a reply that was running, and what Chat records.
+ * It does not say who the reply was from, and it says what to do.
+ */
+const INTERRUPTED_REPLY =
+	"A restart interrupted this reply, and it was not run again. Ask again if you still want it.";
+
+/** The agent link a socket carries, if it carries one. */
+function agentLinkOf(ws: ServerWebSocket<unknown>) {
+	let socket = ws as AnySocket;
+	return isAgentSocket(socket) ? socket.data.link : undefined;
+}
+
+/** The chats with a turn running now. */
+function busyChats(): Chat.Chat[] {
+	return Rooms.all().flatMap(room => room.plan?.chat?.busy ? [room.plan.chat] : []);
+}
+
+function drain(graceful: boolean): Promise<void> {
 	return draining ??= (async () => {
 		let errors: Error[] = [];
 		let record = (reason: unknown) => {
@@ -1859,7 +2310,15 @@ function drain(): Promise<void> {
 				record(err);
 			}
 		};
-		await attempt(() => server.stop(true));
+		let { handover } = config;
+		// Whether anyone is being served: a process still waiting for the lease or starting has no
+		// turn to wait for, no proxy to tell and no request to finish.
+		let serving = graceful && readiness.status() === "ready";
+		if (!serving) readiness.draining();
+		leaseWait?.abort();
+		requests.close();
+		hostedAuth.sessions.stopRefreshing();
+		Chat.holdStarts();
 		if (researchRecoveryTimer) clearTimeout(researchRecoveryTimer);
 		if (experimentTimer) clearInterval(experimentTimer);
 		if (recoveringResearch) await attempt(() => recoveringResearch!);
@@ -1867,41 +2326,121 @@ function drain(): Promise<void> {
 		for (let result of await Promise.allSettled([cleaningSessions])) {
 			if (result.status === "rejected") record(result.reason);
 		}
-		let rooms = await Promise.allSettled(
-			Rooms.all().map(async room => {
-				let opened = room.plan;
-				if (!opened) return;
-				let stopped = conversationRuntime.stop(opened);
-				await stopped;
-				await Service.close(opened);
-			}),
+		if (serving) {
+			// Still serving, so no one notices: turns finish, and every document is committed and
+			// checkpointed while edits go on arriving, which leaves the cut little to write.
+			await attempt(() =>
+				finishTurns({
+					busy: busyChats,
+					interrupt: chat => Chat.interrupt(chat, INTERRUPTED_REPLY),
+					settled: Chat.settled,
+					// So the link a turn runs through withdraws no question when the turn is cut off.
+					beforeInterrupt: () => plannerAttachments?.shutdown(),
+				}, { waitMs: handover.turnWaitMs })
+			);
+			let settling = await Promise.allSettled(
+				Rooms.all().flatMap(room => room.plan ? [Service.settle(room.plan)] : []),
+			);
+			for (let result of settling) {
+				if (result.status === "rejected") record(result.reason);
+			}
+			let stoppingJobs = jobRunner?.shutdown();
+			for (let result of await Promise.allSettled([stoppingJobs])) {
+				if (result.status === "rejected") record(result.reason);
+			}
+		}
+		let report = await cut({
+			unready: () => readiness.draining(),
+			refused: () => readiness.refusedWhileDraining,
+			stopListening: async () => {
+				// Not awaited: it ends when every connection has, and the sockets stay open until the
+				// last step.
+				if (server) void server.stop(false);
+			},
+			finishRequests: async bound => {
+				experiments?.connections.stopWaiting();
+				return requests.finish(bound);
+			},
+			commit: async () => {
+				cutting = true;
+				// Before any link closes, so none withdraws a question it asked on its way out.
+				plannerAttachments?.shutdown();
+				let rooms = await Promise.allSettled(
+					Rooms.all().map(async room => {
+						let opened = room.plan;
+						if (!opened) return;
+						await Service.drain(opened);
+						let stopped = conversationRuntime.stop(opened);
+						await stopped;
+						await Service.close(opened);
+					}),
+				);
+				for (let result of rooms) {
+					if (result.status === "rejected") record(result.reason);
+				}
+				if (summaryCoordinator) await attempt(() => summaryCoordinator!.flush());
+				summaryCoordinator?.close();
+				await attempt(() => documentHistory.flush());
+				liveSync?.close();
+				buildReadiness?.close();
+				spikeScout?.close();
+				// Answers still collecting stay stored; the next process delivers them.
+				decisionAnswers.close();
+				let stoppingJobs = jobRunner?.shutdown();
+				ownerBindings?.revokeAll();
+				// After every room has closed, so what a link keeps is what its client still holds.
+				frozenHolds = plannerAttachments?.freeze(handover.plannerWindowMs) ?? [];
+				for (let result of await Promise.allSettled([stoppingJobs])) {
+					if (result.status === "rejected") record(result.reason);
+				}
+			},
+			// What a remote Planner's link holds is persisted here, ahead of the release.
+			persistLinkState: async () => {
+				await plannerAttachments?.persist(frozenHolds);
+			},
+			release: async () => {
+				await attempt(() => writerLease.stop());
+				if (resettingLease) await attempt(() => resettingLease!);
+				let lease = writerLease.held;
+				if (lease) await attempt(() => storage.leases.release(lease));
+			},
+			closeClients: async () => {
+				if (server) {
+					openSockets.announceRestart(handover.plannerWindowMs, agentLinkOf);
+					await attempt(() => openSockets.stopForRestart(server));
+				}
+			},
+		}, {
+			unreadyMs: serving ? handover.unreadyMs : 0,
+			requestWaitMs: serving ? handover.requestWaitMs : 0,
+		});
+		for (let error of report.errors) record(error);
+		console.info(
+			`chopin: cut finished (${
+				Object.entries(report.phases).map(([name, ms]) => `${name} ${ms} ms`).join(", ")
+			})`,
 		);
-		for (let result of rooms) {
-			if (result.status === "rejected") record(result.reason);
-		}
-		if (summaryCoordinator) await attempt(() => summaryCoordinator!.flush());
-		summaryCoordinator?.close();
-		await attempt(() => documentHistory.flush());
-		liveSync?.close();
-		buildReadiness?.close();
-		spikeScout?.close();
-		let stoppingJobs = jobRunner?.shutdown();
-		ownerBindings?.revokeAll();
-		plannerAttachments?.close();
-		for (let result of await Promise.allSettled([stoppingJobs])) {
-			if (result.status === "rejected") record(result.reason);
-		}
 		await attempt(() => shutdownHarnesses());
-		await attempt(() => writerLease.stop());
-		let lease = writerLease.held;
-		if (lease) await attempt(() => storage.leases.release(lease));
 		await attempt(() => storage.close());
 		if (errors.length > 0) throw new AggregateError(errors, "Chopin shutdown failed.");
 	})();
 }
 
+/** The process was asked to stop: it hands over, which lets running turns finish first. */
 function signal(): void {
-	void drain().then(
+	stop(true);
+}
+
+/**
+ * The process cannot go on (it lost the writer lease, or storage failed): it stops now, with no
+ * turn waited for and no window kept, because what it would serve meanwhile could not be saved.
+ */
+function abandon(): void {
+	stop(false);
+}
+
+function stop(graceful: boolean): void {
+	void drain(graceful).then(
 		() => process.exit(0),
 		err => {
 			console.error("chopin: shutdown failed -", err);
@@ -1914,6 +2453,12 @@ function cleanSessions(): void {
 	if (cleaningSessions) return;
 	cleaningSessions = hostedAuth.sessions.cleanupExpired().then(() => {}, err => {
 		console.error("chopin: could not delete expired login sessions -", err);
+	}).then(async () => {
+		let now = hostedAuth.clock();
+		await storage.mcpSessions.deleteIdle(new Date(now.getTime() - MCP_SESSION_IDLE_MS));
+		await storage.plannerCredentials.deleteExpired(now);
+	}).catch(err => {
+		console.error("chopin: could not delete idle MCP sessions or expired credentials -", err);
 	}).finally(() => {
 		cleaningSessions = undefined;
 	});
@@ -1932,9 +2477,33 @@ async function resetOpenAgents(
 	);
 }
 
+/** Tell every sidebar watching the document's repository that its documents changed. */
+function announceCatalogue(channel: Pick<ChannelRecord, "id" | "repositoryId">): void {
+	if (!server || cutting) return;
+	broadcastRepository(server, channel.repositoryId, {
+		kind: "sidebar:catalogue",
+		ts: 0,
+		repositoryId: channel.repositoryId,
+		channelId: channel.id,
+	});
+}
+
+/**
+ * Someone made a document with New document and opens it next: it is in use now, so on Default
+ * machine its creator's machine is asked to start its Planner at once, while the page is still
+ * loading, rather than once the page has joined the document.
+ */
+function documentCreated(channel: ChannelRecord): void {
+	announceCatalogue(channel);
+	void experiments?.plannerUsed(channel.id).catch(err =>
+		console.error("chopin: could not start a new document's Planner -", err)
+	);
+}
+
 function announceChannel(channel: ChannelRecord): void {
 	// A machine running its Planner hears a new address on its next Planner poll; wake that poll.
 	experiments?.connections.wake(channel.repositoryId);
+	announceCatalogue(channel);
 	let room = Rooms.get(channel.id);
 	if (!room) return;
 	for (let ws of room.members.values()) {
@@ -1944,6 +2513,8 @@ function announceChannel(channel: ChannelRecord): void {
 		ws.data.channelDescription = channel.description?.value;
 		ws.data.channelDescriptionRevision = channel.description?.revision ?? 0;
 		ws.data.channelArchivedAt = channel.archivedAt?.toISOString();
+		if (channel.fullWidth) ws.data.channelFullWidth = true;
+		else delete ws.data.channelFullWidth;
 		ws.data.canEdit = ws.data.canManage && !channel.archivedAt;
 		tell(ws, {
 			kind: "session:channel",
@@ -1956,6 +2527,7 @@ function announceChannel(channel: ChannelRecord): void {
 			...(channel.description ? { description: channel.description.value } : {}),
 			canManage: ws.data.canManage,
 			...(channel.archivedAt ? { archivedAt: channel.archivedAt.toISOString() } : {}),
+			...(channel.fullWidth ? { fullWidth: true } : {}),
 		});
 		tell(ws, {
 			kind: "session:access",
@@ -1983,10 +2555,20 @@ async function archiveChannelLocked(channelId: string, now: Date) {
 				await stopped;
 				await conversationRuntime.interrupt(active);
 				await Service.drain(active);
+				// Its runs end with it, whatever its Planner's link is doing: attached, disconnected
+				// with its work kept, or between two processes of a deploy, which report nothing.
+				await Chat.endRuns({
+					chat: active.chat,
+					room: channelId,
+					server,
+					persist: chat => Service.persist(active, chat),
+				});
 				await Service.persist(active);
 			}
 			return storage.channels.archive({ id: channelId, now });
 		});
+		// An archived document keeps no Planner, not even one whose connection dropped.
+		await plannerAttachments?.documentEnded(channelId);
 		announceChannel(result.channel);
 		void Service.announceCatalogueUnanswered(server, storage, result.channel);
 		return result;
@@ -2088,6 +2670,7 @@ async function deleteChannelLocked(channelId: string): Promise<boolean> {
 		if (room) Rooms.forget(room);
 		buildReadiness?.forget(channelId);
 		void Service.announceDeletedUnanswered(server, storage, channel);
+		announceCatalogue(channel);
 		summaryCoordinator?.resume(channelId);
 		return true;
 	} catch (err) {
@@ -2099,7 +2682,7 @@ async function deleteChannelLocked(channelId: string): Promise<boolean> {
 			channel = await storage.channels.get(channelId);
 		} catch {
 			for (let ws of room?.members.values() ?? []) {
-				ws.close(1012, "document state is temporarily unavailable");
+				ws.close(SERVICE_RESTART, "document state is temporarily unavailable");
 			}
 			throw err;
 		}
@@ -2110,7 +2693,7 @@ async function deleteChannelLocked(channelId: string): Promise<boolean> {
 					await plan(survivingRoom, server);
 				} catch {
 					for (let ws of survivingRoom.members.values()) {
-						ws.close(1012, "document reload required");
+						ws.close(SERVICE_RESTART, "document reload required");
 					}
 				}
 			}
@@ -2134,7 +2717,7 @@ function deleteChannel(channelId: string): Promise<boolean> {
 }
 
 async function announceJobsChanged(channelId: string): Promise<void> {
-	if (draining) return;
+	if (cutting) return;
 	let page = await jobService.list(channelId, 1);
 	if (!page) return;
 	broadcast(server, channelId, { kind: "job:changed", ts: 0, revision: page.revision });
@@ -2143,7 +2726,7 @@ async function announceJobsChanged(channelId: string): Promise<void> {
 }
 
 function announceResearchChanged(channelId: string, workspaceId: string, revision: number): void {
-	if (draining) return;
+	if (cutting) return;
 	broadcast(server, channelId, {
 		kind: "research:changed",
 		ts: 0,
@@ -2172,6 +2755,32 @@ function announceResearchTerminal(channelId: string, id: string, text: string): 
 				id,
 				existing?.text ?? text,
 			);
+		} finally {
+			await Service.close(detached);
+		}
+	});
+}
+
+/**
+ * A build's line in Chat, after the change it reports was persisted. It waits for the document lock
+ * the report may still hold, then posts on the open room, or on the document opened for it.
+ */
+function announceBuildNotice(
+	channelId: string,
+	notice: { id: string; text: string },
+): Promise<void> {
+	if (cutting) return Promise.resolve();
+	return withDocumentLock(channelId, async () => {
+		let post = (plan: Service.Plan) =>
+			Chat.noticeOnce({ chat: plan.chat, plan, server, room: channelId }, notice.id, notice.text);
+		let active = Rooms.get(channelId)?.plan;
+		if (active) {
+			await post(active);
+			return;
+		}
+		let detached = await Service.open(channelId, documentBackend(), server);
+		try {
+			await post(detached);
 		} finally {
 			await Service.close(detached);
 		}
@@ -2445,7 +3054,7 @@ async function credentialsWillRotate(sessionId: string, revision: number): Promi
 			() => true,
 			sessionId,
 			revision,
-			"GitHub credentials refreshed, so the Planner session was restarted. Ask it to continue.",
+			`GitHub credentials refreshed, so ${PLANNER_NAME}'s session was restarted. Ask it to continue.`,
 		),
 		jobs,
 	]);
@@ -2473,6 +3082,7 @@ let machinePlanners = config.agent && config.harness === "remote"
 	? new MachinePlanners(hostedAuth)
 	: undefined;
 experiments = registerExperimentRoutes(router, hostedAuth, {
+	...(config.auth.app ? { app: new GitHubAppClient(config.auth.app) } : {}),
 	planners: machinePlanners,
 	attachments: () => plannerAttachments,
 	documentOpen: id => Rooms.all().some(room => room.id === id || room.parentChannelId === id),
@@ -2506,7 +3116,7 @@ experiments = registerExperimentRoutes(router, hostedAuth, {
 			});
 		}),
 	changed(documentId) {
-		if (server && !draining) {
+		if (server && !cutting) {
 			broadcast(server, documentId, { kind: "experiment:changed", ts: 0, documentId });
 		}
 		void spikeScout?.refresh(documentId);
@@ -2528,11 +3138,60 @@ experiments = registerExperimentRoutes(router, hostedAuth, {
 });
 ownerBindings = new ActiveOwnerBindings(hostedAuth);
 if (config.agent && config.harness === "remote") {
-	plannerAttachments = new PlannerAttachments(hostedAuth, config.plannerAttachGraceMs);
+	plannerAttachments = new PlannerAttachments(hostedAuth, config.plannerAttachGraceMs, {
+		// Under `AUTH_MODE=local`, which is never handed over, holds stay in memory.
+		...(config.auth.local ? {} : {
+			store: {
+				put: hold => storage.plannerHolds.put(heldLease(), hold),
+				delete: async channelId => {
+					await storage.plannerHolds.delete(heldLease(), channelId);
+				},
+			},
+		}),
+		// A question a rebuilt hold's client asks keeps its document open until it is answered.
+		openDocument: async channelId => {
+			if (deletingChannels.has(channelId) || archivingChannels.has(channelId)) {
+				throw new Error("document is unavailable");
+			}
+			await Rooms.get(channelId)?.closing;
+			let held = Rooms.hold(channelId);
+			let release = () => {
+				held.release();
+				evict(held.room);
+			};
+			try {
+				await plan(held.room, server);
+			} catch (err) {
+				release();
+				throw err;
+			}
+			return release;
+		},
+		restoredRuns: (channelId, outcome) => {
+			let room = Rooms.get(channelId);
+			let opened = room?.plan;
+			if (!room || !opened) return;
+			void Chat.restoredRuns({
+				chat: opened.chat,
+				room: channelId,
+				server,
+				persist: chat => Service.persist(opened, chat),
+			}, outcome).catch(err =>
+				console.error("chopin: could not update the workflow runs a restart kept -", err)
+			);
+		},
+	});
+	hostedAuth.machines.onEnded(machineId => {
+		void plannerAttachments?.machineEnded(machineId).catch(err =>
+			console.error("chopin: could not end a machine's Planner hold -", err)
+		);
+	});
 	plannerAttachments.onChange((channelId, planner) => {
 		// A machine chosen for the document may start its Planner, or stop waiting to.
 		experiments?.plannerChanged(channelId);
 		announcePlanner(channelId);
+		// A client that attaches or leaves brings or takes its models.
+		announceModel(channelId);
 		// Settlements that waited for a Planner can run now.
 		if (planner.state === "attached") {
 			void ownerAvailable(channelId).catch(err =>
@@ -2657,6 +3316,8 @@ jobRunner = new JobRunner({
 		return writerLease.held;
 	},
 	resolveActivePlanner: async job => {
+		// A remote document's workers run in its attached Planner client; without one, work waits.
+		if (plannerAttachments && !plannerAttachments.attached(job.channelId)) return undefined;
 		let binding = await ownerBindings!.resolve(job.channelId);
 		if (!binding) return undefined;
 		return {
@@ -2726,9 +3387,11 @@ registerMcpRoutes(router, hostedAuth, {
 			systemTurns,
 		}, input),
 	plannerNotAttached,
+	...(experiments ? { launchCaller: experiments.mcpCaller } : {}),
 	archiveChannel,
 	isChannelDeleting: channelId => deletingChannels.has(channelId),
 	onChannelRenamed: announceChannel,
+	onChannelCreated: announceCatalogue,
 	onDocumentPersisted: target => {
 		void documentHistory.record(target);
 		if (summaryCoordinator) void summaryCoordinator.enqueueNow(target).catch(() => {});
@@ -2744,8 +3407,12 @@ implementations = registerImplementationRoutes(router, hostedAuth, {
 		buildReadiness!.ready(id, revision);
 	}),
 	liveBuild: !!config.liveBuild,
+	resumeMs: config.buildResumeMs,
 	connections: experiments.connections,
 	refuseOffline: experiments.refuseOffline,
+	takers: experiments.takers,
+	mayTake: experiments.mayTake,
+	identity: experiments.identity,
 	machineChoices: experiments.machineChoices,
 	sourceFor: experiments.sourceFor,
 	busy: async connectionId =>
@@ -2793,11 +3460,18 @@ registerChannelRoutes(router, hostedAuth, {
 	onAgentReset: channelOwnerReset,
 	onChannelArchived: archiveChannel,
 	onChannelDeleted: deleteChannel,
+	onChannelCreated: documentCreated,
 	renameChannel: (id, title) =>
 		withImplementationPlan(
 			id,
 			opened => Service.exclusive(opened, () => Service.rename(opened, title)),
 		),
+	// Layout is channel metadata, not document content: no plan lock, and readers hear it at once.
+	setFullWidth: async (id, fullWidth) => {
+		let result = await storage.channels.setFullWidth({ id, fullWidth, now: hostedAuth.clock() });
+		if (result.changed) announceChannel(result.channel);
+		return result;
+	},
 	onChannelRestored: restoreChannel,
 	onVersionRestore: restoreDocumentVersion,
 	onVersionSummaries: config.backgroundJobs && config.agent
@@ -2817,6 +3491,13 @@ registerChannelRoutes(router, hostedAuth, {
 	references: hostedAuth.github instanceof GitHubClient
 		? new GitHubReferences(hostedAuth.github)
 		: undefined,
+});
+registerMentionRoutes(router, hostedAuth, {
+	current: currentDocumentTarget,
+	research: async channelId =>
+		(await storage.research.list(channelId, 100, true)).map(({ id, title }) => ({ id, title })),
+	files: repositoryFiles,
+	people: repositoryPeople,
 });
 registerResearchWorkspaceRoutes(router, hostedAuth, {
 	service: researchService,
@@ -2838,11 +3519,26 @@ registerResearchWorkspaceRoutes(router, hostedAuth, {
 registerNavigationRoutes(router, hostedAuth, { storage });
 registerPreferenceRoutes(router, hostedAuth, { storage });
 registerImageRoutes(router, hostedAuth);
+registerAttachmentRoutes(router, hostedAuth, { limits: chatAttachmentLimits });
+registerTranscriptionRoutes(
+	router,
+	hostedAuth,
+	config.transcription
+		? {
+			maxBytes: config.transcription.maxBytes,
+			transcribe: openaiTranscriber({
+				model: config.transcription.model,
+				apiKey: process.env.OPENAI_API_KEY!,
+			}),
+		}
+		: undefined,
+);
 registerConnectorScript(router, {
 	bundle: join(import.meta.dir, "../../connector/dist/connector.js"),
 	source: join(import.meta.dir, "../../connector/src/main.ts"),
 });
 registerMachinesPath(router);
+registerHealthRoutes(router, readiness);
 
 try {
 	await storage.health();
@@ -2853,18 +3549,78 @@ try {
 	process.exit(1);
 }
 
-try {
-	let acquired = await storage.leases.acquire(
-		"chopin:writer",
-		crypto.randomUUID(),
-		LEASE_TTL_MS,
+/** Where the time went from taking the lease to being ready, for the hand-over budget. */
+let startup: Record<string, number> = {};
+let timed = async <T>(name: string, step: () => Promise<T>): Promise<T> => {
+	let started = performance.now();
+	try {
+		return await step();
+	} finally {
+		startup[name] = Math.round(performance.now() - started);
+	}
+};
+
+let listening: Server<SocketData> | undefined;
+if (config.handover.wait) {
+	// Before the wait, so a stop that arrives in standby leaves at once with nothing to release.
+	process.on("SIGINT", signal);
+	process.on("SIGTERM", signal);
+	requests.hold();
+	server = listening = listen();
+	console.log(
+		`chopin: standby on ${config.host}:${config.port}, waiting for the writer lease`,
 	);
+}
+
+let acquiredAt = 0;
+try {
+	let owner = crypto.randomUUID();
+	let acquired: Lease | undefined;
+	if (config.handover.wait) {
+		leaseWait = new AbortController();
+		acquired = await acquireWhenFree(storage.leases, {
+			name: "chopin:writer",
+			owner,
+			ttlMs: LEASE_TTL_MS,
+			pollMs: LEASE_POLL_MS,
+			signal: leaseWait.signal,
+			waiting: holder =>
+				console.log(
+					`chopin: the writer lease is held until ${holder.expiresAt.toISOString()}; waiting for its release`,
+				),
+			failed: err => console.warn("chopin: could not read the writer lease; trying again -", err),
+		});
+		if (!acquired && draining) {
+			// A stop arrived in standby: its drain ends the process, with nothing here to undo.
+			await draining.catch(() => {});
+			await new Promise<never>(() => {});
+		}
+	} else {
+		acquired = await storage.leases.acquire("chopin:writer", owner, LEASE_TTL_MS);
+	}
 	if (!acquired) throw new Error("another Chopin instance owns the database");
+	acquiredAt = performance.now();
+	readiness.acquired();
 	writerLease.hold(acquired);
-	let reset = await storage.sessions.reset(new Date(), acquired, LEASE_TTL_MS);
-	writerLease.held = reset.lease;
+	if (!config.handover.wait) {
+		// A stop that arrives while startup still runs must release the lease, or the next start finds it held.
+		process.on("SIGINT", signal);
+		process.on("SIGTERM", signal);
+	}
+	let resetting = timed(
+		"reset",
+		() => storage.sessions.reset(new Date(), acquired!, LEASE_TTL_MS),
+	).then(reset => {
+		writerLease.held = reset.lease;
+		return reset;
+	});
+	resettingLease = resetting;
+	let reset = await resetting;
 	// Before any room opens, so no child Conversation is ever loaded or served.
-	let children = await storage.collaboration.dropChildConversations(reset.lease);
+	let children = await timed(
+		"children",
+		() => storage.collaboration.dropChildConversations(reset.lease),
+	);
 	if (children.cleared.length) {
 		console.info(`chopin: cleared ${children.cleared.length} child conversation(s)`);
 	}
@@ -2878,6 +3634,7 @@ try {
 } catch (err) {
 	await shutdownHarnesses();
 	if (writerLease.held) await storage.leases.release(writerLease.held).catch(() => {});
+	if (listening) await listening.stop(true).catch(() => {});
 	await storage.close().catch(() => {});
 	let reason = err instanceof Error ? err.message : String(err);
 	console.error(`chopin: storage writer lease could not start - ${reason}`);
@@ -2887,20 +3644,71 @@ writerLease.start();
 cleanSessions();
 sessionCleanup = setInterval(cleanSessions, SESSION_CLEANUP_MS);
 
-let listening: Server<SocketData> | undefined;
 try {
-	await experiments.service.recover(true);
-	server = listening = listen();
+	// Before anything attaches or is served, so a client that returns finds its hold.
+	if (plannerAttachments && !config.auth.local) {
+		await timed("holds", async () => {
+			let rows = await storage.plannerHolds.list();
+			await plannerAttachments!.restore(rows);
+			// A document already open has had its chance to ask the rebuilt holds' questions again.
+			for (let row of rows) {
+				let opened = Rooms.get(row.channelId)?.plan;
+				if (opened) {
+					plannerAttachments!.rejoinInputs(row.channelId, plannerQuestions(opened, server));
+				}
+			}
+			// Which documents are in use lived in the process that has gone, and a machine is asked to
+			// run only the Planners of documents in use: one told it runs none stops its backend.
+			for (let row of rows) if (row.machineId) await experiments!.plannerUsed(row.channelId);
+		});
+	}
+	await timed("experiments", () => experiments!.service.recover(true));
+	server = listening ??= listen();
 	experimentTimer = setInterval(() => {
 		void experiments!.sweep().catch(error =>
 			console.error("chopin: experiment recovery failed", error)
 		);
 	}, 15_000);
 	experimentTimer.unref();
-	let recovery = await researchService.recoverPendingPlannerInline(placeResearchReference);
-	scheduleResearchRecovery(recovery.deferred);
-	await researchService.recoverTerminalPlannerInline();
 	jobRunner.start();
+	// Ready is decided here, once, from state the process already holds, so a check never
+	// runs a query: the lease, a finished start, a transaction that completes and the client.
+	await storage.health();
+	let index = join(CLIENT, "index.html");
+	if (!config.devClient && !existsSync(index)) {
+		console.error(`chopin: ${index} does not exist, so this process stays not ready`);
+	} else {
+		readiness.started();
+		// Off the readiness path: a message an earlier release held is left as an ordinary one.
+		void retireHeldMessages().catch(err =>
+			console.error("chopin: could not close the messages an earlier release held -", err)
+		);
+		let held = requests.release();
+		console.log(
+			`chopin: ready ${
+				Math.round(performance.now() - acquiredAt)
+			} ms after taking the writer lease (${
+				Object.entries(startup).map(([name, ms]) => `${name} ${ms} ms`).join(", ")
+			})${
+				held.held
+					? `; held ${held.held} request(s) while waiting, longest ${held.longestMs} ms, ${held.expired} answered 503`
+					: ""
+			}`,
+		);
+		// After readiness, because it grows with the work a document left unfinished and a
+		// proxy must not wait for that. A failure stops the process, as it did before readiness.
+		let recovering: Promise<void> = (async () => {
+			let recovery = await researchService.recoverPendingPlannerInline(placeResearchReference);
+			scheduleResearchRecovery(recovery.deferred);
+			await researchService.recoverTerminalPlannerInline();
+		})().catch(err => {
+			console.error("chopin: research recovery failed -", err);
+			abandon();
+		}).finally(() => {
+			if (recoveringResearch === recovering) recoveringResearch = undefined;
+		});
+		recoveringResearch = recovering;
+	}
 } catch (err) {
 	if (listening) await listening.stop(true).catch(() => {});
 	if (researchRecoveryTimer) clearTimeout(researchRecoveryTimer);
@@ -2920,7 +3728,5 @@ try {
 	await storage.close().catch(() => {});
 	throw err;
 }
-process.on("SIGINT", signal);
-process.on("SIGTERM", signal);
 
 console.log(describe(config));

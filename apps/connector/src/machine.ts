@@ -8,11 +8,15 @@ import {
 	CONNECTOR_PLANNER_COMMAND_HEADER,
 	CONNECTOR_PLANNER_HEADER,
 	CONNECTOR_PLATFORM_HEADER,
+	CONNECTOR_SANDBOX_FIX_HEADER,
+	CONNECTOR_SANDBOX_HEADER,
+	CONNECTOR_SANDBOX_REASON_HEADER,
 	CONNECTOR_SERVICE_HEADER,
 	CONNECTOR_UPDATE_REQUIRED,
+	type SandboxReport,
 } from "@chopin/protocol/connector";
 import { redacted } from "./connection";
-import { CONNECTOR_HEADERS, ConnectorError, refusal } from "./mcp";
+import { CONNECTOR_HEADERS, ConnectorError, jsonObject, refusal } from "./mcp";
 import type { Output } from "./output";
 
 /**
@@ -188,7 +192,7 @@ async function post(
 	});
 	let refused = await refusal(response);
 	if (refused) throw refused;
-	let value = await response.json().catch(() => ({})) as Record<string, unknown>;
+	let value = await jsonObject(response);
 	if (!response.ok) {
 		let code = typeof value.error === "string" ? value.error : `http-${response.status}`;
 		throw new ConnectorError(
@@ -286,6 +290,8 @@ export type About = {
 	/** It has a Planner command, so Chopin may ask it to run the Planner of a document. */
 	plannerCommand?: boolean;
 	agent?: { name: string; version?: string };
+	/** Whether agents run in the system's process sandbox, and if not, why and the fix. */
+	sandbox?: SandboxReport;
 };
 
 /** `about` and this machine's hostname and platform, as headers; a value headers can't carry goes. */
@@ -298,6 +304,13 @@ function aboutHeaders(about: About): Record<string, string> {
 		...(about.plannerCommand ? { [CONNECTOR_PLANNER_COMMAND_HEADER]: "1" } : {}),
 		[CONNECTOR_AGENT_HEADER]: about.agent?.name,
 		[CONNECTOR_AGENT_VERSION_HEADER]: about.agent?.version,
+		[CONNECTOR_SANDBOX_HEADER]: about.sandbox?.engine,
+		...(about.sandbox?.engine === "none"
+			? {
+				[CONNECTOR_SANDBOX_REASON_HEADER]: about.sandbox.reason,
+				[CONNECTOR_SANDBOX_FIX_HEADER]: about.sandbox.fix,
+			}
+			: {}),
 	};
 	return Object.fromEntries(
 		Object.entries(headers).filter((entry): entry is [string, string] =>
@@ -362,23 +375,139 @@ export async function plannerCredential(
 	};
 }
 
+/** Why a document's Planner backend keeps failing to start, as the connector tells Chopin. */
+export type PlannerStartFailure = {
+	/** How many launches in a row exited before staying up. */
+	attempts: number;
+	/** How the last one ended: `exit 1`, `signal SIGKILL`, or why it could not be started. */
+	how: string;
+	/** The last meaningful line it printed to stderr, with credentials masked. */
+	reason?: string;
+	/** When it exited (ms). */
+	at: number;
+};
+
+/**
+ * Tell Chopin why `document`'s Planner backend on this machine keeps failing to start, so the
+ * people in the document can read it; without `failure`, that it no longer does. Chopin shows it
+ * only for a Planner it asked this machine to run. A server that does not know the route answers
+ * 404, which the caller takes to mean it never will.
+ */
+export async function reportPlannerFailure(
+	url: string,
+	token: string,
+	document: string,
+	failure: PlannerStartFailure | undefined,
+	signal?: AbortSignal,
+) {
+	await post(
+		url + "/api/connector/planner/failure",
+		{ document, ...(failure ? { failure } : {}) },
+		token,
+		signal,
+	);
+}
+
 /**
  * The machine's GitHub token for its processes to push to `repository` (`owner/name`) and open
  * draft pull requests as its owner, and when it expires (ms). Chopin refuses when it holds no such
  * token, the owner can't push there, or its GitHub App can't write there.
  */
+/** A GitHub account as Chopin names it: the App's bot that writes, or the person who started. */
+export type GitHubAccount = { login: string; id: number; name: string; email: string };
+
+/** What a launch asks Chopin's GitHub token for: its repository, and the work that needs it. */
+export type GitHubGrantRequest = {
+	repository: string;
+	purpose: "planner" | "run";
+	/** The run's id, for a build, investigation or spike. */
+	run?: string;
+	/** The document's id, when the launch knows it. */
+	document?: string;
+};
+
+function account(value: unknown): GitHubAccount | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	let { login, id, name, email } = value as Record<string, unknown>;
+	if (typeof login !== "string" || !login || typeof id !== "number") return undefined;
+	if (typeof email !== "string" || !email) return undefined;
+	return { login, id, name: typeof name === "string" && name ? name : login, email };
+}
+
+/**
+ * The GitHub token Chopin gives this machine for one launch: the token, when it expires (ms), the
+ * account its commits are made as and the person they are made for. A refusal rejects with the
+ * server's code (see `errorCode`); so does an answer without a token or an identity.
+ */
 export async function machineGitHubToken(
+	url: string,
+	token: string,
+	request: GitHubGrantRequest,
+	signal?: AbortSignal,
+) {
+	let value = await post(url + "/api/connector/github-token", request, token, signal);
+	let identity = account(value.identity);
+	if (typeof value.token !== "string" || typeof value.expiresAt !== "number" || !identity) {
+		throw new Error("Chopin's answer had no GitHub token or identity.");
+	}
+	let starter = account(value.starter);
+	return {
+		token: value.token,
+		expiresAt: value.expiresAt,
+		identity,
+		...(starter ? { starter } : {}),
+	};
+}
+
+/**
+ * Whether Chopin would give this machine a token to push to `repository`, asked without one being
+ * made: `ok`, the refusal's code, or `unknown` when Chopin couldn't be asked or doesn't know how.
+ */
+export async function machineGitHubCheck(
 	url: string,
 	token: string,
 	repository: string,
 	signal?: AbortSignal,
+): Promise<string> {
+	try {
+		let value = await post(
+			url + "/api/connector/github-token",
+			{ repository, purpose: "check" },
+			token,
+			signal,
+		);
+		return value.ok === true ? "ok" : "unknown";
+	} catch (error) {
+		let code = errorCode(error);
+		return code && GITHUB_REFUSALS.has(code) ? code : "unknown";
+	}
+}
+
+/**
+ * A token for Chopin's own tools at `/mcp`, for one launch: minted from the launch's own
+ * credential, a Planner's or a run's, and lasting no longer than it.
+ */
+export async function machineMcpToken(
+	url: string,
+	token: string,
+	credential: { planner: string } | { run: string },
+	signal?: AbortSignal,
 ) {
-	let value = await post(url + "/api/connector/github-token", { repository }, token, signal);
+	let value = await post(url + "/api/connector/mcp-token", credential, token, signal);
 	if (typeof value.token !== "string" || typeof value.expiresAt !== "number") {
-		throw new Error("Missing GitHub token.");
+		throw new Error("Missing token for Chopin's tools.");
 	}
 	return { token: value.token, expiresAt: value.expiresAt };
 }
+
+/** Why Chopin gives no GitHub token for a launch; none of these is retried. */
+export const GITHUB_REFUSALS = new Set([
+	"repository-forbidden",
+	"app-cannot-push",
+	"starter-cannot-push",
+	"run-unknown",
+	"no-grant",
+]);
 
 /** Revoke this machine on the server and forget its token, even if the server already had. */
 export async function unpair(url: string, directory: string): Promise<"unpaired" | "not-paired"> {
@@ -468,6 +597,9 @@ export const classifyConnectorError: Classify = error => {
 	// The MCP client's request timeout and closed connection, then an HTTP status refusal.
 	if (status === -32001 || status === -32000) return "retry";
 	if (status === 401) return "forgotten";
+	// A 4xx that carries none of Chopin's own error codes came from something in front of it, such
+	// as a proxy with no upstream during a restart, and says nothing about this machine.
+	if (!code && status >= 400 && status < 500) return "retry";
 	return status >= 500 || status === 429 || status === 408 ? "retry" : "fatal";
 };
 

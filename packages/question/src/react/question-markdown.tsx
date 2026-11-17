@@ -18,9 +18,16 @@ import type { ReactNode } from "react";
 export type QuestionMarkdownRenderer = {
 	/** One line: code spans, emphasis and, unless `links` is false, links. Never a block. */
 	inline: (source: string, options: { links: boolean }) => ReactNode;
-	/** Several lines: paragraphs, lists, code, diagrams and the document's own images. */
-	block: (source: string) => ReactNode;
+	/**
+	 * Several lines: paragraphs, lists, code, diagrams and the document's own images. An option's
+	 * own visual (`place` "preview") also draws tables. The renderer draws the element that holds
+	 * them, with `root` as its class and attributes, so the blocks are its direct children.
+	 */
+	block: (source: string, place: MarkdownPlace, root: MarkdownRoot) => ReactNode;
 };
+
+/** The class and attributes of the element that holds a card's Markdown blocks. */
+export type MarkdownRoot = { className: string; "data-question-markdown": "" };
 
 export const QuestionMarkdownContext = createContext<QuestionMarkdownRenderer | undefined>(
 	undefined,
@@ -32,13 +39,25 @@ export function MarkdownLine({ links = true, text }: { links?: boolean; text: st
 	return renderer ? renderer.inline(text, { links }) : <InlineCode text={text} />;
 }
 
-/** Where card Markdown sits: a question's body, its description, an option's description, or a decision page's body. */
-export type MarkdownPlace = "body" | "hint" | "desc" | "page";
+/**
+ * Where card Markdown sits: a question's body, its description, an option's description, an
+ * option's own visual, or a decision page's body.
+ */
+export type MarkdownPlace = "body" | "hint" | "desc" | "preview" | "page";
+
+/** Constants, so a renderer that memoizes on its props sees the same root each time. */
+let ROOTS: Record<MarkdownPlace, MarkdownRoot> = {
+	body: { className: "question-body", "data-question-markdown": "" },
+	hint: { className: "question-hint", "data-question-markdown": "" },
+	desc: { className: "question-desc", "data-question-markdown": "" },
+	preview: { className: "question-preview-body", "data-question-markdown": "" },
+	page: { className: "question-body question-page-body", "data-question-markdown": "" },
+};
 
 /** Markdown blocks, in an element of their own. */
 export function MarkdownBlocks({ place, text }: { place: MarkdownPlace; text: string }) {
 	let renderer = useContext(QuestionMarkdownContext);
-	return (
+	return renderer ? renderer.block(text, place, ROOTS[place]) : (
 		<div
 			className={place === "body"
 				? "question-body"
@@ -46,10 +65,12 @@ export function MarkdownBlocks({ place, text }: { place: MarkdownPlace; text: st
 				? "question-hint"
 				: place === "desc"
 				? "question-desc"
+				: place === "preview"
+				? "question-preview-body"
 				: "question-body question-page-body"}
 			data-question-markdown=""
 		>
-			{renderer ? renderer.block(text) : <PlainBlocks text={text} />}
+			<PlainBlocks text={text} />
 		</div>
 	);
 }

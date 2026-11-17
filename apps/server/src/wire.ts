@@ -22,6 +22,8 @@ export type Identity = {
 	client: string;
 	/** Validated demo actor bound at admission; `handle` is then the roster ID. */
 	actor?: DemoActor;
+	/** The picture the user table stores for the login; never set for a demo actor. */
+	avatarUrl?: string;
 };
 
 export type AuthorizationResult = "allowed" | "denied" | "unavailable";
@@ -35,6 +37,7 @@ export type SocketData = Identity & {
 	channelDescriptionRevision: number;
 	channelDescription?: string;
 	channelArchivedAt?: string;
+	channelFullWidth?: true;
 	canEdit: boolean;
 	canManage: boolean;
 	principalId: string;
@@ -70,6 +73,22 @@ export type SidebarSocket = ServerWebSocket<SidebarSocketData>;
 
 type Sender = Pick<ServerWebSocket<unknown>, "send">;
 
+/**
+ * permessage-deflate for every socket `Bun.serve` accepts, with one compressor shared by all of
+ * them and reset after each message, so a socket costs no compression memory of its own.
+ *
+ * Only frames of at least `COMPRESS_FROM` characters are compressed (see `compress`). Opening a
+ * large document sends its whole Yjs state and Chat history, over a megabyte of base64 and JSON
+ * that deflate takes to about a sixth; a keystroke's update or a presence frame is a few hundred
+ * bytes and gains less than it costs.
+ */
+export const DEFLATE = { compress: "shared", decompress: "shared" } as const;
+export const COMPRESS_FROM = 1024;
+
+function compress(text: string): boolean {
+	return text.length >= COMPRESS_FROM;
+}
+
 /** Frames are addressed by room, so the topic is simply the room id. */
 export function topic(room: string): string {
 	return `room:${room}`;
@@ -81,8 +100,15 @@ function stamp<T extends Outgoing>(frame: T, extra?: Partial<Frame>): string {
 
 /** Answer one request, on the socket that made it. */
 export function reply<T extends Outgoing>(ws: Sender, rid: string, frame: T): void {
-	ws.send(stamp(frame, { rid }));
+	let text = stamp(frame, { rid });
+	ws.send(text, compress(text));
 }
+
+/**
+ * The code of a refusal for a passing reason: the request is fine, and its client sends it again,
+ * with the same request id, in a moment. Every refusal of a send that is not final says it.
+ */
+export const PASSING: Session.Failure["code"] = "temporarily-unavailable";
 
 /** Refuse one request, on the socket that made it. */
 export function fail(
@@ -96,7 +122,8 @@ export function fail(
 
 /** Tell one socket something it did not ask for. */
 export function tell<T extends Outgoing>(ws: Sender, frame: T): void {
-	ws.send(stamp(frame));
+	let text = stamp(frame);
+	ws.send(text, compress(text));
 }
 
 /**
@@ -106,7 +133,8 @@ export function tell<T extends Outgoing>(ws: Sender, frame: T): void {
  * echoing it back is at best wasted bytes and at worst a second application.
  */
 export function relay<T extends Outgoing>(ws: Socket, frame: T): void {
-	ws.publish(topic(ws.data.room), stamp(frame, { sender: ws.data.handle }));
+	let text = stamp(frame, { sender: ws.data.handle });
+	ws.publish(topic(ws.data.room), text, compress(text));
 }
 
 /** Every sidebar socket watching one repository's decision counts. */
@@ -120,7 +148,8 @@ export function broadcast<T extends Outgoing>(
 	room: string,
 	frame: T,
 ): void {
-	server.publish(topic(room), stamp(frame));
+	let text = stamp(frame);
+	server.publish(topic(room), text, compress(text));
 }
 
 /** Tell every sidebar socket watching a repository something the server decided. */
@@ -129,5 +158,6 @@ export function broadcastRepository<T extends Outgoing>(
 	repositoryId: string,
 	frame: T,
 ): void {
-	server.publish(repositoryTopic(repositoryId), stamp(frame));
+	let text = stamp(frame);
+	server.publish(repositoryTopic(repositoryId), text, compress(text));
 }

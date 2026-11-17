@@ -3,6 +3,7 @@ import * as Plan from "../plan/service";
 import { documentPath } from "@chopin/protocol/document-url";
 import { MAX_GITHUB_REFERENCES, parseGitHubReferenceKey } from "@chopin/protocol/github-reference";
 
+import { ownOrigin } from "../auth/config";
 import { GitHubError } from "../github/client";
 import { StorageError } from "../storage/errors";
 
@@ -54,6 +55,7 @@ function serialized(channel: ChannelRecord) {
 		descriptionRevision: channel.description?.revision ?? 0,
 		...(channel.description ? { description: channel.description.value } : {}),
 		...(channel.archivedAt ? { archivedAt: channel.archivedAt.toISOString() } : {}),
+		...(channel.fullWidth ? { fullWidth: true } : {}),
 		unansweredDecisions: channel.unansweredDecisions,
 	};
 }
@@ -134,24 +136,35 @@ function archived(url: URL): boolean | undefined {
 	return true;
 }
 
+async function requestedBody(request: Request): Promise<Record<string, unknown> | undefined> {
+	let length = Number(request.headers.get("content-length") || "0");
+	if (Number.isFinite(length) && length > 4_096) return undefined;
+	let source = await request.text();
+	if (new TextEncoder().encode(source).length > 4_096) return undefined;
+	try {
+		let value = JSON.parse(source) as unknown;
+		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+		return value as Record<string, unknown>;
+	} catch {
+		return undefined;
+	}
+}
+
+function titleOf(
+	body: Record<string, unknown> | undefined,
+	optional: boolean,
+): { title?: string; valid: boolean } {
+	if (!body) return { valid: false };
+	if (body.title === undefined) return { valid: optional };
+	let title = normalizedTitle(body.title);
+	return title !== undefined ? { valid: true, title } : { valid: false };
+}
+
 async function requestedTitle(
 	request: Request,
 	optional: boolean,
 ): Promise<{ title?: string; valid: boolean }> {
-	let length = Number(request.headers.get("content-length") || "0");
-	if (Number.isFinite(length) && length > 4_096) return { valid: false };
-	let source = await request.text();
-	if (new TextEncoder().encode(source).length > 4_096) return { valid: false };
-	try {
-		let value = JSON.parse(source) as unknown;
-		if (!value || typeof value !== "object" || Array.isArray(value)) return { valid: false };
-		let raw = (value as Record<string, unknown>).title;
-		if (raw === undefined) return { valid: optional };
-		let title = normalizedTitle(raw);
-		return title !== undefined ? { valid: true, title } : { valid: false };
-	} catch {
-		return { valid: false };
-	}
+	return titleOf(await requestedBody(request), optional);
 }
 
 async function failure(err: unknown, _request: Request, auth: HostedAuth): Promise<Response> {
@@ -252,7 +265,11 @@ export function registerChannelRoutes(
 		onChannelArchived?: (channelId: string, now: Date) => Promise<ChannelArchiveResult>;
 		onChannelDeleted?: (channelId: string) => Promise<boolean>;
 		onChannelRenamed?: (channel: ChannelRecord) => void;
+		/** A person created a document. */
+		onChannelCreated?: (channel: ChannelRecord) => void;
 		renameChannel?: (id: string, title: string) => Promise<RenameResult>;
+		/** Turns a document's Full width on or off; announced through `onChannelRenamed`. */
+		setFullWidth?: (id: string, fullWidth: boolean) => Promise<RenameResult>;
 		onChannelRestored?: (channelId: string, now: Date) => Promise<ChannelArchiveResult>;
 		/** Restores an earlier version's prose as a new edit by `author` (a user id). */
 		onVersionRestore?: (
@@ -340,7 +357,7 @@ export function registerChannelRoutes(
 		"POST",
 		"/api/repositories/:owner/:repository/channels",
 		async (request, _url, params) => {
-			if (request.headers.get("origin") !== auth.config.origin) {
+			if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 				return json({ error: "origin is not allowed" }, 403);
 			}
 			try {
@@ -386,6 +403,7 @@ export function registerChannelRoutes(
 					}
 				}
 				if (!channel) throw new StorageError("conflict", "could not reserve a generated title");
+				options.onChannelCreated?.(channel);
 				return json(
 					{
 						repository: repository(repo),
@@ -534,7 +552,7 @@ export function registerChannelRoutes(
 		"POST",
 		"/api/channels/:channelId/version-summaries",
 		async (request, _url, params) => {
-			if (request.headers.get("origin") !== auth.config.origin) {
+			if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 				return json({ error: "origin is not allowed" }, 403);
 			}
 			try {
@@ -556,7 +574,7 @@ export function registerChannelRoutes(
 		"POST",
 		"/api/channels/:channelId/versions/:versionId/restore",
 		async (request, _url, params) => {
-			if (request.headers.get("origin") !== auth.config.origin) {
+			if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 				return json({ error: "origin is not allowed" }, 403);
 			}
 			try {
@@ -638,7 +656,7 @@ export function registerChannelRoutes(
 	}
 
 	router.on("PATCH", "/api/channels/:channelId", async (request, _url, params) => {
-		if (request.headers.get("origin") !== auth.config.origin) {
+		if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 			return json({ error: "origin is not allowed" }, 403);
 		}
 		try {
@@ -660,7 +678,25 @@ export function registerChannelRoutes(
 			if (!repo.permissions.push && !repo.permissions.admin) {
 				return json({ error: "repository write access is required" }, 403);
 			}
-			let requested = await requestedTitle(request, false);
+			let body = await requestedBody(request);
+			// A change is a rename or a layout setting, one at a time.
+			if (body && body.title === undefined && body.fullWidth !== undefined) {
+				if (typeof body.fullWidth !== "boolean") {
+					return json({ error: "fullWidth must be a boolean" }, 400);
+				}
+				if (!options.setFullWidth) {
+					throw new StorageError("unavailable", "document layout is unavailable");
+				}
+				let set = await options.setFullWidth(id, body.fullWidth);
+				if (set.changed) options.onChannelRenamed?.(set.channel);
+				return json({
+					repository: repository(repo),
+					canEdit: true,
+					canManage: true,
+					channel: serialized(set.channel),
+				});
+			}
+			let requested = titleOf(body, false);
 			if (!requested.valid || requested.title === undefined) {
 				return json({ error: "title must be a string" }, 400);
 			}
@@ -691,7 +727,7 @@ export function registerChannelRoutes(
 		action: "archive" | "restore",
 	) => {
 		router.on("POST", path, async (request, _url, params) => {
-			if (request.headers.get("origin") !== auth.config.origin) {
+			if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 				return json({ error: "origin is not allowed" }, 403);
 			}
 			try {
@@ -734,7 +770,7 @@ export function registerChannelRoutes(
 	registerArchiveTransition("/api/channels/:channelId/restore", "restore");
 
 	router.on("DELETE", "/api/channels/:channelId", async (request, _url, params) => {
-		if (request.headers.get("origin") !== auth.config.origin) {
+		if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 			return json({ error: "origin is not allowed" }, 403);
 		}
 		try {
@@ -771,7 +807,7 @@ export function registerChannelRoutes(
 	});
 
 	router.on("POST", "/api/channels/:channelId/agent/reset", async (request, _url, params) => {
-		if (request.headers.get("origin") !== auth.config.origin) {
+		if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 			return json({ error: "origin is not allowed" }, 403);
 		}
 		try {

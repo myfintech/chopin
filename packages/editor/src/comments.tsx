@@ -18,6 +18,8 @@ import { limits } from "@chopin/dialect";
 import { ChopinMark } from "./chopin-mark";
 import { displayName } from "./display-name";
 import { Face } from "./face";
+import { usePendingWork } from "./pending-work";
+import { PLANNER_NAME } from "./people";
 import { PRIMARY_COARSE_POINTER_QUERY } from "./pointer";
 
 import type { KeyboardEvent, ReactNode } from "react";
@@ -44,7 +46,7 @@ export function stamp(ts: number, now = new Date()): string {
 	);
 }
 
-/** Chat's author row: face, display name, quiet timestamp. The handle stays in the name. */
+/** Chat's author row: face, the handle as written (or a demo actor's name), quiet timestamp. */
 export function Author(
 	{ handle, textSize = "sm", ts }: {
 		handle: string;
@@ -52,14 +54,15 @@ export function Author(
 		ts?: number;
 	},
 ) {
+	let name = displayName(handle);
 	return (
 		<span
 			className={`flex min-w-0 items-center gap-2 ${textSize === "xs" ? "text-xs" : "text-sm"}`}
 		>
 			<Face decorative handle={handle} size={20} titled={false} />
 			<span className="min-w-0 truncate font-semibold text-text-primary" title={`@${handle}`}>
-				{displayName(handle)}
-				<span className="sr-only">(@{handle})</span>
+				{name}
+				{name !== handle && <span className="sr-only">(@{handle})</span>}
 			</span>
 			{ts !== undefined && (
 				<time
@@ -82,7 +85,7 @@ function ChopinAuthor({ textSize = "sm", ts }: { textSize?: "xs" | "sm"; ts?: nu
 			<span aria-hidden="true" className="plan-comment-agent">
 				<ChopinMark circle />
 			</span>
-			<span className="min-w-0 truncate font-semibold text-text-primary">Chopin</span>
+			<span className="min-w-0 truncate font-semibold text-text-primary">{PLANNER_NAME}</span>
 			{ts !== undefined && (
 				<time
 					className="shrink-0 text-xs text-text-quaternary tabular-nums"
@@ -106,7 +109,7 @@ export function NoteAuthor(
 
 /** The address a note was sent with, drawn from `to` because the text never carries it. */
 function Mention() {
-	return <span className="plan-comment-mention">@Chopin</span>;
+	return <span className="plan-comment-mention">@{PLANNER_NAME}</span>;
 }
 
 /** One note: its author row and body. Also read back, without actions, in a resolved thread. */
@@ -143,10 +146,10 @@ function Dots() {
 
 /** What the reader is told about Chopin's turn on this thread, while it runs or once it stopped. */
 const OUTCOME: Record<NonNullable<ThreadView["planner"]>, string> = {
-	working: "Chopin is working on it",
-	stopped: "Chopin stopped",
-	failed: "Chopin couldn't reply",
-	off: "Chopin isn't running",
+	working: `${PLANNER_NAME} is working on it`,
+	stopped: `${PLANNER_NAME} stopped`,
+	failed: `${PLANNER_NAME} couldn't reply`,
+	off: `${PLANNER_NAME} isn't running`,
 };
 
 function PlannerStatus({ state }: { state: NonNullable<ThreadView["planner"]> }) {
@@ -292,6 +295,15 @@ export function mention(
 }
 
 /**
+ * Whether a comment composer holds words a reload would lose: text typed and not sent, or a send
+ * whose answer has not come. The words leave the field when sent and return if the send is refused,
+ * so the field alone does not say.
+ */
+export function composerUnsent(text: string, sending: boolean): boolean {
+	return sending || text.trim() !== "";
+}
+
+/**
  * The field and its send, shared by new comments and replies.
  *
  * Its footer holds Send to Chopin and the send. A new comment shows the footer
@@ -320,6 +332,7 @@ function Composer({
 	onTyping?: (writing: boolean) => void;
 }) {
 	let [text, setText] = useState("");
+	let [sending, setSending] = useState(false);
 	let [to, setTo] = useState(initial);
 	let [focused, setFocused] = useState(false);
 	let [coarse, setCoarse] = useState(false);
@@ -329,6 +342,7 @@ function Composer({
 	let chip = useRef<HTMLSpanElement>(null);
 	let caret = useRef<number | undefined>(undefined);
 	let checkbox = useId();
+	usePendingWork(composerUnsent(text, sending));
 
 	useEffect(() => {
 		setCoarse(matchMedia(PRIMARY_COARSE_POINTER_QUERY).matches);
@@ -387,13 +401,14 @@ function Composer({
 		setRefusal(undefined);
 		onTyping?.(false);
 		let sent = onSend(value, addressed ? "planner" : undefined);
+		if (sent) setSending(true);
 		// Refused: put the words back, unless something new was typed meanwhile, and say why.
 		void sent?.then(result => {
 			if (result.ok) return;
 			setRefusal(result.message);
 			setText(current => current ? current : value);
 			setTo(current => current || addressed);
-		});
+		}).finally(() => setSending(false));
 		// A clicked send disables itself and drops focus without a blur, which would leave
 		// the field believing it still had focus; the field takes it back instead.
 		ref.current?.focus({ preventScroll: true });
@@ -442,7 +457,7 @@ function Composer({
 			<div className="plan-comment-composer-input">
 				{to && (
 					<span aria-hidden="true" className="plan-comment-address-chip" ref={chip}>
-						@Chopin
+						@{PLANNER_NAME}
 					</span>
 				)}
 				<textarea
@@ -472,7 +487,7 @@ function Composer({
 							}}
 							type="checkbox"
 						/>
-						Send to Chopin
+						Send to {PLANNER_NAME}
 					</label>
 					<button
 						aria-label={label}

@@ -14,18 +14,21 @@ import {
 	MAX_REQUEST_BYTES,
 	MAX_TITLE_LENGTH,
 	prepare,
-	REPOSITORY_PATH_PATTERN,
+	REPOSITORY_PATH,
 } from "./mcp/create";
 import { prepareUpdate } from "./mcp/update";
 import { MAX_IMAGE_DATA_LENGTH, MAX_IMAGE_REQUEST_BYTES, prepareImage } from "./mcp/image";
 import { IMAGE_TYPES } from "./images/format";
 import { isLifecycleTool, LIFECYCLE_TOOLS, lifecycleCall } from "./mcp/lifecycle";
 import { normalizedTitle } from "./channels/title";
+import { documentText, NOTE_BYTES, READING_IN_PARTS, ReadRangeError } from "./document-reading";
+import { planSourceSchema } from "./tasks/plan-source";
 
 import type { Brief, CreateDocumentInput } from "./mcp/create";
 import type { UpdateDocument } from "./mcp/update";
 import type { UploadImageInput } from "./mcp/image";
 import type { Run, Version } from "./tasks/graphs";
+import type { unapprovedContext } from "./tasks/open-decisions";
 import type { LifecycleArguments } from "./mcp/lifecycle";
 import type { ImplementationLifecycle } from "./tasks/lifecycle";
 import type { Issue } from "@chopin/dialect";
@@ -65,6 +68,10 @@ export type Implementation = {
 	execution: { state: "idle" } | { state: "active"; run: Run };
 	activity?: ImplementationLifecycle["activity"];
 	history: ImplementationLifecycle["history"];
+	/** Decisions still open, for the agent to build on its best judgment; absent when none is. */
+	unapprovedDecisions?: NonNullable<ReturnType<typeof unapprovedContext>>["unapprovedDecisions"];
+	/** Where the graph's plan revision's files were pushed, which a build of it starts from. */
+	planSource?: { revision: number; branch: string; commit: string };
 };
 
 export type ImplementationInput = {
@@ -167,7 +174,7 @@ export type InvokePlannerError =
 	| "planner-owner-unavailable"
 	| "checkout-unverified"
 	| "planner-unavailable"
-	| "planner-queue-full"
+	| "planner-busy"
 	| "system-turn-forbidden"
 	| "system-turn-limited";
 
@@ -175,6 +182,21 @@ export type InvokePlanner<Caller> = {
 	invoke(caller: Caller, input: InvokePlannerInput): Promise<
 		| { kind: "invoked"; document: DocumentSummary & { url: string } }
 		| { kind: "refused"; code: InvokePlannerError; message?: string }
+	>;
+};
+
+export type RecordPlanSourceInput = {
+	id: string;
+	revision: number;
+	branch: string;
+	commit: string;
+};
+
+export type RecordPlanSource<Caller> = {
+	record(caller: Caller, input: RecordPlanSourceInput): Promise<
+		| { kind: "recorded"; source: { revision: number; branch: string; commit: string } }
+		| { kind: "revision-conflict"; revision: number }
+		| { kind: "unavailable-commit" | "archived" | "forbidden" | "unavailable" }
 	>;
 };
 
@@ -188,6 +210,16 @@ export type UploadImage<Caller> = {
 	>;
 };
 
+/**
+ * Where MCP sessions live when they must outlast the process. Without it a handler keeps them in
+ * memory, and a restart makes an agent's session id unknown.
+ */
+export type McpSessions<Caller> = {
+	create(caller: Caller, id: string, client: { name: string; version: string }): Promise<void>;
+	/** The client an id was issued to, or undefined for an id nobody was issued. */
+	find(id: string): Promise<{ name: string; version: string } | undefined>;
+};
+
 export type McpOptions<Caller> = {
 	/** The host owns authentication; MCP only receives its result. */
 	caller(request: Request): Promise<Caller | undefined> | Caller | undefined;
@@ -199,7 +231,9 @@ export type McpOptions<Caller> = {
 	restore?: RestoreDocument<Caller>;
 	invoke?: InvokePlanner<Caller>;
 	upload?: UploadImage<Caller>;
+	planSources?: RecordPlanSource<Caller>;
 	implementations?: Implementations<Caller>;
+	sessions?: McpSessions<Caller>;
 };
 
 type Tool = {
@@ -280,7 +314,7 @@ const IMPLEMENTATION = {
 		planRevision: { type: "integer", minimum: 0 },
 		graphVersion: { type: "integer", minimum: 1 },
 		graphRevision: { type: "integer", minimum: 1 },
-		repository: { type: "string", pattern: REPOSITORY_PATH_PATTERN },
+		repository: REPOSITORY_PATH,
 		branch: { type: "string", minLength: 1, maxLength: 255 },
 		commit: { type: "string", minLength: 1, maxLength: 64 },
 	},
@@ -304,7 +338,7 @@ export const TOOLS: Tool[] = [
 		inputSchema: {
 			type: "object",
 			properties: {
-				repository: { type: "string", pattern: REPOSITORY_PATH_PATTERN },
+				repository: REPOSITORY_PATH,
 				includeArchived: { type: "boolean", default: false },
 			},
 			required: ["repository"],
@@ -319,7 +353,10 @@ export const TOOLS: Tool[] = [
 	},
 	{
 		name: "read_document",
-		description: "Read a Chopin document by ID or canonical URL.",
+		description: "Read a Chopin document by ID or canonical URL. The text result is a short "
+			+ "header (id, title, revision, url, size), the brief when the document has one, and the "
+			+ "document's Markdown source with its real newlines, verbatim; `structuredContent` "
+			+ `carries the whole document as before. ${READING_IN_PARTS}`,
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -329,6 +366,9 @@ export const TOOLS: Tool[] = [
 					maxLength: MAX_DOCUMENT_LOCATOR_LENGTH,
 					pattern: "\\S",
 				},
+				offset: { type: "integer", minimum: 1 },
+				limit: { type: "integer", minimum: 1 },
+				column: { type: "integer", minimum: 1 },
 			},
 			required: ["id"],
 			additionalProperties: false,
@@ -355,7 +395,7 @@ export const TOOLS: Tool[] = [
 			type: "object",
 			properties: {
 				idempotencyKey: { type: "string", minLength: 1, maxLength: 128 },
-				repository: { type: "string", pattern: REPOSITORY_PATH_PATTERN },
+				repository: REPOSITORY_PATH,
 				baseBranch: { type: "string", minLength: 1, maxLength: 255 },
 				baseCommit: { type: "string", minLength: 1, maxLength: 64 },
 				title: { type: "string", maxLength: MAX_TITLE_LENGTH },
@@ -596,7 +636,7 @@ export const TOOLS: Tool[] = [
 								"planner-owner-unavailable",
 								"checkout-unverified",
 								"planner-unavailable",
-								"planner-queue-full",
+								"planner-busy",
 								"system-turn-forbidden",
 								"system-turn-limited",
 							],
@@ -611,7 +651,8 @@ export const TOOLS: Tool[] = [
 	},
 	{
 		name: "upload_image",
-		description: "Upload a PNG, JPEG, WebP or GIF image of at most 1 MiB to a Chopin document "
+		description: "Upload a PNG, JPEG, WebP or GIF image of at most 16 MiB (one over 1 MiB is "
+			+ "stored as a smaller copy) to a Chopin document "
 			+ "and return its path and Markdown. Place the Markdown in the document with "
 			+ "update_document. Only people who can read the document can load the image; "
 			+ "uploading the same bytes again returns the same path.",
@@ -628,7 +669,7 @@ export const TOOLS: Tool[] = [
 					type: "string",
 					contentEncoding: "base64",
 					maxLength: MAX_IMAGE_DATA_LENGTH,
-					description: "Standard base64 image bytes, at most 1 MiB decoded.",
+					description: "Standard base64 image bytes, at most 16 MiB decoded.",
 				},
 				mimeType: { type: "string", enum: [...IMAGE_TYPES] },
 			},
@@ -654,6 +695,71 @@ export const TOOLS: Tool[] = [
 					"too-large",
 					"unsupported-type",
 					"signature-mismatch",
+				]),
+			],
+		},
+	},
+	{
+		name: "record_plan_source",
+		description: "Record where a document revision's files are on GitHub: a branch you pushed "
+			+ "to the document's repository and the commit on it that holds them. A build of that "
+			+ "revision, or a later one with no newer record, starts from this commit instead of the "
+			+ "builder's checkout. Push the commit first: Chopin checks GitHub has it. Recording "
+			+ "another commit for the same revision replaces it.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				id: {
+					type: "string",
+					minLength: 1,
+					maxLength: MAX_DOCUMENT_LOCATOR_LENGTH,
+					pattern: "\\S",
+				},
+				revision: {
+					type: "integer",
+					minimum: 0,
+					description: "The document revision the files belong to; at most its current one.",
+				},
+				branch: {
+					type: "string",
+					minLength: 1,
+					maxLength: 255,
+					description: "A branch name, without refs/heads/.",
+				},
+				commit: { type: "string", pattern: "^[0-9a-f]{40}$" },
+			},
+			required: ["id", "revision", "branch", "commit"],
+			additionalProperties: false,
+		},
+		outputSchema: {
+			type: "object",
+			oneOf: [
+				{
+					type: "object",
+					properties: {
+						recorded: { type: "boolean", const: true },
+						revision: { type: "integer", minimum: 0 },
+						branch: { type: "string" },
+						commit: { type: "string" },
+					},
+					required: ["recorded", "revision", "branch", "commit"],
+					additionalProperties: false,
+				},
+				{
+					type: "object",
+					properties: {
+						code: { type: "string", const: "revision-conflict" },
+						revision: { type: "integer", minimum: 0 },
+					},
+					required: ["code", "revision"],
+					additionalProperties: false,
+				},
+				outcome([
+					"invalid-plan-source",
+					"plan-source-unavailable",
+					"document-archived",
+					"document-unavailable",
+					"repository-forbidden",
 				]),
 			],
 		},
@@ -721,6 +827,50 @@ function text(
 		content: [{ type: "text", text: JSON.stringify(value) }],
 		structuredContent: value,
 		...(isError ? { isError: true as const } : {}),
+	};
+}
+
+function documentContent(
+	document: LinkedDocument,
+	range: { offset?: number; limit?: number; column?: number },
+): ReturnType<typeof text> {
+	let { id, title, description, archivedAt, revision, url, source, brief } = document;
+	let notes = brief
+		? [{
+			title: "Brief:",
+			items: [
+				`goal: ${brief.goal}`,
+				...[
+					["constraint", brief.constraints],
+					["settled decision", brief.settledDecisions],
+					["open question", brief.openQuestions],
+					["repository finding", brief.repositoryFindings],
+				].flatMap(([name, items]) => (items as string[]).map(item => `${name}: ${item}`)),
+			],
+			bytes: NOTE_BYTES.brief,
+			rest: (omitted: number) =>
+				`(${omitted} more brief lines are not shown; the whole brief is in structuredContent.brief.)`,
+		}]
+		: [];
+	return {
+		content: [{
+			type: "text",
+			text: documentText({
+				fields: [
+					["id", id],
+					["title", title],
+					...description ? [["description", description] as [string, string]] : [],
+					...archivedAt ? [["archived", archivedAt] as [string, string]] : [],
+					["revision", String(revision)],
+					["url", url],
+				],
+				notes,
+				source,
+				next: at => `read_document ${JSON.stringify({ id, ...at })}`,
+				range,
+			}),
+		}],
+		structuredContent: document,
 	};
 }
 
@@ -861,6 +1011,7 @@ function serviceInstructions(tools: Tool[]): string | undefined {
 		|| tool.name === "restore_document"
 		|| tool.name === "invoke_planner"
 		|| tool.name === "upload_image"
+		|| tool.name === "record_plan_source"
 	);
 	let implementation = tools
 		.filter(tool =>
@@ -933,6 +1084,7 @@ export function handler<Caller>(
 		&& (tool.name !== "restore_document" || restoring)
 		&& (tool.name !== "invoke_planner" || options.invoke)
 		&& (tool.name !== "upload_image" || options.upload)
+		&& (tool.name !== "record_plan_source" || options.planSources)
 		&& (!["read_implementation", "start_implementation"].includes(tool.name)
 			|| options.implementations)
 		&& (!isLifecycleTool(tool.name) || options.implementations?.reportLifecycle)
@@ -944,6 +1096,7 @@ export function handler<Caller>(
 		caller: Caller,
 		client: { name: string; version: string; session: string },
 		created: { session?: string },
+		registered: boolean,
 	): Promise<Reply | undefined> {
 		let call = record(value) as Call | undefined;
 		if (!call || call.jsonrpc !== "2.0" || typeof call.method !== "string") {
@@ -959,7 +1112,9 @@ export function handler<Caller>(
 		switch (call.method) {
 			case "initialize": {
 				let session = crypto.randomUUID();
-				sessions.set(session, clientInfo(call.params));
+				if (options.sessions) {
+					await options.sessions.create(caller, session, clientInfo(call.params));
+				} else sessions.set(session, clientInfo(call.params));
 				created.session = session;
 				return respond({
 					protocolVersion: "2025-03-26",
@@ -999,13 +1154,33 @@ export function handler<Caller>(
 						: respond(text({ documents }));
 				}
 				if (tool.name === "read_document") {
-					if (Object.keys(tool.arguments).length !== 1 || !isLocator(tool.arguments.id)) {
+					let { id, offset, limit, column, ...extra } = tool.arguments;
+					if (Object.keys(extra).length || !isLocator(id)) {
 						return notification
 							? undefined
 							: error(call.id, -32602, "read_document requires an id or URL");
 					}
-					let document = await options.documents.read(caller, tool.arguments.id);
-					return document ? respond(text(document)) : respond({ content: [], isError: true });
+					for (let value of [offset, limit, column]) {
+						if (value !== undefined && (!Number.isSafeInteger(value) || (value as number) < 1)) {
+							return notification
+								? undefined
+								: error(call.id, -32602, "offset, limit and column must be integers of at least 1");
+						}
+					}
+					let document = await options.documents.read(caller, id);
+					if (!document) return respond({ content: [], isError: true });
+					try {
+						return respond(
+							documentContent(document, {
+								offset: offset as number | undefined,
+								limit: limit as number | undefined,
+								column: column as number | undefined,
+							}),
+						);
+					} catch (err) {
+						if (!(err instanceof ReadRangeError)) throw err;
+						return notification ? undefined : error(call.id, -32602, err.message);
+					}
 				}
 				if (tool.name === "create_document" && creation) {
 					let prepared = prepare(tool.arguments);
@@ -1156,7 +1331,7 @@ export function handler<Caller>(
 						}, true));
 				}
 				if (tool.name === "upload_image" && options.upload) {
-					let prepared = prepareImage(tool.arguments);
+					let prepared = await prepareImage(tool.arguments);
 					if (!prepared) {
 						return notification
 							? undefined
@@ -1173,6 +1348,40 @@ export function handler<Caller>(
 					}
 					return respond(text({
 						code: outcome.kind === "archived"
+							? "document-archived"
+							: outcome.kind === "forbidden"
+							? "repository-forbidden"
+							: "document-unavailable",
+					}, true));
+				}
+				if (tool.name === "record_plan_source" && options.planSources) {
+					let { id, revision, branch, commit, ...extra } = tool.arguments;
+					if (
+						Object.keys(extra).length || !isLocator(id) || !Number.isSafeInteger(revision)
+						|| (revision as number) < 0 || typeof branch !== "string"
+						|| typeof commit !== "string"
+					) {
+						return notification
+							? undefined
+							: error(
+								call.id,
+								-32602,
+								"record_plan_source requires an id, revision, branch and commit",
+							);
+					}
+					let source = planSourceSchema.safeParse({ revision, branch, commit });
+					if (!source.success) return respond(text({ code: "invalid-plan-source" }, true));
+					let outcome = await options.planSources.record(caller, { id, ...source.data });
+					if (outcome.kind === "recorded") {
+						return respond(text({ recorded: true, ...outcome.source }));
+					}
+					if (outcome.kind === "revision-conflict") {
+						return respond(text({ code: outcome.kind, revision: outcome.revision }, true));
+					}
+					return respond(text({
+						code: outcome.kind === "unavailable-commit"
+							? "plan-source-unavailable"
+							: outcome.kind === "archived"
 							? "document-archived"
 							: outcome.kind === "forbidden"
 							? "repository-forbidden"
@@ -1206,7 +1415,7 @@ export function handler<Caller>(
 							? undefined
 							: error(call.id, -32602, "start_implementation requires current revisions");
 					}
-					if (!client.session || !sessions.has(client.session)) {
+					if (!registered) {
 						return respond(text({ code: "session-required" }, true));
 					}
 					if (!options.implementations) {
@@ -1234,7 +1443,7 @@ export function handler<Caller>(
 							? undefined
 							: error(call.id, -32602, `${tool.name} requires its documented arguments`);
 					}
-					if (!client.session || !sessions.has(client.session)) {
+					if (!registered) {
 						return respond(text({ code: "session-required" }, true));
 					}
 					let report = options.implementations?.reportLifecycle;
@@ -1276,7 +1485,10 @@ export function handler<Caller>(
 		}
 
 		let session = request.headers.get("mcp-session-id") ?? "";
-		let client = { ...(sessions.get(session) ?? { name: "unknown", version: "unknown" }), session };
+		let known = session
+			? options.sessions ? await options.sessions.find(session) : sessions.get(session)
+			: undefined;
+		let client = { ...(known ?? { name: "unknown", version: "unknown" }), session };
 		let created: { session?: string } = {};
 		let body: unknown;
 		try {
@@ -1286,7 +1498,7 @@ export function handler<Caller>(
 		} catch {
 			return Response.json(error(null, -32700, "parse error"));
 		}
-		let result = await dispatch(body, caller, client, created);
+		let result = await dispatch(body, caller, client, created, known !== undefined);
 		return result
 			? Response.json(result, {
 				headers: created.session ? { "mcp-session-id": created.session } : undefined,

@@ -5,7 +5,7 @@ import { MAX_LINK_MESSAGE_BYTES, MAX_LINK_NOTE_LENGTH, parseClientMessage } from
 
 import type { ServerWebSocket } from "bun";
 import type { AgentHandlers, HostToolResult, TurnContext } from "./client";
-import type { ClientMessage, ServerMessage } from "./protocol";
+import type { ClientMessage, ClientMessageOf, ServerMessage } from "./protocol";
 
 let stops: Array<() => unknown> = [];
 afterEach(async () => {
@@ -80,7 +80,8 @@ function fakeServer(options: { features?: string[] } = {}) {
 		upgrades,
 		asked,
 		next,
-		send: (message: ServerMessage) => socket!.send(JSON.stringify(message)),
+		send: (message: ServerMessage | string) =>
+			socket!.send(typeof message === "string" ? message : JSON.stringify(message)),
 		close: () => socket!.close(1000, "gone"),
 	};
 }
@@ -99,6 +100,19 @@ const turn = (id: string) => ({
 	tools: [{ name: "read_plan" }],
 });
 
+const imageBlock = (data: string, alt: string, mimeType = "image/png") => ({
+	type: "image",
+	data,
+	mimeType,
+	alt,
+});
+
+function resultOf(message: ClientMessageOf<"part">): { content: unknown[]; isError?: boolean } {
+	let { part } = message;
+	if (part.type !== "tool-result") throw new Error("not a result");
+	return (typeof part.result === "string" ? JSON.parse(part.result) : part.result) as never;
+}
+
 describe("Agent connection client", () => {
 	it("opens /api/v1/agent offering chopin.agent.v1, with the bearer", async () => {
 		let server = fakeServer();
@@ -111,7 +125,9 @@ describe("Agent connection client", () => {
 	it("asks for stage deltas and splits a report too large for one frame across several", async () => {
 		let server = fakeServer({ features: ["run-stage-deltas"] });
 		let client = await connect(server, { turn() {} });
-		expect(server.asked).toEqual(["run-stage-deltas"]);
+		expect(server.asked).toEqual([
+			"run-stage-deltas, decision-option-previews, resumable-sessions, restart-notice",
+		]);
 		expect(client.features).toEqual(["run-stage-deltas"]);
 		let stages = Array.from({ length: 2_000 }, (_, index) => ({
 			id: `s${index}`,
@@ -202,6 +218,236 @@ describe("Agent connection client", () => {
 		]);
 	});
 
+	it("settles a question withdrawn while its link is down at once, and a resumed link does not name it", async () => {
+		let server = fakeServer({ features: ["resumable-sessions"] });
+		let attaching = connectAgent({
+			url: server.url,
+			token: "t",
+			document: "d",
+			handlers: { turn() {} },
+		});
+		await server.next("resume");
+		server.send({ type: "resumed", sessions: [] });
+		let client = await attaching;
+		stops.push(() => client.detach());
+		server.send({ type: "start", session: "s", mode: "planner" });
+		await server.next("started");
+		let controller = new AbortController();
+		let withdrawn = client.ask("s", { method: "confirm", title: "Ship?", message: "Now." }, {
+			signal: controller.signal,
+		});
+		let kept = client.ask("s", { method: "confirm", title: "Also?", message: "Now." });
+		let [first, second] = [await server.next("input-request"), await server.next("input-request")];
+		server.close();
+		let resumption = await client.resumption;
+		expect(resumption).toBeDefined();
+		controller.abort();
+		expect(await withdrawn).toMatchObject({ type: "input-result", status: "cancelled" });
+
+		let again = connectAgent({
+			url: server.url,
+			token: "t",
+			document: "d",
+			handlers: { turn() {} },
+			resume: resumption!,
+		});
+		let resume = await server.next("resume");
+		expect(resume.sessions).toEqual([{ session: "s", requests: [second.request] }]);
+		expect(first.request).not.toBe(second.request);
+		server.send({ type: "resumed", sessions: [{ session: "s", requests: [second.request] }] });
+		let next = await again;
+		stops.push(() => next.detach());
+		server.send({ type: "input-result", request: second.request, status: "answered", value: true });
+		expect(await kept).toMatchObject({ status: "answered", value: true });
+	});
+
+	it("offers restart-notice only as a resumable client, and says when the server expects to be back", async () => {
+		let server = fakeServer({ features: ["resumable-sessions", "restart-notice"] });
+		let attaching = connectAgent({
+			url: server.url,
+			token: "t",
+			document: "d",
+			handlers: { turn() {} },
+		});
+		await server.next("resume");
+		server.send({ type: "resumed", sessions: [] });
+		let client = await attaching;
+		server.send({ type: "restarting", reconnectWithinMs: 10_000 });
+		server.send({ type: "start", session: "s", mode: "planner" });
+		await server.next("started");
+		server.close();
+		expect(await client.closed).toMatchObject({ reconnectWithinMs: 10_000 });
+		expect(await client.resumption).toBeDefined();
+
+		let plain = fakeServer();
+		let opted = await connectAgent({
+			url: plain.url,
+			token: "t",
+			document: "d",
+			handlers: { turn() {} },
+			resumable: false,
+		});
+		stops.push(() => opted.detach());
+		expect(plain.asked).toEqual(["run-stage-deltas, decision-option-previews"]);
+		plain.close();
+		expect(await opted.closed).not.toHaveProperty("reconnectWithinMs");
+	});
+
+	/** A resumable client with a session `s` and one question asked, after its link dropped. */
+	async function dropped(handlers: AgentHandlers = { turn() {} }) {
+		let server = fakeServer({ features: ["resumable-sessions"] });
+		let attaching = connectAgent({ url: server.url, token: "t", document: "d", handlers });
+		await server.next("resume");
+		server.send({ type: "resumed", sessions: [] });
+		let client = await attaching;
+		stops.push(() => client.detach());
+		server.send({ type: "start", session: "s", mode: "planner" });
+		server.send({ type: "start", session: "gone", mode: "planner" });
+		await server.next("started");
+		await server.next("started");
+		let controller = new AbortController();
+		let asked = client.ask("s", { method: "confirm", title: "Ship?", message: "Now." }, {
+			signal: controller.signal,
+		});
+		let { request } = await server.next("input-request");
+		server.close();
+		let resumption = await client.resumption;
+		expect(resumption).toBeDefined();
+		let again = (extra: Partial<Parameters<typeof connectAgent>[0]> = {}) =>
+			connectAgent({
+				url: server.url,
+				token: "t",
+				document: "d",
+				handlers,
+				resume: resumption!,
+				...extra,
+			});
+		return { server, asked, controller, request, again };
+	}
+
+	it("acknowledges each result it is given, including one for a question it already settled", async () => {
+		let server = fakeServer({ features: ["resumable-sessions"] });
+		let attaching = connectAgent({
+			url: server.url,
+			token: "t",
+			document: "d",
+			handlers: { turn() {} },
+		});
+		await server.next("resume");
+		server.send({ type: "resumed", sessions: [] });
+		let client = await attaching;
+		stops.push(() => client.detach());
+		let asked = client.ask("s", { method: "confirm", title: "Ship?", message: "Now." });
+		let { request } = await server.next("input-request");
+		server.send({ type: "input-result", request, status: "answered", value: true });
+		expect(await asked).toMatchObject({ status: "answered" });
+		expect(await server.next("input-received")).toEqual({ type: "input-received", request });
+		server.send({ type: "input-result", request, status: "answered", value: true });
+		expect(await server.next("input-received")).toEqual({ type: "input-received", request });
+	});
+
+	it("sends no acknowledgement to a server that did not accept the feature", async () => {
+		let server = fakeServer();
+		let client = await connect(server, { turn() {} });
+		let asked = client.ask("s", { method: "confirm", title: "Ship?", message: "Now." });
+		let { request } = await server.next("input-request");
+		server.send({ type: "input-result", request, status: "answered", value: true });
+		await asked;
+		await Bun.sleep(50);
+		expect(server.received.filter(message => message.type === "input-received")).toEqual([]);
+	});
+
+	it("cancels in Chopin a question withdrawn while its link was being resumed", async () => {
+		let { server, asked, controller, request, again } = await dropped();
+		let next = again();
+		expect((await server.next("resume")).sessions).toContainEqual({
+			session: "s",
+			requests: [request],
+		});
+		controller.abort();
+		expect(await asked).toMatchObject({ status: "cancelled" });
+		server.send({ type: "resumed", sessions: [{ session: "s", requests: [request] }] });
+		stops.push(async () => (await next).detach());
+		await next;
+		expect(await server.next("input-cancel")).toEqual({ type: "input-cancel", request });
+	});
+
+	it("ends everything for good when the server sends what it cannot read, though it offered the feature", async () => {
+		let server = fakeServer({ features: ["resumable-sessions"] });
+		let attaching = connectAgent({
+			url: server.url,
+			token: "t",
+			document: "d",
+			handlers: { turn() {} },
+		});
+		await server.next("resume");
+		server.send({ type: "resumed", sessions: [] });
+		let client = await attaching;
+		let asked = client.ask("s", { method: "confirm", title: "Ship?", message: "Now." });
+		await server.next("input-request");
+		let settled = false;
+		void asked.then(() => settled = true);
+		server.send("not JSON");
+		expect(await client.closed).toMatchObject({ code: 4400 });
+		expect(await client.resumption).toBeUndefined();
+		expect(await asked).toMatchObject({ status: "cancelled" });
+		expect(settled).toBe(true);
+	});
+
+	it("destroys the sessions the server does not give back, and settles their questions as cancelled", async () => {
+		let destroyed: string[] = [];
+		let { server, asked, request, again } = await dropped({
+			turn() {},
+			destroy: message => void destroyed.push(message.session),
+		});
+		let next = again();
+		await server.next("resume");
+		server.send({ type: "resumed", sessions: [{ session: "s", requests: [] }] });
+		stops.push(async () => (await next).detach());
+		await next;
+		expect(destroyed).toEqual(["gone"]);
+		expect(await asked).toMatchObject({ request, status: "cancelled" });
+	});
+
+	it("keeps its questions pending when its resume is refused with retry, because Chopin could not decide, and settles them for every other refusal", async () => {
+		let { server, asked, request, again } = await dropped();
+		let refused = again();
+		await server.next("resume");
+		server.send({ type: "refused", code: "unavailable", message: "x", retry: true });
+		await expect(refused).rejects.toMatchObject({ code: "unavailable", retry: true });
+		let outcome: unknown;
+		void asked.then(value => outcome = value);
+		await Bun.sleep(50);
+		expect(outcome).toBeUndefined();
+		// Chopin can be asked again, and the same resumption succeeds.
+		let next = again();
+		expect((await server.next("resume")).sessions).toContainEqual({
+			session: "s",
+			requests: [request],
+		});
+		server.send({ type: "resumed", sessions: [{ session: "s", requests: [request] }] });
+		stops.push(async () => (await next).detach());
+		await next;
+		server.send({ type: "input-result", request, status: "answered", value: true });
+		expect(await asked).toMatchObject({ status: "answered", value: true });
+
+		for (
+			let code of [
+				"planner-attached",
+				"access-revoked",
+				"sign-in-required",
+				"document-archived",
+			] as const
+		) {
+			let other = await dropped();
+			let denied = other.again();
+			await other.server.next("resume");
+			other.server.send({ type: "refused", code, message: "x" });
+			await expect(denied).rejects.toMatchObject({ code, retry: false });
+			expect(await other.asked).toMatchObject({ status: "cancelled" });
+		}
+	});
+
 	it("withdraws a question whose signal is already aborted without asking it", async () => {
 		let server = fakeServer();
 		let client = await connect(server, { turn() {} });
@@ -243,6 +489,238 @@ describe("Agent connection client", () => {
 		expect((await server.next("control-result")).message).toHaveLength(MAX_LINK_NOTE_LENGTH);
 		expect(client.send({ type: "runs", session: "s", active: [], paused: [], cards: [] }))
 			.toBe(true);
+	});
+
+	it("offers steer-turn only to a client that can steer, and gives a steer to the running turn", async () => {
+		let plain = fakeServer();
+		await connect(plain, { turn() {} });
+		expect(plain.asked[0]).not.toContain("steer-turn");
+
+		let server = fakeServer({ features: ["steer-turn"] });
+		let steered: string[] = [];
+		let holding = Promise.withResolvers<TurnContext>();
+		let client = await connect(server, {
+			async turn(context) {
+				holding.resolve(context);
+				await new Promise(resolve => context.signal.addEventListener("abort", resolve));
+			},
+			steer(message) {
+				steered.push(message.prompt);
+			},
+		});
+		expect(server.asked[0]).toContain("steer-turn");
+		expect(client.features).toEqual(["steer-turn"]);
+		server.send(turn("running"));
+		await holding.promise;
+		server.send({
+			type: "steer",
+			request: "r1",
+			session: "s",
+			turn: "running",
+			prompt: "@bo: Also X",
+		});
+		expect(await server.next("control-result")).toEqual({
+			type: "control-result",
+			request: "r1",
+			ok: true,
+		});
+		expect(steered).toEqual(["@bo: Also X"]);
+	});
+
+	it("answers a steer for a turn that has ended, or that its handler refuses, with ok false", async () => {
+		let server = fakeServer({ features: ["steer-turn"] });
+		let steered: string[] = [];
+		await connect(server, {
+			turn(context) {
+				context.end("finished");
+			},
+			steer(message) {
+				steered.push(message.prompt);
+				throw new Error("The model is between steps.");
+			},
+		});
+		server.send(turn("over"));
+		await server.next("turn-end");
+		server.send({ type: "steer", request: "late", session: "s", turn: "over", prompt: "too late" });
+		expect(await server.next("control-result")).toEqual({
+			type: "control-result",
+			request: "late",
+			ok: false,
+			message: "The turn has ended.",
+		});
+		expect(steered).toEqual([]);
+	});
+
+	it("leaves out of a result too large for one message the images that do not fit, largest first, and says how big each was", async () => {
+		let server = fakeServer();
+		let content = [
+			{ type: "text", text: "Drew three" },
+			imageBlock("A".repeat(600_000), "small"),
+			imageBlock("A".repeat(1_400_000), "large"),
+			imageBlock("A".repeat(700_000), "middle"),
+		];
+		let results = [{ content }, JSON.stringify({ content })];
+		await connect(server, {
+			turn(context) {
+				for (let result of results) {
+					context.emit({ type: "tool-result", toolCallId: "c", toolName: "draw", result });
+				}
+			},
+		});
+		server.send(turn("big"));
+		let [object, text] = [await server.next("part"), await server.next("part")];
+		for (let sent of [object, text]) {
+			expect(JSON.stringify(sent).length).toBeLessThanOrEqual(MAX_LINK_MESSAGE_BYTES);
+		}
+		for (let sent of [object, text]) {
+			expect(resultOf(sent).content).toEqual([
+				content[0],
+				content[1],
+				{ type: "image", data: "", mimeType: "image/png", alt: "large", tooLarge: 1_050_000 },
+				content[3],
+			]);
+		}
+		expect(typeof (text.part as { result: unknown }).result).toBe("string");
+		expect(typeof (object.part as { result: unknown }).result).toBe("object");
+	});
+
+	it("says how big an image was exactly, whether its base64 was padded or not", async () => {
+		let server = fakeServer();
+		let filler = "A".repeat(1_299_996);
+		let sizes = [
+			["B".repeat(1_299_998), 974_998],
+			["B".repeat(1_299_999), 974_999],
+			[`${"B".repeat(1_299_999)}=`, 974_999],
+			[`${"B".repeat(1_299_998)}==`, 974_998],
+			["B".repeat(1_300_000), 975_000],
+		] as const;
+		await connect(server, {
+			turn(context) {
+				for (let [data] of sizes) {
+					context.emit({
+						type: "tool-result",
+						toolCallId: "c",
+						toolName: "draw",
+						result: {
+							content: [data, filler, filler].map(block => imageBlock(block, "x")),
+						},
+					});
+				}
+			},
+		});
+		server.send(turn("sizes"));
+		for (let [data, size] of sizes) {
+			let sent = resultOf((await server.next("part")) as ClientMessageOf<"part">);
+			let [first, ...rest] = sent.content as Array<Record<string, unknown>>;
+			expect(first, `${data.length}`).toMatchObject({ data: "", tooLarge: size });
+			expect(Buffer.from(data, "base64").length, `${data.length}`).toBe(size);
+			expect(rest.filter(block => block.data === ""), `${data.length}`).toHaveLength(1);
+		}
+	});
+
+	it("leaves out as many images as it takes, and sends a result that fits as it was", async () => {
+		let server = fakeServer();
+		let data = `${"B".repeat(1_299_998)}==`;
+		let fits = { content: [{ type: "image", data: "C".repeat(1_000), mimeType: "image/png" }] };
+		await connect(server, {
+			turn(context) {
+				context.emit({
+					type: "tool-result",
+					toolCallId: "c",
+					toolName: "draw",
+					result: {
+						content: ["first", "second", "third"].map(alt => imageBlock(data, alt, "image/jpeg")),
+						isError: false,
+					},
+				});
+				context.emit({ type: "tool-result", toolCallId: "d", toolName: "draw", result: fits });
+			},
+		});
+		server.send(turn("many"));
+		let { part } = await server.next("part");
+		let result = part.type === "tool-result"
+			? part.result as {
+				content: Array<Record<string, unknown>>;
+				isError: boolean;
+			}
+			: undefined;
+		expect(result?.isError).toBe(false);
+		expect(result?.content.map(block => block.data === "")).toEqual([false, true, true]);
+		expect(result?.content.map(block => block.tooLarge)).toEqual([undefined, 974_998, 974_998]);
+		let unchanged = await server.next("part");
+		expect(unchanged.part).toMatchObject({ result: fits });
+	});
+
+	it("sends a photo too large for a frame as a smaller copy, in order, before the turn ends", async () => {
+		let server = fakeServer();
+		let photo = await new Bun.Image(
+			new Uint8Array(
+				await Bun.file(new URL("../../../e2e/fixtures/option-write-back.png", import.meta.url))
+					.arrayBuffer(),
+			),
+		).resize(3000, 1500).png({ compressionLevel: 0 }).bytes();
+		let data = Buffer.from(photo).toString("base64");
+		expect(data.length).toBeGreaterThan(MAX_LINK_MESSAGE_BYTES);
+		await connect(server, {
+			turn(context) {
+				context.emit({
+					type: "tool-result",
+					toolCallId: "c",
+					toolName: "draw",
+					result: { content: [{ type: "text", text: "Drew it" }, imageBlock(data, "Wide")] },
+				});
+				context.emit({ type: "text-delta", id: "t", delta: "after" });
+			},
+		});
+		server.send(turn("photo"));
+		let sent = await server.next("part");
+		expect(JSON.stringify(sent).length).toBeLessThanOrEqual(MAX_LINK_MESSAGE_BYTES);
+		let [text, image] = resultOf(sent).content as Array<Record<string, unknown>>;
+		expect(text).toEqual({ type: "text", text: "Drew it" });
+		expect(image).toMatchObject({ type: "image", mimeType: "image/webp", alt: "Wide" });
+		expect(image!.tooLarge).toBeUndefined();
+		let copy = await new Bun.Image(Buffer.from(image!.data as string, "base64")).metadata();
+		expect(copy.width / copy.height).toBeCloseTo(2, 1);
+		expect((await server.next("part")).part).toMatchObject({ type: "text-delta", delta: "after" });
+		expect(await server.next("turn-end")).toMatchObject({ turn: "photo", status: "finished" });
+	});
+
+	it("still fails a result it cannot fit by leaving images out, as it always did", async () => {
+		let server = fakeServer();
+		let failures: string[] = [];
+		await connect(server, {
+			turn(context) {
+				for (
+					let result of [
+						{ content: [{ type: "text", text: "x".repeat(MAX_LINK_MESSAGE_BYTES) }] },
+						"x".repeat(MAX_LINK_MESSAGE_BYTES),
+						{
+							content: [{ type: "text", text: "x".repeat(MAX_LINK_MESSAGE_BYTES) }, {
+								type: "image",
+								data: "A".repeat(1_000),
+								mimeType: "image/png",
+							}],
+						},
+					]
+				) {
+					try {
+						context.emit({
+							type: "tool-result",
+							toolCallId: "c",
+							toolName: "draw",
+							result: result as never,
+						});
+					} catch (error) {
+						failures.push((error as Error).message);
+					}
+				}
+			},
+		});
+		server.send(turn("huge"));
+		await server.next("turn-end");
+		expect(failures).toEqual(
+			Array(3).fill("The message exceeds the agent connection's size limit."),
+		);
 	});
 
 	it("settles requests made once the link has closed instead of leaving them pending", async () => {

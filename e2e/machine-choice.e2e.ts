@@ -356,7 +356,7 @@ test("a chosen machine going offline and coming back shows within seconds, witho
 	await expect(build).toHaveAttribute("aria-disabled", "true", live);
 	await expect(build).toHaveAccessibleDescription("build-box is offline");
 	await expect(plan).toHaveClass(/\bmachine-offline\b/);
-	await expect(entry).toHaveAccessibleName("Machines, 2 paired, 1 connected", live);
+	await expect(entry).toHaveAccessibleName("Machines, 1 of 2 connected", live);
 	await expect(entry).toContainText("1/2");
 	await shoot(page, "live-offline-full");
 
@@ -374,7 +374,7 @@ test("a chosen machine going offline and coming back shows within seconds, witho
 	await expect(rows.getByRole("row", { name: /laptop/ })).toContainText("Connected");
 	await laptop.disconnect();
 	await expect(rows.getByRole("row", { name: /laptop/ })).not.toContainText("Connected", live);
-	await expect(entry).toHaveAccessibleName("Machines, 2 paired, 1 connected", live);
+	await expect(entry).toHaveAccessibleName("Machines, 1 of 2 connected", live);
 });
 
 /** Pair and connect `count` machines, the last with a long name; keys pair ten at most. */
@@ -495,7 +495,13 @@ for (let height of [1080, 969]) {
 					await sidebar.getByRole("button", { name: "Add project", exact: true }).click();
 				}
 				await add.getByRole("textbox", { name: "Search repositories" }).fill(repository);
-				await add.getByRole("option", { name: `octo-org/${repository}`, exact: true }).click();
+				let option = add.getByRole("option", { name: `octo-org/${repository}`, exact: true });
+				await option.click();
+				// The first project closes the dialog; later ones keep it open for more changes.
+				if (repository !== "score") {
+					await expect(option).toHaveAttribute("aria-checked", "true");
+					await page.keyboard.press("Escape");
+				}
 				await expect(add).toBeHidden();
 				let create = sidebar.getByRole("button", {
 					name: `New document in ${repository}`,
@@ -703,6 +709,40 @@ test("keyboard Manage machines focuses the Machines heading", async ({ join: ent
 	await expect(page).toHaveURL(/\/machines$/);
 	await expect(page.getByRole("menu", { includeHidden: true })).toHaveCount(0);
 	await expect(page.getByRole("heading", { name: "Machines", exact: true })).toBeFocused();
+});
+
+test("the sidebar machine menu gives focus back to its entry when it closes, but not to a menu opened while it closes", async ({ seed, join: enter }) => {
+	await seed("# Machine choice\n\nThe build goes to the machine chosen here.\n", { graph: GRAPH });
+	let page = await enter(person(), DESKTOP);
+	await connected(page, "laptop");
+	await page.reload();
+	let entry = page.getByRole("complementary", { name: "Projects" })
+		.getByRole("button", { name: /^Machines/ });
+	let sidebar = page.getByRole("menu").filter({ hasText: "Default" });
+	let gone = () =>
+		expect(page.getByRole("menu", { includeHidden: true }).filter({ hasText: "Default" }))
+			.toHaveCount(0);
+	// Closed with nothing else taking focus meanwhile, it is the entry's again.
+	await entry.click();
+	await settledMenu(sidebar);
+	await page.keyboard.press("Escape");
+	await gone();
+	await expect(entry).toBeFocused();
+
+	// Closed, and the machine button pressed while it still fades out. The exit is held at a second
+	// so the test, not the speed of the hand, decides that the button is pressed in the middle of
+	// it. Base UI hands focus back to the entry as the menu leaves; that must not take it from the
+	// button's menu, which closes when focus leaves it.
+	await page.addStyleTag({ content: ".machines-menu { transition-duration: 1s !important; }" });
+	await entry.click();
+	await settledMenu(sidebar);
+	await page.keyboard.press("Escape");
+	let runs = await runOn(page);
+	let current = runs.getByRole("menuitemradio", { checked: true });
+	await expect(current).toBeFocused();
+	await gone();
+	await expect(machineButton(page)).toHaveAttribute("aria-expanded", "true");
+	await expect(current).toBeFocused();
 });
 
 for (let activation of ["Enter", "Space", "touch"] as const) {

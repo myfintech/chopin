@@ -1,6 +1,15 @@
-import { createHash } from "node:crypto";
+import { createHash, createPrivateKey } from "node:crypto";
+import { readFileSync } from "node:fs";
+
+import type { KeyObject } from "node:crypto";
+
+/** The GitHub App's own identity, with which it mints installation tokens for paired machines. */
+export type AppCredentials = { id: string; privateKey: KeyObject };
+
 export type AuthConfig = {
 	origin: string;
+	/** Origins the deployment was served from before APP_ORIGIN (PREVIOUS_ORIGINS). */
+	previousOrigins?: readonly string[];
 	appSlug: string;
 	clientId: string;
 	clientSecret?: string;
@@ -9,18 +18,20 @@ export type AuthConfig = {
 	allowedOrganizations?: ReadonlySet<string>;
 	local?: { installation: string; credentialsDir: string; port: number };
 	demoPersonas?: true;
+	/** GITHUB_APP_ID and its private key; without them no installation token is minted. */
+	app?: AppCredentials;
 };
 
 const GITHUB_USER_LOGIN = /^[a-z0-9](?:[a-z0-9_-]{0,37}[a-z0-9_])?$/i;
 const GITHUB_ORGANIZATION_LOGIN = /^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,38}$/i;
 
-function origin(raw: string | undefined): string {
-	if (!raw) throw new Error("APP_ORIGIN is required");
+function origin(raw: string | undefined, name = "APP_ORIGIN"): string {
+	if (!raw) throw new Error(`${name} is required`);
 	let parsed: URL;
 	try {
 		parsed = new URL(raw);
 	} catch {
-		throw new Error("APP_ORIGIN must be an HTTP or HTTPS origin");
+		throw new Error(`${name} must be an HTTP or HTTPS origin`);
 	}
 	if (
 		parsed.origin !== raw
@@ -30,15 +41,35 @@ function origin(raw: string | undefined): string {
 		|| parsed.pathname !== "/"
 		|| parsed.search
 		|| parsed.hash
-	) throw new Error("APP_ORIGIN must contain only an HTTP or HTTPS origin");
+	) throw new Error(`${name} must contain only an HTTP or HTTPS origin`);
 
 	let loopback = parsed.hostname === "localhost"
 		|| parsed.hostname === "127.0.0.1"
 		|| parsed.hostname === "[::1]";
 	if (parsed.protocol !== "https:" && !loopback) {
-		throw new Error("APP_ORIGIN must use HTTPS unless it is loopback development");
+		throw new Error(`${name} must use HTTPS unless it is loopback development`);
 	}
 	return parsed.origin;
+}
+
+/** The origins a moved deployment was served from, other than its current one. */
+function previous(raw: string | undefined, current: string): string[] | undefined {
+	if (!raw?.trim()) return undefined;
+	let values = raw.split(",").map(value => value.trim());
+	if (values.some(value => !value)) {
+		throw new Error("PREVIOUS_ORIGINS must be a comma-separated list of origins");
+	}
+	let origins = [...new Set(values.map(value => origin(value, "PREVIOUS_ORIGINS")))]
+		.filter(value => value !== current);
+	return origins.length ? origins : undefined;
+}
+
+/** Whether `value` is the deployment's origin or one of the origins it moved from. */
+export function ownOrigin(
+	config: Pick<AuthConfig, "origin" | "previousOrigins">,
+	value: string | null | undefined,
+): boolean {
+	return !!value && (value === config.origin || !!config.previousOrigins?.includes(value));
 }
 
 function encryptionKey(raw: string | undefined): Uint8Array {
@@ -46,6 +77,46 @@ function encryptionKey(raw: string | undefined): Uint8Array {
 		throw new Error("SESSION_ENCRYPTION_KEY must be exactly 32 bytes encoded as 64 hex characters");
 	}
 	return new Uint8Array(Buffer.from(raw, "hex"));
+}
+
+/**
+ * The App's numeric ID and private key (PEM), from GITHUB_APP_PRIVATE_KEY or the file named by
+ * GITHUB_APP_PRIVATE_KEY_FILE. Neither the key nor its path is ever part of an error.
+ */
+export function appCredentials(
+	env: Record<string, string | undefined>,
+): AppCredentials | undefined {
+	let id = env.GITHUB_APP_ID?.trim();
+	let inline = env.GITHUB_APP_PRIVATE_KEY;
+	let file = env.GITHUB_APP_PRIVATE_KEY_FILE?.trim();
+	if (!id && !inline && !file) return undefined;
+	if (!id || !/^[1-9][0-9]{0,19}$/.test(id)) {
+		throw new Error("GITHUB_APP_ID must be the GitHub App's numeric ID");
+	}
+	if (inline && file) {
+		throw new Error("Set GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_FILE, not both");
+	}
+	if (!inline && !file) {
+		throw new Error("GITHUB_APP_ID needs GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_FILE");
+	}
+	let pem: string;
+	if (file) {
+		try {
+			pem = readFileSync(file, "utf8");
+		} catch {
+			throw new Error("GITHUB_APP_PRIVATE_KEY_FILE can't be read");
+		}
+	} else pem = inline!.replace(/\\n/g, "\n");
+	let privateKey: KeyObject;
+	try {
+		privateKey = createPrivateKey(pem);
+	} catch {
+		throw new Error("The GitHub App private key must be a PEM private key");
+	}
+	if (privateKey.asymmetricKeyType !== "rsa") {
+		throw new Error("The GitHub App private key must be an RSA key");
+	}
+	return { id, privateKey };
 }
 
 function allowed(
@@ -88,8 +159,12 @@ export function loadAuth(port = 8787, host = process.env.SERVER_HOST || "127.0.0
 	if (demo === "on" && mode !== "local") {
 		throw new Error("DEMO_PERSONAS=on requires AUTH_MODE=local on a loopback bind");
 	}
+	let previousOrigins = previous(process.env.PREVIOUS_ORIGINS, appOrigin);
+	let app = appCredentials(process.env);
 	return {
+		...(app ? { app } : {}),
 		origin: appOrigin,
+		...(previousOrigins ? { previousOrigins } : {}),
 		appSlug,
 		clientId,
 		...(clientSecret ? { clientSecret } : {}),

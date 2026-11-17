@@ -7,7 +7,8 @@ import {
 	validDocumentTitleText,
 	withDocumentTitle,
 } from "@chopin/dialect";
-import { locksEditing, restoreBuilds, restoreLive } from "../tasks/builds";
+import { locksEditing, releaseEndedRun, restoreBuilds, restoreLive } from "../tasks/builds";
+import { restorePlanSources } from "../tasks/plan-source";
 import {
 	announceImplementation,
 	implementationStatus,
@@ -47,7 +48,10 @@ import * as presence from "./presence";
 import * as edit from "./edit";
 import * as room from "./room";
 import * as Chat from "../chat/service";
+import { validateReactions } from "../chat/reactions";
 import { restoreReferences } from "../chat/references";
+import { savedImages, savedRefusals } from "../chat/images";
+import { entriesForStorage, mergePointers } from "../chat/stored-pointers";
 import * as Comments from "../comments/service";
 import * as Questions from "../questions/service";
 import { sidecarUnansweredDecisions } from "../questions/unanswered";
@@ -62,6 +66,7 @@ import type { Server } from "bun";
 import type { ConversationPlan, Plan as Wire, Request, Sidebar } from "@chopin/protocol";
 import type { Socket, SocketData } from "../wire";
 import type { Presence } from "./presence";
+import type { Titling } from "../channels/document-title";
 import type { Document } from "./room";
 import type { Block } from "./edit";
 import type { Brief, CreationOrigin } from "../mcp";
@@ -78,6 +83,7 @@ import type { StorageAdapter } from "../storage/port";
 import type { PendingCardAction } from "../questions/card-actions";
 import type { ClaimInput, ClaimResult, Graph, Run } from "../tasks/graphs";
 import type { LiveBuild } from "../tasks/builds";
+import type { PlanSource } from "../tasks/plan-source";
 import type { Lifecycle, LifecycleInput, LifecycleResult } from "../tasks/lifecycle";
 
 /** Updates are grouped for this long before being applied together. */
@@ -127,6 +133,16 @@ type Meter = {
 export type Backend = {
 	/** Product documents enforce a leading title; standalone domain rooms remain generic. */
 	documentTitles?: boolean;
+	/**
+	 * Whether a rebuilt remote Planner hold still keeps the document's workflow runs for its client,
+	 * so the cards Chat stored stay live when it opens, marked disconnected once its client is away.
+	 */
+	plannerKeepsRuns?: (channelId: string) => "live" | "down" | undefined;
+	/**
+	 * A document's room has opened: a rebuilt remote Planner hold waits again, for its client, for
+	 * the answers to the questions it left open there.
+	 */
+	rejoinPlannerQuestions?: (plan: Plan, server: Server<SocketData>) => void;
 	storage: StorageAdapter;
 	lease: () => Lease;
 	fatal: (error: unknown) => void;
@@ -138,6 +154,11 @@ export type Backend = {
 	onBuildStopped?: (channelId: string) => void;
 	/** A document's editing lock was released and announced. */
 	onEditingUnlocked?: (channelId: string) => void;
+	/**
+	 * A build opened a pull request or ended, after it was persisted: post the line in Chat. Called
+	 * once per notice for each open plan; the notice's ID keeps a repeat to one line.
+	 */
+	onBuildNotice?: (channelId: string, notice: { id: string; text: string }) => void;
 };
 
 export type DocumentTarget = {
@@ -213,6 +234,8 @@ type Persistence = Backend & {
 	committedSource: string;
 	committedDocument: Uint8Array;
 	committedSidecar: JsonValue;
+	/** The revision and sequence this process last wrote a checkpoint for. */
+	checkpointed?: { revision: number; sequence: number };
 	closing: boolean;
 	/** The member whose batch is committing, for derived work that follows their edit. */
 	editor?: string;
@@ -267,6 +290,10 @@ export type Plan = {
 	pendingCardActions: PendingCardAction[];
 	/** The title a Planner last drafted; any other non-generated title is a person's to keep. */
 	plannerTitle?: string;
+	/** A person renamed the document or edited its title; no drafted title replaces theirs. */
+	titleChosen?: true;
+	/** Who is renaming the document right now; a drafted title waits for them. */
+	titling?: Titling;
 
 	/**
 	 * Every questionnaire this plan has ever held, answered or not.
@@ -293,6 +320,8 @@ export type Plan = {
 	lifecycle: Lifecycle;
 	/** The finished build this living document was last delivered from. */
 	live?: LiveBuild;
+	/** Where recent revisions' files were pushed, oldest first; a build starts from one. */
+	planSources: PlanSource[];
 	/**
 	 * A one-click Build plan waiting for its tasks, kept until the build starts or is cancelled so
 	 * the click outlives a decision the draft raised and a reload. In memory only (prototype).
@@ -341,6 +370,7 @@ type Sidecar = {
 	execution?: Run;
 	lifecycle?: Lifecycle;
 	live?: LiveBuild;
+	planSources?: PlanSource[];
 	mcpUpdates?: McpUpdateRecord[];
 	questions: Questions.Record[];
 	openQuestions: Questions.StoredOpen[];
@@ -355,6 +385,7 @@ type Sidecar = {
 	workflowRuns?: NonNullable<Chat.Chat["runs"]>;
 	initiativePaused?: boolean;
 	plannerTitle?: string;
+	titleChosen?: true;
 };
 
 type ChatView = Pick<Chat.Chat, "entries" | "runs" | "initiativePaused">;
@@ -373,11 +404,12 @@ function state(plan: Plan, chat: ChatView = plan.chat): Sidecar {
 			? { lifecycle: plan.lifecycle }
 			: {}),
 		...(plan.live ? { live: plan.live } : {}),
+		...(plan.planSources.length ? { planSources: plan.planSources } : {}),
 		...(plan.mcpUpdates.length > 0 ? { mcpUpdates: plan.mcpUpdates } : {}),
 		questions: [...plan.records.values()],
 		openQuestions: Questions.dump(plan.questions),
 		threads: [...plan.threads.values()],
-		transcript: chat.entries,
+		transcript: entriesForStorage(chat.entries),
 		conversationPlan: plan.conversationPlan,
 		...(plan.conversationPlanRetries.length
 			? { conversationPlanRetries: plan.conversationPlanRetries }
@@ -395,6 +427,7 @@ function state(plan: Plan, chat: ChatView = plan.chat): Sidecar {
 		...(chat.runs?.length ? { workflowRuns: chat.runs } : {}),
 		...((chat.initiativePaused ?? plan.chat.initiativePaused) ? { initiativePaused: true } : {}),
 		...(plan.plannerTitle !== undefined ? { plannerTitle: plan.plannerTitle } : {}),
+		...(plan.titleChosen ? { titleChosen: true as const } : {}),
 	};
 }
 
@@ -527,7 +560,7 @@ function definitionShape(value: Question.Definition) {
 		question.description,
 		question.multiple,
 		question.response,
-		question.options.map(option => [option.id, option.label, option.description]),
+		question.options.map(option => [option.id, option.label, option.description, option.preview]),
 	]);
 }
 
@@ -576,6 +609,7 @@ function restoredState(
 	if (Object.hasOwn(item, "execution")) expected.push("execution");
 	if (Object.hasOwn(item, "lifecycle")) expected.push("lifecycle");
 	if (Object.hasOwn(item, "live")) expected.push("live");
+	if (Object.hasOwn(item, "planSources")) expected.push("planSources");
 	if (Object.hasOwn(item, "mcpUpdates")) expected.push("mcpUpdates");
 	if (Object.hasOwn(item, "conversationPlan")) expected.push("conversationPlan");
 	if (Object.hasOwn(item, "conversationPlanRetries")) expected.push("conversationPlanRetries");
@@ -588,6 +622,7 @@ function restoredState(
 	if (Object.hasOwn(item, "workflowRuns")) expected.push("workflowRuns");
 	if (Object.hasOwn(item, "initiativePaused")) expected.push("initiativePaused");
 	if (Object.hasOwn(item, "plannerTitle")) expected.push("plannerTitle");
+	if (Object.hasOwn(item, "titleChosen")) expected.push("titleChosen");
 	expected.sort();
 	if (
 		keys.length !== expected.length
@@ -605,6 +640,7 @@ function restoredState(
 		|| !Array.isArray(item.transcript)
 		|| (Object.hasOwn(item, "initiativePaused") && typeof item.initiativePaused !== "boolean")
 		|| (Object.hasOwn(item, "plannerTitle") && typeof item.plannerTitle !== "string")
+		|| (Object.hasOwn(item, "titleChosen") && item.titleChosen !== true)
 	) throw new Error("hosted channel has an invalid sidecar");
 	let execution = Object.hasOwn(item, "execution")
 		? restoreRun(item.execution, graph, item.revision)
@@ -620,9 +656,19 @@ function restoredState(
 		throw new Error("hosted channel has an invalid implementation lifecycle");
 	}
 	let lifecycle = hasLifecycle ? restoredLifecycle : undefined;
+	// A run whose build ended before a release that returns it then is returned as it opens.
+	if (graph && execution && restoredLifecycle) {
+		let released = releaseEndedRun({ graph, execution, lifecycle: restoredLifecycle }, builds);
+		if (!released.execution) {
+			graph = released.graph;
+			execution = undefined;
+			lifecycle = released.lifecycle;
+		}
+	}
 	let live = Object.hasOwn(item, "live")
 		? restoreLive(item.live, builds, lifecycle, graph, item.revision)
 		: undefined;
+	let planSources = restorePlanSources(item.planSources, item.revision);
 	let questions = objects(item.questions, "question record");
 	let records = questions.map(question => Questions.normalizeRecord(question));
 	let openQuestions = objects(item.openQuestions, "open questionnaire");
@@ -678,6 +724,13 @@ function restoredState(
 			|| Array.isArray(entry.author)
 		) throw new Error("hosted channel has an invalid transcript entry");
 		validateNotice(entry, savedMessages);
+		mergePointers(entry);
+		if (
+			(Object.hasOwn(entry, "images") || Object.hasOwn(entry, "refusedImages"))
+				&& (entry.author as Record<string, JsonValue>).kind !== "agent"
+			|| Object.hasOwn(entry, "images") && !savedImages(entry.images)
+			|| Object.hasOwn(entry, "refusedImages") && !savedRefusals(entry.refusedImages)
+		) throw new Error("hosted channel has an invalid transcript image");
 		if (Object.hasOwn(entry, "references")) {
 			let author = entry.author as Record<string, JsonValue>;
 			if (author.kind !== "member") {
@@ -699,6 +752,7 @@ function restoredState(
 		} catch (err) {
 			throw new Error("hosted channel has invalid chat delivery metadata", { cause: err });
 		}
+		validateReactions(entry as unknown as Chat.Chat["entries"][number]);
 	}
 	let mcpUpdates = restoreMcpUpdates(item.mcpUpdates);
 	let conversationPlan = restoreConversationPlan(
@@ -767,6 +821,7 @@ function restoredState(
 		...(execution ? { execution } : {}),
 		...(lifecycle ? { lifecycle } : {}),
 		...(live ? { live } : {}),
+		...(planSources.length ? { planSources } : {}),
 		...(mcpUpdates.length > 0 ? { mcpUpdates } : {}),
 		questions: records,
 		openQuestions: openQuestions as unknown as Questions.StoredOpen[],
@@ -781,6 +836,7 @@ function restoredState(
 		...(workflowRuns.length > 0 ? { workflowRuns } : {}),
 		...(item.initiativePaused === true ? { initiativePaused: true } : {}),
 		...(typeof item.plannerTitle === "string" ? { plannerTitle: item.plannerTitle } : {}),
+		...(item.titleChosen === true ? { titleChosen: true as const } : {}),
 	};
 }
 
@@ -1210,8 +1266,16 @@ export function tellRepositoryUnanswered(
 	});
 }
 
+/** A checkpoint of what is committed, unless this process already wrote one of exactly that. */
+async function checkpointIfStale(plan: Plan): Promise<void> {
+	let { checkpointed, revision, sequence } = plan.persistence;
+	if (checkpointed?.revision === revision && checkpointed.sequence === sequence) return;
+	await checkpointHosted(plan);
+}
+
 async function checkpointHosted(plan: Plan): Promise<void> {
 	let durable = plan.persistence;
+	let written = { revision: durable.revision, sequence: durable.sequence };
 	try {
 		await durable.storage.collaboration.checkpoint({
 			channelId: durable.channelId,
@@ -1227,6 +1291,7 @@ async function checkpointHosted(plan: Plan): Promise<void> {
 			sidecar: durable.committedSidecar,
 			createdAt: new Date(),
 		});
+		durable.checkpointed = written;
 		plan.document.checkpoint = new Uint8Array(durable.committedDocument);
 	} catch (err) {
 		durable.fatal(err);
@@ -1286,7 +1351,8 @@ async function replaceHosted(plan: Plan, operationId: string, captured: Captured
 export function persist(plan: Plan, chat?: () => ChatView): Promise<void> {
 	let commit = () =>
 		commitHosted(plan, undefined, `state:${crypto.randomUUID()}`, capture(plan, chat?.()));
-	let pending = plan.flushing.then(commit, commit);
+	// Not mapped to void: a second step here would move every save a tick later.
+	let pending = plan.flushing.then(commit, commit) as Promise<unknown> as Promise<void>;
 	plan.flushing = pending;
 	return pending;
 }
@@ -1320,6 +1386,18 @@ export async function drain(plan: Plan): Promise<void> {
 	await plan.flushing;
 }
 
+/**
+ * Commit what is admitted and checkpoint it, while the document stays open and in use. A
+ * restart does this for every document before it stops serving, so what is left to write when
+ * the last of them closes is little.
+ */
+export async function settle(plan: Plan): Promise<void> {
+	await drain(plan);
+	let checkpoint = () => checkpointIfStale(plan);
+	plan.flushing = plan.flushing.then(checkpoint, checkpoint);
+	await plan.flushing;
+}
+
 /** One gate for every path that can mutate a plan during implementation. */
 export function implementationActive(plan: Plan): boolean {
 	return plan.claiming || !!plan.execution || plan.builds.some(locksEditing);
@@ -1333,7 +1411,7 @@ export function persistExclusive(plan: Plan, allowArchived = false): Promise<voi
 		`state:${crypto.randomUUID()}`,
 		capture(plan),
 		allowArchived,
-	);
+	).then(() => {});
 }
 
 type RestoredHosted = {
@@ -1479,6 +1557,8 @@ export async function readStored(
 	graph?: Graph;
 	execution?: Run;
 	lifecycle?: Lifecycle;
+	records?: Questions.Record[];
+	planSources?: PlanSource[];
 }> {
 	let restored = await restoreHosted(loaded.channel.id, loaded);
 	try {
@@ -1486,11 +1566,13 @@ export async function readStored(
 		return {
 			source: room.project(restored.document),
 			revision: restored.sidecar.revision,
+			...(restored.sidecar.questions.length > 0 ? { records: restored.sidecar.questions } : {}),
 			...(restored.sidecar.creation ? { creation: restored.sidecar.creation } : {}),
 			...(restored.sidecar.graph ? { graph: restored.sidecar.graph } : {}),
 			...(restored.sidecar.builds ? { builds: restored.sidecar.builds } : {}),
 			...(restored.sidecar.execution ? { execution: restored.sidecar.execution } : {}),
 			...(restored.sidecar.lifecycle ? { lifecycle: restored.sidecar.lifecycle } : {}),
+			...(restored.sidecar.planSources ? { planSources: restored.sidecar.planSources } : {}),
 		};
 	} finally {
 		restored.document.doc.destroy();
@@ -1522,7 +1604,13 @@ export async function open(
 		presence: presence.create(),
 		questions: Questions.restore(sidecar.openQuestions),
 		comments: Comments.create(),
-		chat: Chat.restore(sidecar.transcript, sidecar.workflowRuns, sidecar.initiativePaused),
+		chat: Chat.restore(
+			sidecar.transcript,
+			sidecar.workflowRuns,
+			sidecar.initiativePaused,
+			// An archived document's Planner ended with it: its runs come back stopped.
+			loaded.channel.archivedAt ? undefined : backend.plannerKeepsRuns?.(id),
+		),
 		conversationPlan: sidecar.conversationPlan ?? restoreConversationPlan(undefined),
 		conversationPlanRetries: sidecar.conversationPlanRetries ?? [],
 		conversationPlanJobs: sidecar.conversationPlanJobs ?? [],
@@ -1530,6 +1618,7 @@ export async function open(
 		conversationPlanPendingEffects: sidecar.conversationPlanPendingEffects ?? [],
 		pendingCardActions: sidecar.pendingCardActions ?? [],
 		...(sidecar.plannerTitle !== undefined ? { plannerTitle: sidecar.plannerTitle } : {}),
+		...(sidecar.titleChosen ? { titleChosen: true as const } : {}),
 		outlines: new Map(),
 		records: new Map(
 			sidecar.questions.map(record => [record.id, Questions.normalizeRecord(record)]),
@@ -1540,6 +1629,7 @@ export async function open(
 		execution: sidecar.execution,
 		lifecycle: sidecar.lifecycle ?? { history: [] },
 		...(sidecar.live ? { live: sidecar.live } : {}),
+		planSources: sidecar.planSources ?? [],
 		claiming: false,
 		queue: [],
 		timer: undefined,
@@ -1608,6 +1698,7 @@ export async function open(
 	}
 
 	rememberImplementationLock(plan);
+	backend.rejoinPlannerQuestions?.(plan, server);
 	return plan;
 }
 
@@ -1821,6 +1912,9 @@ async function commit(plan: Plan): Promise<void> {
 		? room.enableTitle(plan.document, plan.persistence.committedTitle)
 		: undefined;
 	let previousRevision = plan.revision;
+	let previousChosen = plan.titleChosen;
+	// Only people send browser updates: a title they touched is theirs from now on.
+	if (outcome.retitled) plan.titleChosen = true;
 	if (room.project(plan.document) !== plan.persistence.committedSource) plan.revision++;
 	let merged = Y.mergeUpdates([
 		...batch.map(item => item.update),
@@ -1842,6 +1936,7 @@ async function commit(plan: Plan): Promise<void> {
 	} catch (err) {
 		if (!(err instanceof ResearchProjectionConflict)) throw err;
 		plan.revision = previousRevision;
+		plan.titleChosen = previousChosen;
 		plan.records = previousRecords;
 		plan.threads = previousThreads;
 		await rejectBatch(plan, batch, ["research-reference-conflict"]);
@@ -1995,6 +2090,7 @@ export async function publishStaged(
 	plan.conversationPlanPendingEffects = candidate.conversationPlanPendingEffects;
 	plan.conversationPlanEffects = candidate.conversationPlanEffects;
 	plan.plannerTitle = candidate.plannerTitle;
+	if (candidate.titleChosen) plan.titleChosen = true;
 	if (mutation) {
 		try {
 			broadcast(server, roomId, {
@@ -2331,8 +2427,24 @@ export function awareness(plan: Plan, ws: Socket, msg: Wire.Awareness): void {
 	relay(ws, { kind: "plan:awareness", ts: 0, epoch: plan.document.epoch, update: msg.update });
 }
 
+/**
+ * Remember whether a person has the title open, or has typed in it on this connection. A drafted
+ * title waits for them, and for a while after they let go.
+ */
+export function titling(plan: Plan, ws: object, state: { active: boolean; edited?: boolean }) {
+	let titling: Titling = plan.titling ??= { people: new Map() };
+	let before = titling.people.get(ws);
+	let edited = !!before?.edited || state.edited === true;
+	if (before?.active && !state.active) titling.releasedAt = Date.now();
+	titling.people.set(ws, { active: state.active, edited });
+}
+
 /** Clear a departed member's cursors rather than leaving peers to time them out. */
 export function departed(plan: Plan, ws: Socket): void {
+	let left = plan.titling?.people.get(ws);
+	if (left && plan.titling!.people.delete(ws) && (left.active || left.edited)) {
+		plan.titling!.releasedAt = Date.now();
+	}
 	let update = presence.drop(plan.presence, ws);
 	if (!update) return;
 	relay(ws, {
@@ -2382,7 +2494,7 @@ export async function close(plan: Plan): Promise<void> {
 	await Chat.close(plan.chat);
 	await plan.flushing;
 	await commitHosted(plan, undefined, `state:${crypto.randomUUID()}`, capture(plan), true);
-	await checkpointHosted(plan);
+	await checkpointIfStale(plan);
 	Questions.shutdown(plan.questions);
 	presence.destroy(plan.presence);
 	plan.document.doc.destroy();
@@ -2524,7 +2636,10 @@ export function placeExperimentReference(
 	});
 }
 
-/** Caller holds the document queue. The H1, metadata and slug commit before publication. */
+/**
+ * Caller holds the document queue. The H1, metadata and slug commit before publication. Only
+ * people rename, directly or through their coding agent, so the title is theirs from then on.
+ */
 export async function rename(
 	plan: Plan,
 	title: string,
@@ -2549,6 +2664,7 @@ export async function rename(
 		records: new Map(plan.records),
 		threads: new Map(plan.threads),
 		outlines: new Map(plan.outlines),
+		titleChosen: true,
 	};
 	try {
 		let outcome = edit.replace(candidate, plan.revision, next);

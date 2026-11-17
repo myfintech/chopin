@@ -1,4 +1,6 @@
+import { usePendingWork } from "@chopin/editor";
 import { Face } from "@chopin/editor/face";
+import { sentenceCase } from "./sentence-case";
 import {
 	CheckIcon,
 	LoaderIcon,
@@ -20,15 +22,18 @@ import {
 	buildPhase,
 	buildProgress,
 	builtCount,
+	builtDetail,
+	endedCard,
 	linkParts,
 	liveTaskGroups,
 	liveTaskState,
+	planSourceLine,
 	plural,
 	pullRequestCommits,
 	pullRequestNumber,
 	retryAction,
+	taskRowName,
 	taskStartsOpen,
-	taskStateLabel,
 	unfinishedReason,
 } from "./build-model";
 import {
@@ -37,9 +42,11 @@ import {
 	implementationResponse as response,
 	stopBuild,
 } from "./build-start";
+import { inlineText } from "./chat/inline-text";
 import { InlineMarkdown, MessageMarkdown } from "./chat/markdown";
 import { LocalAgentNote } from "./local-agent-note";
 import { MachineGlyph } from "./machine-button";
+import "./build-source.css";
 
 import type { ReactNode } from "react";
 import type { BuildPlan } from "./build-plan-button";
@@ -74,7 +81,11 @@ function MachineLabel({ machine }: { machine: BuildMachine }) {
 	return (
 		<span
 			className="build-card-machine"
-			title={machine.connected === false ? `${machine.label} is offline` : undefined}
+			title={machine.connected === false
+				? `${machine.label} is offline`
+				: machine.owner
+				? `${machine.label}, ${machine.owner}'s machine`
+				: undefined}
 		>
 			{machine.connected === undefined
 				? (
@@ -92,10 +103,6 @@ function MachineLabel({ machine }: { machine: BuildMachine }) {
 	);
 }
 
-function sentence(text: string): string {
-	return text.replace(/^[a-z]/, letter => letter.toUpperCase());
-}
-
 /**
  * The build's status and its tasks. Build only reads: the header's Build plan
  * and capsule start and retry builds, so opening this view never starts one.
@@ -107,10 +114,8 @@ export function BuildView(
 		build,
 		canEdit,
 		comments,
-		onShowDecisions,
 		onShowDocument,
 		room,
-		unanswered,
 		userId,
 	}: {
 		active: boolean;
@@ -118,10 +123,8 @@ export function BuildView(
 		canEdit: boolean;
 		/** Accepted comments the document has not yet taken in. */
 		comments: number;
-		onShowDecisions: () => void;
 		onShowDocument: () => void;
 		room: string;
-		unanswered: number;
 		userId: string;
 	},
 ) {
@@ -131,6 +134,7 @@ export function BuildView(
 	let [stopping, setStopping] = useState(false);
 	let [returning, setReturning] = useState(false);
 	let [reason, setReason] = useState("");
+	usePendingWork(returning && reason.trim() !== "");
 	let [open, setOpen] = useState<Record<string, boolean>>({});
 	let [linked, setLinked] = useState<string>();
 	let [now, setNow] = useState(() => Date.now());
@@ -186,7 +190,7 @@ export function BuildView(
 			setReturning(false);
 			build.reload();
 		} catch (error) {
-			setActionError(sentence(error instanceof Error ? error.message : "Return failed"));
+			setActionError(sentenceCase(error instanceof Error ? error.message : "Return failed"));
 		} finally {
 			setBusy(false);
 		}
@@ -221,36 +225,34 @@ export function BuildView(
 				return {
 					title: "Waiting to build",
 					glyph: <span aria-hidden="true" className="build-glyph-dot" data-tone="warning" />,
-					detail: phase.decisions || phase.comments
+					detail: phase.comments
 						? (
 							<span className="build-blockers">
-								{phase.decisions && (
-									<button className="build-link link" onClick={onShowDecisions} type="button">
-										{unanswered > 0
-											? `Answer ${plural(unanswered, "decision", "decisions")} first`
-											: "Answer the open decisions first"}
-									</button>
-								)}
-								{phase.comments && (
-									<button className="build-link link" onClick={onShowDocument} type="button">
-										{comments > 0
-											? `Update the document for ${
-												plural(comments, "accepted comment", "accepted comments")
-											} first`
-											: "Update the document for accepted comments first"}
-									</button>
-								)}
+								<button className="build-link link" onClick={onShowDocument} type="button">
+									{comments > 0
+										? `Update the document for ${
+											plural(comments, "accepted comment", "accepted comments")
+										} first`
+										: "Update the document for accepted comments first"}
+								</button>
 							</span>
 						)
 						: "This document can’t be built yet.",
 				};
 			}
-			if (phase.kind === "drafting" && phase.draft === "returned") {
-				return { title: "Returned for changes", detail: "Build plan builds it again." };
+			// Who stopped it, the task its agent blocked, or why it failed, as Chat's end line says.
+			if (phase.kind === "drafting" && phase.draft === "returned" && snapshot) {
+				return endedCard(snapshot);
 			}
+			// Build plan is the approval: pressing it approves these tasks and starts them.
 			return {
 				title: "Not built yet",
-				...(phase.kind === "review" ? { count: plural(tasks.length, "task", "tasks") } : {}),
+				...(phase.kind === "review"
+					? {
+						count: plural(tasks.length, "task", "tasks"),
+						detail: "Build plan approves these tasks and builds them.",
+					}
+					: {}),
 			};
 		}
 		if (look.kind === "tasks") {
@@ -292,15 +294,12 @@ export function BuildView(
 			};
 		}
 		if (look.kind === "built") {
-			let commits = snapshot?.live?.commits.length ?? 0;
 			return {
 				...base,
 				title: "Built",
 				count: builtCount(look),
 				glyph: <CheckIcon aria-hidden="true" className="build-card-check" />,
-				detail: commits > 0
-					? `${plural(commits, "commit", "commits")} since first build`
-					: undefined,
+				detail: builtDetail(snapshot),
 			};
 		}
 		if (look.kind === "stopped" || look.kind === "failed" || look.kind === "agent") {
@@ -335,7 +334,10 @@ export function BuildView(
 
 	// The build the card's footer names: the one running, else the last that ran.
 	let shown:
-		| Pick<BuildRequest, "id" | "user" | "state"> & { createdAt?: string; finishedAt?: string }
+		| Pick<BuildRequest, "id" | "user" | "state" | "planSource"> & {
+			createdAt?: string;
+			finishedAt?: string;
+		}
 		| undefined = look.kind === "plan" || look.kind === "tasks"
 			? undefined
 			: activeBuild ?? (phase.kind === "live" && snapshot?.live
@@ -353,6 +355,7 @@ export function BuildView(
 	);
 	let machine = shown && snapshot?.buildMachines?.[shown.id];
 	let when = buildAgo(shown, now);
+	let from = planSourceLine(shown);
 
 	if (phase.kind === "stopped" && canEdit && !returning) {
 		action = (
@@ -375,7 +378,9 @@ export function BuildView(
 					cancelBuildRequest(room).then(
 						() => build.reload(),
 						error =>
-							setActionError(sentence(error instanceof Error ? error.message : "Cancel failed")),
+							setActionError(
+								sentenceCase(error instanceof Error ? error.message : "Cancel failed"),
+							),
 					);
 				}}
 				type="button"
@@ -397,7 +402,7 @@ export function BuildView(
 					stopBuild(room, activeBuild.id).then(
 						() => build.reload(),
 						error =>
-							setActionError(sentence(error instanceof Error ? error.message : "Stop failed")),
+							setActionError(sentenceCase(error instanceof Error ? error.message : "Stop failed")),
 					).finally(() => setStopping(false));
 				}}
 				type="button"
@@ -457,7 +462,7 @@ export function BuildView(
 				{phase.kind === "loading" && (
 					<p className="build-status-line">
 						{loadError
-							? <span className="text-destructive-ink">{sentence(loadError)}</span>
+							? <span className="text-destructive-ink">{sentenceCase(loadError)}</span>
 							: <span className="sr-only">Loading tasks</span>}
 					</p>
 				)}
@@ -489,7 +494,7 @@ export function BuildView(
 								{card.segments.map((state, index) => <span data-state={state} key={index} />)}
 							</div>
 						)}
-						{(login || machine || action) && (
+						{(login || machine || from || action) && (
 							<footer className="build-card-foot">
 								{login && shown && (
 									<span className="build-card-person">
@@ -506,6 +511,11 @@ export function BuildView(
 									</span>
 								)}
 								{machine && <MachineLabel machine={machine} />}
+								{from && (
+									<span className="build-card-source" title={shown?.planSource?.commit}>
+										{from}
+									</span>
+								)}
 								<span className="flex-1" />
 								{action}
 							</footer>
@@ -641,6 +651,7 @@ function TaskRow(
 				<button
 					aria-controls={panel}
 					aria-expanded={expanded}
+					aria-label={taskRowName(inlineText(task.title), state, !!noChange)}
 					className="build-task-toggle"
 					onClick={onToggle}
 					type="button"
@@ -649,7 +660,6 @@ function TaskRow(
 					<span className="build-task-title">
 						<InlineMarkdown links={false} source={task.title} />
 					</span>
-					<span className="sr-only">, {taskStateLabel(state, !!noChange)}</span>
 				</button>
 				{pullRequest && (
 					<a

@@ -21,6 +21,7 @@
  */
 
 import { limits, ulid } from "@chopin/dialect";
+import { PLANNER_NAME } from "@chopin/protocol/address";
 
 import * as room from "../plan/room";
 import * as Chat from "../chat/service";
@@ -327,34 +328,39 @@ type Admitted =
 /**
  * Whether a note sent to the Planner can be acted on, asked before it is saved.
  *
- * A full queue refuses the note rather than saving one nobody will act on, as
- * does a remote Planner nobody has attached. A server without a Planner still
- * takes it — it is a comment either way — and says so. A child's note is admitted by its root's queue, which runs its turn,
- * and refused if the child no longer belongs to a live root.
+ * A turn that is running refuses the note rather than saving one nobody will act on (nothing is
+ * held for the next turn), as does a remote Planner nobody has attached. A server without a
+ * Planner still takes it — it is a comment either way — and says so. A child's note is admitted
+ * by its root's Chat, which runs its turn, and refused if the child no longer belongs to a live
+ * root.
  */
 async function admit(
 	msg: { to?: unknown },
 	context: Addressed | undefined,
-	thread?: string,
 ): Promise<Admitted> {
 	if (msg.to === undefined) return {};
-	if (msg.to !== "planner" || !context) return { refused: "A comment can only be sent to Chopin." };
+	if (msg.to !== "planner" || !context) {
+		return { refused: `A comment can only be sent to ${PLANNER_NAME}.` };
+	}
 	let admitted: Wire.Planner | "busy";
 	if (context.root) {
 		try {
-			admitted = await context.root.admission(thread ?? "");
+			admitted = await context.root.admission();
 		} catch (err) {
 			console.error("[comments] could not reach the root document's Chat:", err);
-			return { refused: "Chopin can't be reached from this document right now." };
+			return { refused: `${PLANNER_NAME} can't be reached from this document right now.` };
 		}
 	} else {
-		// Under HARNESS=remote a turn with no Planner attached would never run.
+		// Under HARNESS=remote a turn with no Planner attached, or whose machine is away, would
+		// never run.
 		let unattached = context.config.agent ? await context.plannerNotAttached?.() : undefined;
 		if (unattached) return { refused: unattached, code: "planner-not-attached" };
-		admitted = Chat.admission(context, thread);
+		admitted = Chat.admission(context);
 	}
 	if (admitted === "busy") {
-		return { refused: "Chopin has too much waiting already. Try again when it has caught up." };
+		return {
+			refused: `${PLANNER_NAME} is working on something else. Try again when it has finished.`,
+		};
 	}
 	return { planner: admitted };
 }
@@ -441,7 +447,7 @@ export async function respond(
 	let text = said(msg.text);
 	if (!text) return refuse("invalid", "A comment needs something in it.");
 
-	let admitted = await admit(msg, context, msg.id);
+	let admitted = await admit(msg, context);
 	if ("refused" in admitted) {
 		return refuse(msg.to === "planner" ? "busy" : "invalid", admitted.refused, admitted.code);
 	}
@@ -501,18 +507,43 @@ function announce(
  * turn's focus: the notice goes in the root's transcript and the turn edits the
  * child and answers here.
  */
-async function send(context: Addressed, id: string, note: Wire.Note): Promise<void> {
+async function send(
+	context: Addressed,
+	id: string,
+	note: Wire.Note,
+): Promise<void> {
 	let { plan, root } = context;
 	if (!context.config.agent) return announce(context, id, false, "off");
 
 	let record = plan.threads.get(id);
 	if (!record || record.status !== "open") return;
+	let { text, said, about } = turn(context, record, note.text);
+	about.asked = true;
+	try {
+		await (root
+			? root.instruct(Store.speaker(note), text, said, about)
+			: Chat.instruct(context, Store.speaker(note), text, said, about));
+	} catch (err) {
+		console.error("[comments] could not send a comment to the Planner:", err);
+		return announce(context, id, working(plan, id, root), "failed");
+	}
+	// Only when a turn is now running; a refusal already said why it is not.
+	if (working(plan, id, root)) announce(context, id, true);
+}
+
+/** What the Planner is told about a thread, and how its turn reports back. */
+function turn(
+	context: Addressed,
+	record: Record,
+	note: string,
+): { text: string; said: string; about: Chat.Instruction } {
+	let { plan, root } = context;
+	let id = record.id;
 	let quote = reading(plan, record).quote;
-	let handle = Store.speaker(note);
 	// How many notes the turn could read when it began; set again if a folded turn starts.
 	let seen = { notes: record.notes.length };
 	let text = address(plan.threads.get(id) ?? record, quote, root ? context.room : undefined);
-	let said = `Comment on “${excerpt(quote)}” sent to Chopin`;
+	let said = `Comment on “${excerpt(quote)}” sent to ${PLANNER_NAME}`;
 	let about: Chat.Instruction = {
 		thread: id,
 		// Resolved before its turn came round: nobody is waiting for it now.
@@ -521,18 +552,9 @@ async function send(context: Addressed, id: string, note: Wire.Note): Promise<vo
 			seen.notes = plan.threads.get(id)?.notes.length ?? 0;
 		},
 		ended: outcome => ended(context, id, outcome, seen.notes),
-		comment: { thread: id, excerpt: excerpt(quote), note: note.text },
+		comment: { thread: id, excerpt: excerpt(quote), note },
 	};
-	try {
-		await (root
-			? root.instruct(handle, text, said, about)
-			: Chat.instruct(context, handle, text, said, about));
-	} catch (err) {
-		console.error("[comments] could not send a comment to the Planner:", err);
-		return announce(context, id, working(plan, id, root), "failed");
-	}
-	// Only when a turn is now running or queued; a refusal already said why it is not.
-	if (working(plan, id, root)) announce(context, id, true);
+	return { text, said, about };
 }
 
 /**
@@ -552,11 +574,7 @@ async function ended(
 	let { plan } = context;
 	let record = plan.threads.get(id);
 	let text = outcome.text?.trim().slice(0, limits.MAX_NOTE);
-	// A note that arrived mid-turn is answered by the turn queued for it, not by
-	// whatever this one last said about something else.
-	let queued = () => context.root ? context.root.working(id) : !!Chat.queuedFor(plan.chat, id);
-	let following = queued();
-	if (outcome.status === "done" && record?.status === "open" && text && !following) {
+	if (outcome.status === "done" && record?.status === "open" && text) {
 		let last = record.notes.slice(0, seen).findLastIndex(note => note.to === "planner");
 		let answered = record.notes.slice(last + 1).some(note => note.author === "planner");
 		if (!answered) {
@@ -566,13 +584,12 @@ async function ended(
 		}
 	}
 
-	let still = queued();
 	let reason = outcome.status === "stopped"
 		? "stopped" as const
 		: outcome.status === "failed"
 		? "failed" as const
 		: undefined;
-	announce(context, id, still, still ? undefined : reason);
+	announce(context, id, false, reason);
 }
 
 /** Add the Planner's note to an open thread, durably, then tell the room. */

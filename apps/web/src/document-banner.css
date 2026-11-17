@@ -1,0 +1,31 @@
+/* Room for the bar's own focus ring, which its entrance would otherwise clip. */
+.document-banner-inset {
+	padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3);
+}
+
+.document-banner {
+	flex-shrink: 0;
+}
+
+/*
+ * The offline bar (`connection-state.css`), drawn here in flow at the top of the document: the
+ * same words, roles and entrance, as a rounded strip inside the document's inset.
+ */
+.document-banner .offline-bar {
+	border-bottom: 0;
+	border-radius: var(--radius-lg);
+}
+
+/*
+ * On a phone the top bar floats over every pane, and each pane's scroller is padded to start below
+ * it. The banner floats just under the bar in the same way, and its height is added to that padding
+ * (`--phone-pane-top` takes `--phone-notice-height`), so the first of a pane's content always
+ * starts below it and nothing is ever covered at rest.
+ */
+.workspace-root[data-workspace-phone] > .document-banner {
+	position: absolute;
+	/* Over the panes (Chat's is 10) and under the top bar (30), so Reconnect can always be pressed. */
+	z-index: 20;
+	inset-inline: 0;
+	inset-block-start: var(--phone-top-chrome);
+}

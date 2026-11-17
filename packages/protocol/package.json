@@ -21,6 +21,26 @@
 			"types": "./address.ts",
 			"default": "./address.ts"
 		},
+		"./planner-name": {
+			"types": "./planner-name.ts",
+			"default": "./planner-name.ts"
+		},
+		"./attachment": {
+			"types": "./attachment.ts",
+			"default": "./attachment.ts"
+		},
+		"./commands": {
+			"types": "./commands.ts",
+			"default": "./commands.ts"
+		},
+		"./mention-sources": {
+			"types": "./mention-sources.ts",
+			"default": "./mention-sources.ts"
+		},
+		"./model-choice": {
+			"types": "./model-choice.ts",
+			"default": "./model-choice.ts"
+		},
 		"./connector": {
 			"types": "./connector.ts",
 			"default": "./connector.ts"
@@ -37,9 +57,25 @@
 			"types": "./agents.ts",
 			"default": "./agents.ts"
 		},
+		"./plain-words": {
+			"types": "./plain-words.ts",
+			"default": "./plain-words.ts"
+		},
+		"./pending-work": {
+			"types": "./pending-work.ts",
+			"default": "./pending-work.ts"
+		},
+		"./restart": {
+			"types": "./restart.ts",
+			"default": "./restart.ts"
+		},
 		"./run-stages": {
 			"types": "./run-stages.ts",
 			"default": "./run-stages.ts"
+		},
+		"./threads": {
+			"types": "./threads.ts",
+			"default": "./threads.ts"
 		}
 	}
 }

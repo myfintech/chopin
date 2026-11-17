@@ -19,7 +19,16 @@
  * race.
  */
 
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+	lazy,
+	Suspense,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { createPortal, flushSync } from "react-dom";
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
 import { readOnly$ } from "@mdxeditor/editor";
@@ -50,20 +59,23 @@ import {
 	mergeRegister,
 } from "lexical";
 import { $isTableCellNode, $isTableRowNode } from "@lexical/table";
-import { $isCodeBlockNode, $isMathNode } from "@chopin/dialect";
+import { $isCodeBlockNode, $isMathNode, codeWraps, withCodeWrap } from "@chopin/dialect";
 
 import { enclosing, remember } from "../collapse";
+import { $liveRangeSelection } from "../live-selection";
 import { widgets$ } from "../widget-options";
 import { describeDiagramError, kindOf, languageOptions, plainText, titleOf } from "./code";
 import { CodeView } from "./code-view";
+import { CopyCode } from "./code-copy";
 import { fitsLegibly } from "./diagram-fit";
 import { DiagramSheet, ExpandDiagram, FitDiagram } from "./diagram-sheet";
 import { usePhone } from "../pointer";
 import { LanguageMenu } from "./language-menu";
+import { useNearAtMount, useNearViewport } from "./near-viewport";
 import { registerPreviewSelection } from "./preview-selection";
 import { diffSourceLine, lastLineStart, offsetOfLine } from "./source-offset";
 import { hiddenSides, scrollEdges } from "./tab-edges";
-import { CodeIcon, WarningIcon } from "@chopin/icons";
+import { CodeIcon, WarningIcon, WrapIcon } from "@chopin/icons";
 
 import type { ElementNode, LexicalCommand, LexicalEditor, LexicalNode } from "lexical";
 import type { Wireframe as WireframeTree } from "@chopin/diagrams/wireframe";
@@ -89,7 +101,9 @@ type Block = {
  */
 const SeeCodeDiagram = lazy(() =>
 	import("@chopin/diagrams/react").then(({ Diagram, DiagramDrawing }) => ({
-		default: function SeeCodeDiagram({ spec, idPrefix }: { spec: unknown; idPrefix: string }) {
+		default: function SeeCodeDiagram(
+			{ spec, idPrefix, near }: { spec: unknown; idPrefix: string; near?: boolean },
+		) {
 			let phone = usePhone();
 			let [expanded, setExpanded] = useState<number>();
 			let opener = useRef<HTMLButtonElement | null>(null);
@@ -98,6 +112,7 @@ const SeeCodeDiagram = lazy(() =>
 					<Diagram
 						spec={spec}
 						idPrefix={idPrefix}
+						near={near}
 						onExpand={phone
 							? (button, width) => {
 								opener.current = button;
@@ -128,6 +143,30 @@ const SeeCodeDiagram = lazy(() =>
 	}))
 );
 
+/**
+ * A SeeCode diagram's preview. A diagram that mounts a long way from the reader opens on its whole
+ * drawing instead of playing its entrance where nobody is looking, which would rewrite its step
+ * counter and controls inside the editor for each step; one in view plays as it always has.
+ */
+function SeeCodePreview({ spec, idPrefix }: { spec: unknown; idPrefix: string }) {
+	let preview = useRef<HTMLDivElement>(null);
+	let near = useNearAtMount(preview);
+	return (
+		<div
+			ref={preview}
+			className="plan-seecode"
+			contentEditable={false}
+			role="region"
+			aria-label="Diagram preview"
+			tabIndex={0}
+		>
+			<Suspense fallback={null}>
+				<SeeCodeDiagram spec={spec} idPrefix={idPrefix} near={near} />
+			</Suspense>
+		</div>
+	);
+}
+
 const WireframeView = lazy(() =>
 	import("@chopin/diagrams/wireframe/view").then(({ Wireframe }) => ({ default: Wireframe }))
 );
@@ -146,7 +185,8 @@ function renders(
 	if (block.kind === "seecode") return spec !== undefined;
 	if (block.kind === "wireframe") return drawing?.source === block.source;
 	if (block.kind === "math" || block.kind === "mermaid") return !!html;
-	return block.kind === "code" || block.kind === "diff";
+	// Code is coloured in place (`code-paint-plugin.tsx`), so only a patch has a second reading.
+	return block.kind === "diff";
 }
 
 function collect(editor: LexicalEditor): Block[] {
@@ -285,6 +325,36 @@ function Language(
 	return <LanguageMenu onChange={set} options={options} value={block.language} />;
 }
 
+/**
+ * Wrap lines, as Notion has it: a setting of the block, written into its fence as `wrap`, so every
+ * reader sees the block wrap. Code that scrolls is offered it; a fence nobody named already wraps
+ * its source, and a phone wraps code anyway.
+ */
+function Wrap({ block, editor }: { block: Block; editor: LexicalEditor }) {
+	let wraps = codeWraps(block.meta);
+	let toggle = useCallback(() => {
+		editor.update(() => {
+			let node = $getNodeByKey(block.key);
+			if (!$isCodeBlockNode(node)) return;
+			node.setMeta(withCodeWrap(node.getMeta(), !codeWraps(node.getMeta())));
+		});
+	}, [editor, block.key]);
+	return (
+		<button
+			type="button"
+			aria-pressed={wraps}
+			onClick={toggle}
+			// As the source toggle: a click must not drop a caret into the source first.
+			onMouseDown={event => event.preventDefault()}
+			aria-label="Wrap lines"
+			className="plan-code-wrap btn btn-icon btn-ghost"
+			data-tooltip="Wrap lines"
+		>
+			<WrapIcon aria-hidden="true" size={16} />
+		</button>
+	);
+}
+
 function Toggle({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
 	return (
 		<button
@@ -330,6 +400,10 @@ function Preview(
 
 	let drawn = block.kind === "math" || block.kind === "mermaid" || block.kind === "seecode"
 		|| block.kind === "wireframe";
+	// A Mermaid drawing is made once its block is within a screen of the reader, not when the document
+	// opens. Until then the block shows its source, as it does while a drawing is on its way.
+	let element = editor.getElementByKey(block.key);
+	let near = useNearViewport(element, block.kind === "mermaid");
 
 	useEffect(() => {
 		// A block that stopped being a diagram must stop showing one. Its
@@ -344,6 +418,7 @@ function Preview(
 			setFailed(undefined);
 			return;
 		}
+		if (block.kind === "mermaid" && !near) return;
 		let cancelled = false;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		if (block.kind === "seecode") setSpec(undefined);
@@ -413,7 +488,7 @@ function Preview(
 			cancelled = true;
 			clearTimeout(timer);
 		};
-	}, [drawn, block.key, block.kind, block.inline, block.source]);
+	}, [drawn, near, block.key, block.kind, block.inline, block.source]);
 
 	/*
 	 * Hiding is applied to the DOM, never to the document: the source is still
@@ -427,7 +502,7 @@ function Preview(
 	 * A layout effect, because opening a block and putting the caret in its
 	 * source happen in one gesture, and a caret cannot land in a hidden box.
 	 *
-	 * Code and diffs swap: their preview is the same text, coloured, so
+	 * Diffs swap: their preview is the same patch, drawn, so
 	 * showing both would put every line on screen twice. A drawing is a
 	 * different reading of its source, and stays above it while it is edited.
 	 */
@@ -462,9 +537,23 @@ function Preview(
 		else delete element.dataset.planText;
 		if (wireframe && editing) element.dataset.planEditing = "";
 		else delete element.dataset.planEditing;
+		/*
+		 * Code is read where it is written, so for someone who cannot put a caret in it the lines
+		 * themselves are the scroll lane a keyboard has to reach, as the drawn copy was. Only then:
+		 * inside an editable root a focusable box would take focus from the caret.
+		 */
+		let source = element.querySelector<HTMLElement>("[data-plan-source]");
+		if (source && block.kind === "code" && (disabled || reading)) {
+			source.tabIndex = 0;
+			source.setAttribute("role", "group");
+			source.setAttribute("aria-label", "Code");
+		} else if (source?.hasAttribute("tabindex")) {
+			source.removeAttribute("tabindex");
+			source.removeAttribute("role");
+			source.removeAttribute("aria-label");
+		}
 	});
 
-	let element = editor.getElementByKey(block.key);
 	let host = element?.querySelector<HTMLElement>("[data-plan-preview]");
 	// A wireframe is chromeless: the caret going in is the way to its source.
 	let chrome = block.kind === "wireframe"
@@ -483,6 +572,9 @@ function Preview(
 	}, [block.key, hidable, onHidable]);
 
 	let title = block.kind !== "diff" ? titleOf(block.meta) : undefined;
+	let phone = usePhone();
+	let wrappable = !disabled && !phone
+		&& (block.kind === "code" || block.kind === "diff" || plainText(block.language));
 
 	// These portals are siblings, so their stable keys also need distinct roles.
 	return (
@@ -515,14 +607,17 @@ function Preview(
 					{
 						// Tab indents code, so the way out has to be said
 						// where someone is typing it. A block with a preview
-						// returns to it on Escape, and Tab leaves from there.
+						// returns to it on Escape, and Tab leaves from there;
+						// any other leaves for the block after it.
 						editing && !disabled && block.kind !== "math" && (
 							<span className="text-xs text-text-tertiary">
-								{hidable ? "Esc to preview" : "Esc then Tab to leave"}
+								{hidable ? "Esc to preview" : "Esc to leave"}
 							</span>
 						)
 					}
+					{wrappable && <Wrap block={block} editor={editor} />}
 					{hidable && !reading && <Toggle collapsed={collapsed} onToggle={onToggle} />}
+					{named && <CopyCode source={block.source} />}
 					{title && <span className="plan-code-title">{title}</span>}
 					{named && <Language block={block} editor={editor} disabled={disabled} />}
 				</div>,
@@ -562,6 +657,24 @@ function sidesOf(element: HTMLElement): ReturnType<typeof hiddenSides> {
 }
 
 /**
+ * The object a block's markup is given to React as. React 19 compares `dangerouslySetInnerHTML` by
+ * identity and sets `innerHTML` again for any other object: the whole drawing is parsed and
+ * replaced, and the editor's mutation observer reads the page's layout, though the markup is the
+ * very string it was. The previews render again on every editor update, so a new object each time
+ * redrew every diagram and formula for every keystroke anywhere in the document.
+ */
+function useInnerHtml(html: string) {
+	return useMemo(() => ({ __html: html }), [html]);
+}
+
+/** A formula, as KaTeX drew it. */
+function Formula({ html, inline }: { html: string; inline: boolean }) {
+	let inner = useInnerHtml(html);
+	if (inline) return <span dangerouslySetInnerHTML={inner} />;
+	return <div contentEditable={false} dangerouslySetInnerHTML={inner} />;
+}
+
+/**
  * A drawn diagram in its own horizontal scroller.
  *
  * Mermaid lays text out at its authored size, so shrinking a wide chart to the
@@ -587,6 +700,16 @@ export function Diagram(
 	let phone = usePhone();
 	let expand = useRef<HTMLButtonElement>(null);
 	let [more, setMore] = useState<ReturnType<typeof hiddenSides>>();
+	let inner = useInnerHtml(html);
+	// The copy's IDs are its own, so its markers and styles never resolve to the drawing in the
+	// document.
+	let sheet = useMemo(
+		() =>
+			expanded
+				? { __html: html.replaceAll(`ace-mermaid-${id}`, `ace-mermaid-${id}-sheet`) }
+				: undefined,
+		[expanded, html, id],
+	);
 
 	useEffect(() => {
 		let element = region.current;
@@ -631,7 +754,7 @@ export function Diagram(
 				// Mermaid draws its labels as HTML. Inside the editable root, a
 				// click would otherwise put a caret in a label and type into it.
 				contentEditable={false}
-				dangerouslySetInnerHTML={{ __html: html }}
+				dangerouslySetInnerHTML={inner}
 			/>
 			{phone && !fit && <ExpandDiagram buttonRef={expand} onExpand={() => setExpanded(true)} />}
 			{!phone && !fit && <FitDiagram fitted={fitted} onToggle={() => setFitted(!fitted)} />}
@@ -643,14 +766,7 @@ export function Diagram(
 						requestAnimationFrame(() => expand.current?.focus());
 					}}
 				>
-					<div
-						className="plan-diagram-sheet-drawing"
-						// The copy's IDs are its own, so its markers and styles
-						// never resolve to the drawing in the document.
-						dangerouslySetInnerHTML={{
-							__html: html.replaceAll(`ace-mermaid-${id}`, `ace-mermaid-${id}-sheet`),
-						}}
-					/>
+					<div className="plan-diagram-sheet-drawing" dangerouslySetInnerHTML={sheet} />
 				</DiagramSheet>
 			)}
 		</>
@@ -714,7 +830,7 @@ function Rendered(
 	if (error) return <div data-plan-error="">{error}</div>;
 	if (!block.source.trim()) return null;
 
-	if (block.kind === "code" || block.kind === "diff") {
+	if (block.kind === "diff") {
 		return (
 			<CodeView
 				kind={block.kind}
@@ -726,19 +842,7 @@ function Rendered(
 	}
 	if (block.kind === "seecode") {
 		if (spec === undefined) return null;
-		return (
-			<div
-				className="plan-seecode"
-				contentEditable={false}
-				role="region"
-				aria-label="Diagram preview"
-				tabIndex={0}
-			>
-				<Suspense fallback={null}>
-					<SeeCodeDiagram spec={spec} idPrefix={block.key} />
-				</Suspense>
-			</div>
-		);
+		return <SeeCodePreview spec={spec} idPrefix={block.key} />;
 	}
 
 	if (!html) return null;
@@ -749,8 +853,7 @@ function Rendered(
 	// Inline math is a span inside a sentence, so what wraps it has to be one
 	// too: a block element here would put a formula somebody wrote mid-clause
 	// on a line of its own, and the rest of the sentence after it.
-	if (block.inline) return <span dangerouslySetInnerHTML={{ __html: html }} />;
-	return <div contentEditable={false} dangerouslySetInnerHTML={{ __html: html }} />;
+	return <Formula html={html} inline={block.inline} />;
 }
 
 /** Asked for with the toggle, or opened by going into the block. */
@@ -1121,7 +1224,13 @@ export function PreviewPlugin() {
 			let node = $getNodeByKey(block.key);
 			let preview = editor.getElementByKey(block.key);
 			if (block.kind === "math") node?.selectNext(0, 0);
-			else $setSelection(null);
+			else {
+				$setSelection(null);
+				// Moving focus to the preview below makes Lexical leave the DOM selection alone on
+				// commit; without clearing it here, a press's pending selectionchange puts the caret
+				// straight back into the source and reopens it.
+				root()?.ownerDocument.getSelection()?.removeAllRanges();
+			}
 			flushSync(() =>
 				setShown(prev => {
 					let next = { ...prev };
@@ -1271,8 +1380,8 @@ export function PreviewPlugin() {
 				KEY_ESCAPE_COMMAND,
 				event => {
 					if (latest.current.disabled) return false;
-					let selection = $getSelection();
-					if (!$isRangeSelection(selection) || !selection.isCollapsed()) return false;
+					let selection = $liveRangeSelection(editor);
+					if (!selection || !selection.isCollapsed()) return false;
 					let key = enclosing(selection.anchor.getNode());
 					let block = key ? blockAt(editor.getElementByKey(key)) : undefined;
 					if (!block || !latest.current.hidable.has(block.key)) return false;
@@ -1349,8 +1458,8 @@ export function PreviewPlugin() {
 		let collapsed = !current.current[key];
 		if (!collapsed) {
 			editor.update(() => {
-				let selection = $getSelection();
-				if (!$isRangeSelection(selection)) return;
+				let selection = $liveRangeSelection(editor);
+				if (!selection) return;
 				if (enclosing(selection.anchor.getNode()) !== key) return;
 				$getNodeByKey(key)?.selectNext(0, 0);
 			});

@@ -1,5 +1,5 @@
 import { Machines } from "../auth/machines";
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test";
 import { mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,11 +10,16 @@ import { decideReplying } from "../conversation-plan/decisions.test-fixtures";
 import { Admission } from "../auth/admission";
 import { Sessions } from "../auth/session";
 import { fullPlanner } from "../harness/atomic/full";
+import { ToolBoundaryError } from "../harness/remote/link";
+import { createHumanInput, PendingInputs } from "../harness/atomic/human-input";
 import { forgetWorkspaces } from "../harness/atomic/workspace";
 import { openPlannerSession } from "../harness/session";
 import * as Plan from "../plan/service";
+import * as Questions from "../questions/service";
+import { member } from "../questions/text-response.test-fixtures";
 import { MemoryStorage } from "../storage/memory/adapter";
 import { configured, LOCAL } from "../testing/config";
+import { expectPlainStatusLines } from "../testing/plain-words";
 import * as Chat from "./service";
 
 import type { Server } from "bun";
@@ -152,7 +157,7 @@ type Seen = {
 	tools: readonly string[];
 };
 
-test("withholds a fragmented Chat question and repairs within the same Planner session", async () => {
+test("streams a fragmented Chat question, then repairs it within the same Planner session", async () => {
 	let { context, events } = await setup();
 	let prompts: string[] = [];
 	let checked: string[] = [];
@@ -187,7 +192,8 @@ test("withholds a fragmented Chat question and repairs within the same Planner s
 	};
 	context.openPlannerSession = async () => ({ ok: true, value: session });
 	await browserTurn(context, "Help me draft a new plan.");
-	expect(events.some(event => JSON.stringify(event).includes("trying to accomplish"))).toBe(false);
+	// The question was shown as it streamed; the check found it after it ended.
+	expect(events.some(event => JSON.stringify(event).includes("trying to accomplish"))).toBe(true);
 	expect(
 		context.chat.entries.filter(entry => entry.author.kind === "agent").map(entry => entry.text),
 	)
@@ -197,8 +203,8 @@ test("withholds a fragmented Chat question and repairs within the same Planner s
 	expect(prompts[1]).toContain("inline decision cards");
 });
 
-test.each(["new", "existing", "unanchored"])(
-	"a rejected reply reports only new durable captures (%s)",
+test.each(["new", "existing", "unanchored", "replayed", "changed", "discarded", "discarded-new"])(
+	"a rejected reply reports only durable captures the turn made or repeated (%s)",
 	async kind => {
 		let { context } = await setup();
 		let options = {
@@ -226,7 +232,18 @@ test.each(["new", "existing", "unanchored"])(
 					blocks: [{ index: block.index, digest: block.digest }],
 				}],
 			}, options);
-		if (kind === "existing") await capture();
+		let discard = async (output: unknown) => {
+			let { decisions } = JSON.parse(output as string);
+			await Questions.discard(context.plan, context.server, context.room, member().ws, {
+				kind: "question:discard",
+				ts: 0,
+				rid: "discard",
+				id: decisions[0].id,
+			});
+		};
+		if (kind === "existing" || kind === "replayed" || kind === "changed") await capture();
+		// A person discarded the card the Planner is about to repeat.
+		if (kind === "discarded") await discard(await capture());
 		context.decide = decideReplying({ input: { type: "noul", noul: 0.19 } });
 		let turns = 0;
 		context.openPlannerSession = async () => ({
@@ -235,7 +252,23 @@ test.each(["new", "existing", "unanchored"])(
 				async destroy() {},
 				async stream() {
 					if (turns++ === 0) {
-						if (kind === "new") await capture();
+						if (kind === "new" || kind === "replayed" || kind === "discarded") await capture();
+						if (kind === "discarded-new") await discard(await capture());
+						if (kind === "changed") {
+							// The same key for another question: the new one must not be lost silently.
+							await documentTools.open_decisions.execute!({
+								revision: context.plan.revision,
+								questions: [{
+									key: "today-value",
+									header: "Useful curation",
+									question: "Which sources should Today draw from?",
+									response: "text",
+									options: [],
+									multiple: false,
+									blocks: [{ index: block.index, digest: block.digest }],
+								}],
+							}, options);
+						}
 						if (kind === "unanchored") {
 							await documentTools.open_decision.execute!({
 								revision: context.plan.revision,
@@ -259,7 +292,24 @@ test.each(["new", "existing", "unanchored"])(
 		if (kind === "new") {
 			expect(entries).toContain("Added 1 inline decision to the document.");
 			expect(entries.some(text => text?.includes("could not move"))).toBe(false);
+		} else if (kind === "replayed") {
+			expect(entries).toContain("1 inline decision is already in the document.");
+			expect(entries.some(text => text?.includes("could not move"))).toBe(false);
+			expect(context.plan.records.size).toBe(1);
 		} else expect(entries.some(text => text?.includes("could not move"))).toBe(true);
+		if (kind === "changed") {
+			expect(entries.some(text => text?.includes("already in the document"))).toBe(false);
+			expect(context.plan.records.size).toBe(1);
+		}
+		if (kind === "discarded" || kind === "discarded-new") {
+			// The person's discard stands: nothing was recreated and nothing live holds the question.
+			expect(entries.some(text => text?.includes("already in the document"))).toBe(false);
+			expect(entries.some(text => text?.startsWith("Added"))).toBe(false);
+			expect([...context.plan.records.values()].map(record => record.status)).toEqual([
+				"discarded",
+			]);
+			expect(context.plan.questions.open.size).toBe(0);
+		}
 	},
 );
 
@@ -400,12 +450,46 @@ test("an invoked instruction persists verbatim as a member message before public
 	}
 });
 
-test("queued invocations post their durable message exactly once", async () => {
+test("an invoking caller is introduced to the room with their picture before their message is posted", async () => {
+	let { context, events, user } = await setup();
+	let finished = Promise.withResolvers<void>();
+	context.openPlannerSession = async () => ({
+		ok: true,
+		value: {
+			async stream() {
+				return {
+					fullStream: (async function*() {
+						await finished.promise;
+						yield { type: "finish" };
+					})(),
+				} as never;
+			},
+			destroy: async () => {},
+		},
+	});
+	try {
+		let caller = { ...user, avatarUrl: "https://avatars.test/u/7" };
+		expect(await Chat.invoke(context, caller, "Plan this.")).toBeUndefined();
+		let kinds = events.map(event => event.kind);
+		expect(kinds.indexOf("session:people")).toBeGreaterThanOrEqual(0);
+		expect(kinds.indexOf("session:people")).toBeLessThan(kinds.indexOf("chat:message"));
+		expect(events.find(event => event.kind === "session:people")).toMatchObject({
+			people: [{ login: "ana", avatarUrl: "https://avatars.test/u/7" }],
+		});
+	} finally {
+		finished.resolve();
+		await context.chat.running;
+	}
+});
+
+test("invocations while a turn runs are given to it and post their durable message exactly once", async () => {
 	let fixture = await setup();
 	let { context, user } = fixture;
 	let first = Promise.withResolvers<void>();
 	let opened = Promise.withResolvers<void>();
 	let prompts: string[] = [];
+	let steered: string[] = [];
+	context.steers = () => true;
 	context.openPlannerSession = async () => ({
 		ok: true,
 		value: {
@@ -419,6 +503,9 @@ test("queued invocations post their durable message exactly once", async () => {
 					})(),
 				} as never;
 			},
+			steer: async text => {
+				steered.push(text);
+			},
 			destroy: async () => {},
 		},
 	});
@@ -427,12 +514,14 @@ test("queued invocations post their durable message exactly once", async () => {
 		await opened.promise;
 		await Chat.invoke(context, user, "Second");
 		await Chat.invoke(context, user, "Second");
-		expect(context.chat.waiting.map(item => item.text)).toEqual(["Second", "Second"]);
+		await until(() => steered.length === 2);
+		expect(context.chat.waiting).toEqual([]);
 		expect(context.chat.entries.map(entry => entry.text)).toEqual(["First", "Second", "Second"]);
 		expect(new Set(context.chat.entries.map(entry => entry.id)).size).toBe(3);
 		first.resolve();
 		await context.chat.running;
-		expect(prompts).toEqual(["@ana: First", "@ana: Second", "@ana: Second"]);
+		expect(prompts).toEqual(["@ana: First"]);
+		expect(steered).toEqual(["@ana: Second", "@ana: Second"]);
 		expect(context.chat.entries.map(entry => entry.text)).toEqual(["First", "Second", "Second"]);
 		expect(context.chat.waiting).toEqual([]);
 		expect(context.chat.busy).toBe(false);
@@ -444,6 +533,13 @@ test("queued invocations post their durable message exactly once", async () => {
 		first.resolve();
 	}
 });
+
+/** Waits for what a detached delivery has yet to do. */
+async function until(done: () => boolean): Promise<void> {
+	for (let deadline = Date.now() + 2_000; !done(); await Bun.sleep(5)) {
+		if (Date.now() > deadline) throw new Error("timed out waiting");
+	}
+}
 
 test("a child document's Planner cannot be invoked, so its Chat stays empty", async () => {
 	let { context, user } = await setup();
@@ -463,18 +559,14 @@ test("an invoked instruction with focus names the child in its turn", async () =
 	expect(seen[0]!.prompt).toContain(`child id ${focus.channelId}`);
 });
 
-test("failed persistence, an unavailable Planner and a full queue start no invoked turn", async () => {
+test("failed persistence, an unavailable Planner and a busy one that takes no message mid-run start no invoked turn", async () => {
 	let { context, events, user } = await setup();
 	context.config.agent = false;
 	expect(await Chat.invoke(context, user, "Review")).toBe("planner-unavailable");
 	context.config.agent = true;
 	context.chat.busy = true;
-	context.chat.waiting = Array.from(
-		{ length: 20 },
-		(_, index) => ({ id: String(index), handle: "ana", text: "Waiting" }),
-	);
-	expect(await Chat.invoke(context, user, "Review")).toBe("planner-queue-full");
-	context.chat.waiting = [];
+	expect(await Chat.invoke(context, user, "Review")).toBe("planner-busy");
+	expect(context.chat.waiting).toEqual([]);
 	context.chat.busy = false;
 	context.persist = async () => {
 		throw new Error("storage failed");
@@ -498,7 +590,13 @@ test("an invocation runs under the channel's existing owner and is attributed to
 	}
 	expect(seen.map(turn => ({ owner: turn.owner, prompt: turn.prompt }))).toEqual([
 		{ owner: owner.id, prompt: "@ana: Review" },
-		{ owner: owner.id, prompt: "@ana: Review" },
+		// The second turn's fresh session is told the first message before its own prompt.
+		{
+			owner: owner.id,
+			prompt: expect.stringMatching(
+				/^A fresh Planner session[\s\S]*@ana: Review\n\nThe conversation so far ends here\. The current turn follows\.\n\n@ana: Review$/,
+			),
+		},
 	]);
 	expect(context.chat.entries.filter(entry => entry.author.kind === "member")).toMatchObject([
 		{ author: { kind: "member", handle: "ana" }, text: "Review" },
@@ -541,10 +639,12 @@ test("the atomic harness verifies a checkout before posting and every later sess
 	await browserTurn(context, "@chopin Continue");
 	expect(await Chat.invoke(context, user, "Again", other)).toBe("checkout-unverified");
 	await browserTurn(context, "@chopin Once more");
-	let offsets = events.filter(event => event.kind === "chat:state" && event.busy)
-		.map(event => (event.turn as Wire.Turn).entryOffset);
+	let busy = events.filter(event => event.kind === "chat:state" && event.busy)
+		.map(event => event.turn as Wire.Turn);
 	// Invoked instructions post first; browser turns reserve their prompt before it is appended.
-	expect(offsets).toEqual([1, 2, 3]);
+	expect(busy.filter(turn => !turn.quiet).map(turn => turn.entryOffset)).toEqual([1, 2, 3]);
+	// Each turn goes quiet once its words are all out, the same turn at the same offset.
+	expect(busy.filter(turn => turn.quiet).map(turn => turn.entryOffset)).toEqual([1, 2, 3]);
 	expect(seen).toHaveLength(3);
 	for (let turn of seen) {
 		expect(turn.full?.cwd).toBe(matching);
@@ -678,7 +778,10 @@ test("a Planner that still owns workflow runs outlives its turn, pauses, resumes
 		return () => holds--;
 	};
 	let ws = { data: { handle: "ana" } } as unknown as Socket;
-	let said = () => context.chat.entries.at(-1)?.text;
+	let said = () => {
+		expectPlainStatusLines(context.chat.entries);
+		return context.chat.entries.at(-1)?.text;
+	};
 	let runs = () => (events.findLast(event => event.kind === "chat:state")?.runs as
 		| Wire.Run[]
 		| undefined);
@@ -694,7 +797,7 @@ test("a Planner that still owns workflow runs outlives its turn, pauses, resumes
 
 	await Chat.abort(context, ws);
 	expect(planner.calls.at(-1)).toBe("pause");
-	expect(said()).toBe("@ana stopped the Planner and paused its workflows.");
+	expect(said()).toBe("@ana stopped chopin and paused its workflows.");
 	planner.set({ active: [], paused: ["run-1"], cards: [card("paused")] });
 	await tick();
 	expect(runs()?.map(run => run.status)).toEqual(["paused"]);
@@ -702,7 +805,7 @@ test("a Planner that still owns workflow runs outlives its turn, pauses, resumes
 
 	await Chat.resume(context, ws);
 	expect(planner.calls.at(-1)).toBe("resume");
-	expect(said()).toBe("@ana resumed the Planner's workflows.");
+	expect(said()).toBe("@ana resumed chopin's workflows.");
 	planner.set({ active: ["run-1"], paused: [], cards: [card("waiting")] });
 	await tick();
 	expect(runs()?.[0]).toMatchObject({
@@ -750,6 +853,330 @@ test("a failed foreground turn aborts late work and releases a Planner with work
 	expect(context.chat.entries.at(-1)?.text).toBe("The reply could not be verified.");
 });
 
+test("a reply that cannot move its questions into decisions fails the turn but keeps the workflow session, its run and its open question past 30 minutes", async () => {
+	let { context, user, backend } = await setup(configured(ATOMIC));
+	let began = Math.floor(Date.now() / 1000);
+	let planner = runningSession({
+		active: ["run-1"],
+		paused: [],
+		cards: [{ ...card("waiting"), started: began, updated: began }],
+	});
+	let withdrawn = new AbortController();
+	let destroy = planner.session.destroy;
+	planner.session.destroy = async () => {
+		withdrawn.abort();
+		await destroy();
+	};
+	let opened = 0;
+	context.decide = decideReplying({ input: { type: "noul", noul: 1 } });
+	context.openPlannerSession = async () => {
+		opened++;
+		return { ok: true, value: planner.session };
+	};
+	try {
+		await Chat.invoke(context, user, "Run the workflow");
+		await context.chat.running;
+		let asked = createHumanInput(Chat.documentRoom(context)).questionnaire({
+			questions: [{
+				header: "Scope",
+				question: "Which scope should the plan cover?",
+				options: [{ label: "Narrow", description: "" }, { label: "Broad", description: "" }],
+			}],
+		}, { signal: withdrawn.signal } as never);
+		let record = () =>
+			[...context.plan.records.values()].find(value => value.status !== "answered");
+		for (let attempt = 0; attempt < 20 && !record(); attempt++) await tick();
+		expect(record()?.status).toBe("open");
+
+		await backend.storage.leases.renew(backend.lease()!, 2 * 3_600_000);
+		setSystemTime(new Date(Date.now() + 31 * 60_000));
+		let stream = planner.session.stream;
+		planner.session.stream = async () =>
+			({
+				fullStream: (async function*() {
+					yield { type: "text-start", id: "reply" };
+					yield { type: "text-delta", id: "reply", text: "Which scope should the plan cover?" };
+					yield { type: "text-end", id: "reply" };
+				})(),
+			}) as never;
+		await Chat.invoke(context, user, "Any news?");
+		await context.chat.running;
+		await tick();
+		let said = () => context.chat.entries.map(entry => entry.text);
+		expect(said().some(text => text.includes("could not move its questions"))).toBe(true);
+		// Both replies were shown as they streamed; the turn says it could not move the question.
+		expect(said().filter(text => text === "Which scope should the plan cover?")).toHaveLength(2);
+		expect(planner.calls).not.toContain("destroy");
+		expect(context.chat.retained).toBeDefined();
+		expect(context.chat.runs?.map(run => run.status)).toEqual(["waiting"]);
+		expect(said().some(text => text.includes("was stopped"))).toBe(false);
+		expect(record()?.status).toBe("open");
+		expect(withdrawn.signal.aborted).toBe(false);
+
+		planner.session.stream = stream;
+		await Chat.invoke(context, user, "Any news now?");
+		await context.chat.running;
+		expect(opened).toBe(1);
+		expect(record()?.status).toBe("open");
+
+		await context.chat.retained?.release();
+		expect((await asked).cancelled).toBe(true);
+		expect(context.chat.runs?.map(run => run.status)).toEqual(["stopped"]);
+		expect(said().filter(text => text === "plan-review was stopped after 31 min.")).toHaveLength(1);
+	} finally {
+		setSystemTime();
+	}
+});
+
+/**
+ * A Planner whose only open work is a question it asked, with no workflow run reported: the
+ * session's own signal ends with the session, as a host tool's does under Atomic.
+ */
+async function askingPlanner(kind: "refused" | "settled" = "refused") {
+	let fixture = await setup(configured(ATOMIC));
+	let { context } = fixture;
+	let inputs = new PendingInputs();
+	let planner = runningSession({ active: [], paused: [], cards: [] });
+	Object.assign(planner.session, { inputs });
+	let withdrawn = new AbortController();
+	let destroy = planner.session.destroy;
+	planner.session.destroy = async () => {
+		withdrawn.abort();
+		await destroy();
+	};
+	let asked: Promise<{ cancelled: boolean }> | undefined;
+	let streams = 0;
+	planner.session.stream = async () => {
+		if (streams++ === 0) {
+			asked = createHumanInput(Chat.documentRoom(context), undefined, undefined, inputs)
+				.questionnaire({
+					questions: [{
+						header: "Scope",
+						question: "Which scope should the plan cover?",
+						options: [{ label: "Narrow", description: "" }, { label: "Broad", description: "" }],
+					}],
+				}, { signal: withdrawn.signal } as never);
+			for (let attempt = 0; attempt < 20 && !context.plan.records.size; attempt++) await tick();
+		}
+		return {
+			fullStream: (async function*() {
+				if (kind === "settled") return;
+				yield { type: "text-start", id: "reply" };
+				yield { type: "text-delta", id: "reply", text: "Which scope should the plan cover?" };
+				yield { type: "text-end", id: "reply" };
+			})(),
+		} as never;
+	};
+	context.decide = decideReplying({ input: { type: "noul", noul: 1 } });
+	context.openPlannerSession = async () => ({ ok: true, value: planner.session });
+	return {
+		...fixture,
+		planner,
+		withdrawn,
+		asked: () => asked!,
+		status: () => [...context.plan.records.values()].map(record => record.status),
+	};
+}
+
+test("a refused reply keeps a Planner that only waits on a question it asked, however long nobody answers, and lets it go once that ends", async () => {
+	let { context, user, backend, planner, withdrawn, asked, status } = await askingPlanner();
+	try {
+		await Chat.invoke(context, user, "Plan it");
+		await context.chat.running;
+		await tick();
+		let said = () => context.chat.entries.map(entry => entry.text);
+		expect(said().some(text => text.includes("could not move its questions"))).toBe(true);
+		// Both replies were shown as they streamed; the turn says it could not move the question.
+		expect(said().filter(text => text === "Which scope should the plan cover?")).toHaveLength(2);
+		expect(planner.calls).not.toContain("destroy");
+		expect(withdrawn.signal.aborted).toBe(false);
+		expect(context.chat.retained).toBeDefined();
+		expect(status()).toEqual(["open"]);
+
+		await backend.storage.leases.renew(backend.lease()!, 2 * 3_600_000);
+		setSystemTime(new Date(Date.now() + 31 * 60_000));
+		await tick();
+		expect(status()).toEqual(["open"]);
+		expect(planner.calls).not.toContain("destroy");
+
+		// Nobody ever answered: the question ends only when its own request is withdrawn.
+		withdrawn.abort();
+		expect((await asked()).cancelled).toBe(true);
+		for (let attempt = 0; attempt < 10 && context.chat.retained; attempt++) await tick();
+		expect(context.chat.retained).toBeUndefined();
+		expect(planner.calls.at(-1)).toBe("destroy");
+	} finally {
+		setSystemTime();
+	}
+});
+
+test("a Planner that ended its turn with a question still open is kept, not only after a refused reply", async () => {
+	let { context, user, planner, withdrawn, status } = await askingPlanner("settled");
+	await Chat.invoke(context, user, "Plan it");
+	await context.chat.running;
+	await tick();
+	expect(planner.calls).not.toContain("destroy");
+	expect(withdrawn.signal.aborted).toBe(false);
+	expect(status()).toEqual(["open"]);
+	expect(context.chat.retained).toBeDefined();
+});
+
+test("an explicit Stop, and the document closing, still end a Planner that waits on a question", async () => {
+	for (let ending of ["stop", "close"] as const) {
+		let { context, user, planner, withdrawn, asked, status } = await askingPlanner();
+		await Chat.invoke(context, user, "Plan it");
+		await context.chat.running;
+		await tick();
+		expect(context.chat.retained).toBeDefined();
+		expect(status()).toEqual(["open"]);
+		if (ending === "stop") {
+			await Chat.abort(context, { data: { handle: "ana" } } as unknown as Socket);
+			expect(context.chat.entries.at(-1)?.text).toBe(
+				"@ana stopped chopin and withdrew its open question.",
+			);
+		} else await Chat.close(context.chat);
+		expect(withdrawn.signal.aborted).toBe(true);
+		expect((await asked()).cancelled).toBe(true);
+		expect(planner.calls).toContain("destroy");
+		expect(context.chat.retained).toBeUndefined();
+		expect(status()).toEqual(["cancelled"]);
+	}
+});
+
+test("an explicit Stop leaves a Planner whose workflows are paused and whose question is open as it was, so the workflows can still resume", async () => {
+	let { context, user, planner, withdrawn, status } = await askingPlanner("settled");
+	let ws = { data: { handle: "ana" } } as unknown as Socket;
+	await Chat.invoke(context, user, "Plan it");
+	await context.chat.running;
+	await tick();
+	expect(status()).toEqual(["open"]);
+	// A run it owns was paused, and untilUnpaused holds its question open with it.
+	planner.set({ active: [], paused: ["run-1"], cards: [card("paused")] });
+	await tick();
+	let spoken = context.chat.entries.length;
+
+	await Chat.abort(context, ws);
+	expect(planner.calls).not.toContain("destroy");
+	expect(withdrawn.signal.aborted).toBe(false);
+	expect(context.chat.retained).toBeDefined();
+	expect(status()).toEqual(["open"]);
+	expect(context.chat.runs?.map(run => run.status)).toEqual(["paused"]);
+	expect(context.chat.entries).toHaveLength(spoken);
+
+	await Chat.resume(context, ws);
+	expect(planner.calls.at(-1)).toBe("resume");
+	expect(context.chat.entries.at(-1)?.text).toBe("@ana resumed chopin's workflows.");
+});
+
+test("a turn the Planner's dropped link ended keeps the session whose client may return, and lets it go for good once the link is given up", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	let began = Math.floor(Date.now() / 1000) - 31 * 60;
+	let planner = runningSession({
+		active: ["run-1"],
+		paused: [],
+		cards: [{ ...card("waiting"), started: began, updated: began }],
+	});
+	let suspended = true;
+	Object.assign(planner.session, { suspended: () => suspended });
+	planner.session.stream = async () => {
+		throw new Error("The machine disconnected during the turn.");
+	};
+	context.openPlannerSession = async () => ({ ok: true, value: planner.session });
+	await Chat.invoke(context, user, "Run the workflow");
+	await context.chat.running;
+	await tick();
+	let said = () => context.chat.entries.map(entry => entry.text);
+	expect(said()).toContain(
+		"The machine's connection dropped during this reply. Its workflows and open questions are kept; ask again once it has reconnected.",
+	);
+	expect(planner.calls).not.toContain("destroy");
+	expect(context.chat.retained).toBeDefined();
+	expect(context.chat.runs?.map(run => run.status)).toEqual(["waiting"]);
+	expect(said().some(text => text.includes("was stopped"))).toBe(false);
+
+	// The client never came back: the link's end reports its runs stopped, and the session goes.
+	suspended = false;
+	let ended = Math.floor(Date.now() / 1000);
+	planner.set({
+		active: [],
+		paused: [],
+		cards: [{ ...card("stopped"), started: began, updated: ended, ended }],
+	});
+	for (let attempt = 0; attempt < 10 && context.chat.retained; attempt++) await tick();
+	expect(context.chat.retained).toBeUndefined();
+	expect(planner.calls.at(-1)).toBe("destroy");
+	expect(context.chat.runs?.map(run => run.status)).toEqual(["stopped"]);
+});
+
+test("a run that outlives a refused reply still ends as finished, never as stopped", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	let began = Math.floor(Date.now() / 1000) - 31 * 60;
+	let planner = runningSession({
+		active: ["run-1"],
+		paused: [],
+		cards: [{ ...card("running"), started: began, updated: began }],
+	});
+	context.decide = decideReplying({ input: { type: "noul", noul: 1 } });
+	context.openPlannerSession = async () => ({ ok: true, value: planner.session });
+	await Chat.invoke(context, user, "Run the workflow");
+	await context.chat.running;
+	planner.session.stream = async () =>
+		({
+			fullStream: (async function*() {
+				yield { type: "text-delta", id: "reply", text: "Tell me which scope you want." };
+			})(),
+		}) as never;
+	await Chat.invoke(context, user, "Any news?");
+	await context.chat.running;
+	expect(context.chat.retained).toBeDefined();
+	let ended = Math.floor(Date.now() / 1000);
+	planner.set({
+		active: [],
+		paused: [],
+		cards: [{ ...card("finished"), started: began, updated: ended, ended }],
+	});
+	for (let attempt = 0; attempt < 10; attempt++) await tick();
+	let said = context.chat.entries.map(entry => entry.text);
+	expect(said).toContain("plan-review finished after 31 min.");
+	expect(said.some(text => text.includes("was stopped"))).toBe(false);
+	expect(context.chat.runs?.map(run => run.status)).toEqual(["finished"]);
+	expect(context.chat.retained).toBeUndefined();
+});
+
+test("an explicit Stop during a reply ends the turn and pauses the workflows, and is not reported as a failed reply", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	let planner = runningSession();
+	context.decide = decideReplying({ input: { type: "noul", noul: 1 } });
+	context.openPlannerSession = async () => ({ ok: true, value: planner.session });
+	let ws = { data: { handle: "ana" } } as unknown as Socket;
+	await Chat.invoke(context, user, "Run the workflow");
+	await context.chat.running;
+	let gate = Promise.withResolvers<void>();
+	let streaming = Promise.withResolvers<AbortSignal>();
+	planner.session.stream = async (_prompt: string, signal?: AbortSignal) => {
+		streaming.resolve(signal!);
+		return {
+			fullStream: (async function*() {
+				yield { type: "text-start", id: "reply" };
+				yield { type: "text-delta", id: "reply", text: "Which scope should the plan cover?" };
+				await gate.promise;
+				yield { type: "text-end", id: "reply" };
+			})(),
+		} as never;
+	};
+	await Chat.invoke(context, user, "Any news?");
+	let signal = await streaming.promise;
+	await Chat.abort(context, ws);
+	gate.resolve();
+	await context.chat.running;
+	expect(signal.aborted).toBe(true);
+	expect(planner.calls).toContain("pause");
+	let said = context.chat.entries.map(entry => entry.text);
+	expect(said).toContain("@ana stopped chopin and paused its workflows.");
+	expect(said.some(text => text.includes("could not"))).toBe(false);
+	expect(said).not.toContain("Which scope should the plan cover?");
+});
+
 test("concurrent Stop requests pause a retained Planner's workflows only once", async () => {
 	let { context, user } = await setup(configured(ATOMIC));
 	let planner = runningSession();
@@ -775,7 +1202,7 @@ test("concurrent Stop requests pause a retained Planner's workflows only once", 
 	expect(callsBeforePauseSettled).toBe(1);
 	expect(
 		context.chat.entries.filter(entry =>
-			entry.text === "@ana stopped the Planner and paused its workflows."
+			entry.text === "@ana stopped chopin and paused its workflows."
 		),
 	).toHaveLength(1);
 });
@@ -787,7 +1214,7 @@ test("Stop ignores active progress and resets for resumed or new workflow runs",
 	let ws = { data: { handle: "ana" } } as unknown as Socket;
 	let notices = () =>
 		context.chat.entries.filter(entry =>
-			entry.text === "@ana stopped the Planner and paused its workflows."
+			entry.text === "@ana stopped chopin and paused its workflows."
 		);
 
 	expect(await Chat.invoke(context, user, "Run the workflow")).toBeUndefined();
@@ -842,8 +1269,8 @@ test("Stop can retry when pausing a retained Planner's workflows fails", async (
 	await Chat.abort(context, ws);
 	expect(planner.calls.filter(call => call === "pause")).toHaveLength(2);
 	expect(context.chat.entries.map(entry => entry.text).slice(-2)).toEqual([
-		"@ana stopped the turn.",
-		"@ana stopped the Planner and paused its workflows.",
+		"@ana asked chopin to stop, but its workflows could not be paused.",
+		"@ana stopped chopin and paused its workflows.",
 	]);
 });
 
@@ -1675,7 +2102,7 @@ test("a focused member turn names the child before the member's words", async ()
 		.toBe("shorten the summary");
 });
 
-test("a focused message queued behind a busy turn still names the child when it drains", async () => {
+test("a focused message given to a running turn still names the child", async () => {
 	let { context } = await setup();
 	let child = "0f5b2c1e-8d3a-4b6f-9a21-7c4e5d6f7a8b";
 	context.children = {
@@ -1688,6 +2115,8 @@ test("a focused message queued behind a busy turn still names the child when it 
 	let first = Promise.withResolvers<void>();
 	let opened = Promise.withResolvers<void>();
 	let prompts: string[] = [];
+	let steered: string[] = [];
+	context.steers = () => true;
 	context.openPlannerSession = async () => ({
 		ok: true,
 		value: {
@@ -1696,10 +2125,13 @@ test("a focused message queued behind a busy turn still names the child when it 
 				opened.resolve();
 				return {
 					fullStream: (async function*() {
-						if (prompts.length === 1) await first.promise;
+						await first.promise;
 						yield { type: "finish" };
 					})(),
 				} as never;
+			},
+			steer: async text => {
+				steered.push(text);
 			},
 			destroy: async () => {},
 		},
@@ -1718,12 +2150,177 @@ test("a focused message queued behind a busy turn still names the child when it 
 	await send("@chopin first");
 	await opened.promise;
 	await send("@chopin shorten the summary", child);
-	expect(context.chat.waiting).toHaveLength(1);
+	await until(() => steered.length === 1);
+	expect(context.chat.waiting).toHaveLength(0);
 	first.resolve();
 	await context.chat.running;
-	expect(prompts).toHaveLength(2);
+	expect(prompts).toHaveLength(1);
 	expect(prompts[0]).not.toContain(child);
-	let drained = prompts[1]!;
-	expect(drained.indexOf(`child id ${child}`)).toBeGreaterThanOrEqual(0);
-	expect(drained.indexOf(`child id ${child}`)).toBeLessThan(drained.indexOf("shorten the summary"));
+	let given = steered[0]!;
+	expect(given.indexOf(`child id ${child}`)).toBeGreaterThanOrEqual(0);
+	expect(given.indexOf(`child id ${child}`)).toBeLessThan(given.indexOf("shorten the summary"));
+});
+
+function failingMemberTurn(
+	context: Chat.Room,
+	stream: (prompt: string) => Promise<never> | AsyncGenerator<unknown>,
+) {
+	let planner = runningSession();
+	planner.session.stream = (async (prompt: string) => {
+		let made = stream(prompt);
+		return made instanceof Promise ? made : { fullStream: made };
+	}) as never;
+	context.openPlannerSession = async () => ({ ok: true, value: planner.session });
+	return planner;
+}
+
+test("a failed turn's notice says why it ended, for the member message and child that began it, and keeps saying so after a restore", async () => {
+	let { context, backend } = await setup(configured(ATOMIC));
+	let child = "0f5b2c1e-8d3a-4b6f-9a21-7c4e5d6f7a8b";
+	context.children = {
+		list: async () => [],
+		resolve: async id => id === child ? { id, title: "Source review", createdAt: "" } : undefined,
+		open: async () => {
+			throw new Error("not used");
+		},
+	};
+	failingMemberTurn(context, async () => {
+		throw new Error("429 Too Many Requests");
+	});
+	let ws = { data: { handle: "ana", principalId: "U_ana" }, send() {} } as unknown as Socket;
+	let requestId = crypto.randomUUID();
+	await Chat.send(context, ws, {
+		kind: "chat:send",
+		rid: "send",
+		requestId,
+		to: "planner",
+		text: "@chopin shorten the summary",
+		focus: child,
+		ts: 0,
+	} as never);
+	await context.chat.running;
+	let notice = context.chat.entries.at(-1)!;
+	expect(notice.text).toBe("429 Too Many Requests");
+	expect(notice.turnFailure).toEqual({
+		kind: "error",
+		detail: "429 Too Many Requests",
+		request: requestId,
+		focus: child,
+	});
+
+	await context.persist();
+	let reopened = await Plan.open(context.room, backend, context.server);
+	try {
+		expect(reopened.chat.entries.at(-1)?.turnFailure).toEqual(notice.turnFailure);
+	} finally {
+		await Plan.close(reopened);
+	}
+});
+
+test("a turn the Planner's link dropped under says dropped, which a client leaves to the connection to tell", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	let planner = failingMemberTurn(context, async () => {
+		throw new Error("The machine disconnected during the turn.");
+	});
+	Object.assign(planner.session, { suspended: () => true });
+	await Chat.invoke(context, user, "Run the workflow");
+	await context.chat.running;
+	let notice = context.chat.entries.at(-1)!;
+	expect(notice.text).toContain("connection dropped during this reply");
+	expect(notice.turnFailure?.kind).toBe("dropped");
+});
+
+test("a tool that failed inside a turn that went on is no failure of the turn", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	failingMemberTurn(context, async function*() {
+		yield { type: "tool-call", toolCallId: "t1", toolName: "read_plan", input: {} };
+		yield { type: "tool-error", toolCallId: "t1", toolName: "read_plan", error: new Error("no") };
+		yield { type: "finish" };
+	} as never);
+	await Chat.invoke(context, user, "Read it");
+	await context.chat.running;
+	expect(context.chat.entries.filter(entry => entry.turnFailure)).toEqual([]);
+});
+
+test("a tool the turn was refused ends it as refused, once, whatever else ends with it", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	failingMemberTurn(context, async function*() {
+		yield { type: "tool-approval-request", approvalId: "a1", toolCall: { toolName: "bash" } };
+		await new Promise(resolve => setTimeout(resolve, 20));
+	} as never);
+	await Chat.invoke(context, user, "Run a command");
+	await context.chat.running;
+	let refused = context.chat.entries.filter(entry => entry.turnFailure);
+	expect(refused.map(entry => entry.turnFailure?.kind)).toEqual(["refused"]);
+	expect(refused[0]!.text).toBe("Chopin's tool approval was denied.");
+});
+
+test("a tool the remote Planner used without declaring it ends the turn as a tool failure, with no boundary words in what the room is told", async () => {
+	for (
+		let ending of [
+			async function*() {
+				yield {
+					type: "error",
+					error: new ToolBoundaryError("Chopin's tool boundary failure: bash"),
+				};
+			},
+			async () => {
+				throw new ToolBoundaryError("Chopin's tool boundary failure: bash");
+			},
+		]
+	) {
+		let { context, user } = await setup(configured(ATOMIC));
+		failingMemberTurn(context, ending as never);
+		await Chat.invoke(context, user, "Run a command");
+		await context.chat.running;
+		let failed = context.chat.entries.filter(entry => entry.turnFailure);
+		expect(failed.map(entry => entry.turnFailure?.kind)).toEqual(["tool"]);
+		expect(failed[0]!.turnFailure?.detail).toBeUndefined();
+		expect(failed[0]!.text).not.toMatch(/boundary|Chopin's tool/i);
+		expect(failed[0]!.text).toBe("The reply stopped: a tool it needed isn't available.");
+	}
+});
+
+test("an error the model's stream reports ends the turn with the words it gave, in one entry, not Chopin's own generic line", async () => {
+	let { context, user } = await setup(configured(ATOMIC));
+	failingMemberTurn(context, async function*() {
+		yield { type: "text-delta", id: "m", text: "Which" };
+		yield { type: "error", error: new Error("429 Too Many Requests") };
+	} as never);
+	await Chat.invoke(context, user, "Shorten the summary");
+	await context.chat.running;
+	let failed = context.chat.entries.filter(entry => entry.turnFailure);
+	expect(failed).toHaveLength(1);
+	expect(failed[0]!.text).toBe("429 Too Many Requests");
+	expect(failed[0]!.turnFailure).toMatchObject({ kind: "error", detail: "429 Too Many Requests" });
+});
+
+test("a stream that timed out ends the turn as timed out, however the harness names it, with none of its words", async () => {
+	let timeout = new Error("The operation was aborted due to timeout");
+	timeout.name = "TimeoutError";
+	let { context, user } = await setup(configured(ATOMIC));
+	failingMemberTurn(context, async function*() {
+		yield { type: "error", error: timeout };
+	} as never);
+	await Chat.invoke(context, user, "Shorten the summary");
+	await context.chat.running;
+	let failed = context.chat.entries.filter(entry => entry.turnFailure);
+	expect(failed.map(entry => entry.turnFailure?.kind)).toEqual(["timed-out"]);
+	expect(failed[0]!.turnFailure?.detail).toBeUndefined();
+});
+
+test("a stream that stopped without saying why is a failed reply with no words repeating the banner's own", async () => {
+	for (let part of [{ type: "abort" }, { type: "error", error: undefined }]) {
+		let { context, user } = await setup(configured(ATOMIC));
+		failingMemberTurn(context, async function*() {
+			yield part;
+		} as never);
+		await Chat.invoke(context, user, "Shorten the summary");
+		await context.chat.running;
+		let failed = context.chat.entries.filter(entry => entry.turnFailure);
+		expect(failed).toHaveLength(1);
+		expect(failed[0]!.turnFailure?.kind).toBe("error");
+		expect(failed[0]!.turnFailure?.detail).toBeUndefined();
+		expect(failed[0]!.text).toBe("chopin's reply failed. Try again.");
+	}
 });

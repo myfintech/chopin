@@ -12,12 +12,15 @@
 
 import { createHash, randomBytes } from "node:crypto";
 
+import { ownOrigin } from "../../auth/config";
 import { MachineError } from "../../auth/machines";
+import { documentUrl } from "../../channels/document-url";
 import { GitHubTokenError } from "../../github/client";
 import { locateDocument } from "../../mcp/hosted";
 
 import type { HostedAuth } from "../../auth/routes";
-import type { StoredMachine } from "../../storage/model";
+import type { Repository } from "../../github/client";
+import type { ChannelRecord, StoredMachine } from "../../storage/model";
 
 /** How long a Planner credential can open a link; an open link no longer depends on it. */
 export const PLANNER_CREDENTIAL_MS = 15 * 60_000;
@@ -28,18 +31,15 @@ export type MachinePlannerAuth =
 	& Pick<HostedAuth, "config" | "machines" | "sessions" | "storage" | "github">
 	& { clock?: () => Date };
 
-type Issued = { machineId: string; channelId: string; expiresAt: number };
-
 /** What a redeemed credential lets a link do: be `machine`'s Planner for one document. */
 export type MachineGrant = { machine: StoredMachine; channelId: string };
 
-function digest(token: string): string {
-	return createHash("sha256").update(token).digest("base64url");
+function digest(token: string): Uint8Array {
+	return new Uint8Array(createHash("sha256").update(token).digest());
 }
 
 export class MachinePlanners {
 	#auth: MachinePlannerAuth;
-	#issued = new Map<string, Issued>();
 	/** The login each machine's links attach through now, while it is created or once it is. */
 	#logins = new Map<string, Promise<string>>();
 	/** Every login created for each machine that may still be live, all ended with the machine. */
@@ -54,20 +54,25 @@ export class MachinePlanners {
 		return (this.#auth.clock ?? (() => new Date()))().getTime();
 	}
 
-	/** Forgets every credential that can no longer open a link. */
-	#prune(now: number): void {
-		for (let [key, issued] of this.#issued) {
-			if (issued.expiresAt <= now) this.#issued.delete(key);
-		}
-	}
-
-	/** A credential for `machine` to attach as `channelId`'s Planner; only its hash is kept. */
-	issue(machine: StoredMachine, channelId: string): { token: string; expiresAt: number } {
+	/**
+	 * A credential for `machine` to attach as `channelId`'s Planner. Only its digest is kept, in
+	 * storage and written before the credential is handed out, so a process that starts after a
+	 * restart accepts it while it lasts.
+	 */
+	async issue(
+		machine: StoredMachine,
+		channelId: string,
+	): Promise<{ token: string; expiresAt: number }> {
 		let now = this.#now();
-		this.#prune(now);
+		await this.#auth.storage.plannerCredentials.deleteExpired(new Date(now));
 		let token = PREFIX + randomBytes(32).toString("base64url");
 		let expiresAt = now + PLANNER_CREDENTIAL_MS;
-		this.#issued.set(digest(token), { machineId: machine.id, channelId, expiresAt });
+		await this.#auth.storage.plannerCredentials.put({
+			digest: digest(token),
+			machineId: machine.id,
+			channelId,
+			expiresAt: new Date(expiresAt),
+		});
 		return { token, expiresAt };
 	}
 
@@ -75,12 +80,8 @@ export class MachinePlanners {
 	 * Forgets every credential `machineId` holds for `channelId`, so a backend Chopin stopped there
 	 * cannot attach again with one; the machine's next credential request is answered as usual.
 	 */
-	withdraw(machineId: string, channelId: string): void {
-		for (let [key, issued] of this.#issued) {
-			if (issued.machineId === machineId && issued.channelId === channelId) {
-				this.#issued.delete(key);
-			}
-		}
+	async withdraw(machineId: string, channelId: string): Promise<void> {
+		await this.#auth.storage.plannerCredentials.deleteForMachine(machineId, channelId);
 	}
 
 	/** Whether a bearer is shaped as a Planner credential rather than a GitHub token. */
@@ -93,8 +94,9 @@ export class MachinePlanners {
 	 * expires a credential may open links again, so a backend can reattach after a dropped socket.
 	 */
 	async redeem(token: string): Promise<MachineGrant | undefined> {
-		this.#prune(this.#now());
-		let issued = TOKEN.test(token) ? this.#issued.get(digest(token)) : undefined;
+		let issued = TOKEN.test(token)
+			? await this.#auth.storage.plannerCredentials.find(digest(token), new Date(this.#now()))
+			: undefined;
 		if (!issued) return undefined;
 		let machine = await this.current({ id: issued.machineId } as StoredMachine);
 		return { machine, channelId: issued.channelId };
@@ -108,6 +110,45 @@ export class MachinePlanners {
 		let stored = await this.#auth.machines.current(machine.id);
 		await this.#auth.machines.access(stored);
 		return stored;
+	}
+
+	/**
+	 * The document of a credential's grant, `channelId`, when `locator` names it by its id or its
+	 * address now, read without asking GitHub for the repository again: its access comes from the
+	 * machine token's installations, which are held a while (`repositoryAccess`), and must be the
+	 * stored repository's, readable. Undefined when `locator` names it no other way it could be told
+	 * without GitHub, so the caller locates it as before; "forbidden" when the machine can't read it.
+	 */
+	async granted(
+		machine: StoredMachine,
+		channelId: string,
+		locator: string,
+	): Promise<{ channel: ChannelRecord; repository: Repository } | "forbidden" | undefined> {
+		let channel = await this.#auth.storage.channels.get(channelId);
+		if (!channel) return undefined;
+		if (locator !== channel.id) {
+			let asked: URL;
+			try {
+				asked = new URL(locator, this.#auth.config.origin);
+			} catch {
+				return undefined;
+			}
+			if (!ownOrigin(this.#auth.config, asked.origin)) return undefined;
+			let address = new URL(
+				await documentUrl(channel, this.#auth.storage.channels),
+				this.#auth.config.origin,
+			);
+			if (asked.pathname.toLowerCase() !== address.pathname.toLowerCase()) return undefined;
+		}
+		let repository = await this.#auth.machines.use(
+			machine,
+			token =>
+				this.#auth.github.repositoryAccess(token, channel.repositoryOwner, channel.repositoryName),
+		);
+		if (!repository?.permissions.pull || repository.id !== channel.repositoryId) {
+			return "forbidden";
+		}
+		return { channel, repository };
 	}
 
 	/** The document a locator names, read with the machine's own GitHub token. */
@@ -163,11 +204,13 @@ export class MachinePlanners {
 
 	/** A revoked or unauthorized machine's credentials and every login it holds end now. */
 	async #ended(machineId: string): Promise<void> {
-		for (let [key, issued] of this.#issued) {
-			if (issued.machineId === machineId) this.#issued.delete(key);
-		}
 		let current = this.#logins.get(machineId);
 		this.#logins.delete(machineId);
+		try {
+			await this.#auth.storage.plannerCredentials.deleteForMachine(machineId);
+		} catch (error) {
+			console.error("[agent] withdrawing an ended machine's Planner credentials failed:", error);
+		}
 		await current?.catch(() => undefined);
 		let delegated = this.#delegated.get(machineId) ?? new Set<string>();
 		this.#delegated.delete(machineId);

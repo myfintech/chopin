@@ -8,7 +8,10 @@ import plannerStop from "../assets/icons/planner-stop.svg";
 
 import { settledStages } from "@chopin/protocol/run-stages";
 
+import "./run-row.css";
+
 import type { Chat as Wire } from "@chopin/protocol";
+import type { BuildRun } from "../build-model";
 
 const SHOWN_STAGES = 6;
 const SHOWN_RUNS = 3;
@@ -34,6 +37,52 @@ const STAGE: Record<Wire.RunStage["status"], string> = {
 	skipped: "skipped",
 	stopped: "stopped",
 };
+
+/**
+ * What a run card's status reads. A disconnected Planner's live runs keep the status they last
+ * reported, but say the Planner is away: nothing is running now, and nothing has ended. While the
+ * page's connection banner shows, the card says nothing of the machine and reads as last reported.
+ */
+export function runStatusLabel(run: Wire.Run, offline = false): string {
+	return run.disconnected && !offline ? "disconnected" : STATUS[run.status];
+}
+
+/**
+ * What a disconnected run's card says it last reported, and what happens once its machine is back.
+ * It is text about the machine's connection, so a run waiting on Decisions says it waits for people.
+ */
+export function disconnectedNote(run: Wire.Run): string {
+	let then = `Last reported ${
+		run.status === "waiting" ? "waiting for people" : STATUS[run.status]
+	}. `;
+	return run.status === "paused"
+		? `${then}Resume it once the machine reconnects.`
+		: run.status === "waiting"
+		? `${then}Answers reach it when the machine reconnects.`
+		: `${then}It carries on when the machine reconnects.`;
+}
+
+/**
+ * Pause while a run is live, Resume while it is paused. A Planner that is away cannot take a
+ * Resume, which Chopin refuses rather than keeps, so a paused run offers none until it returns.
+ */
+export function runControlKind(run: Wire.Run): "pause" | "resume" | undefined {
+	if (run.status === "running" || run.status === "waiting") return "pause";
+	return run.status === "paused" && !run.disconnected ? "resume" : undefined;
+}
+
+/**
+ * How many runs are still live, and how many are paused and can be resumed now. Stop reaches the
+ * live runs of a disconnected Planner, which holds it for its return; a Resume it cannot hold,
+ * so its paused runs are not counted as resumable.
+ */
+export function runCounts(runs: Wire.Runs | undefined): { active: number; paused: number } {
+	let list = runs ?? [];
+	return {
+		active: list.filter(run => run.status === "running" || run.status === "waiting").length,
+		paused: list.filter(run => runControlKind(run) === "resume").length,
+	};
+}
 
 /** Waiting runs first, then running, paused, and ended; newest first within each. */
 const GROUP: Record<Wire.Run["status"], number> = {
@@ -183,11 +232,20 @@ function RunPulse() {
 }
 
 /** A hollow ring for work that is pending, paused, or was stopped. */
-function RunRing() {
-	return <span aria-hidden="true" className="run-ring" />;
+function RunRing({ told }: { told?: boolean }) {
+	return (
+		<span
+			aria-hidden="true"
+			className="run-ring"
+			{...(told ? { "data-run-disconnected": "" } : {})}
+		/>
+	);
 }
 
-function RunGlyph({ status }: { status: Wire.Run["status"] }) {
+function RunGlyph(
+	{ away, told, status }: { away: boolean; told: boolean; status: Wire.Run["status"] },
+) {
+	if (away && status !== "waiting") return <RunRing told={told} />;
 	if (status === "running") return <RunPulse />;
 	if (status === "waiting") {
 		return <WarningIcon aria-hidden="true" className="text-warning-ink" size={16} />;
@@ -201,8 +259,10 @@ function RunGlyph({ status }: { status: Wire.Run["status"] }) {
 	return <RunRing />;
 }
 
-function StageGlyph({ status }: { status: Wire.RunStage["status"] }) {
-	if (status === "running") return <RunPulse />;
+function StageGlyph(
+	{ away, told, status }: { away: boolean; told: boolean; status: Wire.RunStage["status"] },
+) {
+	if (status === "running") return away ? <RunRing told={told} /> : <RunPulse />;
 	if (status === "completed") {
 		return <CheckIcon aria-hidden="true" className="text-success-ink" size={16} />;
 	}
@@ -221,18 +281,27 @@ type RunControls = {
 	onShowDecisions?: () => void;
 	onPause?: (runId: string) => void;
 	onResume?: (runId: string) => void;
+	/** The page's connection banner is showing, the one thing said about the connection. */
+	offline?: boolean;
 };
 
 function RunRow(
-	{ run, tag, open, onToggle, loadStages, onShowDecisions, onPause, onResume }: RunControls & {
-		run: Wire.Run;
-		/** Tells apart runs of the same workflow. */
-		tag?: string;
-		open: boolean;
-		onToggle: () => void;
-	},
+	{ run, tag, open, onToggle, loadStages, onShowDecisions, onPause, onResume, offline }:
+		& RunControls
+		& {
+			run: Wire.Run;
+			/** Tells apart runs of the same workflow. */
+			tag?: string;
+			open: boolean;
+			onToggle: () => void;
+		},
 ) {
-	let live = run.status === "running" || run.status === "waiting";
+	let away = !!run.disconnected;
+	// The machine's state is told only while the page can hear it: through a lost connection the
+	// last frame is all there is, and the connection banner is the one thing said about the connection.
+	let told = away && !offline;
+	// A disconnected run's clock stays at its last report, as a paused run's does.
+	let live = (run.status === "running" || run.status === "waiting") && !away;
 	let now = useNow(live);
 	let [expanded, setExpanded] = useState(false);
 	let unfolded = open && expanded && stageWindow(run, false).earlier > 0;
@@ -243,41 +312,45 @@ function RunRow(
 	let stagesId = `run-stages-${run.id}`;
 	let listId = `run-stage-list-${run.id}`;
 	let title = tag ? `${run.name} ${tag}` : run.name;
-	let control = live && onPause
-		? { label: `Pause ${title}`, icon: plannerStop, act: () => onPause(run.id), kind: "pause" }
-		: run.status === "paused" && onResume
+	let kind = runControlKind(run);
+	// A Pause is held for the Planner's return, and the control says so.
+	let control = kind === "pause" && onPause
 		? {
-			label: `Resume ${title}`,
-			icon: plannerResume,
-			act: () => onResume(run.id),
-			kind: "resume",
+			label: told ? `Pause ${title} when the machine reconnects` : `Pause ${title}`,
+			icon: plannerStop,
+			act: () => onPause(run.id),
+			kind,
 		}
+		: kind === "resume" && onResume
+		? { label: `Resume ${title}`, icon: plannerResume, act: () => onResume(run.id), kind }
 		: undefined;
 
 	return (
 		<li className="run-row" data-run-status={run.status}>
-			<div className="flex min-w-0 items-center gap-1">
+			<div className="run-head flex min-w-0 items-center gap-1">
 				<button
 					aria-controls={stagesId}
 					aria-expanded={open}
-					aria-label={`${title}, ${STATUS[run.status]}, ${elapsed(end - run.started)}`}
+					aria-label={`${title}, ${
+						told ? `disconnected, was ${STATUS[run.status]}` : STATUS[run.status]
+					}, ${elapsed(end - run.started)}`}
 					className="run-toggle"
 					data-run-toggle=""
 					onClick={onToggle}
 					type="button"
 				>
-					<RunGlyph status={run.status} />
+					<RunGlyph away={away} told={told} status={run.status} />
 					<span className="min-w-0 truncate font-mono text-text-secondary">{run.name}</span>
 					{tag && (
 						<span className="shrink-0 font-mono text-text-quaternary tabular-nums">{tag}</span>
 					)}
 					<span
-						aria-live="polite"
+						aria-live={away && offline ? "off" : "polite"}
 						className={`shrink-0 ${
-							run.status === "waiting" ? "text-warning-ink" : "text-text-tertiary"
+							run.status === "waiting" && !away ? "text-warning-ink" : "text-text-tertiary"
 						}`}
 					>
-						{STATUS[run.status]}
+						{runStatusLabel(run, offline)}
 					</span>
 					<span className="ml-auto shrink-0 text-text-quaternary tabular-nums">
 						{elapsed(end - run.started)}
@@ -303,6 +376,11 @@ function RunRow(
 			</div>
 			{open && (
 				<div className="pb-1 pl-[22px]" id={stagesId}>
+					{told && (
+						<p className="pb-1 text-text-tertiary" data-run-disconnected-note="">
+							{disconnectedNote(run)}
+						</p>
+					)}
 					{earlier > 0 && (
 						<button
 							aria-controls={listId}
@@ -354,7 +432,7 @@ function RunRow(
 								data-run-stage={stage.status}
 								key={stage.id}
 							>
-								<StageGlyph status={stage.status} />
+								<StageGlyph away={away} told={told} status={stage.status} />
 								{stage.kind === "tool" && (
 									<WrenchIcon
 										aria-hidden="true"
@@ -397,11 +475,114 @@ function RunRow(
 	);
 }
 
-export function RunStack(
-	{ runs, loadStages, onShowDecisions, onPause, onResume }: RunControls & {
-		runs: readonly Wire.Run[];
+/** `#12` for a pull request link, else nothing. */
+function pullNumber(url: string): string | undefined {
+	return url.match(/\/pull\/(\d+)(?:[/?#]|$)/)?.[1];
+}
+
+/**
+ * The document's running build, at the head of the strip: what it is on, what its agent is doing,
+ * and the pull requests it has opened, with the way into Build. It goes when the build ends; Chat's
+ * line about how it ended stays.
+ */
+function BuildRunRow(
+	{ build, open, onToggle, onShowBuild }: {
+		build: BuildRun;
+		open: boolean;
+		onToggle: () => void;
+		onShowBuild?: () => void;
 	},
 ) {
+	let now = useNow(true);
+	let started = Date.parse(build.started) / 1000;
+	let since = elapsed(now - (Number.isFinite(started) ? started : now));
+	let title = build.kind === "rebuild" ? "Building changes" : "Build";
+	let status = build.state === "queued"
+		? "queued"
+		: build.kind === "rebuild" || !build.total
+		? "running"
+		: `${build.done} of ${build.total} tasks`;
+	let detailId = `build-run-${build.id}`;
+	let links = build.pullRequests.flatMap(url => {
+		let number = pullNumber(url);
+		return number ? [{ url, number }] : [];
+	});
+	return (
+		<li className="run-row" data-build-run={build.state} data-run-status="running">
+			<div className="run-head flex min-w-0 items-center gap-1">
+				<button
+					aria-controls={detailId}
+					aria-expanded={open}
+					aria-label={`${title}, ${status}, ${since}`}
+					className="run-toggle"
+					data-run-toggle=""
+					onClick={onToggle}
+					type="button"
+				>
+					{build.state === "queued" ? <RunRing /> : <RunPulse />}
+					<span className="min-w-0 truncate text-text-secondary">{title}</span>
+					<span aria-live="polite" className="shrink-0 text-text-tertiary tabular-nums">
+						{status}
+					</span>
+					<span className="ml-auto shrink-0 text-text-quaternary tabular-nums">{since}</span>
+					<ChevronIcon
+						aria-hidden="true"
+						className="run-chevron shrink-0 text-text-quaternary"
+						size={16}
+					/>
+				</button>
+			</div>
+			{open && (
+				<div className="flex min-w-0 flex-col pb-1 pl-[22px]" id={detailId}>
+					{build.task && (
+						<p className="truncate text-text-secondary" data-build-run-task="">{build.task}</p>
+					)}
+					{build.activity && (
+						<p className="truncate text-text-tertiary" data-build-run-activity="">
+							{build.activity}
+						</p>
+					)}
+					<div className="flex min-w-0 flex-wrap items-center gap-x-2">
+						{links.map(link => (
+							<a
+								aria-label={`Pull request #${link.number}`}
+								className="link tabular-nums"
+								href={link.url}
+								key={link.url}
+								rel="noreferrer"
+								target="_blank"
+							>
+								#{link.number}
+							</a>
+						))}
+						{onShowBuild && (
+							<button
+								className="btn btn-sm btn-ghost -ml-2 text-text-tertiary"
+								data-build-run-open=""
+								onClick={onShowBuild}
+								type="button"
+							>
+								Open Build
+							</button>
+						)}
+					</div>
+				</div>
+			)}
+		</li>
+	);
+}
+
+export function RunStack(
+	{ runs, build, onShowBuild, loadStages, onShowDecisions, onPause, onResume, offline }:
+		& RunControls
+		& {
+			runs: readonly Wire.Run[];
+			/** The document's running build, shown first; absent when none runs. */
+			build?: BuildRun;
+			onShowBuild?: () => void;
+		},
+) {
+	let [buildOpen, setBuildOpen] = useState(true);
 	let [chosen, setChosen] = useState<ReadonlyMap<string, boolean>>(new Map());
 	let [showAll, setShowAll] = useState(false);
 	let ordered = orderRuns(runs);
@@ -414,16 +595,27 @@ export function RunStack(
 	return (
 		<section
 			aria-label="Workflow runs"
-			className="rounded-lg bg-page px-3 text-sm ring-hairline"
+			className="run-stack rounded-lg bg-page px-3 text-sm ring-hairline"
 			data-run-stack=""
 		>
 			<ol className="flex flex-col">
+				{build && (
+					<BuildRunRow
+						build={build}
+						onShowBuild={onShowBuild}
+						onToggle={() => setBuildOpen(open => !open)}
+						open={buildOpen}
+					/>
+				)}
 				{shown.map(run => {
-					let open = chosen.get(run.id) ?? run.id === fallback;
+					// Beside a build, whose details are unfolded, only a run waiting on people unfolds itself.
+					let first = run.id === fallback && (!build || run.status === "waiting");
+					let open = chosen.get(run.id) ?? first;
 					return (
 						<RunRow
 							key={run.id}
 							loadStages={loadStages}
+							offline={offline}
 							onPause={onPause}
 							onResume={onResume}
 							onShowDecisions={onShowDecisions}

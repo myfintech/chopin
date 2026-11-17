@@ -12,6 +12,7 @@ export const PLANNER_TOOL_NAMES = [
 	"list_background_jobs",
 	"read_background_job",
 	"create_research_workspace",
+	"upload_plan_image",
 	"edit_plan",
 	"open_decision",
 	"open_decisions",
@@ -60,6 +61,8 @@ export const BACKGROUND_TOOL_NAMES: Readonly<Record<ConversationPlan.JobKind, re
 	});
 
 export const HEADING_TOOL_NAMES = BACKGROUND_TOOL_NAMES.heading;
+
+export const REACTION_TOOL_NAMES: readonly string[] = Object.freeze([]);
 
 // Extensions are Planner-only; background job profiles keep upstream's tool set.
 PLANNER_TOOL_NAMES.push(...extensionToolNames(PLANNER_TOOL_NAMES));

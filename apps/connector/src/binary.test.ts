@@ -7,6 +7,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { compiledChopin } from "./testing/binary";
+import { answerTokens } from "./testing/github-grant";
 import { git } from "./workspace";
 
 let scratch = await mkdtemp(join(tmpdir(), "chopin-binary-"));
@@ -29,6 +30,44 @@ async function checkout() {
 	git(root, "commit", "-m", "fixture");
 	return root;
 }
+
+/** Whether MXC ships an executor for this system and architecture, so the binary carries one. */
+let hasExecutor = (["linux", "win32"].includes(process.platform)
+	|| process.platform === "darwin" && process.arch === "arm64")
+	&& (process.arch === "x64" || process.arch === "arm64");
+
+test.skipIf(!binary || !hasExecutor)(
+	"the compiled binary carries MXC's executor, writes it out once and runs its sandbox probe with it",
+	async () => {
+		let directory = await mkdtemp(join(scratch, "state-"));
+		let status = () => {
+			let result = Bun.spawnSync([binary!, "status", "--json"], {
+				env: {
+					...process.env,
+					CHOPIN_CONNECTOR_STATE_DIR: directory,
+					CHOPIN_URL: "http://127.0.0.1:9",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(result.stderr.toString()).toBe("");
+			return JSON.parse(result.stdout.toString()) as {
+				sandbox: { engine: string; reason?: string };
+			};
+		};
+		let report = status().sandbox;
+		// Whatever this machine lacks, the binary had the executor to try: it is never "no executor".
+		if (report.engine === "none") expect(report.reason).not.toContain("no MXC executor");
+		else expect(["seatbelt", "bubblewrap", "processcontainer"]).toContain(report.engine);
+		let written = [...new Bun.Glob("*/*").scanSync({ cwd: join(directory, "sandbox") })];
+		expect(written).toHaveLength(1);
+		expect(written[0]).toMatch(/^[0-9a-f]{16}\/(lxc-exec|mxc-exec-mac|wxc-exec\.exe)$/);
+		// The second run finds it where it was written.
+		let again = status().sandbox;
+		expect(again).toEqual(report);
+		expect([...new Bun.Glob("*/*").scanSync({ cwd: join(directory, "sandbox") })]).toEqual(written);
+	},
+);
 
 test.skipIf(!binary)("the compiled binary prints its version", () => {
 	for (let flag of ["--version", "version"]) {
@@ -143,6 +182,9 @@ test.skipIf(!binary)(
 				if (path === "/api/connector/connections") {
 					return Response.json({ token: "connection-token" });
 				}
+				// The run's GitHub token, which the binary asks for before anything starts.
+				let issued = await answerTokens(request);
+				if (issued) return issued;
 				let token = request.headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
 				if (path !== "/connector/mcp" || !["connection-token", "run-token"].includes(token)) {
 					return new Response(null, { status: 401 });
@@ -175,6 +217,7 @@ test.skipIf(!binary)(
 			binary!,
 			"connect",
 			root,
+			"--no-sandbox",
 			"--",
 			process.execPath,
 			join(import.meta.dir, "testing/fake-agent.ts"),

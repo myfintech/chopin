@@ -1,30 +1,43 @@
 /**
- * Decision cards read Markdown with Chat's renderer.
+ * Decision cards read Markdown with Chat's renderer, MarkdownText.
  *
  * The same element allowlist, link handling and continued numbered lists as a
  * Chat message, with two additions a decision needs: a ```mermaid fence draws
- * with the document's own Mermaid renderer, and an image shows only when it is
- * this document's own upload. Raw HTML is shown as the text it was written as,
- * so a question that mentions `<div>` still says so.
+ * with the document's own Mermaid renderer (MarkdownText's `componentsByLanguage`),
+ * and an image shows only when it is this document's own upload. Raw HTML is shown
+ * as the text it was written as, so a question that mentions `<div>` still says so.
+ * A card is not a message: its code has no copy header, and its text is read
+ * without GitHub's table, strikethrough and autolink syntax, except an option's
+ * own visual, which also reads tables.
  */
 
-import { lazy, Suspense, useMemo, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import { lazy, Suspense, useContext, useMemo, useRef, useState } from "react";
 import { HOSTED_IMAGE_PATH } from "@chopin/dialect";
+import { ImagePlace } from "@chopin/editor/image-place";
 import { QuestionMarkdownContext } from "@chopin/question/react";
+import { gfmTableFromMarkdown } from "mdast-util-gfm-table";
+import { gfmTable } from "micromark-extension-gfm-table";
 
-import { CHAT_COMPONENTS, CHAT_ELEMENTS, CHAT_INLINE, inlineSource } from "./chat/markdown";
+import { MarkdownText } from "@/components/assistant-ui/elements/markdown-text";
+import { CHAT_COMPONENTS, CHAT_ELEMENTS, MarkdownPhrase } from "./chat/markdown";
+import { noHtmlRemarkPlugin } from "./chat/no-html";
 import { orderedRunsRemarkPlugin } from "./chat/ordered-runs";
 
 import type { ReactNode } from "react";
-import type { Components } from "react-markdown";
 import type { QuestionMarkdownRenderer } from "@chopin/question/react";
+import type { SyntaxHighlighterProps } from "./chat/assistant-ui/markdown-primitive";
+import type { MarkdownComponents } from "./chat/markdown";
 
 const CardDiagram = lazy(() =>
 	import("@chopin/editor/card-diagram").then(({ CardDiagram }) => ({ default: CardDiagram }))
 );
+const ImageLightbox = lazy(() =>
+	import("@chopin/editor/image-lightbox").then(({ ImageLightbox }) => ({ default: ImageLightbox }))
+);
 
-const BLOCK_ELEMENTS = [...CHAT_ELEMENTS, "img"];
+const BLOCK_ELEMENTS = CHAT_ELEMENTS;
+/** An option's own visual may also be a small table. */
+const PREVIEW_ELEMENTS = [...BLOCK_ELEMENTS, "table", "thead", "tbody", "tr", "th", "td"];
 
 /**
  * The URL a card loads an image from, or undefined when the image is not this
@@ -36,47 +49,75 @@ export function documentImageUrl(src: string | undefined, document: string): str
 	return `${src}?document=${encodeURIComponent(document)}`;
 }
 
-/** An image, or its alt text in its place when it is refused or fails to load. */
+/**
+ * An image, or its alt text in its place when it is refused or fails to load. A loaded image
+ * opens large on a click, from its own button, so it never picks the option it sits in.
+ */
 function CardImage({ alt, document, src }: { alt: string; document: string; src?: string }) {
 	let [failed, setFailed] = useState(false);
+	let [viewing, setViewing] = useState(false);
+	let place = useContext(ImagePlace);
+	let view = useRef<HTMLButtonElement>(null);
 	let url = documentImageUrl(src, document);
 	if (!alt.trim()) return null;
 	if (!url || failed) {
 		return <span className="question-image-alt" data-question-image="refused">{alt}</span>;
 	}
 	return (
-		<img
-			alt={alt}
-			className="question-image"
-			data-question-image="document"
-			decoding="async"
-			loading="lazy"
-			onError={() => setFailed(true)}
-			src={url}
-		/>
+		<>
+			<button
+				aria-haspopup="dialog"
+				aria-label={`View larger: ${alt}`}
+				className="question-image-view"
+				onClick={() => setViewing(true)}
+				ref={view}
+				type="button"
+			>
+				<img
+					alt={alt}
+					className="question-image"
+					data-question-image="document"
+					decoding="async"
+					loading="lazy"
+					onError={() => setFailed(true)}
+					src={url}
+				/>
+			</button>
+			{viewing && (
+				<Suspense fallback={null}>
+					<ImageLightbox
+						images={[{ src: url, alt }]}
+						onClose={() => {
+							setViewing(false);
+							requestAnimationFrame(() => view.current?.focus());
+						}}
+						place={place}
+					/>
+				</Suspense>
+			)}
+		</>
 	);
 }
 
-function text(node: unknown): string {
-	if (!node || typeof node !== "object") return "";
-	let value = node as { type?: string; value?: string; children?: unknown[] };
-	if (value.type === "text") return value.value ?? "";
-	return (value.children ?? []).map(text).join("");
+/** A card's diagram: the document's own Mermaid renderer, in place of the fence's `pre`. */
+function CardMermaid({ code }: SyntaxHighlighterProps) {
+	return (
+		<Suspense fallback={<div className="question-diagram" data-question-diagram="pending" />}>
+			<CardDiagram source={code.replace(/\n$/, "")} />
+		</Suspense>
+	);
 }
 
-function mermaidSource(node: unknown): string | undefined {
-	let code = (node as { children?: unknown[] } | undefined)?.children?.[0] as {
-		tagName?: string;
-		properties?: { className?: unknown };
-	} | undefined;
-	let classes = code?.tagName === "code" ? code.properties?.className : undefined;
-	if (!Array.isArray(classes) || !classes.includes("language-mermaid")) return undefined;
-	return text(code).replace(/\n$/, "");
-}
+let NO_HEADER = () => null;
 
-function blockComponents(document: string): Components {
+let MERMAID = { mermaid: { CodeHeader: NO_HEADER, SyntaxHighlighter: CardMermaid } };
+
+function blockComponents(document: string): MarkdownComponents {
 	return {
 		...CHAT_COMPONENTS,
+		CodeHeader: NO_HEADER,
+		// A preview's table is its own scrolling lane in the card's styles, so it needs no wrapper.
+		table: ({ children }) => <table className="aui-md-table">{children}</table>,
 		img: ({ alt, src }) => (
 			<CardImage
 				alt={alt ?? ""}
@@ -84,23 +125,24 @@ function blockComponents(document: string): Components {
 				src={typeof src === "string" ? src : undefined}
 			/>
 		),
-		pre: ({ children, node }) => {
-			let source = mermaidSource(node);
-			if (source === undefined) return <pre>{children}</pre>;
-			return (
-				<Suspense fallback={<div className="question-diagram" data-question-diagram="pending" />}>
-					<CardDiagram source={source} />
-				</Suspense>
-			);
-		},
 	};
 }
 
 /** A heading or label is a phrase, so its code spans take the card's own inline-code chip. */
-const INLINE_COMPONENTS: Components = {
+const INLINE_COMPONENTS: MarkdownComponents = {
 	...CHAT_COMPONENTS,
 	code: ({ children }) => <code className="inline-code">{children}</code>,
 };
+
+/** Reads GitHub's pipe tables, and nothing else of GFM, as remark-gfm's table part does. */
+function tablesRemarkPlugin(this: { data(): unknown }) {
+	let data = this.data() as {
+		micromarkExtensions?: unknown[];
+		fromMarkdownExtensions?: unknown[];
+	};
+	(data.micromarkExtensions ??= []).push(gfmTable());
+	(data.fromMarkdownExtensions ??= []).push(gfmTableFromMarkdown());
+}
 
 type MarkdownNode = { type: string; value?: string; children?: MarkdownNode[] };
 
@@ -126,30 +168,40 @@ export function lineBreaksRemarkPlugin() {
 	return (tree: MarkdownNode) => walk(tree);
 }
 
+let PLAIN_BLOCKS = [noHtmlRemarkPlugin, orderedRunsRemarkPlugin, lineBreaksRemarkPlugin];
+let PREVIEW_BLOCKS = [
+	noHtmlRemarkPlugin,
+	tablesRemarkPlugin,
+	orderedRunsRemarkPlugin,
+	lineBreaksRemarkPlugin,
+];
+
 export function questionMarkdown(document: string): QuestionMarkdownRenderer {
 	let components = blockComponents(document);
 	return {
 		inline: (source, { links }) => (
-			<ReactMarkdown
-				allowedElements={links ? CHAT_INLINE : CHAT_INLINE.filter(name => name !== "a")}
+			<MarkdownPhrase
 				components={INLINE_COMPONENTS}
-				unwrapDisallowed
-			>
-				{inlineSource(source)}
-			</ReactMarkdown>
+				links={links}
+				source={source}
+			/>
 		),
-		block: source => (
-			<ReactMarkdown
-				allowedElements={BLOCK_ELEMENTS}
+		block: (source, place, root) => (
+			<MarkdownText
+				allowedElements={place === "preview" ? PREVIEW_ELEMENTS : BLOCK_ELEMENTS}
+				className={root.className}
 				components={components}
-				remarkPlugins={[orderedRunsRemarkPlugin, lineBreaksRemarkPlugin]}
+				componentsByLanguage={MERMAID}
+				containerProps={ROOT_PROPS}
+				remarkPlugins={place === "preview" ? PREVIEW_BLOCKS : PLAIN_BLOCKS}
+				text={source}
 				unwrapDisallowed
-			>
-				{source}
-			</ReactMarkdown>
+			/>
 		),
 	};
 }
+
+let ROOT_PROPS = { "data-question-markdown": "", "data-slot": undefined };
 
 /** Card text in this document renders as Markdown, with this document's images. */
 export function QuestionMarkdownProvider(

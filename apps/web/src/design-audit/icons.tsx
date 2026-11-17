@@ -17,6 +17,8 @@ import {
 	MachineIcon,
 	MessageIcon,
 	MessagePlusIcon,
+	MicIcon,
+	PaperclipIcon,
 	PlusIcon,
 	ProgressHalfIcon,
 	SearchIcon,
@@ -24,6 +26,8 @@ import {
 	SignInIcon,
 	SirenIcon,
 	SparkleIcon,
+	StopIcon,
+	UsersIcon,
 	WarningIcon,
 	WrenchIcon,
 } from "@chopin/icons";
@@ -54,8 +58,8 @@ const NUCLEO_ICONS: readonly IconCatalogueItem[] = [
 	{ name: "Document actions", source: documentActions },
 	{ name: "New document", source: newDocument },
 	{ name: "Chat", source: chat },
-	{ name: "Planner stop", source: plannerStop },
-	{ name: "Planner resume", source: plannerResume },
+	{ name: "Workflow stop", source: plannerStop },
+	{ name: "Workflow resume", source: plannerResume },
 	{ icon: LinkPlusIcon, name: "Link plus" },
 	{ icon: MessagePlusIcon, name: "Message plus" },
 	{ icon: ArrowUpIcon, name: "Arrow up" },
@@ -67,6 +71,9 @@ const NUCLEO_ICONS: readonly IconCatalogueItem[] = [
 	{ icon: InfoIcon, name: "Info" },
 	{ icon: KeyboardIcon, name: "Keyboard" },
 	{ icon: ImageIcon, name: "Image" },
+	{ icon: PaperclipIcon, name: "Paperclip" },
+	{ icon: MicIcon, name: "Microphone" },
+	{ icon: StopIcon, name: "Stop" },
 	{ icon: LightbulbIcon, name: "Lightbulb" },
 	{ icon: PlusIcon, name: "Plus" },
 	{ icon: CloseIcon, name: "Close" },
@@ -84,6 +91,7 @@ const NUCLEO_ICONS: readonly IconCatalogueItem[] = [
 	{ icon: LoaderIcon, name: "Loader" },
 	{ icon: MachineIcon, name: "Machine" },
 	{ icon: ServerIcon, name: "Server" },
+	{ icon: UsersIcon, name: "Users" },
 ];
 
 export function IconCatalogue() {

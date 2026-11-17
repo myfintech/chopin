@@ -9,6 +9,7 @@ const PREVIEW_CONFIGURATION = [
 	"OPENAI_API_KEY",
 	"JEV_API_KEY",
 	"APP_ORIGIN",
+	"PREVIOUS_ORIGINS",
 	"GITHUB_APP_SLUG",
 	"GITHUB_APP_CLIENT_ID",
 	"GITHUB_APP_CLIENT_SECRET",
@@ -36,5 +37,22 @@ describe("deployment compose", () => {
 			SERVICE_URL_APP_8787: null,
 			STORAGE_DRIVER: "postgres",
 		});
+	});
+
+	it("gives a stopping process time to hand over, and builds with the image that runs now", async () => {
+		let source = await Bun.file(new URL("../compose.yaml", import.meta.url)).text();
+		let compose = Bun.YAML.parse(source) as {
+			services?: {
+				app?: { stop_grace_period?: string; build?: { args?: Record<string, string> } };
+			};
+		};
+		// Longer than the turn wait, unready window, request wait and commit of a hand-over.
+		expect(compose.services?.app?.stop_grace_period).toBe("30s");
+		expect(compose.services?.app?.build?.args).toEqual({
+			PREVIOUS_IMAGE: "${PREVIOUS_IMAGE:-no-previous}",
+		});
+		let dockerfile = await Bun.file(new URL("../Dockerfile", import.meta.url)).text();
+		expect(dockerfile).toContain("ARG PREVIOUS_IMAGE=no-previous");
+		expect(dockerfile).toContain("AS no-previous");
 	});
 });

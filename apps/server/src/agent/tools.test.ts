@@ -85,6 +85,7 @@ test("document tool names and schemas remain available to the Planner", async ()
 		"list_background_jobs",
 		"read_background_job",
 		"create_research_workspace",
+		"upload_plan_image",
 		"assess_visual",
 		"edit_plan",
 		"open_decision",
@@ -956,7 +957,7 @@ test("chat-started tools retain only the current member request provenance", asy
 							} else {
 								if (!researchTool?.handler) throw new Error("research tool is missing");
 								let question = "Which public release evidence supports adopting version 3?";
-								let attempts = turn === 2 ? 2 : 1;
+								let attempts = turn === 3 ? 2 : 1;
 								for (let attempt = 0; attempt < attempts; attempt++) {
 									let result = await researchTool.handler({ question }, {
 										toolCallId: `research-${turn}-${attempt}`,
@@ -1001,6 +1002,16 @@ test("chat-started tools retain only the current member request provenance", asy
 	);
 	let running = plan.chat.running;
 	await firstStarted.promise;
+	await Chat.instruct(
+		context,
+		"ana",
+		"Act on the accepted comment.",
+		"@ana accepted a comment.",
+	);
+	let error = spyOn(console, "error").mockImplementation(() => {});
+	continueFirst.resolve();
+	await running;
+	// Nothing a person sends waits for a turn: bob's message starts the turn after these two.
 	let queuedContext = { ...context, claimantSessionId: queuedClaimant.id };
 	await Chat.send(
 		queuedContext,
@@ -1014,17 +1025,12 @@ test("chat-started tools retain only the current member request provenance", asy
 			ts: 0,
 		},
 	);
-	let queuedEntryId = plan.chat.waiting[0]!.id;
-	await Chat.instruct(
-		context,
-		"ana",
-		"Act on the accepted comment.",
-		"@ana accepted a comment.",
-	);
-	let error = spyOn(console, "error").mockImplementation(() => {});
-	continueFirst.resolve();
+	let queuedEntryId =
+		plan.chat.entries.find(entry =>
+			entry.author.kind === "member" && entry.author.handle === "bob"
+		)!.id;
 	await sent.promise;
-	await running;
+	await plan.chat.running;
 	if (!researchTool?.handler) throw new Error("research tool is missing");
 	let stale = await researchTool.handler({ question: "Search again" }, {
 		sessionId: "session",
@@ -1050,7 +1056,7 @@ test("chat-started tools retain only the current member request provenance", asy
 		claimantSessionId: claimant.id,
 		lifecycle: 0,
 	});
-	expect(activeRequests[1]).toMatchObject({
+	expect(activeRequests[2]).toMatchObject({
 		entryId: queuedEntryId,
 		userId: "U_bob",
 		handle: "bob",
@@ -1058,8 +1064,8 @@ test("chat-started tools retain only the current member request provenance", asy
 		claimantSessionId: queuedClaimant.id,
 		lifecycle: 0,
 	});
-	expect(activeRequests[0]?.turnId).not.toBe(activeRequests[1]?.turnId);
-	expect(activeRequests[2]).toBeUndefined();
+	expect(activeRequests[0]?.turnId).not.toBe(activeRequests[2]?.turnId);
+	expect(activeRequests[1]).toBeUndefined();
 	expect(researchRequests).toEqual([
 		{
 			entryId: queuedEntryId,
@@ -1076,11 +1082,11 @@ test("chat-started tools retain only the current member request provenance", asy
 			question: "start research on version 3 adoption",
 		},
 	]);
-	expect(researchResponses.slice(0, 2).map(value => JSON.parse(value))).toEqual([
+	expect(researchResponses.slice(1, 3).map(value => JSON.parse(value))).toEqual([
 		expect.objectContaining({ workspaceId: "workspace-1", state: "pending", stage: "queued" }),
 		expect.objectContaining({ workspaceId: "workspace-1", state: "pending", stage: "queued" }),
 	]);
-	expect(researchResponses[2]).toContain(
+	expect(researchResponses[0]).toContain(
 		"Error: research workspaces require the explicit member message",
 	);
 	expect(researchResponses[3]).toContain(
@@ -1109,21 +1115,7 @@ test("chat-started tools retain only the current member request provenance", asy
 	}]);
 });
 
-test("planner graph edits name readiness blockers before changing a graph", async () => {
-	let { plan, server } = await opened("Prepare the implementation.\n");
-	plan.records.set("open", {
-		id: "open",
-		status: "open",
-		definition: {
-			questions: [{
-				id: "question",
-				header: "Readiness",
-				question: "May implementation begin?",
-				multiple: false,
-				options: [{ id: "yes", label: "Yes", description: "" }],
-			}],
-		},
-	} as never);
+async function graphEdit({ plan, server }: Awaited<ReturnType<typeof opened>>) {
 	let graph = fixtureTools({
 		plan,
 		server,
@@ -1141,28 +1133,61 @@ test("planner graph edits name readiness blockers before changing a graph", asyn
 		operations: [{
 			op: "add",
 			task: {
-				id: "blocked",
-				title: "Blocked graph",
-				context: "The plan still has an open decision.",
-				goal: "Demonstrate that preparation is refused.",
-				acceptance: ["The tool names the blocker.", "No graph is created."],
+				id: "first",
+				title: "First task",
+				context: "The plan is ready enough to build.",
+				goal: "Demonstrate the graph edit.",
+				acceptance: ["The tool answers.", "The graph reflects the answer."],
 				dependsOn: [],
 			},
 		}],
 	};
-	let response = await graph.handler(args, {
-		sessionId: "session",
-		toolCallId: "call",
-		toolName: "edit_implementation_graph",
-		arguments: args,
-	});
+	return JSON.parse(
+		await graph.handler(args, {
+			sessionId: "session",
+			toolCallId: "call",
+			toolName: "edit_implementation_graph",
+			arguments: args,
+		}) as string,
+	);
+}
 
-	expect(JSON.parse(response as string)).toEqual({
+test("planner graph edits name readiness blockers before changing a graph", async () => {
+	let context = await opened("Prepare the implementation.\n");
+	let { plan } = context;
+	plan.threads.set("accepted", { id: "accepted", status: "accepted", notes: [] } as never);
+
+	expect(await graphEdit(context)).toEqual({
 		ok: false,
 		reason: "not-ready",
-		blockers: ["unanswered questionnaires"],
+		blockers: ["accepted comments awaiting plan changes"],
 	});
 	expect(plan.graph).toBeUndefined();
+});
+
+test("planner graph edits go ahead while decisions are open, and leave them open", async () => {
+	let context = await opened("Prepare the implementation.\n");
+	let { plan } = context;
+	for (let status of ["open", "reopened"] as const) {
+		plan.records.set(status, {
+			id: status,
+			status,
+			definition: {
+				questions: [{
+					id: "question",
+					header: "Readiness",
+					question: "May implementation begin?",
+					multiple: false,
+					options: [{ id: "yes", label: "Yes", description: "" }],
+				}],
+			},
+		} as never);
+	}
+
+	expect(await graphEdit(context)).toMatchObject({ ok: true });
+	expect(plan.graph?.versions).toHaveLength(1);
+	expect(plan.records.get("open")?.status).toBe("open");
+	expect(plan.records.get("reopened")?.status).toBe("reopened");
 });
 
 test("the graph tool advertises exactly the task fields its validators accept", async () => {

@@ -353,9 +353,11 @@
 	flex: 0 0 var(--project-sidebar-width, 0px);
 }
 
+/* Its content ends where its edge, Resize Projects sidebar's 4px, begins: the list's scroll lane is never under the grip. */
 .motion-sidebar .project-sidebar {
 	width: var(--project-sidebar-width, 0px);
 	flex: 0 0 var(--project-sidebar-width, 0px);
+	padding-inline-end: 4px;
 }
 
 .motion-sidebar.is-open {
@@ -442,7 +444,7 @@
 	padding: var(--spacing) var(--spacing) var(--spacing) var(--project-sidebar-inset);
 	font-size: var(--text-xs);
 	font-weight: 500;
-	color: color-mix(in srgb, var(--color-text-tertiary) 60%, transparent);
+	color: var(--color-text-tertiary);
 }
 
 .project-sidebar-projects,
@@ -792,6 +794,11 @@
 	padding: 0 var(--project-sidebar-inset) var(--spacing) var(--project-sidebar-label);
 	font-size: var(--text-xs);
 	line-height: 1rem;
+	color: var(--color-text-tertiary);
+}
+
+/* Loading keeps the quiet status role; an error and Load more are read, at 4.5:1 on the ground. */
+.project-sidebar-status[data-loading] {
 	color: var(--color-text-quaternary);
 }
 
@@ -1281,6 +1288,38 @@
 	visibility: visible;
 }
 
+/* A project row's checkbox: the choice-control checkbox, drawn inside its option. */
+.navigation-palette-check {
+	display: grid;
+	width: calc(var(--spacing) * 4);
+	height: calc(var(--spacing) * 4);
+	flex-shrink: 0;
+	place-items: center;
+	border: var(--edge-width) solid var(--color-control-edge);
+	border-radius: var(--radius-sm);
+	background: var(--color-page);
+	color: var(--color-text-tertiary);
+	transition:
+		background-color var(--duration-base) var(--ease-out),
+		border-color var(--duration-base) var(--ease-out);
+}
+
+.navigation-palette-check[data-checked] {
+	border-color: var(--color-brand);
+	background: var(--color-brand);
+	color: var(--color-page);
+}
+
+/* The check and the loader take the box's ink, as icons in a primary button do. */
+.navigation-palette-check [data-nucleo-icon] {
+	color: inherit;
+}
+
+/* At 12px the line icons' stroke is a single pixel; the check carries the weight choice-control's does. */
+.navigation-palette-check[data-checked] path {
+	stroke-width: 2.5;
+}
+
 /* Touch has no hover to disclose the action, so every addable row shows it. */
 @media (pointer: coarse) {
 	.navigation-palette-option {
@@ -1304,7 +1343,8 @@
 }
 
 @media (prefers-reduced-motion: no-preference) {
-	.navigation-palette-status [data-palette-loader] {
+	.navigation-palette-status [data-palette-loader],
+	.navigation-palette-check [data-palette-loader] {
 		animation: button-loader-spin var(--duration-linger) linear infinite;
 	}
 }
@@ -1494,11 +1534,37 @@
 	min-height: var(--control-target-coarse);
 }
 
-:root[data-plan-coarse-pointer]
-	:where(.document-actions-menu, .navigation-account-menu)
-	:is(button, a),
-:root[data-plan-coarse-pointer] .app-menu-item {
-	min-height: var(--control-target-coarse);
+/*
+ * A menu row keeps its own height on touch. An invisible target of the coarse height grows around
+ * it, and a row that follows another stands a target's pitch from it (the space the rows no longer
+ * take up themselves, as one margin, since neighbouring margins would collapse), so adjacent
+ * targets meet and never overlap, and the menu is as tall as it was.
+ */
+@layer components {
+	:root[data-plan-coarse-pointer]
+		:where(:where(.document-actions-menu, .navigation-account-menu)
+			:is(button, a), .app-menu-item) {
+		position: relative;
+	}
+
+	:root[data-plan-coarse-pointer]
+		:where(:where(.document-actions-menu, .navigation-account-menu)
+			:is(button, a)
+			+ :is(button, a), .app-menu-item + .app-menu-item) {
+		margin-block-start: calc(var(--control-target-coarse) - var(--menu-item-height-normal));
+	}
+
+	:root[data-plan-coarse-pointer]
+		:where(:where(.document-actions-menu, .navigation-account-menu)
+			:is(button, a), .app-menu-item)::after {
+		content: "";
+		position: absolute;
+		top: 50%;
+		left: 0;
+		width: 100%;
+		height: var(--control-target-coarse);
+		transform: translateY(-50%);
+	}
 }
 
 .title-control {

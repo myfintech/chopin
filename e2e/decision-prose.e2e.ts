@@ -97,7 +97,7 @@ test("Save writes prose, collapses the card, marks its margin, and records activ
 
 	await expect(card(page)).toHaveCount(0);
 	await expect(marker(page)).toBeVisible();
-	await expect(page.getByText("Chopin wrote up", { exact: false })).toBeVisible();
+	await expect(page.getByText("chopin wrote up", { exact: false })).toBeVisible();
 	let [mark, paragraph] = await Promise.all([
 		marker(page).boundingBox(),
 		prose(page).boundingBox(),
@@ -346,7 +346,7 @@ test("a failed prose job is visible on the opening message and Retry uses the co
 	await waitForProseJob(page, "failed");
 	let opening = page.locator(`[data-chat-message-id="${source}"]`);
 	await opening.getByRole("button", { name: /Analysis for message/ }).click();
-	let jobs = page.getByRole("group", { name: "Planner jobs" });
+	let jobs = page.getByRole("group", { name: "Background jobs" });
 	await expect(jobs).toContainText("prose failed");
 	await scriptProse(OPTION);
 	await jobs.getByRole("button", { name: "Retry prose job", exact: true }).click();

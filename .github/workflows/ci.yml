@@ -25,7 +25,7 @@ permissions:
 env:
   # Matches the version this is developed against. Bun's lockfile format and
   # its workspace catalogs are both young enough that "latest" is a variable.
-  BUN_VERSION: 1.4.2
+  BUN_VERSION: 1.4.4
   # Shard counts; keep each matrix below in step with its count.
   UNIT_SHARDS: 3
   E2E_SHARDS: 12
@@ -292,6 +292,11 @@ jobs:
           key: ms-playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
 
       - run: bun node_modules/@playwright/test/cli.js install chromium
+
+      # The emoji spec checks that an emoji is drawn in colour, from the platform's emoji font.
+      - name: Colour emoji font
+        if: ${{ matrix.suite == 'design' }}
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends fonts-noto-color-emoji
 
       - name: Design behaviour (keyboard, focus, motion, and scrolling)
         if: ${{ matrix.suite == 'design' }}

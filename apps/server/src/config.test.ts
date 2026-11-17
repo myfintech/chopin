@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { delimiter } from "node:path";
 
+import { attachmentLimits } from "./attachments/limits";
 import { describe as description } from "./config";
 import { configured, LOCAL, REQUIRED } from "./testing/config";
 
@@ -20,6 +21,62 @@ describe("configuration", () => {
 
 	it("defaults the built-in adapter to PostgreSQL", () => {
 		expect(configured({ STORAGE_DRIVER: undefined }).storage.driver).toBe("postgres");
+	});
+
+	it("names what a Chat message may carry, with limits of its own that an operator can change", () => {
+		expect(configured().chatAttachments).toEqual({
+			maxBytes: 1_048_576,
+			maxCount: 5,
+			maxTotalBytes: 4_194_304,
+		});
+		expect(
+			configured({
+				CHAT_ATTACHMENT_MAX_BYTES: "2048",
+				CHAT_ATTACHMENT_MAX_COUNT: "3",
+				CHAT_ATTACHMENT_MAX_TOTAL_BYTES: "4096",
+			}).chatAttachments,
+		).toEqual({ maxBytes: 2048, maxCount: 3, maxTotalBytes: 4096 });
+		for (
+			let [name, value] of [
+				["CHAT_ATTACHMENT_MAX_BYTES", "0"],
+				["CHAT_ATTACHMENT_MAX_BYTES", "1.5"],
+				["CHAT_ATTACHMENT_MAX_BYTES", "99999999999"],
+				["CHAT_ATTACHMENT_MAX_COUNT", "-1"],
+				["CHAT_ATTACHMENT_MAX_COUNT", "21"],
+				["CHAT_ATTACHMENT_MAX_TOTAL_BYTES", "many"],
+			] as const
+		) {
+			expect(() => configured({ [name]: value }), `${name}=${value}`).toThrow(
+				`${name} must be a whole number between`,
+			);
+		}
+		// One file that could never fit in a message is a mistake, not a setting.
+		expect(() =>
+			configured({ CHAT_ATTACHMENT_MAX_BYTES: "2000", CHAT_ATTACHMENT_MAX_TOTAL_BYTES: "1000" })
+		)
+			.toThrow("CHAT_ATTACHMENT_MAX_TOTAL_BYTES must be at least CHAT_ATTACHMENT_MAX_BYTES");
+	});
+
+	it("takes no files at a count of zero, and never more than a remote Planner's connection carries", () => {
+		expect(attachmentLimits(configured({ CHAT_ATTACHMENT_MAX_COUNT: "0" }))).toBeUndefined();
+		expect(attachmentLimits(configured({ HARNESS: "copilot-sdk" }))).toEqual({
+			maxBytes: 1_048_576,
+			maxCount: 5,
+			maxTotalBytes: 4_194_304,
+		});
+		let remote = attachmentLimits(
+			configured({ HARNESS: "remote", CHAT_ATTACHMENT_MAX_BYTES: "4000000" }),
+		);
+		expect(remote).toEqual({ maxBytes: 1_048_576, maxCount: 5, maxTotalBytes: 1_048_576 });
+		expect(
+			attachmentLimits(
+				configured({
+					HARNESS: "remote",
+					CHAT_ATTACHMENT_MAX_BYTES: "1000",
+					CHAT_ATTACHMENT_MAX_TOTAL_BYTES: "3000",
+				}),
+			),
+		).toEqual({ maxBytes: 1000, maxCount: 5, maxTotalBytes: 3000 });
 	});
 
 	it("keeps foreground visuals opt-in and requires a decisions model", () => {
@@ -118,7 +175,7 @@ describe("configuration", () => {
 		});
 	});
 
-	it("accepts a remote Planner on a public bind with no MODEL, and only without background jobs", () => {
+	it("accepts a remote Planner on a public bind with no MODEL, with or without background jobs", () => {
 		let remote = { HARNESS: "remote", SERVER_HOST: "0.0.0.0", BACKGROUND_JOBS: "off" };
 		let config = configured(remote);
 		expect(config).toMatchObject({ harness: "remote", host: "0.0.0.0", model: "" });
@@ -127,8 +184,11 @@ describe("configuration", () => {
 			"Planner: attached client over /api/v1/agent (model and client tools run on its machine)",
 		);
 		expect(configured({ ...remote, MODEL: "openai/gpt-6" }).model).toBe("openai/gpt-6");
-		expect(() => configured({ HARNESS: "remote" }))
-			.toThrow("HARNESS=remote requires BACKGROUND_JOBS=off");
+		expect(configured({ HARNESS: "remote" })).toMatchObject({
+			harness: "remote",
+			backgroundJobs: true,
+			webResearch: true,
+		});
 	});
 
 	it("keeps a detached remote Planner's ownership two minutes unless PLANNER_ATTACH_GRACE_MS says otherwise", () => {
@@ -140,6 +200,43 @@ describe("configuration", () => {
 		for (let value of ["", "-1", "1.5", "3600001", "soon"]) {
 			expect(() => configured({ ...remote, PLANNER_ATTACH_GRACE_MS: value }))
 				.toThrow("PLANNER_ATTACH_GRACE_MS must be an integer between 0 and 3600000 milliseconds");
+		}
+	});
+
+	it("exits when another process holds the writer lease unless HANDOVER=wait, and times a hand-over by default as the design proposes", () => {
+		expect(configured({ BACKGROUND_JOBS: "off" }).handover).toEqual({
+			wait: false,
+			turnWaitMs: 10_000,
+			unreadyMs: 300,
+			requestWaitMs: 1_000,
+			plannerWindowMs: 10_000,
+			holdMs: 20_000,
+		});
+		expect(configured({ BACKGROUND_JOBS: "off", HANDOVER: "wait" }).handover.wait).toBe(true);
+		expect(configured({ BACKGROUND_JOBS: "off", HANDOVER: "off" }).handover.wait).toBe(false);
+		expect(
+			configured({
+				BACKGROUND_JOBS: "off",
+				HANDOVER_TURN_WAIT_MS: "0",
+				HANDOVER_UNREADY_MS: "550",
+				HANDOVER_REQUEST_WAIT_MS: "2000",
+				HANDOVER_PLANNER_WINDOW_MS: "15000",
+				HANDOVER_HOLD_MS: "5000",
+			}).handover,
+		).toMatchObject({
+			turnWaitMs: 0,
+			unreadyMs: 550,
+			requestWaitMs: 2_000,
+			plannerWindowMs: 15_000,
+			holdMs: 5_000,
+		});
+		expect(() => configured({ BACKGROUND_JOBS: "off", HANDOVER: "yes" }))
+			.toThrow("HANDOVER must be wait or off");
+		for (let name of ["TURN_WAIT", "UNREADY", "REQUEST_WAIT", "PLANNER_WINDOW", "HOLD"]) {
+			for (let value of ["-1", "1.5", "soon", "999999999"]) {
+				expect(() => configured({ BACKGROUND_JOBS: "off", [`HANDOVER_${name}_MS`]: value }))
+					.toThrow(`HANDOVER_${name}_MS must be an integer between 0 and`);
+			}
 		}
 	});
 
@@ -239,6 +336,26 @@ describe("configuration", () => {
 		);
 		expect(() => configured({ APP_ORIGIN: "http://127.0.0.1:8787" })).not.toThrow();
 		expect(() => configured({ SESSION_ENCRYPTION_KEY: "short" })).toThrow("32 bytes");
+	});
+
+	it("accepts the exact origins a moved deployment was served from", () => {
+		expect(configured().auth.previousOrigins).toBeUndefined();
+		expect(configured({ PREVIOUS_ORIGINS: " " }).auth.previousOrigins).toBeUndefined();
+		expect(
+			configured({
+				PREVIOUS_ORIGINS:
+					"https://old.example.com, https://older.example.com,https://chopin.example",
+			}).auth.previousOrigins,
+		).toEqual(["https://old.example.com", "https://older.example.com"]);
+		expect(() => configured({ PREVIOUS_ORIGINS: "http://old.example.com" })).toThrow(
+			"PREVIOUS_ORIGINS must use HTTPS",
+		);
+		expect(() => configured({ PREVIOUS_ORIGINS: "https://old.example.com/path" })).toThrow(
+			"PREVIOUS_ORIGINS must contain only an HTTP or HTTPS origin",
+		);
+		expect(() => configured({ PREVIOUS_ORIGINS: "https://old.example.com,," })).toThrow(
+			"PREVIOUS_ORIGINS must be a comma-separated list of origins",
+		);
 	});
 
 	it("loads normalized user and organization admission lists", () => {

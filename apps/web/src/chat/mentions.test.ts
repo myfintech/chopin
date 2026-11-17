@@ -28,6 +28,8 @@ describe("mention trigger", () => {
 		expect(mentionTrigger("(@octo", 6)).toEqual({ query: "octo", start: 1, end: 6 });
 		expect(mentionTrigger("one\n@oct", 8)).toEqual({ query: "oct", start: 4, end: 8 });
 		expect(mentionTrigger("@a-b", 4)).toEqual({ query: "a-b", start: 0, end: 4 });
+		// A caret before a leading `@chopin` (a refused draft put back) has nothing typed before it.
+		expect(mentionTrigger("@chopin outline the plan", 0)).toBeUndefined();
 	});
 
 	test("never opens inside an email address or after a word character", () => {
@@ -84,6 +86,22 @@ describe("mention candidates", () => {
 			{ kind: "person", login: "lavaman131" },
 			{ kind: "person", login: "Octocat" },
 			{ kind: "person", login: "ana" },
+			{ kind: "person", login: "mona" },
+			{ kind: "person", login: "hubot" },
+		]);
+	});
+
+	test("puts the people here before the others who can read the document", () => {
+		let candidates = mentionCandidates({
+			authors: ["hubot"],
+			people: ["cy"],
+			readers: ["mona", "CY", "me", "hubot"],
+			planner: true,
+			self: "me",
+		});
+		expect(candidates).toEqual([
+			planner,
+			{ kind: "person", login: "cy" },
 			{ kind: "person", login: "mona" },
 			{ kind: "person", login: "hubot" },
 		]);
@@ -240,25 +258,52 @@ describe("mention picker markup", () => {
 		}),
 	);
 
-	test("is a listbox of options named by login with the active one selected", () => {
+	test("is a listbox of options with the active one selected", () => {
 		expect(html).toContain('role="listbox"');
+		expect(html).toContain('aria-label="Mentions"');
 		expect(html).toContain('id="mentions-option-0"');
-		expect(html).toContain('aria-label="chopin"');
-		expect(html).toContain('aria-label="octocat"');
+		expect(html).toContain('id="mentions-option-1"');
 		expect(html.match(/aria-selected="true"/g)).toHaveLength(1);
-		expect(html).toContain('id="mentions-option-1" role="option" tabindex="-1" type="button"');
+		// And the one selected is that active option.
+		expect(html.match(/<button[^>]*id="mentions-option-1"[^>]*>/)![0]).toContain(
+			'aria-selected="true"',
+		);
+		// A row is not a tab stop: the draft keeps focus and points at it.
+		expect(html.match(/<button[^>]*id="mentions-option-0"[^>]*>/)![0]).toContain('tabindex="-1"');
+	});
+
+	test("lists chopin first as an agent, and the people as human", () => {
+		expect(html.indexOf(">chopin<")).toBeLessThan(html.indexOf(">octocat<"));
+		expect(html).toMatch(/>chopin<\/span><span class="[^"]*">agent</);
+		expect(html).toMatch(/>octocat<\/span><span class="[^"]*">human</);
 	});
 
 	test("draws a decorative avatar for people and the Planner mark for the Planner", () => {
 		expect(html).toContain('alt=""');
 		expect(html).toContain("https://github.com/octocat.png?size=40");
 		expect(html).not.toContain("github.com/chopin.png");
-		expect(html).toContain('aria-label="Chopin"');
+		// The badge is hidden from a screen reader, which reads the row's own words.
+		expect(html).toContain(
+			'<span aria-hidden="true" class="presence-host"><span aria-hidden="true"',
+		);
+		// Without a machine to speak of, Chopin shows no presence.
+		expect(html).not.toContain("presence-dot");
 	});
 
-	test("shows nothing but the login in a row", () => {
-		let text = html.replace(/<span aria-hidden="true">[^<]*<\/span>/g, "").replace(/<[^>]*>/g, " ")
-			.replace(/\s+/g, " ").trim();
-		expect(text).toBe("chopin octocat");
+	test("Chopin's mark carries its presence, and its name says it", () => {
+		let away = renderToStaticMarkup(
+			createElement(MentionPicker, {
+				active: 0,
+				id: "mentions",
+				onActive: () => {},
+				onSelect: () => {},
+				options,
+				presence: "away",
+			}),
+		);
+		expect(away).toContain('<span class="presence-dot" data-presence="away"></span>');
+		expect(away).toContain('aria-label="chopin, agent, Away"');
+		// Only Chopin's row: a person's presence is not Chopin's to say.
+		expect(away.match(/presence-dot/g)).toHaveLength(1);
 	});
 });

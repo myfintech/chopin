@@ -1,13 +1,19 @@
-import { chatInput } from "./chat-input";
+import AxeBuilder from "@axe-core/playwright";
+
+import { allBanners, connectionBanner, failureBanner, phaseVoice, watchBanners } from "./banner";
+import { chatInput, expectChatValue } from "./chat-input";
+import { expectFocusIndicator } from "./focus";
 /**
  * Slice 5: a scripted Planner turn through the real host tools, chat
  * projection, and sockets, against the isolated `AGENT=on` harness project.
  */
+import { readFileSync } from "node:fs";
+
 import { FAKE_MCP_PORT, PULL_REQUESTS } from "./harness/fixtures";
-import { expect, ready, test } from "./room";
+import { authenticate, expect, ready, test } from "./room";
 
 import type { Chat } from "../packages/protocol/index";
-import type { Page } from "@playwright/test";
+import type { Page, WebSocketRoute } from "@playwright/test";
 import type { Implementation } from "../packages/protocol/implementation";
 
 function chatPane(page: Page) {
@@ -93,6 +99,65 @@ test("a scripted Planner turn reaches read_plan and list_pull_requests through r
 	let reloadedChat = chatPane(opened);
 	await expect(reloadedChat.getByText("Harness parent", { exact: false })).toBeVisible();
 	await expect(reloadedChat.getByText(PULL_REQUESTS[0]!.title, { exact: false })).toBeVisible();
+});
+
+test("a message the sparkle button addressed reaches the Planner, which takes a turn, and one without the mention goes to the team alone", async ({ join, page, seed }) => {
+	await seed("# Chip routing\nThe harp needs new strings.\n");
+	let sent: Chat.Send[] = [];
+	let entries = new Map<string, Chat.Entry>();
+	let states: Chat.State[] = [];
+	await page.routeWebSocket("**/ws?**", route => {
+		let server = route.connectToServer();
+		route.onMessage(message => {
+			if (typeof message === "string" && message.includes('"chat:send"')) {
+				sent.push(JSON.parse(message) as Chat.Send);
+			}
+			server.send(message);
+		});
+		server.onMessage(message => {
+			if (typeof message === "string") {
+				let frame = JSON.parse(message) as { kind: string };
+				if (frame.kind === "chat:state") states.push(frame as Chat.State);
+				if (frame.kind === "chat:message") {
+					let { entry } = frame as Chat.Message;
+					entries.set(entry.id, entry);
+				}
+			}
+			route.send(message);
+		});
+	});
+	let opened = await join("ana");
+	let chat = chatPane(opened);
+	let draft = chatInput(chat);
+
+	// The button writes @chopin into the words, so the message is Chopin's: it goes to the Planner,
+	// which takes a turn and answers.
+	await chat.getByRole("button", { name: "Ask chopin", exact: true }).click();
+	await expectChatValue(draft, "@chopin ");
+	await opened.keyboard.type("what does the plan say?");
+	await draft.press("Enter");
+	await expect.poll(() => states.some(frame => frame.busy)).toBe(true);
+	await expect(chat.getByText("Chip routing", { exact: false })).toBeVisible();
+	await expect.poll(() => states.at(-1)?.busy).toBe(false);
+	expect(sent.at(-1)).toMatchObject({ to: "planner", text: "@chopin what does the plan say?" });
+	await expect.poll(() => entries.get(sent[0]!.requestId)?.to).toBe("planner");
+
+	// Nothing stays on: without the mention the message is the team's. It is in the Chat, and the
+	// Planner is not asked. A teammate is there: alone, every message would be Chopin's.
+	await join("bo");
+	await expect(draft).toHaveAttribute("data-placeholder", "Message the team, or @chopin to ask");
+	await draft.fill("thanks, both of you");
+	await draft.press("Enter");
+	await expect(chat.getByText("thanks, both of you", { exact: true })).toBeVisible();
+	expect(sent.at(-1)).toMatchObject({ to: "room", text: "thanks, both of you" });
+	await expect.poll(() => sent.length).toBe(2);
+	// The server filed it as the team's, with no Planner named. It is no count of busy frames or
+	// of Stop buttons that says so: Chopin's own work shows as both, the title it keeps after any
+	// message a moment later and its joining in after a quiet spell (conversation-initiative.e2e).
+	await expect.poll(() => entries.get(sent[1]!.requestId)).toMatchObject({
+		text: "thanks, both of you",
+	});
+	expect(entries.get(sent[1]!.requestId)).not.toHaveProperty("to");
 });
 
 test("tool activity redacts credential text before broadcast and history replay", async ({ join, page, seed }) => {
@@ -324,12 +389,12 @@ test("only Build plan asks the Planner for tasks, once, without a Chat message, 
 	let stopped = opened.getByRole("button", { name: "Build stopped", exact: true });
 	await expect(stopped).toBeVisible();
 	await expect(stopped).toHaveAccessibleDescription(
-		"Chopin couldn’t break the plan into tasks.",
+		"chopin couldn’t break the plan into tasks.",
 	);
 	expect(sends).toHaveLength(0);
 	let transcript = chatPane(opened);
 	// The notice renders its @mention as a name.
-	await expect(transcript).toContainText(/asked Chopin to break the plan into tasks\./);
+	await expect(transcript).toContainText(/asked chopin to break the plan into tasks\./);
 	await expect(transcript).not.toContainText("Prepare an implementation graph");
 
 	await stopped.click();
@@ -343,4 +408,448 @@ test("only Build plan asks the Planner for tasks, once, without a Chat message, 
 	expect(drafts[1]!.build).toBe(true);
 	expect(drafts[1]!.planRevision).toBe(drafts[0]!.planRevision);
 	expect(sends).toHaveLength(0);
+});
+
+/**
+ * A reply that ends without finishing is one quiet banner by the composer, never a modal, in a
+ * machine's plain words, with Retry only where sending the same turn again can help. Each way
+ * the fake Planner can end a reply is named by the message that asks for it.
+ */
+const ENDINGS = [
+	{
+		kind: "error",
+		prompt: "FAIL-MODEL",
+		title: "Couldn't finish the reply.",
+		detail: "429 Too Many Requests",
+		retry: true,
+	},
+	{ kind: "timed-out", prompt: "FAIL-TIMEOUT", title: "The reply took too long.", retry: true },
+	{
+		kind: "tool",
+		prompt: "FAIL-TOOL",
+		title: "The reply stopped: a tool it needed isn't available.",
+		retry: true,
+	},
+	{
+		kind: "refused",
+		prompt: "FAIL-REFUSED",
+		title: "The reply stopped: it needed something it isn't allowed to use.",
+		retry: false,
+	},
+] as const;
+// `unreachable` (a turn that throws something that is not an Error) cannot be driven through the
+// harness: it wraps whatever a turn throws into a stream error, which is told as `error`. That kind
+// is pinned by `turn-failure.test.ts` and `failure.test.ts`.
+
+/** Words that are Chopin's own, which a failure never says to a person. */
+const JARGON = /boundary|approval|Planner|attach|bash|harness|Error:/i;
+
+async function ask(page: Page, text: string): Promise<void> {
+	let chat = chatPane(page);
+	await chatInput(chat).fill(`@chopin ${text}`);
+	await chat.getByRole("button", { name: "Send message" }).click();
+}
+
+/** How many times the Chat's words say it: the banner is the one place, the transcript's own line gives way. */
+function said(text: string, words: string): number {
+	return text.split(words).length - 1;
+}
+
+/** Chat is a tab of its own on a phone. */
+async function openChat(page: Page): Promise<void> {
+	let input = chatInput(chatPane(page));
+	if (await input.isVisible()) return;
+	await page.getByRole("navigation", { name: "Workspace view" })
+		.getByRole("button", { name: /^Chat/ }).click();
+	await expect(input).toBeVisible();
+}
+
+function chatBanner(page: Page, kind?: string) {
+	return chatPane(page).locator(
+		`.chat-composer [data-error-banner]${kind ? `[data-kind="${kind}"]` : ""}`,
+	);
+}
+
+for (let ending of ENDINGS) {
+	test(
+		`a reply that ends as ${ending.kind} is one quiet banner by the composer, ${
+			ending.retry ? "with Retry" : "with no button, since asking again would be refused again"
+		}, and nothing else says it`,
+		async ({ join, seed }) => {
+			await seed("# Failing turn\nThe harp needs new strings.\n");
+			let page = await join("ana");
+			let chat = chatPane(page);
+			await ask(page, `${ending.prompt} ${ending.kind} outline the plan`);
+
+			let banner = chatBanner(page, ending.kind);
+			await expect(banner).toHaveCount(1, { timeout: 20_000 });
+			await expect(banner).toBeVisible();
+			// A notice, not a modal: an alert in the composer's own place, over nothing, taking no focus.
+			await expect(chat.getByRole("alert")).toHaveCount(1);
+			await expect(page.getByRole("dialog")).toHaveCount(0);
+			await expect(chatInput(chat)).toBeEditable();
+			await expect(banner).toContainText(ending.title);
+			let detail = banner.locator(".composer-notice-line");
+			if ("detail" in ending) await expect(detail).toHaveText(ending.detail);
+			else await expect(detail).toHaveCount(0);
+			await expect(banner).not.toContainText(JARGON);
+			// One cause, one banner: the connection is fine, and the failed reply's own line in the
+			// transcript is what the banner stands in for, so the words are said once.
+			await expect(allBanners(page)).toHaveCount(1);
+			await expect(connectionBanner(page)).toHaveCount(0);
+			await expect.poll(async () => said(await chat.innerText(), ending.title)).toBe(1);
+			if ("detail" in ending) {
+				expect(said(await chat.innerText(), ending.detail)).toBe(1);
+			}
+			await expect(chat).not.toContainText(JARGON);
+
+			let retry = banner.getByRole("button", { name: "Retry", exact: true });
+			if (ending.retry) await expect(retry).toBeVisible();
+			else {
+				await expect(banner.getByRole("button")).toHaveCount(0);
+				await expect(banner.getByRole("link")).toHaveCount(0);
+			}
+
+			// It is the room's record, so it is there after a reload, said the same way.
+			await page.reload();
+			await ready(page);
+			await expect(chatBanner(page, ending.kind)).toHaveCount(1);
+			await expect(chatBanner(page, ending.kind)).toContainText(ending.title);
+			await expect(allBanners(page)).toHaveCount(1);
+		},
+	);
+}
+
+/** What the fake Planner says of the turn a Retry ran, in the words `RETRY-CONTEXT` answers with. */
+const CLEAN_CONTEXT =
+	"the message 1 time(s); the partial reply not in context; the error not in context.";
+const RETRY_PARTIAL = "Partial draft before the failure.";
+
+/** Every Chat frame the page sends, by kind. */
+async function recordSends(
+	page: Page,
+): Promise<Array<{ kind: string; requestId?: string; message?: string }>> {
+	let sent: Array<{ kind: string; requestId?: string; message?: string }> = [];
+	await page.routeWebSocket("**/ws?**", route => {
+		let server = route.connectToServer();
+		route.onMessage(message => {
+			if (typeof message === "string") {
+				let frame = JSON.parse(message) as { kind: string };
+				if (frame.kind.startsWith("chat:send") || frame.kind === "chat:retry") sent.push(frame);
+			}
+			server.send(message);
+		});
+		server.onMessage(message => route.send(message));
+	});
+	return sent;
+}
+
+test("Retry runs the same message's turn again: one message for everyone, the failed attempt gone, and the agent given the message once and nothing of the failure", async ({ join, seed }) => {
+	await seed("# Retried turn\nThe harp needs new strings.\n");
+	let ana = await join("ana");
+	let sent = await recordSends(ana);
+	await ana.reload();
+	await ready(ana);
+	let ben = await join("ben");
+	let marker = crypto.randomUUID();
+	await ask(ana, `RETRY-CONTEXT-1 ${marker} compare the export options`);
+	let banner = chatBanner(ana, "error");
+	await expect(banner).toContainText("Couldn't finish the reply.", { timeout: 20_000 });
+	await expect(chatBanner(ben, "error")).toContainText("Couldn't finish the reply.");
+	await expect(chatPane(ben)).toContainText(RETRY_PARTIAL);
+
+	await banner.getByRole("button", { name: "Retry", exact: true }).click();
+	for (let page of [ana, ben]) {
+		let chat = chatPane(page);
+		await expect(chat).toContainText(`Attempt 2: ${CLEAN_CONTEXT}`, { timeout: 20_000 });
+		// One message, one reply, and nothing left of the attempt that failed.
+		await expect.poll(async () => said(await chat.innerText(), marker)).toBe(1);
+		await expect.poll(async () => said(await chat.innerText(), "Attempt 2:")).toBe(1);
+		await expect(chat).not.toContainText(RETRY_PARTIAL);
+		await expect(chat).not.toContainText("503 Service Unavailable");
+		await expect(allBanners(page)).toHaveCount(0);
+	}
+	// The page sent the message once and asked for its turn again, by its id: no second send.
+	expect(sent.filter(frame => frame.kind === "chat:send")).toHaveLength(1);
+	let retries = sent.filter(frame => frame.kind === "chat:retry");
+	expect(retries).toHaveLength(1);
+	expect(retries[0]!.message).toBe(sent[0]!.requestId);
+
+	// It is the room's record: a reload reads the same one message and one reply.
+	await ben.reload();
+	await ready(ben);
+	let reloaded = chatPane(ben);
+	await expect(reloaded).toContainText(`Attempt 2: ${CLEAN_CONTEXT}`);
+	expect(said(await reloaded.innerText(), marker)).toBe(1);
+	await expect(reloaded).not.toContainText(RETRY_PARTIAL);
+});
+
+test("a Retry that fails again says the new failure in the same place, and the next Retry still runs the one message", async ({ join, seed }) => {
+	await seed("# Twice failed\nThe harp needs new strings.\n");
+	let ana = await join("ana");
+	let chat = chatPane(ana);
+	let marker = crypto.randomUUID();
+	await ask(ana, `RETRY-CONTEXT-2 ${marker} shorten the summary`);
+	let banner = chatBanner(ana, "error");
+	await expect(banner.locator(".composer-notice-line")).toHaveText(
+		"503 Service Unavailable (attempt 1)",
+		{ timeout: 20_000 },
+	);
+	let retry = banner.getByRole("button", { name: "Retry", exact: true });
+	await retry.click();
+	// The new failure takes the old one's place: one banner, its own words, still offering Retry.
+	await expect(banner.locator(".composer-notice-line")).toHaveText(
+		"503 Service Unavailable (attempt 2)",
+		{ timeout: 20_000 },
+	);
+	await expect(allBanners(ana)).toHaveCount(1);
+	await expect(chat).not.toContainText("(attempt 1)");
+	expect(said(await chat.innerText(), marker)).toBe(1);
+	expect(said(await chat.innerText(), RETRY_PARTIAL)).toBe(1);
+
+	await retry.click();
+	await expect(chat).toContainText(`Attempt 3: ${CLEAN_CONTEXT}`, { timeout: 20_000 });
+	await expect.poll(async () => said(await chat.innerText(), marker)).toBe(1);
+	await expect(chat).not.toContainText(RETRY_PARTIAL);
+	await expect(allBanners(ana)).toHaveCount(0);
+});
+
+test("only the person who asked is offered Retry; another member reads the same failure with no button, and it goes for both with the answer", async ({ join, seed }) => {
+	await seed("# Shared failure\nThe harp needs new strings.\n");
+	let ana = await join("ana");
+	let ben = await join("ben");
+	await ask(ana, `FAIL-ONCE ${crypto.randomUUID()} shorten the summary`);
+	let hers = chatBanner(ana, "error");
+	let his = chatBanner(ben, "error");
+	await expect(hers).toContainText("Couldn't finish the reply.", { timeout: 20_000 });
+	await expect(his).toContainText("Couldn't finish the reply.");
+	await expect(hers.getByRole("button", { name: "Retry", exact: true })).toBeVisible();
+	await expect(his.getByRole("button")).toHaveCount(0);
+	await expect(allBanners(ben)).toHaveCount(1);
+	await hers.getByRole("button", { name: "Retry", exact: true }).click();
+	await expect(chatPane(ben).getByText(PULL_REQUESTS[0]!.title, { exact: false })).toBeVisible({
+		timeout: 20_000,
+	});
+	await expect(allBanners(ana)).toHaveCount(0);
+	await expect(allBanners(ben)).toHaveCount(0);
+});
+
+for (
+	let [shape, options] of [
+		["desktop", undefined],
+		["phone", { hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } }],
+	] as const
+) {
+	test(`the failure banner is reached and used from the keyboard, enters once and not at all under reduced motion, and has nothing axe objects to, on a ${shape}`, async ({ join, seed }) => {
+		await seed("# Keyed failure\nThe harp needs new strings.\n");
+		let page = await join("ana", options);
+		await page.emulateMedia({ reducedMotion: "reduce" });
+		let chat = chatPane(page);
+		let retried = 0;
+		await page.routeWebSocket("**/ws?**", route => {
+			let server = route.connectToServer();
+			route.onMessage(message => {
+				if (typeof message === "string" && message.includes('"chat:retry"')) retried++;
+				server.send(message);
+			});
+			server.onMessage(message => route.send(message));
+		});
+		await page.reload();
+		await ready(page);
+		await openChat(page);
+		await ask(page, `FAIL-ONCE ${crypto.randomUUID()} keyboard`);
+		let banner = chatBanner(page, "error");
+		await expect(banner).toBeVisible({ timeout: 20_000 });
+		// Reduced motion: it simply appears.
+		expect(await banner.evaluate(element => getComputedStyle(element).animationName)).toBe("none");
+
+		let result = await new AxeBuilder({ page }).include("[data-error-banner]").analyze();
+		expect(result.violations).toEqual([]);
+
+		// From the keyboard: Retry is reached forward, from the Chat's own first control, and shows
+		// its ring; Enter asks again.
+		let retry = banner.getByRole("button", { name: "Retry", exact: true });
+		await chat.getByRole("button").first().focus();
+		let visited: string[] = [];
+		for (let step = 0; step < 40; step++) {
+			if (await retry.evaluate(element => element === document.activeElement)) break;
+			await page.keyboard.press("Tab");
+			visited.push(
+				await page.evaluate(() => {
+					let active = document.activeElement;
+					return active
+						? `${active.tagName}:${
+							active.getAttribute("aria-label") ?? active.textContent?.trim().slice(0, 20)
+						}`
+						: "nothing";
+				}),
+			);
+		}
+		expect(visited.at(-1) ?? "", `Tab visited ${visited.join(" > ")}`).toContain("Retry");
+		await expectFocusIndicator(retry);
+		await expect(banner).toBeInViewport();
+		let before = retried;
+		await page.keyboard.press("Enter");
+		// Enter runs the failed message's turn again; it sends no message.
+		await expect.poll(() => retried).toBe(before + 1);
+		await expect(chat.getByText(PULL_REQUESTS[0]!.title, { exact: false })).toBeVisible({
+			timeout: 20_000,
+		});
+		await expect(allBanners(page)).toHaveCount(0);
+	});
+}
+
+test("a failed reply waits behind the connection banner when the connection drops, and is back, unchanged, when it returns: one cause, one banner, always", async ({ join, page, seed }) => {
+	test.setTimeout(90_000);
+	await seed("# Cut failure\nThe harp needs new strings.\n");
+	let sockets: WebSocketRoute[] = [];
+	let offline = false;
+	await page.routeWebSocket("**/ws?**", route => {
+		if (offline) return route.close();
+		let server = route.connectToServer();
+		route.onMessage(message => server.send(message));
+		server.onMessage(message => route.send(message));
+		sockets.push(route);
+	});
+	await page.addInitScript(() => {
+		Math.random = () => 0.999;
+		let seen = { most: 0 };
+		(window as unknown as { mostBanners: typeof seen }).mostBanners = seen;
+		let count = () => {
+			seen.most = Math.max(seen.most, document.querySelectorAll("[data-banner]").length);
+		};
+		addEventListener("DOMContentLoaded", () => {
+			new MutationObserver(count).observe(document.body, {
+				childList: true,
+				subtree: true,
+				attributes: true,
+			});
+		});
+	});
+	await watchBanners(page);
+	let opened = await join("ana");
+	await ask(opened, `FAIL-MODEL ${crypto.randomUUID()} cut`);
+	let failure = chatBanner(opened, "error");
+	await expect(failure).toContainText("Couldn't finish the reply.", { timeout: 20_000 });
+
+	offline = true;
+	for (let route of sockets) await route.close();
+	// The connection is the cause now, and it is the one thing said: the failure waits.
+	await expect(connectionBanner(opened)).toHaveAttribute("data-layer", "socket", {
+		timeout: 30_000,
+	});
+	await expect(failureBanner(opened)).toHaveCount(0);
+	await expect(allBanners(opened)).toHaveCount(1);
+	await expect(opened.getByRole("alert")).toHaveCount(0);
+
+	offline = false;
+	await opened.evaluate(() => dispatchEvent(new Event("online")));
+	// The bar goes without a word, and then the failure is told again, as it was.
+	await expect(connectionBanner(opened)).toHaveCount(0, { timeout: 30_000 });
+	await expect(failure).toContainText("Couldn't finish the reply.");
+	await expect(failure.locator(".composer-notice-line")).toHaveText("429 Too Many Requests");
+	await expect(allBanners(opened)).toHaveCount(1);
+	// At no moment, from any frame the page drew, were there two.
+	expect(
+		await opened.evaluate(() =>
+			(window as unknown as { mostBanners: { most: number } }).mostBanners.most
+		),
+	).toBe(1);
+	// The failure is not one of the live region's words: only the connection is spoken.
+	await expect(phaseVoice(opened)).not.toContainText(/429|reply/);
+});
+
+test("images the Planner makes reach Chat as stored, generated images only readers are served", async ({ baseURL, browser, join, page, room, seed }) => {
+	await seed("# Picture plan\nRefunds stop at the cap.\n");
+	let frames = await recordChat(page);
+	let pictures = [
+		{
+			file: "the-cap.webp",
+			type: "image/webp",
+			width: 1536,
+			height: 1024,
+			alt: "The cap is a balance of 100.",
+		},
+		{
+			file: "option-write-back.png",
+			type: "image/png",
+			width: 960,
+			height: 420,
+			alt: "Write-back: write, cache, then database later",
+		},
+		{
+			file: "option-write-through.png",
+			type: "image/png",
+			width: 960,
+			height: 420,
+			alt: "Write-through: write, cache, database",
+		},
+	].map(picture => ({
+		...picture,
+		bytes: readFileSync(new URL(`./fixtures/${picture.file}`, import.meta.url)),
+	}));
+	let opened = await join("ana");
+	let chat = chatPane(opened);
+	await chatInput(chat).fill("@chopin GENERATE-IMAGES draw the cap and both write paths");
+	await chat.getByRole("button", { name: "Send message" }).click();
+
+	let shown = () =>
+		frames("chat:message").map(item => item.frame.entry).findLast(entry =>
+			entry.images?.length === 3
+		);
+	await expect.poll(() => shown()?.images?.length, { timeout: 30_000 }).toBe(3);
+	let images = shown()!.images!;
+	expect(shown()!.author).toEqual({ kind: "agent" });
+	expect(images.map(({ alt, width, height, generated }) => ({ alt, width, height, generated })))
+		.toEqual(pictures.map(({ alt, width, height }) => ({ alt, width, height, generated: true })));
+	for (let [index, image] of images.entries()) {
+		expect(image.src).toMatch(/^\/images\/[0-9a-f]{64}\.(webp|png)$/);
+		let served = await opened.request.get(`${image.src}?document=${room}`);
+		expect(served.status()).toBe(200);
+		expect(served.headers()["content-type"]).toBe(pictures[index]!.type);
+		expect(served.headers()["x-content-type-options"]).toBe("nosniff");
+		expect(served.headers()["content-security-policy"]).toBe("default-src 'none'; sandbox");
+		expect((await served.body()).equals(pictures[index]!.bytes)).toBe(true);
+	}
+	await expect.poll(() => frames("chat:state").at(-1)?.frame.busy).toBe(false);
+
+	for (let picture of pictures) {
+		let image = chat.getByRole("img", { name: picture.alt, exact: true });
+		await expect(image).toBeVisible();
+		// A tile is drawn from the server's 360px copy, or the image itself where it is narrower.
+		await expect.poll(() => image.evaluate(element => (element as HTMLImageElement).naturalWidth))
+			.toBe(Math.min(picture.width, 360));
+	}
+	// Three images are a gallery, whose tiles carry no attribution: each image is told as generated
+	// in the lightbox, as it is shown.
+	await chat.getByRole("button", { name: `Open image: ${pictures[0]!.alt}`, exact: true }).click();
+	let box = opened.locator("[data-image-viewer]");
+	for (let [index, picture] of pictures.entries()) {
+		if (index > 0) await box.getByRole("button", { name: "Next", exact: true }).click();
+		await expect(box.getByRole("status")).toHaveText(`${index + 1} of ${pictures.length}`);
+		await expect(box.getByRole("img", { name: picture.alt, exact: true })).toBeVisible();
+		await expect(box.getByText("Generated", { exact: true })).toBeVisible();
+	}
+	await opened.keyboard.press("Escape");
+	await expect(box).toHaveCount(0);
+
+	await opened.reload();
+	await ready(opened);
+	let reloaded = chatPane(opened);
+	for (let picture of pictures) {
+		await expect(reloaded.getByRole("img", { name: picture.alt, exact: true })).toBeVisible();
+	}
+
+	let scoped = `${images[0]!.src}?document=${room}`;
+	expect((await fetch(new URL(scoped, baseURL))).status).toBe(404);
+	let stranger = await browser.newContext({ baseURL });
+	try {
+		let outsider = await stranger.newPage();
+		await authenticate(outsider, `score-outsider-${crypto.randomUUID()}`, baseURL!);
+		expect((await stranger.request.get("/api/session")).status()).toBe(200);
+		expect((await stranger.request.get(scoped)).status()).toBe(404);
+		expect((await stranger.request.get(images[0]!.src)).status()).toBe(404);
+	} finally {
+		await stranger.close();
+	}
 });

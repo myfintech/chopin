@@ -1,6 +1,7 @@
 import { createJustBashNetworkSandboxSession } from "@ai-sdk/sandbox-just-bash";
 
 import { registerCredential } from "../harness/harnesses";
+import { registerRemotePlanner } from "../harness/remote/registry";
 
 export type WorkerSandbox = Awaited<ReturnType<typeof createJustBashNetworkSandboxSession>>;
 type Destroyable = { destroy(): PromiseLike<void> };
@@ -10,6 +11,14 @@ export type WorkerAgent<Session extends Destroyable> = {
 };
 
 export type WorkerSession<Session> = { session: Session; close(): Promise<void> };
+
+/**
+ * The model a worker's artifact records. Under `HARNESS=remote` the operator may configure none, and the
+ * attached client then chooses its own.
+ */
+export function workerModel(configured: string): string {
+	return configured || "attached-client";
+}
 
 async function openAbortable<T extends Destroyable>(
 	opening: Promise<T>,
@@ -24,14 +33,17 @@ async function openAbortable<T extends Destroyable>(
 }
 
 /**
- * Opens one bounded worker session: a fresh sandbox, a registered per-session
- * credential, and the agent session. Aborting while either resource is still
- * opening destroys it once it arrives. `close()` destroys the session, then the
- * sandbox, then releases the credential, continuing past failures.
+ * Opens one bounded worker session for a document: a fresh sandbox, a registered
+ * per-session credential, and the agent session. The session is also registered as
+ * an isolated session of the document, so under `HARNESS=remote` it runs in the
+ * client attached as that document's Planner. Aborting while either resource is
+ * still opening destroys it once it arrives. `close()` destroys the session, then
+ * the sandbox, then releases the credential, continuing past failures.
  */
 export async function openWorkerSession<Session extends Destroyable>(
 	agent: WorkerAgent<Session>,
 	options: {
+		channelId: string;
 		token: () => string | undefined;
 		maxAiCredits: number;
 		aborted: Promise<never>;
@@ -42,6 +54,10 @@ export async function openWorkerSession<Session extends Destroyable>(
 	let sandbox = await openAbortable(openSandbox(), options.aborted);
 	let sessionId = crypto.randomUUID();
 	let release = registerCredential(sessionId, options.token, options.maxAiCredits);
+	let unregister = registerRemotePlanner(sessionId, {
+		channelId: options.channelId,
+		isolated: true,
+	});
 	let session: Session | undefined;
 	let close = async () => {
 		try {
@@ -50,6 +66,7 @@ export async function openWorkerSession<Session extends Destroyable>(
 			try {
 				await sandbox.destroy();
 			} finally {
+				unregister();
 				release();
 			}
 		}

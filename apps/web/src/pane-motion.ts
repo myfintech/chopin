@@ -49,15 +49,17 @@ export function usePaneSettledWidth(target: RefObject<HTMLElement | null>) {
 			target.current?.style.removeProperty("align-self");
 		};
 		let run = (event: TransitionEvent) => {
-			let element = target.current;
-			let available = element?.parentElement?.clientWidth;
+			// Every transition on the page starts here, a Chat row's fade on each row a pointer crosses,
+			// so only a pane track's width is measured for.
 			if (
-				!element || !available || event.propertyName !== "width"
-				|| !(event.target instanceof HTMLElement)
+				event.propertyName !== "width" || !(event.target instanceof HTMLElement)
 				|| !event.target.matches(".motion-sidebar, .workspace-chat-panel")
 			) {
 				return;
 			}
+			let element = target.current;
+			let available = element?.parentElement?.clientWidth;
+			if (!element || !available) return;
 			let effect = event.target.getAnimations()
 				.find(animation =>
 					animation instanceof CSSTransition && animation.transitionProperty === "width"
@@ -87,12 +89,20 @@ export function usePaneSettledWidth(target: RefObject<HTMLElement | null>) {
 	}, [target]);
 }
 
-/** The workspace waits for the sidebar track to settle before it re-measures its layout. */
+/**
+ * The workspace waits for the sidebar track to settle before it re-measures its layout.
+ *
+ * Only the sidebar's own animations are asked for: the question comes from a resize observer on
+ * every layout change, and `document.getAnimations()` collects every running animation on the page.
+ */
 export function sidebarMoving(): boolean {
-	return document.getAnimations().some(animation =>
-		animation instanceof CSSTransition && animation.transitionProperty === "width"
-		&& animation.effect instanceof KeyframeEffect
-		&& animation.effect.target instanceof Element
-		&& animation.effect.target.matches(".motion-sidebar")
-	);
+	for (let sidebar of document.querySelectorAll(".motion-sidebar")) {
+		if (
+			sidebar.getAnimations().some(animation =>
+				animation instanceof CSSTransition && animation.transitionProperty === "width"
+				&& animation.effect instanceof KeyframeEffect && animation.effect.target === sidebar
+			)
+		) return true;
+	}
+	return false;
 }

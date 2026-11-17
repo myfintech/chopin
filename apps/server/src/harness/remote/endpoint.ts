@@ -22,6 +22,7 @@ import {
 } from "@chopin/agent-link";
 
 import { AdmissionDenied } from "../../auth/admission";
+import { ownOrigin } from "../../auth/config";
 import { documentUrl } from "../../channels/document-url";
 import { GitHubError } from "../../github/client";
 import {
@@ -68,6 +69,8 @@ export type AgentHooks = {
 	unavailable?: (channelId: string) => boolean;
 	/** Observes attached links. */
 	register?: LinkOptions["register"];
+	/** A document's attached client reported what it offers, which may be nothing now. */
+	catalogChanged?: (channelId: string) => void;
 	timeoutMs?: number;
 	revalidateEveryMs?: number;
 	/** How often the link is sent a protocol ping. */
@@ -150,7 +153,7 @@ export async function admitAgent(
 	if (!enabled) return refusal(404, "This Chopin does not accept agent connections.");
 	if (!offersSubprotocol(request)) return subprotocolRequired();
 	let origin = request.headers.get("origin");
-	if (origin !== null && origin !== auth.config.origin) {
+	if (origin !== null && !ownOrigin(auth.config, origin)) {
 		return refusal(403, "origin is not allowed");
 	}
 	let token = request.headers.get("authorization")?.match(BEARER)?.[1];
@@ -203,10 +206,13 @@ export function agentLink(
 ): AgentLink {
 	let channelId: string | undefined;
 	let link: AgentLink;
-	let locate = (document: string) =>
+	// A machine's credential names its document: one the link names by its id or its address is read
+	// without asking GitHub for the repository again (see `MachinePlanners.granted`).
+	let locate = async (document: string) =>
 		machine
-			? machine.planners.locate(machine.machine, document)
-			: locateDocument(auth, caller, document);
+			? await machine.planners.granted(machine.machine, machine.channelId, document)
+				?? await machine.planners.locate(machine.machine, document)
+			: await locateDocument(auth, caller, document);
 	async function attach(message: { document: string }): Promise<AttachOutcome> {
 		let located = await locate(message.document);
 		if (located === "forbidden") {
@@ -228,7 +234,7 @@ export function agentLink(
 			return {
 				ok: false,
 				code: "repository-forbidden",
-				message: "This Planner credential was issued for another document.",
+				message: "This credential was issued for another document.",
 			};
 		}
 		if (channel.archivedAt) {
@@ -249,11 +255,33 @@ export function agentLink(
 				: {}),
 		}, link);
 		if (!granted.ok) return granted;
+		let document = { id: channel.id, title: channel.title, repository: fullName, url };
+		if (granted.takeover) {
+			let { takeover } = granted;
+			return {
+				ok: true,
+				document,
+				takeover: async names => {
+					let taken = await takeover(names);
+					if (!taken.ok) return taken;
+					channelId = channel.id;
+					return {
+						ok: true,
+						document,
+						detach: taken.detach,
+						claim: taken.claim,
+						lapse: taken.lapse,
+					};
+				},
+			};
+		}
 		channelId = channel.id;
 		return {
 			ok: true,
-			document: { id: channel.id, title: channel.title, repository: fullName, url },
+			document,
 			detach: granted.detach,
+			claim: granted.claim,
+			lapse: granted.lapse,
 		};
 	}
 	async function revalidate(): Promise<boolean> {
@@ -278,6 +306,9 @@ export function agentLink(
 		timeoutMs: hooks.timeoutMs,
 		revalidateEveryMs: hooks.revalidateEveryMs,
 		features,
+		catalogChanged: () => {
+			if (channelId) hooks.catalogChanged?.(channelId);
+		},
 	});
 	return link;
 }

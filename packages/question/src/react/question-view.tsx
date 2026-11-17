@@ -16,6 +16,7 @@ import { MAX_NEW_LABEL, MAX_SHARED_OPTIONS } from "../limits";
 import { answered } from "../draft";
 import { InlineCode } from "./inline-code";
 import { MarkdownBlocks, MarkdownLine, MarkdownText } from "./question-markdown";
+import { OptionPreview } from "./option-preview";
 import { questionHeading, questionParts } from "../text";
 import { CriteriaGrid } from "./criteria";
 import { Key, letter } from "./option-key";
@@ -24,6 +25,8 @@ import { projectSuggestion, reduceSuggestionEditState } from "./project-suggesti
 import { cardRelation, RelationNote } from "./relation-note";
 import { ResolvedActions } from "./resolved-actions";
 import { TextAnswer } from "./text-answer";
+import { usePendingWork } from "./use-pending-work";
+import { PLANNER_NAME } from "@chopin/protocol/planner-name";
 import type { VisibleSuggestion } from "./project-suggestion";
 import type { Relation } from "../relation";
 
@@ -223,6 +226,9 @@ function Choices(
 		let selected = question.multiple
 			? !!draft?.options[option.id]
 			: draft?.choice === option.id;
+		// With its own visual in the row, the option's name stays its label and description, not
+		// every word an image or diagram carries; the visual is its own group beside them.
+		let named = option.preview ? `${name}:${option.id}` : undefined;
 
 		return (
 			<label
@@ -248,16 +254,29 @@ function Choices(
 						);
 					}}
 					className="question-input"
+					aria-labelledby={named
+						&& (option.description ? `${named}:label ${named}:desc` : `${named}:label`)}
 				/>
 				<Key>{letter(index)}</Key>
 				<span className="question-text">
-					<span className="question-label">
+					<span className="question-label" id={named && `${named}:label`}>
 						<MarkdownLine links={false} text={option.label} />
 					</span>
 					{!custom && selected && option.id === suggestedOptionId && (
 						<span className="text-sm text-text-tertiary">{" from chat"}</span>
 					)}
-					{option.description && <MarkdownText place="desc" text={option.description} />}
+					{option.description && (
+						named
+							? (
+								<span className="question-desc-wrap" id={`${named}:desc`}>
+									<MarkdownText place="desc" text={option.description} />
+								</span>
+							)
+							: <MarkdownText place="desc" text={option.description} />
+					)}
+					{option.preview && (
+						<OptionPreview compact={matrix} label={option.label} text={option.preview} />
+					)}
 				</span>
 				{!matrix && (
 					<span aria-hidden="true" className="question-check">
@@ -378,6 +397,8 @@ function AddOption(
 	let label = text?.trim() ?? "";
 	let duplicate = label ? duplicateOf(question, label) : undefined;
 	let ready = !!label && !duplicate && !disabled;
+	// Typed text is kept until the option is added, so a reload would lose it.
+	usePendingWork(!!label || pending !== null);
 
 	useEffect(() => {
 		let target = focus.current;
@@ -729,6 +750,9 @@ function Resolved(
 														{option.description && (
 															<MarkdownText place="desc" text={option.description} />
 														)}
+														{option.preview && (
+															<OptionPreview label={option.label} text={option.preview} />
+														)}
 													</span>
 													<span aria-hidden="true" className="question-check">
 														<CheckIcon />
@@ -816,7 +840,7 @@ function Callout(
 }
 
 const EXPIRED_NOTE =
-	"Nobody answered this question, so the Planner used its best judgement for this decision.";
+	`Nobody answered this question, so ${PLANNER_NAME} used its best judgement for this decision.`;
 
 /**
  * Host input an earlier Chopin closed unanswered; questions no longer expire.
@@ -1213,7 +1237,9 @@ export function QuestionView(props: QuestionViewProps) {
 											{plainInlineList(previousAnswer.labels)}
 										</p>
 									)}
-									{refining && <p className="question-hint" role="status">Chopin is refining…</p>}
+									{refining && (
+										<p className="question-hint" role="status">{PLANNER_NAME} is refining…</p>
+									)}
 								</div>
 								<span className="question-head-actions">
 									<Presence

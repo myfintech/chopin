@@ -147,6 +147,10 @@
 		"ms": 7507,
 		"tests": 3
 	},
+	"handover.e2e.ts": {
+		"ms": 249189,
+		"tests": 13
+	},
 	"harness-children.e2e.ts": {
 		"ms": 15351,
 		"tests": 3
@@ -366,6 +370,10 @@
 	"smoke.e2e.ts": {
 		"ms": 32564,
 		"tests": 19
+	},
+	"steering.e2e.ts": {
+		"ms": 42000,
+		"tests": 7
 	},
 	"syntax-contrast.e2e.ts": {
 		"ms": 5342,

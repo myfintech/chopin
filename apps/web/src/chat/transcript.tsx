@@ -1,33 +1,70 @@
 /** The shared chat, grouped for reading rather than event delivery. */
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from "react";
 import {
-	CloseIcon,
-	MessageForwardIcon,
-	MessageIcon,
-	SignInIcon,
-	SparkleIcon,
-	WarningIcon,
-} from "@chopin/icons";
+	Fragment,
+	lazy,
+	memo,
+	startTransition,
+	Suspense,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+	useSyncExternalStore,
+} from "react";
+import type { ReactNode } from "react";
+import { MessageForwardIcon, MessageIcon, SignInIcon, WrenchIcon } from "@chopin/icons";
 import { parseChildDocumentPath } from "@chopin/protocol/document-url";
 
-import { ChopinMark, Face, openCommentThread, useCardMeta } from "@chopin/editor";
+import { ChopinMark, Face, openCommentThread, PLANNER_NAME, useCardMeta } from "@chopin/editor";
 import { EmptyState } from "@chopin/visuals";
 
+import { deliveryOf, failureOf } from "./delivery";
+import { MessageToolbar } from "./actions/message-toolbar";
+import { ReactionPills, ReactionRefusal } from "./actions/reaction-pills";
+import { DeliveryMark, FailedLine } from "./message-delivery";
+import { ChatImageDocument, MessageImages } from "./image";
+import { messageMenuActions } from "./message-menu-actions";
 import { MessageMarkdown } from "./markdown";
+import { plainTextOf } from "./message-copy";
+import { withIntents } from "./pending-reactions";
+import { ownEmoji, reactionChanges, reactionCounts } from "./reactions";
+import type { ReactionCounts } from "./reactions";
+import { TurnImages } from "./turn-images";
+import type { Intent } from "./pending-reactions";
 import { MessageMarkers } from "../conversation-plan/markers";
 import type { ExcerptCorrectionAction } from "../conversation-plan/analysis-overview";
 import type { CardLink } from "../conversation-plan/links";
-import { capitalize, displayText, group, workAnnouncement, workPhase } from "./model";
+import { displayText, group, workAnnouncement, workPhase } from "./model";
+import {
+	arrivedInBulk,
+	earlierRows,
+	FIRST_MESSAGES,
+	IDLE_WAIT_MS,
+	newestRows,
+} from "./newest-first";
+import { movedOffers, slideOffset } from "./offer-motion";
 import { WorkProgress } from "./work-progress";
+import { AppRow, ResearchAvatar, SpeakerHead } from "./speaker";
+import { AgentAvatar } from "./presence";
+import { messageSpeaker, researchSpeaker } from "./speakers";
+import type { ToolbarActions } from "./actions/message-toolbar";
 import { clearSourceHighlight, highlightSource } from "../conversation-plan/source";
+import { OverlayScrollbar } from "./overlay-scrollbar";
+import { scrollProgress } from "./scroll-progress";
 import type { ChatDestination } from "../conversation-plan/source";
+
+/** The files of a message are drawn by code that loads when a message first has some. */
+let MessageFiles = lazy(() => import("./attachments/message-files"));
 
 /** Message analysis is a development diagnostic; the browser suite builds it in too. */
 const ANALYSIS = import.meta.env.DEV || import.meta.env.VITE_MESSAGE_ANALYSIS === "on";
 
 import type { Chat, ConversationPlan } from "@chopin/protocol";
 import type { CompletedWork, Group, Message } from "./model";
+import type { OfferPlace } from "./offer-motion";
 import type { CardMetaStore, QuestionnaireStore } from "@chopin/editor";
 import type { Transport } from "@chopin/question/react";
 import { ActivityLine, DecisionPrompt } from "./decision-entry";
@@ -36,6 +73,15 @@ import { ResearchOfferCard } from "./research-offer";
 import type { ResearchOfferControls } from "./research-offer";
 import { researchTranscript } from "./research-transcript";
 import type { ResearchTranscriptItem } from "./research-transcript";
+import { CompactingRow, CompactionDivider } from "./compaction/compaction-divider";
+import { ThreadSummaryRow } from "./threads/thread-summary-row";
+
+export type TranscriptThreads = {
+	summaries: Record<string, Chat.ThreadSummary>;
+	openRootId?: string;
+	canStart: boolean;
+	onOpen: (rootId: string) => void;
+};
 
 type PlanMarkers = {
 	decisions?: TranscriptDecisions;
@@ -52,6 +98,7 @@ type PlanMarkers = {
 	sourceDestination?: ChatDestination;
 	conversationPlan?: ConversationPlan.State;
 	researchOffers?: ResearchOfferControls;
+	threads?: TranscriptThreads;
 };
 
 export type TranscriptDecisions = {
@@ -63,8 +110,13 @@ export type TranscriptDecisions = {
 	onOpenCard: (questionnaireId: string) => void;
 };
 
-function when(ts: number): string {
-	return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+let gutterFormat: Intl.DateTimeFormat | undefined;
+
+/** The time a grouped message shows in the avatar's gutter: the hour and minute alone, as Slack's. */
+function clock(ts: number): string {
+	gutterFormat ??= new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" });
+	return gutterFormat.format(new Date(ts * 1000))
+		.replace(/\s*[^\d:.\s]+\.?\s*$/u, "").replace(/^\s*[^\d\s]+\.?\s*/u, "");
 }
 
 const READY = /^Research is ready\. \[Open the research document\]\((\/documents\/\S+)\)\.$/;
@@ -74,16 +126,46 @@ function readyChild(text: string): string | undefined {
 	return path ? parseChildDocumentPath(path)?.childSlug : undefined;
 }
 
+/** A GitHub pull request link a build's line names as `[#12](url)`; nothing else is a link. */
+const PULL_LINK = /\[#(\d+)\]\((https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\1)\)/g;
+
+/** A system line's words, with a build's pull request links drawn as links. */
+export function systemParts(text: string): Array<string | { number: string; url: string }> {
+	let parts: Array<string | { number: string; url: string }> = [];
+	let last = 0;
+	for (let match of text.matchAll(PULL_LINK)) {
+		if (match.index > last) parts.push(text.slice(last, match.index));
+		parts.push({ number: match[1]!, url: match[2]! });
+		last = match.index + match[0].length;
+	}
+	if (last < text.length) parts.push(text.slice(last));
+	return parts;
+}
+
 function SystemEntry(
 	{ enter, item }: { enter: boolean; item: Extract<Group, { kind: "system" }> },
 ) {
 	let readyPath = READY.exec(item.text)?.[1];
 	let linked = readyPath !== undefined && parseChildDocumentPath(readyPath) !== undefined;
-	let Icon = readyPath
-		? SparkleIcon
-		: item.text.startsWith("Research could not be completed")
-		? WarningIcon
-		: SignInIcon;
+	// A research child's own word, that it is ready or could not be completed, is the child speaking.
+	if (linked || item.text.startsWith("Research could not be completed")) {
+		return (
+			<AppRow avatar={<ResearchAvatar />} enter={enter} speaker={researchSpeaker(item.ts)}>
+				{linked
+					? (
+						<MessageMarkdown
+							className="break-words text-base [overflow-wrap:anywhere]"
+							source={item.text}
+						/>
+					)
+					: (
+						<p className="m-0 break-words text-base text-text-secondary [overflow-wrap:anywhere]">
+							{displayText(item.text)}
+						</p>
+					)}
+			</AppRow>
+		);
+	}
 	return (
 		<div
 			className="flex items-start justify-start gap-3 text-left text-text-tertiary"
@@ -91,20 +173,27 @@ function SystemEntry(
 			data-chat-system
 		>
 			<div className="mt-0.5 shrink-0">
-				<Icon aria-hidden="true" size={16} />
+				{/^Build (opened|updated|finished|stopped|failed|didn’t)\b/.test(item.text)
+					? <WrenchIcon aria-hidden="true" size={16} />
+					: <SignInIcon aria-hidden="true" size={16} />}
 			</div>
-			{linked
-				? (
-					<MessageMarkdown
-						className="min-w-0 break-words text-sm [overflow-wrap:anywhere]"
-						source={item.text}
-					/>
-				)
-				: (
-					<p className="m-0 min-w-0 break-words text-sm [overflow-wrap:anywhere]">
-						{displayText(item.text)}
-					</p>
+			<p className="m-0 min-w-0 break-words text-sm [overflow-wrap:anywhere]">
+				{systemParts(displayText(item.text)).map((part, index) =>
+					typeof part === "string"
+						? part
+						: (
+							<a
+								className="link tabular-nums"
+								href={part.url}
+								key={index}
+								rel="noreferrer"
+								target="_blank"
+							>
+								#{part.number}
+							</a>
+						)
 				)}
+			</p>
 		</div>
 	);
 }
@@ -138,12 +227,13 @@ function CommentSystemEntry(
 			<span className="chat-comment-notice-head">
 				<MessageForwardIcon aria-hidden="true" className="icon-first-line" size={16} />
 				<span>
-					Comment on <span className="chat-comment-notice-title">“{comment.excerpt}”</span>{" "}
-					sent to Chopin
+					Comment on <span className="chat-comment-notice-title">“{comment.excerpt}”</span> sent to
+					{" "}
+					{PLANNER_NAME}
 				</span>
 			</span>
 			<span className="chat-comment-notice-body">
-				<span className="chat-comment-notice-mention">@Chopin</span> {comment.note}
+				<span className="chat-comment-notice-mention">@{PLANNER_NAME}</span> {comment.note}
 			</span>
 		</button>
 	);
@@ -206,13 +296,32 @@ function DecisionSystemEntry(
 let LEADING_MENTION = /^\s*@chopin\b[^\S\n]*/i;
 
 function MessageBody(
-	{ enter, handle, message, onWithdraw, ...markers }: {
+	{
+		enter,
+		handle,
+		headed,
+		intents,
+		message,
+		onDelete,
+		onReact,
+		onRetry,
+		quietFailures,
+		room,
+		...markers
+	}: {
 		enter: boolean;
 		handle: string;
+		headed: boolean;
+		intents: readonly Intent[];
 		message: Message;
-		onWithdraw: (id: string) => void;
+		onDelete: (id: string) => void;
+		onReact?: (id: string, emoji: string, on: boolean) => void;
+		onRetry: (id: string) => void;
+		quietFailures: boolean;
+		room?: string;
 	} & PlanMarkers,
 ) {
+	let host = useRef<HTMLDivElement>(null);
 	let toPlanner = message.to === "planner" && message.author.kind === "member";
 	let lead = toPlanner ? LEADING_MENTION.exec(message.text)?.[0].length ?? 0 : 0;
 	let text = toPlanner ? message.text.slice(lead) : message.text;
@@ -220,132 +329,211 @@ function MessageBody(
 		? message.references?.filter(item => item.start >= lead)
 			.map(item => ({ ...item, start: item.start - lead, end: item.end - lead }))
 		: message.references;
-	if (!toPlanner && !displayText(text) && message.author.kind === "member") text = "Ask Chopin";
+	if (
+		!toPlanner && !displayText(text) && message.author.kind === "member"
+		&& !message.attachments?.length
+	) text = `Ask ${PLANNER_NAME}`;
+	// Only the sender sees that a message is still only in their browser, or that the server refused it.
+	let own = message.author.kind === "member" && message.author.handle === handle;
+	let delivery = own ? deliveryOf(message) : undefined;
+	let threadSummary = markers.threads?.summaries[message.id];
+	let rootOpen = markers.threads?.openRootId === message.id;
+	let threads = markers.threads;
+	let canThread = !!threads
+		&& (!!threadSummary || threads.canStart)
+		&& !message.streaming && delivery === undefined;
+	let menu = messageMenuActions(message, handle, quietFailures);
+	let actions = useRef<ToolbarActions>(null!);
+	actions.current = {
+		plain: () => plainTextOf(text, references, toPlanner ? "@chopin" : undefined),
+		react: (emoji, on) => onReact?.(message.id, emoji, on),
+		delete: () => onDelete(message.id),
+		retry: () => onRetry(message.id),
+		thread: () => threads?.onOpen(message.id),
+	};
+	let shown = withIntents(message.reactions, intents, message.id, handle);
+	let openPicker = useRef<() => void>(undefined);
+	// What the pills last showed, so a pill that appears or a count that changes, and only that, moves.
+	let drawnReactions = useRef<ReactionCounts | undefined>(undefined);
+	let reactionMotion = reactionChanges(drawnReactions.current, shown.reactions);
+	useEffect(() => {
+		drawnReactions.current = reactionCounts(shown.reactions);
+	});
 
 	return (
-		<div
-			className="chat-message-body relative"
-			data-chat-enter={enter || undefined}
-			data-chat-source={markers.sourceDestination?.source.messageId === message.id || undefined}
-			data-chat-message-id={message.id}
-			data-chat-raw={message.text}
-			data-chat-state={message.working
-				? "working"
-				: message.workDisconnected
-				? "disconnected"
-				: undefined}
-		>
-			{(message.working || message.workDisconnected || !!message.tools?.length) && (
-				<WorkProgress
-					decisions={markers.decisions}
-					active={!!message.working}
-					disconnected={!!message.workDisconnected}
-					responseSeen={!!message.workResponseSeen}
-					streaming={!!message.workStreaming || !!message.streaming}
-					tools={message.tools ?? []}
-				/>
-			)}
-			{markers.sourceDestination?.source.messageId === message.id && (
-				<span
-					aria-hidden="true"
-					className="chat-source-tint"
-					key={markers.sourceDestination.token}
-				/>
-			)}
-			{(text || toPlanner) && (
-				<div className="flex items-start gap-1">
-					<div className="min-w-0 flex-1" data-chat-message-text>
-						<MessageMarkdown
-							className="break-words text-chat-body [overflow-wrap:anywhere]"
-							mention={toPlanner ? "@chopin" : undefined}
-							references={references}
-							source={text}
+		<ChatImageDocument value={room}>
+			<MessageImages
+				sender={{
+					// The viewer names who sent it and how long ago, as Slack's does.
+					name: messageSpeaker({ author: message.author }).name,
+					...(message.ts === undefined ? {} : { ts: message.ts }),
+					face: message.author.kind === "agent"
+						? <ChopinMark circle />
+						: <Face decorative handle={message.author.handle} size={36} titled={false} />,
+				}}
+			>
+				<div
+					className="chat-message-body relative"
+					data-chat-enter={enter || undefined}
+					data-chat-headed={headed || undefined}
+					data-chat-source={markers.sourceDestination?.source.messageId === message.id || undefined}
+					data-chat-message-id={message.id}
+					data-chat-raw={message.text}
+					data-thread-root-open={rootOpen || undefined}
+					ref={host}
+					data-chat-state={message.working
+						? "working"
+						: message.workDisconnected
+						? "disconnected"
+						: undefined}
+				>
+					{!headed && message.ts !== undefined && (
+						<span aria-hidden="true" className="chat-gutter-time tabular-nums">
+							{clock(message.ts)}
+						</span>
+					)}
+					{(message.working || message.workDisconnected || !!message.tools?.length) && (
+						<WorkProgress
+							decisions={markers.decisions}
+							active={!!message.working}
+							disconnected={!!message.workDisconnected}
+							responseSeen={!!message.workResponseSeen}
+							streaming={!!message.workStreaming || !!message.streaming}
+							tools={message.tools ?? []}
 						/>
-						{message.streaming && <span className="ml-0.5">▍</span>}
-					</div>
-					{message.queued && message.author.kind === "member" && message.author.handle === handle
-						&& (
-							<button
-								aria-label="Withdraw queued message"
-								data-tooltip="Withdraw message"
-								className="btn btn-icon btn-ghost -my-1 shrink-0"
-								onClick={() => onWithdraw(message.id)}
-								title="Withdraw"
-								type="button"
-							>
-								<CloseIcon aria-hidden="true" size={16} />
-							</button>
-						)}
+					)}
+					{markers.sourceDestination?.source.messageId === message.id && (
+						<span
+							aria-hidden="true"
+							className="chat-source-tint"
+							key={markers.sourceDestination.token}
+						/>
+					)}
+					{(text || toPlanner) && (
+						<div className="flex items-start gap-1">
+							<div className="min-w-0 flex-1" data-chat-message-text>
+								<MessageMarkdown
+									className="break-words text-chat-body [overflow-wrap:anywhere]"
+									mention={toPlanner ? "@chopin" : undefined}
+									references={references}
+									source={text}
+									streaming={!!message.streaming}
+								/>
+								{message.streaming && <span className="ml-0.5">▍</span>}
+							</div>
+							{delivery && delivery !== "failed" && <DeliveryMark mark={delivery} />}
+						</div>
+					)}
+					<TurnImages images={message.images} refused={message.refusedImages} />
+					{!!message.attachments?.length && room && (
+						<Suspense fallback={null}>
+							<MessageFiles channelId={room} files={message.attachments} />
+						</Suspense>
+					)}
+					{menu.retry && <FailedLine reason={failureOf(message)} />}
+					{shown.reactions.length > 0 && (
+						<ReactionPills
+							counted={reactionMotion.counted}
+							entered={reactionMotion.entered}
+							handle={handle}
+							onAdd={onReact ? () => openPicker.current?.() : undefined}
+							onToggle={(emoji, on) => onReact?.(message.id, emoji, on)}
+							pending={shown.pending}
+							reactions={shown.reactions}
+						/>
+					)}
+					{shown.refusal && <ReactionRefusal text={shown.refusal} />}
+					{threadSummary && markers.threads && (
+						<ThreadSummaryRow onOpen={markers.threads.onOpen} summary={threadSummary} />
+					)}
+					<MessageToolbar
+						actions={actions}
+						canDelete={menu.delete}
+						canRetry={menu.retry}
+						host={host}
+						markdown={message.text}
+						openPicker={openPicker}
+						reactable={!!onReact}
+						reacted={ownEmoji(shown.reactions, handle)}
+						thread={canThread ? message.id : undefined}
+					/>
+					{ANALYSIS && markers.onCardLink && markers.onRetryAnalysis && (
+						<MessageMarkers
+							canEdit={!!markers.canEdit}
+							messageId={message.id}
+							messageText={message.text}
+							jobs={markers.conversationPlanJobs}
+							onCard={markers.onCardLink}
+							onAddExcerpt={markers.onAddExcerpt}
+							onRetry={markers.onRetryAnalysis}
+							onRetryJob={markers.onRetryJob}
+							state={markers.conversationPlan}
+						/>
+					)}
 				</div>
-			)}
-			{ANALYSIS && !message.queued && markers.onCardLink && markers.onRetryAnalysis && (
-				<MessageMarkers
-					canEdit={!!markers.canEdit}
-					messageId={message.id}
-					messageText={message.text}
-					jobs={markers.conversationPlanJobs}
-					onCard={markers.onCardLink}
-					onAddExcerpt={markers.onAddExcerpt}
-					onRetry={markers.onRetryAnalysis}
-					onRetryJob={markers.onRetryJob}
-					state={markers.conversationPlan}
-				/>
-			)}
-		</div>
+			</MessageImages>
+		</ChatImageDocument>
 	);
 }
 
-function MessageGroup(
-	{ enter, entering, group: item, handle, onWithdraw, ...markers }: {
+let MessageGroup = memo(function MessageGroup(
+	{
+		enter,
+		entering,
+		group: item,
+		handle,
+		intents,
+		onDelete,
+		onReact,
+		onRetry,
+		quietFailures,
+		room,
+		...markers
+	}: {
 		/** The whole group entered; `entering` holds messages that joined it later. */
+		room?: string;
 		enter: boolean;
 		entering: ReadonlySet<string>;
 		group: Extract<ResearchTranscriptItem, { kind: "messages" }>;
 		handle: string;
-		onWithdraw: (id: string) => void;
+		intents: readonly Intent[];
+		onDelete: (id: string) => void;
+		onReact?: (id: string, emoji: string, on: boolean) => void;
+		onRetry: (id: string) => void;
+		quietFailures: boolean;
 	} & PlanMarkers,
 ) {
 	let first = item.messages[0]!;
 	let active = item.messages.find(message => message.working);
-	let name = item.author.kind === "agent" ? "Chopin" : capitalize(item.author.handle);
+	let speaker = messageSpeaker({
+		author: item.author,
+		ts: first.ts,
+		activeTs: active?.ts,
+	});
 
 	return (
 		<div
-			className={`flex gap-3 ${item.queued ? "text-text-quaternary" : ""}`}
+			className="flex gap-2"
 			data-chat-enter={enter || undefined}
 			data-chat-entry
-			data-chat-state={item.queued ? "queued" : undefined}
+			data-speaker-kind={speaker.kind}
 		>
-			<div className={`w-6 shrink-0 ${item.queued ? "opacity-45" : ""}`}>
+			<div className="w-9 shrink-0" data-chat-avatar="">
 				{item.continued
 					? null
 					: item.author.kind === "agent"
-					? <ChopinMark circle />
-					: <Face decorative handle={item.author.handle} size={24} titled={false} />}
+					? <AgentAvatar />
+					: <Face decorative handle={item.author.handle} size={36} titled={false} />}
 			</div>
 			<div
-				className={`flex min-w-0 flex-1 flex-col gap-1 ${item.continued ? "" : "-mt-0.5"} ${
-					item.queued ? "opacity-60" : ""
-				}`}
+				className={`flex min-w-0 flex-1 flex-col gap-1 ${item.continued ? "" : "-mt-0.5"}`}
 			>
-				{!item.continued && (
-					<div className="flex items-baseline gap-1.5 text-sm">
-						<span className="min-w-0 break-all font-semibold">{name}</span>
-						<span
-							className={item.queued
-								? "text-sm text-text-quaternary tabular-nums"
-								: "text-2xs text-text-tertiary tabular-nums"}
-						>
-							{item.queued
-								? "queued"
-								: active
-								? `Started at ${when(active.ts!)}`
-								: when(first.ts!)}
-						</span>
-					</div>
-				)}
-				{item.messages.map(message => (
+				{!item.continued && <SpeakerHead speaker={speaker} />}
+				{item.messages.map((message, index) => (
 					<MessageBody
+						headed={index === 0 && !item.continued}
+						intents={intents}
+						onReact={onReact}
 						enter={entering.has(message.id)}
 						decisions={markers.decisions}
 						canEdit={markers.canEdit}
@@ -357,21 +545,66 @@ function MessageGroup(
 						conversationPlan={markers.conversationPlan}
 						researchOffers={markers.researchOffers}
 						sourceDestination={markers.sourceDestination}
+						threads={markers.threads}
 						handle={handle}
 						key={message.id}
 						message={message}
-						onWithdraw={onWithdraw}
+						onDelete={onDelete}
+						onRetry={onRetry}
+						quietFailures={quietFailures}
+						room={room}
 					/>
 				))}
 			</div>
 		</div>
 	);
+});
+
+let noop = () => {};
+let NO_INTENTS: readonly Intent[] = [];
+let NONE_ENTERING: ReadonlySet<string> = new Set();
+
+/**
+ * A thread's root at the head of its panel: the row Chat draws for it, with its toolbar and its
+ * reactions, and no Reply in thread, since it is that thread.
+ */
+export function ThreadRoot(
+	{ entry, handle, intents, onReact, room }: {
+		entry: Chat.Entry;
+		handle: string;
+		intents: readonly Intent[];
+		onReact: (id: string, emoji: string, on: boolean) => void;
+		room: string;
+	},
+) {
+	let item = useMemo(() => group([entry])[0], [entry]);
+	if (item?.kind !== "messages") return null;
+	return (
+		<MessageGroup
+			enter={false}
+			entering={NONE_ENTERING}
+			group={item}
+			handle={handle}
+			intents={intents}
+			onDelete={noop}
+			onReact={onReact}
+			onRetry={noop}
+			quietFailures={false}
+			room={room}
+		/>
+	);
 }
 
-export function Transcript(
+/**
+ * Memoized: Chat renders again with every key typed in its composer, and a long transcript is
+ * hundreds of messages that the key does not change.
+ */
+export let Transcript = memo(function Transcript(
 	{
 		active,
 		canEdit,
+		compacting,
+		compactions,
 		completedWork,
 		conversationPlan,
 		conversationPlanJobs,
@@ -381,24 +614,36 @@ export function Transcript(
 		emptyHint,
 		entries,
 		handle,
+		lead,
+		tail,
 		live,
 		onCardLink,
 		onAddExcerpt,
 		onOpenChild,
 		room,
+		onDelete = noop,
+		onReact,
+		reactionIntents = NO_INTENTS,
+		onRetry = noop,
+		quietFailures = false,
 		onRetryAnalysis,
 		onRetryJob,
-		onWithdraw,
-		queued,
 		sourceDestination,
 		suspendedWork,
+		threads,
 		working,
 	}: {
 		active: boolean;
 		canEdit?: boolean;
+		compacting?: boolean;
+		compactions?: Chat.CompactionRecord[];
 		completedWork?: CompletedWork[];
 		conversationPlan?: ConversationPlan.State;
 		conversationPlanJobs?: ConversationPlan.Job[];
+		lead?: ReactNode;
+		/** The last row, after every entry: chopin's ephemeral note to this person. */
+		tail?: ReactNode;
+		threads?: TranscriptThreads;
 		onCardLink?: (link: CardLink) => void;
 		onAddExcerpt?: (action: ExcerptCorrectionAction) => Promise<void>;
 		onOpenChild?: (channelId: string) => Promise<boolean>;
@@ -417,8 +662,14 @@ export function Transcript(
 		handle: string;
 		/** False until the current connection's history has arrived. */
 		live?: boolean;
-		onWithdraw: (id: string) => void;
-		queued: Chat.Waiting[];
+		/** Drop a message the server refused. */
+		onDelete?: (id: string) => void;
+		onReact?: (id: string, emoji: string, on: boolean) => void;
+		reactionIntents?: readonly Intent[];
+		/** Send a message that could not be sent again. */
+		onRetry?: (id: string) => void;
+		/** The page's connection banner shows: a message's "Couldn't send" gives way to it, and is back with the connection. */
+		quietFailures?: boolean;
 		suspendedWork?: CompletedWork;
 		working?: Pick<Chat.Turn, "id" | "started" | "entryOffset">;
 		sourceDestination?: ChatDestination;
@@ -429,13 +680,41 @@ export function Transcript(
 	let pinned = useRef(true);
 	// Growth follows only a reader resting on the last line, not one a few pixels up.
 	let flush = useRef(true);
+	// The reader is following the newest line: true from the last time they were near it until they
+	// scroll up. Unlike `pinned` it does not give way when a row grows under them, which lengthens the
+	// distance without their having moved.
+	let follow = useRef(true);
+	let scrolledTo = useRef(0);
+	// How far the transcript can scroll, from its resize observer, and how far it has, from its scroll
+	// timeline; undefined until the observer has answered, or where there are no scroll timelines.
+	let scrollRange = useRef<number>(undefined);
+	let scrollProgressOf = useRef<() => number>(undefined);
+	// Whether the pointer is on a message. The message it is on shows its toolbar, and a message with
+	// the keyboard's focus gives way to it; the transcript says so to the stylesheet only while a
+	// message has that focus, the one time it changes anything, since saying it restyles every message.
+	let pointing = useRef(false);
+	let markPointing = (element: HTMLElement) => {
+		let focused = document.activeElement;
+		let on = pointing.current && !!focused && element.contains(focused)
+			&& !!focused.closest(".chat-message-body") && focused.matches(":focus-visible");
+		if (element.hasAttribute("data-chat-pointing") !== on) {
+			element.toggleAttribute("data-chat-pointing", on);
+		}
+	};
+	// The animation frame in which the transcript next moves to its newest line.
+	let pin = useRef(0);
 	let previous = useRef<{ groups: Set<string>; atoms: Set<string>; planned: boolean }>(undefined);
 	let entered = useRef(new Set<string>());
-	let places = useRef(new Map<string, { at: string; top: number }>());
+	let places = useRef(new Map<string, OfferPlace>());
+	let stamp = useRef(0);
+	let offered = useRef(false);
 	let sourceOwner = useRef({});
-	let groups = researchTranscript(
-		group(entries, queued, working, completedWork, suspendedWork),
-		researchOffers ? conversationPlan?.researchOffers ?? [] : [],
+	let offers = researchOffers ? conversationPlan?.researchOffers : undefined;
+	// The same rows while the transcript does not change, so a row already mounted is not rendered
+	// again when older ones are mounted above it.
+	let groups = useMemo(
+		() => researchTranscript(group(entries, working, completedWork, suspendedWork), offers ?? []),
+		[entries, working, completedWork, suspendedWork, offers],
 	);
 	let messages = groups.flatMap(item => item.kind === "messages" ? item.messages : []);
 	// A turn keeps one row from its placeholder through completion, so it enters once.
@@ -450,7 +729,7 @@ export function Transcript(
 		if (item.kind === "system") return { item, key: item.id };
 		let first = item.messages[0]!;
 		let turn = first.working ? working?.id : turns.get(first.id);
-		return { item, key: turn ? `turn:${turn}` : `${item.queued ? "queued" : "sent"}-${first.id}` };
+		return { item, key: turn ? `turn:${turn}` : `sent-${first.id}` };
 	});
 	let atoms = new Set(
 		groups.flatMap(item =>
@@ -476,6 +755,42 @@ export function Transcript(
 		}
 	}
 	let enters = (key: string) => entered.current.has(`row:${key}`);
+	// The oldest rows not mounted yet (`newest-first.ts`). A transcript that arrives in bulk mounts
+	// its newest screenful with the document, and the rest in the steps below, once it has painted.
+	let sizes = keyed.map(({ item }) => item.kind === "messages" ? item.messages.length : 1);
+	let [mounting, setMounting] = useState<{ bulk?: Chat.Entry[]; from: number }>({ from: 0 });
+	let from = Math.min(mounting.from, keyed.length);
+	// Set once for each arrival, from the render that finds it; a live message changes nothing.
+	if (mounting.bulk !== entries && arrivedInBulk(before ? entering.size : atoms.size)) {
+		from = newestRows(sizes, FIRST_MESSAGES);
+		setMounting({ bulk: entries, from });
+	}
+	useEffect(() => {
+		if (from === 0) return;
+		let idle: number | undefined;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let step = () => {
+			startTransition(() => {
+				setMounting(current => ({ ...current, from: earlierRows(sizes, current.from) }));
+			});
+		};
+		// After the frame that paints what is mounted, and then when the page is idle, so a step
+		// does not hold up what the reader does next. A browser without idle callbacks takes the
+		// next task.
+		let frame = requestAnimationFrame(() => {
+			if (typeof requestIdleCallback === "function") {
+				idle = requestIdleCallback(step, { timeout: IDLE_WAIT_MS });
+			} else timer = setTimeout(step);
+		});
+		return () => {
+			cancelAnimationFrame(frame);
+			if (idle !== undefined) cancelIdleCallback(idle);
+			clearTimeout(timer);
+		};
+		// `sizes` is new with each render and read only for the rows above `from`, which later
+		// messages do not change.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [from]);
 	let readySubscribe = useCallback(
 		(listener: () => void) => researchOffers?.store.subscribe(listener) ?? (() => {}),
 		[researchOffers?.store],
@@ -505,14 +820,14 @@ export function Transcript(
 		let hasDetails = !!messages.find(message => message.id === suspendedWork.anchorId)?.tools
 			?.length;
 		announcement = hasDetails
-			? "Chopin connection lost. Work details remain available."
-			: "Chopin connection lost.";
+			? `${PLANNER_NAME} connection lost. Work details remain available.`
+			: `${PLANNER_NAME} connection lost.`;
 	} else if (completedWork?.length) {
 		let anchorId = completedWork.at(-1)?.anchorId;
 		let hasDetails = !!messages.find(message => message.id === anchorId)?.tools?.length;
 		announcement = hasDetails
-			? "Chopin turn ended. Work details remain available."
-			: "Chopin turn ended.";
+			? `${PLANNER_NAME} turn ended. Work details remain available.`
+			: `${PLANNER_NAME} turn ended.`;
 	}
 	let latestPrompt = new Map<string, string>();
 	let latestScoped = new Map<string, string>();
@@ -532,9 +847,14 @@ export function Transcript(
 				entering.has(message.id) && message.author.kind === "member"
 				&& message.author.handle === handle
 			)
-		) pinned.current = true;
-		// Rows that arrived behind a hidden Chat (the phone tab) are not news when it opens.
-		if (!active || !scroller.current?.getClientRects().length) {
+		) {
+			pinned.current = true;
+			follow.current = true;
+		}
+		// Rows that arrived behind a hidden Chat (the phone tab) are not news when it opens. Only a
+		// row carrying a mark can be told apart from news, so with none the question is not asked: it
+		// forces a layout, and this runs after every render.
+		if (entered.current.size > 0 && (!active || !scroller.current?.getClientRects().length)) {
 			entered.current.clear();
 			for (let row of stack.current?.querySelectorAll("[data-chat-enter]") ?? []) {
 				row.removeAttribute("data-chat-enter");
@@ -547,47 +867,131 @@ export function Transcript(
 		}
 	});
 
+	// Where every offer card is painted now, content-relative so the reader's own scrolling is not
+	// motion. Every read comes before the map is replaced.
+	let stampOffers = useCallback(() => {
+		let element = scroller.current;
+		// A transcript that has never had an offer card has nothing to look for on every resize.
+		if (!element || (!offered.current && places.current.size === 0)) return;
+		let cards = [...element.querySelectorAll<HTMLElement>("[data-chat-placement]")];
+		let top = element.getBoundingClientRect().top;
+		let scrolled = element.scrollTop;
+		places.current = new Map(
+			cards.map(card => [card.dataset.chatOffer!, {
+				at: card.dataset.chatPlacement!,
+				top: card.getBoundingClientRect().top - top + scrolled,
+			}]),
+		);
+	}, []);
+
 	// An offer that follows a newer message slides from where it was last painted rather than
-	// teleporting. Positions are kept content-relative so the reader's own scrolling is not motion.
+	// teleporting. Only a change of which card follows which message can start a slide, so that, and
+	// nothing else, is what this waits for. Where the cards are painted is kept current by the
+	// observer below and by the frame after each change.
+	let offerPlacements = keyed.flatMap(({ item }) =>
+		item.kind === "research"
+			? [
+				`${item.offer.id}@${
+					item.offer.workflow?.placementMessageId ?? item.offer.source.messageId
+				}`,
+			]
+			: []
+	).join("\n");
+	offered.current = offerPlacements !== "";
 	useLayoutEffect(() => {
 		let element = scroller.current;
 		if (!element) return;
-		let scrolled = element.scrollTop;
-		if (active && pinned.current) element.scrollTop = element.scrollHeight;
-		let reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-		let cards = () => [
-			...element.querySelectorAll<HTMLElement>("[data-chat-placement]"),
-		];
-		let place = (card: HTMLElement) =>
-			card.getBoundingClientRect().top - element.getBoundingClientRect().top;
-		for (let card of cards()) {
-			let last = places.current.get(card.dataset.chatOffer!);
-			if (!last || last.at === card.dataset.chatPlacement || reduce) continue;
-			for (let running of card.getAnimations()) running.cancel();
-			let offset = last.top - scrolled - place(card);
-			if (Math.abs(offset) < 1) continue;
-			let tokens = getComputedStyle(card);
-			let duration = tokens.getPropertyValue("--acc-expand").trim();
-			card.animate([{ transform: `translateY(${offset}px)` }, { transform: "none" }], {
-				duration: parseFloat(duration) * (duration.endsWith("ms") ? 1 : 1000),
-				easing: tokens.getPropertyValue("--motion-move"),
-			});
+		// Which cards follow a different message is read from their attributes, before anything is
+		// measured, and only those cards are measured and moved.
+		let moved = movedOffers(
+			[...element.querySelectorAll<HTMLElement>("[data-chat-placement]")].map(card => ({
+				card,
+				offer: card.dataset.chatOffer!,
+				placement: card.dataset.chatPlacement!,
+			})),
+			places.current,
+		);
+		if (moved.length > 0 && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+			let scrolled = element.scrollTop;
+			if (active && pinned.current) element.scrollTop = element.scrollHeight;
+			// A running slide is cancelled so that the card is measured where it now is. Then every
+			// read for every card, one layout in all, and only then the writes.
+			for (let { card } of moved) for (let running of card.getAnimations()) running.cancel();
+			let top = element.getBoundingClientRect().top;
+			let slides: { card: HTMLElement; offset: number; duration: string; easing: string }[] = [];
+			for (let { card, offer } of moved) {
+				let offset = slideOffset(
+					places.current.get(offer)!,
+					scrolled,
+					card.getBoundingClientRect().top - top,
+				);
+				if (Math.abs(offset) < 1) continue;
+				let tokens = getComputedStyle(card);
+				slides.push({
+					card,
+					offset,
+					duration: tokens.getPropertyValue("--acc-expand").trim(),
+					easing: tokens.getPropertyValue("--motion-move"),
+				});
+			}
+			for (let { card, duration, easing, offset } of slides) {
+				card.animate([{ transform: `translateY(${offset}px)` }, { transform: "none" }], {
+					duration: parseFloat(duration) * (duration.endsWith("ms") ? 1 : 1000),
+					easing,
+				});
+			}
 		}
-		let frame = requestAnimationFrame(() => {
-			places.current = new Map(
-				cards().map(card => [card.dataset.chatOffer!, {
-					at: card.dataset.chatPlacement!,
-					top: place(card) + element.scrollTop,
-				}]),
-			);
-		});
-		return () => cancelAnimationFrame(frame);
-	});
+		stamp.current = requestAnimationFrame(stampOffers);
+		return () => cancelAnimationFrame(stamp.current);
+	}, [active, offerPlacements, stampOffers]);
 
+	// Any render may grow a row, so every render keeps a reader near the bottom on the newest line.
+	// Whether the reader is following is decided here, before the render's growth can move them; the
+	// move waits for the animation frame. `scrollHeight` asks the browser to lay the page out, and
+	// read in the commit that has just changed the transcript it made the layout twice for a render
+	// that came after another in the same task: once for the read, once for the frame. In the frame
+	// one render or twenty make it once, and the frame's own layout serves it.
+	useLayoutEffect(() => {
+		if (!active || !follow.current) return;
+		cancelAnimationFrame(pin.current);
+		pin.current = requestAnimationFrame(() => {
+			let element = scroller.current;
+			if (element && follow.current) element.scrollTop = element.scrollHeight;
+		});
+	});
+	useEffect(() => () => cancelAnimationFrame(pin.current), []);
+
+	// How far the transcript can scroll: its stack and its padding past what shows of it, from the
+	// observer's entries, as the overlay scrollbar counts it, so a scroll step asks for no layout.
 	useLayoutEffect(() => {
 		let element = scroller.current;
-		if (active && pinned.current && element) element.scrollTop = element.scrollHeight;
-	}, [active, entries, queued]);
+		let inner = stack.current;
+		if (!element || !inner) return;
+		scrollProgressOf.current = scrollProgress(element);
+		if (!scrollProgressOf.current) return;
+		let shown: number | undefined;
+		let padding = 0;
+		let content: number | undefined;
+		let observer = new ResizeObserver(entries => {
+			for (let entry of entries) {
+				let block = entry.borderBoxSize[0]?.blockSize ?? entry.contentRect.height;
+				if (entry.target === element) {
+					shown = block;
+					padding = block - (entry.contentBoxSize[0]?.blockSize ?? entry.contentRect.height);
+				} else content = block;
+			}
+			if (shown !== undefined && content !== undefined) {
+				scrollRange.current = Math.max(0, Math.round(padding + content - shown));
+			}
+		});
+		observer.observe(element, { box: "border-box" });
+		observer.observe(inner, { box: "border-box" });
+		return () => {
+			observer.disconnect();
+			scrollRange.current = undefined;
+			scrollProgressOf.current = undefined;
+		};
+	}, []);
 
 	// Rows grow after they mount (streaming, work details, offer cards) and the pane resizes
 	// (phone keyboard, composer, window); a reader at the bottom stays on the newest line.
@@ -596,11 +1000,13 @@ export function Transcript(
 		if (!active || !element || !stack.current) return;
 		let observer = new ResizeObserver(() => {
 			if (flush.current) element.scrollTop = element.scrollHeight;
+			// Layout is current here, so reading the cards forces nothing.
+			stampOffers();
 		});
 		observer.observe(stack.current);
 		observer.observe(element);
 		return () => observer.disconnect();
-	}, [active]);
+	}, [active, stampOffers]);
 
 	useEffect(() => {
 		if (!active || !sourceDestination) return;
@@ -611,6 +1017,8 @@ export function Transcript(
 		if (!message) return;
 		pinned.current = false;
 		flush.current = false;
+		follow.current = false;
+		cancelAnimationFrame(pin.current);
 		message.scrollIntoView({ block: "center", inline: "nearest" });
 		let exact = highlightSource(sourceOwner.current, message, sourceDestination.source);
 		message.dataset.sourceExact = String(exact);
@@ -618,19 +1026,43 @@ export function Transcript(
 			clearSourceHighlight(sourceOwner.current);
 			delete message.dataset.sourceExact;
 		};
-	}, [active, sourceDestination]);
+		// Again once every row is mounted, for a message older than the first ones mounted.
+	}, [active, sourceDestination, from === 0]);
 
-	return (
+	let view = (
 		<div
-			className="flex min-h-0 min-w-0 flex-1 flex-col overflow-auto px-5 py-3 text-left"
+			className="chat-scroll flex min-h-0 min-w-0 flex-1 flex-col overflow-auto pt-3 text-left"
 			data-chat-scroll=""
 			data-focus-boundary=""
 			ref={scroller}
+			onPointerOver={event => {
+				pointing.current = !!(event.target as Element).closest(
+					".chat-message-body, [data-chat-head]",
+				);
+				markPointing(event.currentTarget);
+			}}
+			onPointerLeave={event => {
+				pointing.current = false;
+				markPointing(event.currentTarget);
+			}}
+			onFocus={event => markPointing(event.currentTarget)}
+			onBlur={event => markPointing(event.currentTarget)}
 			onScroll={event => {
 				let element = event.currentTarget;
-				let distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+				// How far it can scroll comes from the resize observer and how far it has from the scroll
+				// timeline, so a step under a resting pointer lays nothing out (`scroll-progress.ts`).
+				let range = scrollRange.current;
+				let progress = range === undefined ? undefined : scrollProgressOf.current?.();
+				let top = progress === undefined ? element.scrollTop : progress * range!;
+				let distance = progress === undefined
+					? element.scrollHeight - top - element.clientHeight
+					: range! - top;
 				pinned.current = distance < 48;
 				flush.current = distance <= 2;
+				// Near the newest line is following it; moving up leaves it.
+				if (pinned.current) follow.current = true;
+				else if (top < scrolledTo.current) follow.current = false;
+				scrolledTo.current = top;
 			}}
 		>
 			<span
@@ -643,10 +1075,17 @@ export function Transcript(
 				{announcement}
 			</span>
 			<div
-				className="relative flex min-h-full shrink-0 flex-col gap-4 [&>*:first-child]:mt-auto"
+				className={`relative flex min-h-full shrink-0 flex-col gap-4 ${
+					lead ? "" : "[&>*:first-child]:mt-auto"
+				}`}
+				data-chat-led={lead ? "" : undefined}
 				data-chat-stack
 				ref={stack}
 			>
+				{lead}
+				{compactions?.filter(item => !item.afterEntryId).map(item => (
+					<CompactionDivider compaction={item} key={`compact:${item.id}`} />
+				))}
 				{empty && (
 					<p
 						className="px-1 text-left text-sm text-text-tertiary"
@@ -655,15 +1094,20 @@ export function Transcript(
 						{empty}
 					</p>
 				)}
-				{keyed.map(({ item, key }) =>
-					item.kind === "research"
+				{keyed.slice(from).map(({ item, key }) => {
+					let groupIds = item.kind === "messages"
+						? new Set(item.messages.map(message => message.id))
+						: new Set([item.kind === "system" ? item.id : ""]);
+					let afterCompactions = compactions?.filter(
+						compaction => compaction.afterEntryId && groupIds.has(compaction.afterEntryId),
+					) ?? [];
+					let node = item.kind === "research"
 						? (
 							<div
 								data-chat-enter={enters(key) || undefined}
 								data-chat-offer={item.offer.id}
 								data-chat-placement={item.offer.workflow?.placementMessageId
 									?? item.offer.source.messageId}
-								key={key}
 							>
 								<ResearchOfferCard controls={researchOffers!} offer={item.offer} />
 							</div>
@@ -677,7 +1121,6 @@ export function Transcript(
 									item={item as Extract<Group, { kind: "system" }> & {
 										decision: NonNullable<Chat.Entry["decision"]>;
 									}}
-									key={key}
 									latest={item.decision.kind === "prompt"
 										? latestPrompt.get(item.decision.questionnaireId) === item.id
 										: item.decision.kind === "scoped-choice"
@@ -690,14 +1133,13 @@ export function Transcript(
 								<CommentSystemEntry
 									comment={item.comment}
 									enter={enters(key)}
-									key={key}
 									onOpenChild={onOpenChild}
 									room={room}
 								/>
 							)
 							: announced.has(readyChild(item.text) ?? "")
 							? null
-							: <SystemEntry enter={enters(key)} item={item} key={key} />
+							: <SystemEntry enter={enters(key)} item={item} />
 						: (
 							<MessageGroup
 								decisions={decisions}
@@ -713,18 +1155,37 @@ export function Transcript(
 								entering={entered.current}
 								group={item}
 								handle={handle}
-								key={key}
-								onWithdraw={onWithdraw}
+								onDelete={onDelete}
+								intents={reactionIntents}
+								onReact={onReact}
+								onRetry={onRetry}
+								quietFailures={quietFailures}
+								room={room}
 								sourceDestination={sourceDestination}
+								threads={threads}
 							/>
-						)
-				)}
-				<div className="h-4 shrink-0" />
+						);
+					return (
+						<Fragment key={key}>
+							{node}
+							{afterCompactions.map(compaction => (
+								<CompactionDivider
+									compaction={compaction}
+									key={`compact:${compaction.id}`}
+								/>
+							))}
+						</Fragment>
+					);
+				})}
+				{compacting && <CompactingRow />}
+				{tail}
+				{/* With the stack's own gap, the last message ends 20px above the box, as Slack's clears its. */}
+				<div className="h-1 shrink-0" />
 				{emptyHint && (
 					<div
-						aria-hidden={groups.length > 0 || undefined}
+						aria-hidden={groups.length > 0 || !!tail || undefined}
 						className={`pointer-events-none absolute inset-0 flex items-center justify-center px-6 transition-opacity motion-reduce:transition-none ${
-							groups.length > 0 ? "opacity-0" : "opacity-100"
+							groups.length > 0 || tail ? "opacity-0" : "opacity-100"
 						}`}
 						data-chat-empty=""
 					>
@@ -735,13 +1196,13 @@ export function Transcript(
 							description={
 								<>
 									{emptyHint.automatic
-										? "Talk it through with your collaborators and Chopin."
+										? `Talk it through with your collaborators and ${PLANNER_NAME}.`
 										: "Talk it through with your collaborators."}
 									{emptyHint.planner && !emptyHint.automatic && (
 										<>
-											{" "}Mention{" "}
-											<strong className="font-medium text-text-secondary">@chopin</strong>{" "}
-											to ask the Planner
+											{" "}Use <strong className="font-medium text-text-secondary">@</strong> to ask
+											{" "}
+											{PLANNER_NAME}
 											{emptyHint.references ? ", or " : "."}
 										</>
 									)}
@@ -760,4 +1221,11 @@ export function Transcript(
 			</div>
 		</div>
 	);
-}
+
+	return (
+		<div className="chat-scroll-host flex min-h-0 min-w-0 flex-1 flex-col">
+			{view}
+			<OverlayScrollbar content={stack} scroller={scroller} />
+		</div>
+	);
+});

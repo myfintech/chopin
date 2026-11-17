@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import * as limits from "@chopin/dialect/limits";
 
+import { NAMES_AS_WRITTEN } from "../agent/identity";
 import { WEB_SEARCH_MAX_CALLS, WebSearchTimeoutError, webSearchTool } from "../harness/web-search";
 import { JobExecutionError } from "./registry";
-import { openWorkerSession, type WorkerSession } from "./worker-session";
+import { openWorkerSession, workerModel, type WorkerSession } from "./worker-session";
 import type { WebSearchFailureDiagnostic } from "../harness/web-search";
 import type { researchAgent } from "../harness/agents";
 import type { Config } from "../config";
@@ -956,8 +957,10 @@ async function stage(
 				throw err;
 			}
 			if (!web.ok) {
+				let { reason, classification, durationMs } = web.error.failure;
+				metrics.webFailure = { webFailure: classification, webFailureDurationMs: durationMs };
 				throw publicStageError(
-					"web-search-unavailable",
+					reason,
 					metrics,
 					new Error(
 						web.error.kind === "MissingTool"
@@ -971,6 +974,7 @@ async function stage(
 		diagnose("opening-session");
 		if (publicWeb) await execution.progress("worker-session", "started");
 		worker = await openWorkerSession(agent, {
+			channelId: execution.job.channelId,
 			token: () => credential.token,
 			maxAiCredits: STAGE_AI_CREDITS,
 			aborted,
@@ -990,7 +994,8 @@ async function stage(
 				abortSignal,
 				options: {
 					model: config.model,
-					instructions,
+					// A stage whose words a person reads (a report, an answer) names people as Chat does.
+					instructions: publicWeb ? instructions : `${instructions} ${NAMES_AS_WRITTEN}`,
 					...(web?.ok ? { webSearch: web.value.tool, webContext: { credential } } : {}),
 				},
 			}),
@@ -1157,7 +1162,7 @@ export function researchEvidenceDefinition(options: ResearchEvidenceOptions): Jo
 			return parseResearchEvidenceArtifact({
 				...input,
 				...evidence,
-				model: options.config.model,
+				model: workerModel(options.config.model),
 			});
 		},
 	};
@@ -1231,7 +1236,7 @@ export function researchAnswerDefinition(options: ResearchAnswerOptions): JobDef
 					privateFindings: privateValue.findings,
 					documentRevision: input.document.revision,
 					documentSourceHash: input.document.sourceHash,
-					model: options.config.model,
+					model: workerModel(options.config.model),
 				});
 			}
 
@@ -1260,7 +1265,7 @@ export function researchAnswerDefinition(options: ResearchAnswerOptions): JobDef
 				sources: evidence.sources,
 				documentRevision: input.document.revision,
 				documentSourceHash: input.document.sourceHash,
-				model: options.config.model,
+				model: workerModel(options.config.model),
 			});
 		},
 	};

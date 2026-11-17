@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { HarnessAgent } from "@ai-sdk/harness/agent";
 import { createJustBashNetworkSandboxSession } from "@ai-sdk/sandbox-just-bash";
 import { jsonSchema, tool } from "ai";
@@ -10,6 +10,7 @@ import {
 	ATOMIC_RESULT_TOOL_NAME,
 	createAtomicAdapter,
 	FULL_PLANNER_TOOLS,
+	operatorPlannerTools,
 } from "./adapter";
 import {
 	classifyRuns,
@@ -19,6 +20,7 @@ import {
 	registerFullPlanner,
 	resumeOwnedRuns,
 	runCards,
+	settleEndedRuns,
 	untilUnpaused,
 	workflowRuns,
 } from "./full";
@@ -98,7 +100,9 @@ async function run(
 		projectPackage = false,
 		operatorPackage = false,
 		askingWorkflow = false,
+		operatorSettings,
 		afterTurn,
+		during,
 		events,
 		reports,
 	}: {
@@ -113,8 +117,12 @@ async function run(
 		operatorPackage?: boolean;
 		/** Load a workflow whose stage calls ask_user_question, through the operator's extension paths. */
 		askingWorkflow?: boolean;
+		/** The operator's Atomic `settings.json`, as the host CLI would have written it. */
+		operatorSettings?: Record<string, unknown>;
 		/** Runs once the Planner's turn has ended, while its session and workflow runs are still live. */
 		afterTurn?: () => Promise<void>;
+		/** Runs while the turn is under way, with the session the turn runs in. */
+		during?: (session: Awaited<ReturnType<HarnessAgent["createSession"]>>) => Promise<void>;
 		/** Collects, in order, the tool reports the adapter makes and the stream parts a tool yields. */
 		events?: string[];
 		/** Collects every runs report the Planner session makes. */
@@ -174,9 +182,12 @@ async function run(
 	api.registerTool({name: "operator_tool", label: "Operator", description: "Marker", parameters: {type:"object"}, async execute() { return {content:[{type:"text",text:"marker"}], details:{}}; }});
 	let nudged = false;
 	api.on("agent_end", () => {
-		if (process.env.CHOPIN_TEST_SELF_STARTED_TURN !== "1" || nudged) return;
+		let how = process.env.CHOPIN_TEST_SELF_STARTED_TURN;
+		if (!how || nudged) return;
 		nudged = true;
-		setTimeout(() => api.sendMessage({ customType: "self-started", content: "SELF-STARTED", display: true }, { triggerTurn: true }), 20);
+		setTimeout(() => how === "queued"
+			? api.sendUserMessage("SELF-STARTED", { deliverAs: "followUp" })
+			: api.sendMessage({ customType: "self-started", content: "SELF-STARTED", display: true }, { triggerTurn: true }), 20);
 	});
 };`,
 		);
@@ -207,7 +218,11 @@ async function run(
 				"---\nname: project-marker\ndescription: PROJECT-SKILL-MARKER\n---\nProject skill.\n",
 			);
 			await mkdir(join(cwd, ".atomic"), { recursive: true });
-			await writeFile(join(cwd, ".atomic", "settings.json"), JSON.stringify({ packages: [pkg] }));
+			// A checkout naming its own tool for the Planner's turns, which only the operator's settings may do.
+			await writeFile(
+				join(cwd, ".atomic", "settings.json"),
+				JSON.stringify({ packages: [pkg], chopin: { plannerTools: ["project_tool"] } }),
+			);
 		}
 		if (askingWorkflow) {
 			await mkdir(operatorPackageDir, { recursive: true });
@@ -273,6 +288,9 @@ export default workflow({
 			);
 		}
 		process.env.ATOMIC_CODING_AGENT_DIR = agentDir;
+		if (operatorSettings) {
+			await writeFile(join(agentDir, "settings.json"), JSON.stringify(operatorSettings));
+		}
 		let humanInput: HostInput = host ?? {
 			confirm: async () => false,
 			select: async () => undefined,
@@ -316,6 +334,7 @@ export default workflow({
 		stub.requests.length = 0;
 		try {
 			let result = await agent.stream({ session, prompt });
+			let meanwhile = during?.(session);
 			let parts: { type: string; toolName?: string; dynamic?: boolean; preliminary?: boolean }[] =
 				[];
 			for await (let part of result.fullStream) {
@@ -325,12 +344,17 @@ export default workflow({
 				}
 			}
 			await result.text;
+			await meanwhile;
 			await afterTurn?.();
 			let requests = [...stub.requests];
 			if (!worker) {
 				let files = {
 					operator: await Bun.file(join(agentDir, "settings.json")).exists(),
 					journal: await Bun.file(journal).exists(),
+					journalDirectoryMode: await stat(dirname(journal)).then(
+						info => info.mode & 0o777,
+						() => undefined,
+					),
 					defaultJournal: await Bun.file(join(root, "workflows", "journal.sqlite")).exists(),
 					environment: process.env.ATOMIC_WORKFLOW_JOURNAL_PATH,
 					project: projectPackage
@@ -441,11 +465,76 @@ test("Planner sessions use their checkout cwd and route ask_user_question throug
 	expect(prompt.requests[0]!.prompt).toBe("OPERATOR-PROMPT-MARKER");
 });
 
+test("a Planner turn takes a person's message while it runs, and the model reads it as its next input", async () => {
+	let asked = Promise.withResolvers<void>();
+	let released = Promise.withResolvers<void>();
+	let host: HostInput = {
+		confirm: async () => false,
+		select: async () => undefined,
+		input: async () => undefined,
+		editor: async () => undefined,
+		questionnaire: async value => {
+			asked.resolve();
+			await released.promise;
+			return {
+				answers: [{
+					questionIndex: 0,
+					question: value.questions[0]!.question,
+					kind: "option",
+					answer: "Second",
+				}],
+				cancelled: false,
+			};
+		},
+	};
+	let result = await run(true, "question", {
+		host,
+		during: async session => {
+			// The turn is inside its tool call: the message waits for the step's end, not for the turn's.
+			await asked.promise;
+			await session.experimental_steerTurn("@bo: Also say what the rollout costs.");
+			released.resolve();
+		},
+	});
+	expect(result.requests).toHaveLength(2);
+	expect(result.requests[1]!.hasPriorToolResult).toBe(true);
+	expect(result.requests[1]!.prompt).toBe("@bo: Also say what the rollout costs.");
+});
+
 test("a Planner session without a checkout is just as full in its empty working directory", async () => {
 	let result = await run(true, "cwd", { checkout: false });
 	expectPlannerTools(result.requests[0]!.toolNames);
 	expect(result.requests[0]!.system).toContain(result.cwd);
 	expect(result.requests.at(-1)!.toolResults.join("\n")).toContain(result.cwd);
+});
+
+test("the operator's chopin.plannerTools adds a read-only tool an extension registers to the Planner's own turns", async () => {
+	let result = await run(true, "plain", {
+		operatorSettings: { chopin: { plannerTools: ["operator_tool"] } },
+	});
+	let names = result.requests[0]!.toolNames;
+	expect(names).toContain("operator_tool");
+	for (let name of WITHHELD_TOOLS.filter(name => name !== "operator_tool")) {
+		expect(names).not.toContain(name);
+	}
+	for (let name of names) {
+		expect([...FULL_PLANNER_TOOLS, "operator_tool", "host_tool"]).toContain(name);
+	}
+});
+
+test("chopin.plannerTools takes only a list of names, and never a tool that writes, runs commands or starts agents", () => {
+	expect([...operatorPlannerTools({})]).toEqual([]);
+	expect([...operatorPlannerTools({ chopin: { plannerTools: ["code_search_extra"] } })]).toEqual([
+		"code_search_extra",
+	]);
+	for (let bad of ["bash", "edit", "write", "kill", "subagent", "todo"]) {
+		expect(() => operatorPlannerTools({ chopin: { plannerTools: ["read", bad] } })).toThrow(bad);
+	}
+	for (let malformed of ["bash", [""], [1], { name: "x" }]) {
+		expect(() => operatorPlannerTools({ chopin: { plannerTools: malformed } })).toThrow(
+			"list of tool names",
+		);
+	}
 });
 
 test("a checkout's project settings add its packages without writing either settings file", async () => {
@@ -548,6 +637,8 @@ test(
 			// and through the session rather than the process-wide environment variable.
 			expect(result.files).toMatchObject({ journal: true, defaultJournal: false });
 			expect(result.files?.environment).toBeUndefined();
+			// Only the server's user can enter its directory, which also holds the worker-logs/ Atomic keeps.
+			expect(result.files?.journalDirectoryMode).toBe(0o700);
 		} finally {
 			if (environment !== undefined) process.env.NODE_ENV = environment;
 			await room.close();
@@ -556,17 +647,42 @@ test(
 	60_000,
 );
 
-test("a turn Atomic starts by itself between the Planner's turns is stopped before it reaches the model", async () => {
-	process.env.CHOPIN_TEST_SELF_STARTED_TURN = "1";
-	try {
-		let result = await run(true, "plain", {
-			afterTurn: () => new Promise(resolve => setTimeout(resolve, 500)),
+test(
+	"an operator's shared storage selection, even an adapter package, does not move a Planner's workflow journal",
+	async () => {
+		let result = await run(true, "launch", {
+			askingWorkflow: true,
+			// What `atomic storage join` writes; the adapter package is not installed here.
+			operatorSettings: {
+				storage: {
+					adapter: "@bastani/atomic-storage-libsql",
+					options: { url: "libsql://chopin-test.invalid" },
+				},
+			},
 		});
-		expect(result.requests).toHaveLength(1);
-	} finally {
-		delete process.env.CHOPIN_TEST_SELF_STARTED_TURN;
-	}
-});
+		let launched = result.requests.at(-1)!.toolResults.join("\n");
+		expect(launched).toContain("asking-workflow");
+		expect(launched).not.toContain('"failed"');
+		expect(result.files).toMatchObject({ journal: true, defaultJournal: false });
+	},
+	WORKFLOW_TOOL_TIMEOUT_MS,
+);
+
+// Atomic starts a turn for its own notices, and since 0.9.41 for a message queued on an idle session.
+test.each(["notice", "queued"])(
+	"a turn Atomic starts by itself (%s) between the Planner's turns is stopped before it reaches the model",
+	async how => {
+		process.env.CHOPIN_TEST_SELF_STARTED_TURN = how;
+		try {
+			let result = await run(true, "plain", {
+				afterTurn: () => new Promise(resolve => setTimeout(resolve, 500)),
+			});
+			expect(result.requests).toHaveLength(1);
+		} finally {
+			delete process.env.CHOPIN_TEST_SELF_STARTED_TURN;
+		}
+	},
+);
 
 test("worker sessions stay isolated, even beside a full Planner session on the same harness", async () => {
 	let alone = await run(false);
@@ -602,6 +718,41 @@ test("paused roots are paused, roots whose run ended are neither, and every othe
 	});
 	expect(classifyRuns([])).toEqual({ active: [], paused: [] });
 });
+
+for (let held of ["suspended", "waiting"] as const) {
+	test(`a stage that Atomic holds between turns (${held}) is shown as still running`, async () => {
+		let { foldLifecycle, runCards } = await import("./full");
+		let cards = new Map();
+		let event = (target: object, at: number) =>
+			({
+				type: "workflow_lifecycle",
+				eventId: `e${at}`,
+				cursor: { epoch: "e", revision: at },
+				runId: "run-1",
+				rootRunId: "run-1",
+				ownerSessionId: "session",
+				occurredAt: at * 1000,
+				observedAt: at * 1000,
+				delivery: "live",
+				target,
+			}) as never;
+		foldLifecycle(
+			cards,
+			event({ kind: "run", runId: "run-1", status: "running" }, 100),
+			"plan-review",
+		);
+		foldLifecycle(
+			cards,
+			event(
+				{ kind: "stage", runId: "run-1", stageId: "a", stageName: "draft-1", status: held },
+				101,
+			),
+		);
+		expect(runCards(cards, { active: ["run-1"], paused: [] })[0]!.stages).toEqual([
+			{ id: "run-1:a", name: "draft-1", status: "running", started: 101 },
+		]);
+	});
+}
 
 test("run cards fold lifecycle events into ordered stages, Decisions waits, and paused or finished status", async () => {
 	let { foldLifecycle, runCards } = await import("./full");
@@ -727,6 +878,48 @@ test("Stop and Resume use the session's run control, and a partial pause is repo
 		failedRuns: [{ runId: "run-2", reason: "pause_failed", message: "busy" }],
 	} as typeof outcome;
 	await expect(pauseOwnedRuns(workflows)).rejects.toThrow("run-2: busy");
+});
+
+test("before a session goes, each run that ended is waited on until its ending is journaled, never a live, paused or blocked one", async () => {
+	let card = (id: string, status: PlannerRuns["cards"][number]["status"]) => ({
+		id,
+		name: id,
+		status,
+		started: 0,
+		updated: 0,
+		stages: [],
+		waiting: 0,
+	});
+	let waited: string[] = [];
+	let errors: unknown[][] = [];
+	let error = console.error;
+	console.error = (...args: unknown[]) => void errors.push(args);
+	try {
+		await settleEndedRuns({
+			waitForSettled: async runId => {
+				waited.push(runId);
+				if (runId === "failed") throw new Error("journal unavailable");
+			},
+		}, {
+			active: ["live"],
+			paused: ["paused"],
+			cards: [
+				card("finished", "finished"),
+				card("failed", "failed"),
+				card("stopped", "stopped"),
+				card("blocked", "blocked"),
+				card("live", "running"),
+				card("paused", "paused"),
+			],
+		});
+	} finally {
+		console.error = error;
+	}
+	expect(waited.sort()).toEqual(["failed", "finished", "stopped"]);
+	expect(errors).toHaveLength(1);
+	expect(String(errors[0]!.join(" "))).toContain("failed");
+	expect(String(errors[0]!.join(" "))).toContain("journal unavailable");
+	await settleEndedRuns({ waitForSettled: async () => {} }, undefined);
 });
 
 test("an answer to a paused run's question is held until the run resumes, including child runs", async () => {

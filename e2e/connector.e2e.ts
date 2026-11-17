@@ -37,6 +37,7 @@ for (let transport of ["stdio", "http"] as const) {
 			script,
 			"connect",
 			transport === "stdio" ? "." : root,
+			"--no-sandbox",
 			"--",
 			"bun",
 			join(ROOT, "apps/connector/src/testing/fake-agent.ts"),
@@ -124,6 +125,7 @@ function start(baseURL: string, root: string, state: string) {
 		join(ROOT, "apps/connector/src/main.ts"),
 		"connect",
 		root,
+		"--no-sandbox",
 		"--",
 		"bun",
 		join(ROOT, "apps/connector/src/testing/fake-agent.ts"),
@@ -166,6 +168,12 @@ test("a paired machine reconnects without pairing, until it is disconnected in t
 		await expect(
 			page.getByRole("checkbox", {
 				name: "Let Chopin build and prototype automatically on this machine",
+				exact: true,
+			}),
+		).not.toBeChecked();
+		await expect(
+			page.getByRole("checkbox", {
+				name: "Let teammates run their work on this machine",
 				exact: true,
 			}),
 		).not.toBeChecked();

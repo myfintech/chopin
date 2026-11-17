@@ -22,7 +22,9 @@ The most useful technical references are:
 - [Agent connection](docs/agent-connection.md)
 - [Background jobs and workers](docs/background-jobs.md)
 - [Experimental implementation lifecycle](docs/implementation-lifecycle.md)
+- [Adding an assistant-ui element](docs/assistant-ui.md)
 - [Self-hosting](docs/self-hosting.md)
+- [Deploys nobody can see](docs/zero-downtime-deploys.md)
 
 ## Commands
 
@@ -47,7 +49,7 @@ bun run docker:up       # build and start app plus PostgreSQL locally
 bun run docker:down     # tear down the local Compose project
 ```
 
-The repository pins Bun 1.4.2. `mise.toml` selects that version automatically for
+The repository pins Bun 1.4.4. `mise.toml` selects that version automatically for
 contributors who use [mise](https://mise.jdx.dev); run `mise install` once. Keep
 the package metadata, `mise.toml`, Docker image, CI, and documentation
 synchronized when changing it.
@@ -100,7 +102,7 @@ harnesses as runtime package boundaries.
 The browser edits Lexical bound to Yjs. One WebSocket multiplexes session,
 document (`plan:*` on the wire), conversation, questions, comments, and
 implementation lifecycle messages; the Projects sidebar's own `/ws/sidebar`
-socket carries only decision counts. The server keeps each open channel as an
+socket carries decision counts and says when a repository's documents change. The server keeps each open channel as an
 authoritative Y.Doc with a headless Lexical mirror so it can validate and
 serialize the document without trusting a browser.
 
@@ -116,10 +118,15 @@ MDAST object identity preserves existing Lexical nodes, selections, and undo
 history.
 
 PostgreSQL is the only runtime storage adapter. One renewable `chopin:writer`
-lease permits one application process per database. Hosted browser sessions use
-encrypted credentials in PostgreSQL and restore on presentation of the browser
-cookie. Startup clears Planner ownership and metadata-only local sessions;
-collaborative state and external implementation runs are durable.
+lease permits one application process per database. A second process started with
+`HANDOVER=wait` waits beside the holder in standby, reading the lease without a lock,
+and takes it when the holder's cut releases it; only the holder serves.
+[Deploys nobody can see](docs/zero-downtime-deploys.md) gives the order and the proxy
+it needs. Hosted browser sessions use encrypted credentials in PostgreSQL and restore
+on presentation of the browser cookie. Startup clears Planner ownership, except a
+remote Planner's persisted hand-over hold, and metadata-only local sessions;
+collaborative state, saved Planner requests and external implementation runs are
+durable.
 
 ## Authority and security
 
@@ -135,7 +142,10 @@ collaborative state and external implementation runs are durable.
   App installation and repository role.
 - **MCP has a different credential boundary.** `/mcp` checks its caller-supplied
   GitHub bearer directly, does not require the App installation, and can mutate
-  data for callers with push or administration access.
+  data for callers with push or administration access. Work on a paired machine
+  instead presents an MCP token minted from its launch's credential, limited to
+  that launch's documents and life (`experiments/mcp-token.ts`); `/mcp` never
+  takes a GitHub App installation token or a launch's own Planner or run credential.
 - **Planner ownership is process-bound.** The first eligible Planner or
   model-backed research request supplies its GitHub App token and Copilot
   entitlement. Server-authored turns nobody typed (re-linking decisions after a
@@ -157,11 +167,42 @@ collaborative state and external implementation runs are durable.
   client sees what a turn sees and steers its document writes. Attaching makes
   the account's live browser login the document's Planner owner, one client per
   document; nothing else claims ownership. `@chopin` and `invoke_planner` on a
-  document without one fail with `planner-not-attached`. Signing out the
-  owner's login, its expiry, or a Planner reset closes the link. A paired
-  machine's Planner backend attaches with a document-scoped credential instead
-  and owns through a cookie-less login carrying the machine's own GitHub token,
-  which only revoking the machine or its authorization ends. See
+  document without one, or whose machine is away, are refused with the
+  connection's own words and nothing is kept for later. A client that offers the
+  optional `steer-turn` feature is given a message sent while its turn runs as a
+  `steer` frame (`docs/agent-connection.md`); one that does not is refused such a
+  message. Signing out the owner's login, its expiry, or a Planner reset closes the link. A lost
+  connection never ends work by itself: a link that offered
+  `resumable-sessions` and then dropped unexpectedly keeps its sessions that hold
+  a live run or an open question, however long it stays away, and holds any Stop
+  pressed meanwhile or still unanswered when it dropped for its client's return.
+  Run cards say the Planner is disconnected, not stopped; Decisions stay open and
+  answerable; answers and cancellations made meanwhile are delivered when the
+  same account's client resumes. No timer ends that, and `PLANNER_ATTACH_GRACE_MS`
+  leases only a detached link's ownership. Only an explicit Stop, a sign-out or
+  expiry, a Planner reset, unpairing or revoking the machine, the owner choosing
+  another machine, archiving the document, or the same account attaching with a client that
+  does not resume (a browser sign-in over a machine's parked work included) ends it; no other
+  close keeps it.
+  A restart keeps what the cut writes to `planner_link_holds`: the sessions a client holds,
+  the questions it waits on (with the decisions each asked, which the next process waits on
+  again so a member's answer reaches the client's own request), the answers it is owed and the
+  Stops it has not heard. Until its window (`HANDOVER_PLANNER_WINDOW_MS`, counted from the
+  release of the lease: the next process starts it as it rebuilds the hold, so no step between
+  the write and the release, however slow, and no late takeover takes anything from it; only a
+  row the cut wrote more than an hour before is no window's) ends, a hold whose link the cut
+  closed is shown as attached. A `resume` inside the window is never refused: before the owner's
+  browser sign-in is back it waits for it, with the link kept and the machine shown attached, and
+  takes the sessions back the moment it is; one still without it once the window is over is
+  refused `unavailable` with `retry`. Only that process is given the window: it rewrites the
+  row without it before it shows the hold, so a process that starts after it crashed, inside the
+  window or after it, finds the hold disconnected. A crash keeps only
+  the hold of a link that had already dropped. Without a `resume` the hold turns disconnected
+  when the window ends. A graceful shutdown posts no Chat line about it. A same-account
+  client that returns before the server noticed its old link died takes that link's work
+  over with its first `resume`. A paired machine's Planner backend attaches with a document-scoped
+  credential instead and owns through a cookie-less login carrying the machine's
+  own GitHub token, which only revoking the machine or its authorization ends. See
   [Hosted agent](docs/hosted-agent.md#remote-planner).
 - **Repository node IDs are authoritative.** Owner and repository names resolve
   GitHub requests but never replace the stored node identity.
@@ -174,16 +215,197 @@ collaborative state and external implementation runs are durable.
   `LIVE_SPIKES` prototypes run only passages the consenting editor changed, on a
   push-refusing throwaway worktree, under hourly caps and a 20-minute deadline;
   see [Prototype spikes](docs/local-experiments.md#prototype-spikes-live_spikes).
+- **A shared machine runs teammates' work as its owner.** An owner who shares a machine
+  consents to the Planner, builds and runs of a document whose editor chose it, or made it
+  their favorite and chose none, in repositories the owner can push to (checked with the machine's
+  own token, as Default machine does). The
+  agent pushes as the App's bot with a token for the one repository, crediting the editor, whose
+  push access the server checks ([GitHub App identity](docs/github-app-identity.md)); the build
+  records the editor as `user` and the
+  owner as `machineOwner`, and only the connection it was queued on may claim or report it.
+  Work Chopin starts by itself never leaves its builder's own machines. Where a document's Planner runs is
+  derived from stored choices (the creator's, else an editor's whose machine can run it now),
+  never from process memory, so a restart asks one machine; a choice that cannot run it yet
+  stops nothing and never interrupts an attached Planner. That check is held per machine and
+  repository (a pass 10 minutes, a refusal a minute, asked once however many listings ask
+  at once). The Machines page, polled every few seconds, lists a machine that serves every
+  repository from two held lists of what can be pushed to, not a check per repository: the
+  person's own (a minute) and its owner's, listed with the machine's token once per owner
+  for everyone (10 minutes, a failure a minute), so its cost to the owner's token does not
+  grow with teammates or polls. Only a repository the machine has a checkout of is asked
+  on its own. A person's one favorite may be a teammate's shared machine they could use (the
+  same eligibility as its listing); Automatic and Default machine prefer it where it serves the
+  repository, and fall back where it doesn't, for a pressed rebuild too, ahead of the machine its
+  first build ran on. A favorite is stored and published one change at a time per machine, with
+  unsharing and revoking, so memory never keeps one storage has cleared. Machines, a person's own
+  and teammates' shared ones, are listed together newest paired first. Unsharing clears
+  teammates' choices and favorites of the machine and hands a document to Default machine only where the machine ran its Planner,
+  had been asked to, was placing it, or someone uses the document; any other just loses
+  the choice.
+- **Agents on a machine run in its process sandbox.** The connector starts the ACP
+  agent and each Planner backend through one `Sandbox` seam (`apps/connector/src/sandbox.ts`):
+  MXC's Seatbelt, bubblewrap or ProcessContainer, in one policy. Writes go to the run's
+  worktree or the Planner's own worktree, the agent's state, a private temporary directory and what
+  the owner adds. A sandboxed agent never writes the person's own checkout: a Planner runs in it
+  (`CHOPIN_CHECKOUT`, whether a regular checkout, a linked worktree of the person's or a clone
+  Chopin made) and reads it, whole, so its files, its submodules (whose `.git` files the person's
+  `git status` and `git diff` follow), its `.git`, index and `HEAD` are never writable, and no path
+  the owner adds with `--sandbox-write` changes that: one that is the checkout or inside it (a
+  submodule's folder) or its git directory is not granted, and one that holds it is granted with
+  the checkout held read-only. The working directory is written only where the connector made it for the launch (`Launch.own`). A
+  Planner's changes reach the person as commits and a pushed branch from its own worktree
+  (`CHOPIN_WORKTREE`), never by in-place edits. Git on the host runs what a repository's configuration names, and finds that
+  configuration through files (a worktree's or a submodule's `.git`, a `commondir`) that name another
+  directory, and a sandbox can only hold back paths that exist. So the policy is an allow-list: the repository's
+  git directory is read-only whole, which also stops its entries being renamed or made again, with
+  only `objects`, `refs`, `logs` and `lfs` written in it (data git reads, not programs or
+  pointers), and only by a launch with a worktree of its own: for a linked worktree the connector
+  made for the launch (a run's, or a Planner's own), that worktree's one entry in `worktrees/` with
+  `commondir`, `gitdir`, `config.worktree` and the directories `hooks`, `info` and `modules` read-only
+  inside it (made empty where there is none). A name made at the top of that entry can't be refused:
+  git takes the lock of its `HEAD` and index by creating a file beside each, which a sandbox can't grant
+  for those names and refuse for the others (measured: `git add` and `git commit` fail with `Unable to
+  create 'index.lock'` when the entry is read-only), so that directory stays writable and a
+  new name in it (`future-pointer`, `rebase-merge/`, `locked`, a file named like a hook) is made. Such a
+  name is never a pointer, configuration, hook or program for the person's git in their checkout, which
+  stays read-only with the rest of the git directory (it reads the entry to list, prune and remove the
+  worktree, to see which branch it has checked out or is rebasing, which a planted name can make refuse
+  a checkout or delete of that branch, and `gc` reads its `HEAD` and index), and it makes no hardened connector git run anything
+  (tested: status, fetch, the removal of the worktree and retention with such names planted, an unfinished
+  rebase's `exec` line among them, run nothing; git run inside the worktree itself would, as the next
+  sentences say). Which entry is the launch's own
+  is the connector's record of what it made for it (`Launch.own`), never what a folder is called or
+  what is in it. Its `config`, `hooks`, `info`, `HEAD`, `index`, `packed-refs`, submodules' git
+  directories, `worktrees` and every worktree's entry but the launch's own, the person's included,
+  are read-only, and no file can be added at its top level. The guarantee is that nothing a
+  sandboxed agent writes is in a tree the person's own git reads in their checkout, but `objects`,
+  `refs`, `logs` and `lfs` (an agent can add commits and move branches there) and the launch's own
+  entry, whose names are no pointer, configuration or program there; the worktree an agent works in
+  is its own, and git run inside it by a person runs what the agent left. Paths are real
+  paths: `repositoryAt` resolves a symbolic `.git` (and a `.git` file that leads through a link)
+  once, and the policy names that directory, never the link. A Planner's own worktree is made by
+  the connector on the host before a sandboxed backend starts (`preparePlannerWorktree`), because
+  `git worktree add` would need `worktrees/` written, and with no filter run (`noFilters`: every
+  filter any configuration defines is given no command); an unsandboxed backend makes it itself. The
+  limit, said plainly: in the sandbox anything written in a Planner's checkout, `git add`, `commit`
+  and `checkout` included, fails (it is read-only whole), and works in the launch's own worktree.
+  A Planner backend that edits `CHOPIN_CHECKOUT` in place must edit its worktree instead; nothing
+  in this repository does. `git worktree add/remove`, `git config` without `-c`, `git remote add`, `branch -D`, `tag -d` and `gc` fail
+  everywhere; `push -u` can't record an upstream (see [Git in the sandbox](docs/chopin-cli.md#git-in-the-sandbox)). Every git command the connector runs on the host
+  goes through `apps/connector/src/git-host.ts`, which is told where the repository is
+  (`GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`, recorded by `repositoryAt` the first time the
+  connector sees a working tree and never read from the files an agent can write), reads a copy of
+  the person's configuration of the settings a fetch and a checkout need (`GIT_CONFIG_NOSYSTEM`,
+  `GIT_CONFIG_GLOBAL`), and replaces what a repository may set for hooks, the file-system monitor, the
+  ssh command, attributes, `ext::` remotes, credential helpers (reset, and none of the person's
+  named again; a command's caller gives the credentials it needs in the environment) and the
+  local transport (never allowed; `GIT_ALLOW_PROTOCOL` in the connector's own environment is the
+  person's way to a mirror on disk). Not guaranteed: what an agent writes
+  in its own worktree and its own entry (an unfinished rebase's `exec` lines, a repository it
+  `git init`s, a submodule it adds to its own index with a `.git` it wrote, which the connector's
+  git doesn't open) is the agent's, and git run there by a person runs what is there; a repository's
+  own configuration is still read by the connector's git (filters, proxies), which the policy keeps
+  an agent from writing. `removePlantedRedirects` remains as a cheap detector of a `commondir` an
+  earlier release's agent left, and is not the defense. The rest of the disk reads except credentials (on Windows only what a
+  ProcessContainer is given: the profile, MXC's baseline of tool directories, per-user programs, the
+  working directory and worktree and the repository's git directory, whole, see `windowsReadRoots` and `launchPolicy`; not run on Windows), and the connector's state
+  directory is left out of the read grants, so an agent sees there only its own worktree and the
+  folder of its own tokens (`<worktree>.tokens`) and nothing made later (Seatbelt lets a denial
+  win over a grant inside it, so a denial can't give an agent its own paths back; a working directory or
+  an owner's `--sandbox-write` path that holds the state directory, a home or a dotfiles checkout, is read
+  and written around it too, and the connected start check with no registered checkout runs in an empty
+  folder of its own, not the home); egress goes only
+  through a loopback allow-list proxy. Credentials in the agent's environment are not hidden. A
+  machine with no working sandbox runs agents unsandboxed and says so, unless its owner chose
+  `--require-sandbox`. Do not start an agent process outside the seam. The one exception is the two
+  ACP `initialize` start checks, `chopin service install`'s and `chopin connect --install-service`'s
+  before the machine is paired (`checkAgent`): they are not runs, send the agent nothing from Chopin
+  (no document, prompt or instruction), last 10 seconds at most, and are not sandboxed, even with
+  `--require-sandbox`; `--skip-check` leaves them out. The check that names the agent to Chopin
+  once connected goes through the seam. See [Sandbox](docs/chopin-cli.md#sandbox).
 - **Persistence should precede publication.** Do not acknowledge or broadcast a
   domain mutation before its fenced durable commit.
 
 ## Conversation and Planner addressing
 
 The web composer uses `packages/protocol/address.ts` to translate `@chopin` into
-`Chat.Send.to = "planner"`; ordinary messages use `to = "room"`. The wire
+`Chat.Send.to = "planner"`; ordinary messages use `to = "room"`. A person addresses Chopin with
+an `@chopin` mention in the draft's words, typed, chosen in the `@` menu, or written at the caret
+by the composer's sparkle button or Command+J (`apps/web/src/chat/ask-chopin.ts` holds its rules);
+the composer draws no other state for it, and the message on the wire is its words. A person
+alone in the document (`alone` in `apps/server/src/chat/initiative.ts`: no other writer has it
+open, spoke in the last two minutes or is typing) is talking to Chopin: the server takes their
+room message as one to the Planner, with no silence window or judgment, and their draft says
+_Message chopin_. The wire
 destination is authoritative on the server. Do not describe `@chopin` as a server
 authorization boundary: a custom write-authorized client can send an explicit
 Planner destination without a mention.
+
+Nothing a person sends is ever held for the Planner. A message to it starts a turn
+when none is running; while one runs it is posted to the transcript and
+acknowledged at once and given to that turn (`PlannerSession.steer`, through the
+harness's own mid-run input: Atomic's `steer`, a `steer` frame to a remote client
+that offered `steer-turn`), which reads it at its next step as `@handle: text`, in the
+same turn. Steering takes the same write access as starting a turn: `chat:send` is
+checked before `Chat.send`, so a reader cannot steer. A background job never makes a
+person wait: a message to the Planner (or an `invoke_planner` message) while a job's turn
+runs, or while one is being handed the Chat, is acknowledged at once and the job gives way
+(`preempt` in `apps/server/src/chat/service.ts`). Its turn is stopped and starts the
+person's turn as it ends; a write its own tool has under way finishes first and stands as its
+result, and with none it goes back to pending, its attempts unspent, and runs again when that
+turn's end wakes the queue. One job (kind and target) gives way at most three times in a row;
+the next run is let finish, with the person's turn right behind it. A turn a person started, or
+one Chopin started for a Build or a comment, is never preempted. A harness that cannot take
+input mid-run (the Copilot SDK) refuses a message while a turn runs with `planner-busy`:
+"chopin can't take messages while it works on this machine. Stop it to ask now." (the server
+log names the harness). A machine that is away,
+in its hand-over window before the client resumes ("Still connecting to @mona's machine, so
+this message wasn't sent. Send it again in a moment."), or with none attached, refuses it with
+the connection's own words (`planner-not-attached`),
+mid-turn too; for a machine that is away they say the message was not sent and to send it again
+when the machine is back, and never that it is kept (the machine's own work is; the message is
+not). A message sent while a turn is only beginning or finishing has no session
+to be given to, and is answered as a passing trouble (`temporarily-unavailable`). If the
+turn ends before it can read the message, an idle Chat starts a turn for it and any other
+says plainly that Chopin did not read it. A comment note, an `invoke_planner as system` call
+and a task draft need a turn of their own, so a running turn refuses them before anything is
+saved. Only Chopin's own scheduling still waits for the running turn (or, for a job, a person's), in `chat.waiting`:
+background jobs and server-authored instructions nobody typed (initiative, an ended workflow
+run, readiness, decision follow-ups). `planner_deferred_turns` is no longer written or read;
+at start the writer-lease holder closes any row an earlier release left open
+(`deferredTurns.retire`), so a message it held stays in its Chat as an ordinary one that no
+Planner took. The table and its rows are kept, and no migration was added.
+
+A message to the Planner leaves the composer at once. The browser shows it from
+its outbox (`apps/web/src/chat/delivery.ts`) as the person's own, saying Sending (never
+waiting, queued or a clock), until the server's entry for the same request ID arrives; from
+then it carries no mark. The outbox holds a message only for the browser's own connection:
+it sends one message at a time, oldest first, once the current connection's transcript has
+arrived, and only to a server that acknowledges sends. When `planner-not-attached` or
+`planner-busy` refuses a send and the composer holds no newer draft, the typed text (with its
+mention, references and staged files) returns to the composer draft and chopin says why in a row
+at the end of the transcript only that person sees (`chat/quiet-note.tsx`, with How to fix where
+the machine has something to fix), and while Chopin works the one button offers Stop so the
+person can stop Chopin and send it;
+when a newer draft was already typed, or another refusal rejected the message, it says
+"Couldn't send" on the message with Try again and Delete (which act on the outbox alone, since
+the server kept nothing), and not while the page's offline bar
+shows. A refusal with a passing reason is not a refusal of the message: a storage, room or
+authorization trouble that will pass, or a turn that is only beginning or finishing
+(`temporarily-unavailable`). The browser keeps the message sending and sends it again, in order
+and with the same request ID, in a moment. Only a refusal with neither code is final, and so
+are `planner-busy` and `planner-not-attached`. One the server kept, though the commit's answer
+was lost, is answered with its first answer when the same request is sent again, and is given
+to a turn once.
+
+A reply that fails is retried on the same message (`chat:retry`), never as a new one. Only the
+message's sender may, while its failure is the latest Planner turn and asking again can help. The
+server takes the failed attempt out of the transcript (the failure notice and every agent entry
+the attempt wrote, `retryTarget` in `apps/server/src/chat/retry.ts`), saves that, tells the room
+with `chat:removed`, and runs the message's turn as it began: the agent reads the message once and
+nothing of the attempt. An Atomic session branches back to its leaf before the attempt; a remote
+client that offered `retry-turn` is told `message` and `retry` to drop the attempt from what it
+keeps ([Retrying a failed turn](docs/agent-connection.md#retrying-a-failed-turn)).
 
 `instruction()` strips the mention before model input. Recent room messages that
 did not address the Planner still enter a bounded backscroll for the next turn.
@@ -293,12 +515,20 @@ plan can approve and dispatch a graph through the owner-paired ACP connector;
 its run-scoped bridge exposes the document and lifecycle reporting tools. The
 Planner cannot approve, lock, or start a graph. See docs/local-launcher.md.
 
+Open or reopened decisions never block a build. **Build plan**, **Build** and
+**Retry** go ahead: the coding agent builds on its best judgment, reads each
+unanswered decision as `unapprovedDecisions` (in `read_implementation` and
+`read_rebuild`), and is told to put that list in the body of every pull request
+it opens. The decisions stay open and answerable once the active build releases
+its lock; building never answers or closes one.
+
 A person's press is the approval. **Build plan** approves and starts the
 drafted graph. Once a build has delivered, with or without `LIVE_BUILD`, a
 rebuild appends its tasks as an approved, completed graph version from the
 coding agent's report, with no separate review: without `LIVE_BUILD` that
 approval is the person pressing **Build** (or **Retry**) on the changes, which
-the server refuses while decisions or accepted comments are open; under
+the server refuses while accepted comments await plan changes or required
+investigations are open, but never for an open decision; under
 `LIVE_BUILD` it is the Build plan press that made the document live.
 
 An approved graph binds one plan revision, graph version, and graph revision.
@@ -331,14 +561,25 @@ and storage revision. See [Experimental implementation lifecycle](docs/implement
 
 ### Code and diff blocks
 
-- Syntax and diff previews are derived React views beside Lexical's canonical
-  code node. Do not mount a second editor or write highlighted DOM into Lexical.
+- Code in a named language is coloured on Lexical's canonical code node itself,
+  with CSS Custom Highlights (`widgets/code-paint-plugin.tsx`): ranges over its
+  own text, never DOM written into Lexical. Diff previews are derived React views
+  beside the canonical node. Do not mount a second editor or write highlighted
+  DOM into Lexical.
 - An unnamed fence is plain text. Never guess a language from content.
 - Invalid `patch` content temporarily falls back to plain code rendering without
   changing the stored language. Repairing the text restores the diff view.
-- The preview is non-editable derived UI. The current Enter handler requires a
+- A diff preview is non-editable derived UI. The current Enter handler requires a
   Lexical range selection inside the canonical code block; do not assume a key
   event focused only on the preview will return to the source.
+- Enter in a code block is always a line break. Escape, Mod+Enter and the arrows
+  at its end leave it (`widgets/code-keys.tsx`); a paste into it is inserted as
+  raw text, because Lexical's own paste makes each line a paragraph.
+- Wrap lines is the word `wrap` in the fence's info string (`` ```ts wrap ``), outside any
+  quoted value; `codeWraps` and `withCodeWrap` in the dialect read and write it. A fence
+  without it is never rewritten. Full width is channel metadata (`channels.full_width`),
+  set through `PATCH /api/channels/:id` and announced with `session:channel`, not
+  document content: it has no Yjs history and is not undone by the editor.
 
 ### Change marks and presence
 
@@ -379,6 +620,32 @@ so merge ranges from all mounted editors before replacing a registry entry.
   after `send()` loses edits on disconnect.
 - Rebuilds and reconnects must replay unacknowledged updates only when the epoch
   is still compatible.
+- Shutdown closes every socket with 1012 (`OpenSockets.stopForRestart()`) before
+  `server.stop(true)`, whose own 1001 reads as a loss. The browser takes 1012 as a
+  quiet restart and a probe's 4xx as a refusal only with `x-chopin-refusal: 1`
+  (or a 401); answer any new refusal of `/ws` or `/ws/sidebar` through
+  `refused()` so a proxy's 4xx cannot be mistaken for it. A request waiting when
+  the 1012 arrives rejects as `WireLost` with `restarting` set; only a caller whose
+  request carries its own identity, as `chat:send` does, may send it again quietly.
+  For `RESTART_QUIET_MS` after a 1012 `Wire` raises no `onOutage`, so the page's one
+  offline bar stays away (it waits ten seconds more, `OFFLINE_BAR_GRACE`, as Slack's does,
+  and the Planner's machine is never drawn in Chat), and every other surface that speaks of a lost connection
+  waits `useConnectionNotice(lost, wire.restarting)`; a new one must honour both. What the
+  page draws holds through that quiet too (`readsConnected` for Build plan and the editors'
+  controls, `quietRestart` for Chat's hint and composer): a control that comes and goes with the
+  connection must not change for a restart, and `e2e/handover.e2e.ts` samples them.
+- The cut has a fixed order (`apps/server/src/handover/cut.ts`, held by its test): readiness
+  off for the whole unready window while everything is still served, then the listener stops,
+  in-flight requests finish, edits stop and commit, link state is persisted, the lease is
+  released, and only then do clients hear `session:restarting` and lose their sockets. A
+  process answers nothing after it releases the lease, and refuses nothing it was routed.
+  Before SIGTERM's cut it keeps serving and starts no new Planner turn. Do not move a step
+  across the release or the listener stop, and do not make readiness depend on a query.
+  `Chat.close` waits for every send already admitted before it marks the Chat closed, so a
+  message being saved at the cut is saved and answered; a `chat:send` that reaches a closed Chat
+  of a stopping process (`holdStarts`) is answered with nothing, never "chat is closed", because
+  its browser sends it again to the next process and must not show it as one that could not be
+  sent.
 - Room opening and closing share the document lifecycle lock. Opening waits for
   an active close; eviction forgets the room only after runtime shutdown and
   persistence complete. Preserve that ordering.
@@ -399,6 +666,13 @@ so merge ranges from all mounted editors before replacing a registry entry.
   reads raw Copilot SDK events and keeps its own live tool check against session
   metadata. Treat that as adapter-internal behavior, not a property every harness
   in `HARNESS` shares.
+- A host tool's return value is what its model reads: the Copilot SDK, Atomic and an
+  attached client show it as is, or as one line of JSON for an object, and `HarnessAgent`
+  applies a tool's `toModelOutput` only when a turn ends. `read_plan` and `read_child`
+  return their structured view, and each real harness in `harnesses.ts` is wrapped by
+  `withModelOutput` so its model reads them as text of at most `READ_BYTES` bytes, paged
+  with `next:`; Atomic's MCP adapter silently drops the middle of text over 20 KiB. A new
+  `HARNESS` must be wrapped too.
 - The GitHub MCP tools reached through `apps/server/src/harness/github-tools.ts`
   come from a remote server that can change its offered tool count. Diagnose by
   required names and denied capabilities, not literal counts.
@@ -415,6 +689,15 @@ so merge ranges from all mounted editors before replacing a registry entry.
 
 - Keep one React owner for derived code or diff previews. Mounting a second owner
   over the same node causes race-driven cleanup and remounting.
+- While a pane edge is dragged, `apps/web/src/pane-drag-skip.ts` leaves the document's
+  far tables and code blocks and Chat's far rows out of layout (`content-visibility: auto`
+  on blocks marked `data-drag-skip`, only while the page carries `data-pane-dragging`).
+  A geometry read inside such a block lays it out again for the read, so code that
+  measures on every resize step must not reach into far blocks. Mark only blocks far
+  from the window: with every block marked, the browser stopped anchoring the reader's
+  scroll position. A Playwright trace snapshot reads every element and can take seconds
+  on a page in that state, so the browser tests that drag long documents run with
+  `trace: "off"`.
 - Native `<select>` option values must remain globally unique, including the
   empty sentinel.
 - Add both MDXEditor's selected-cell class and Lexical's selected-cell theme
@@ -434,6 +717,13 @@ so merge ranges from all mounted editors before replacing a registry entry.
 - Coolify preview variables that must remain late-bound use direct `${NAME}`
   references. A `${NAME:-default}` can be resolved from production before the
   preview environment is attached.
+- The deploy that overlaps two processes needs a proxy that checks `/api/health/ready`
+  actively and holds requests; `deploy/overlap` is a local reference, not a production
+  file. A stopped Compose slot's name does not resolve, so a deploy script waits for the
+  proxy to see the new slot before it stops the old one (`scripts/overlap.ts` does).
+  `scripts/deploy-under-load.ts` is the many-client version, run by hand or from the
+  `deploy under load` workflow and never as part of `bun test`; strict invisibility is switched
+  on only after it passes on the built image.
 - The Docker image expects internal port 8787. Changing `PORT` alone breaks its
   health check and routing assumptions.
 - Bun wrapper processes can outlive a failed child. The development and E2E

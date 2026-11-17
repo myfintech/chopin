@@ -52,7 +52,37 @@ test("approval queues the reviewed graph once and pickup survives reopening", as
 	await Plan.close(reopened);
 });
 
-test("stale graph approval and unresolved planning decisions cannot queue a build", async () => {
+test("a build keeps the plan source it started from across a reopen, and one recorded since its press is refused", async () => {
+	let { plan, backend, server } = await prepared();
+	let planSource = { revision: 0, branch: "plans/one", commit: "c".repeat(40) };
+	let input = {
+		planRevision: 0,
+		graphVersion: 1,
+		graphRevision: 1,
+		user: "U_test",
+		connectionId: "laptop",
+		machineId: "M_laptop",
+		repositoryId: "R_test",
+		checkout: {
+			repository: checkout.repository,
+			branch: planSource.branch,
+			commit: planSource.commit,
+		},
+	};
+	plan.planSources = [planSource];
+	// The press was checked before the Planner recorded it: that press is refused.
+	await expect(queueBuild(plan, { ...input, checkout })).rejects.toThrow("plan source has changed");
+	let queued = await queueBuild(plan, { ...input, planSource });
+	expect(queued.planSource).toEqual(planSource);
+	let id = plan.id;
+	await Plan.close(plan);
+	let reopened = await Plan.open(id, backend, server);
+	expect(reopened.planSources).toEqual([planSource]);
+	expect(reopened.builds[0]!.planSource).toEqual(planSource);
+	await Plan.close(reopened);
+});
+
+test("a stale graph approval or an accepted comment cannot queue a build", async () => {
 	let { plan } = await prepared();
 	let input = {
 		planRevision: 0,
@@ -65,11 +95,35 @@ test("stale graph approval and unresolved planning decisions cannot queue a buil
 		checkout,
 	};
 	await expect(queueBuild(plan, input)).rejects.toThrow("reviewed graph has changed");
-	plan.records.set("open", { id: "open", status: "open" } as never);
+	plan.threads.set("accepted", { id: "accepted", status: "accepted", notes: [] } as never);
 	await expect(queueBuild(plan, { ...input, graphRevision: 1 }))
-		.rejects.toThrow("unanswered questionnaires");
+		.rejects.toThrow("accepted comments awaiting plan changes");
 	expect(plan.graph?.versions[0].state).toBe("draft");
 	expect(plan.builds).toEqual([]);
+	plan.threads.clear();
+	await Plan.close(plan);
+});
+
+test("open decisions do not stop a build from queueing, and stay open", async () => {
+	let { plan } = await prepared();
+	let record = { id: "open", status: "open" } as never;
+	plan.records.set("open", record);
+	plan.records.set("again", { id: "again", status: "reopened" } as never);
+	let queued = await queueBuild(plan, {
+		planRevision: 0,
+		graphVersion: 1,
+		graphRevision: 1,
+		user: "U_test",
+		connectionId: "laptop",
+		machineId: "M_laptop",
+		repositoryId: "R_test",
+		checkout,
+	});
+	expect(queued.state).toBe("queued");
+	expect(plan.graph?.versions[0].state).toBe("approved");
+	// Building never answers or closes a decision.
+	expect(plan.records.get("open")).toBe(record);
+	expect(plan.records.get("again")?.status).toBe("reopened");
 	plan.records.clear();
 	await Plan.close(plan);
 });

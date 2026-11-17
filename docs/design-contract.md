@@ -29,24 +29,49 @@ reviewed again. A local disable comment is not an exception: the detector runs w
 New interface work must use shared semantic roles and finite component variants;
 do not add aesthetic exceptions or descendant overrides for individual contexts.
 
-## Contrast and visual hierarchy
+## Copied registry source
 
-AA contrast is preferred for primary content and controls, not required for every
-text role. Maggie has approved the original lighter timestamps and secondary chat
-metadata, muted queued/loading and tool-status text, original pierre-light code
-and diff colours, supplementary audit-page labels in their quaternary role, and
-original destructive red. Preserve those choices; do not
-promote them to darker roles just to make a contrast audit pass.
+Components copied from a registry with `shadcn add` (assistant-ui's elements and the shadcn parts they
+stand on) keep the registry's own Tailwind classes, so they cannot follow the token rules above. They
+are accepted as recorded third-party source, as a set and never one finding at a time, under these
+conditions, which [`scripts/design-contract/registry.mjs`](../scripts/design-contract/registry.mjs)
+checks for both `check-design-contract.ts` and `check-design.mjs`:
 
-Browser screenshot and contrast-report comparisons are optional review tools;
-run `bun run design:browser` when reviewing appearance. Required CI retains token
-checks and `bun run design:behavior` for keyboard, focus, motion and layout behaviour.
-See [rendered design checks](../e2e/design/README.md).
+- `apps/web/src/components/sources.json` records each copied file: its registry, its item, the
+  upstream revision it was copied at and the sha256 of its bytes. A file that is not recorded is held
+  to every rule, and a file under `apps/web/src/components/` that is not recorded is an error, so
+  hand-written code cannot hide in the directory.
+- A recorded file must still match its hash. Editing one fails the check and puts the file back under
+  every rule; copy it again with `shadcn add --overwrite` and record it.
+- A copy may carry a recorded patch (`<file>.patch`, one reason per hunk) that adds an extension point
+  and nothing that changes a class or a size. The record then keeps the registry's hash and adds the
+  patch's, and the file must be exactly the registry's bytes plus that patch. See
+  [Patching a copy](assistant-ui.md#patching-a-copy).
+- Nothing about Chopin's own code changes. A rule is never loosened for it, and the copies get no
+  per-finding exceptions.
+- The one generated file in the directory, the assistant-ui geometry layer, is recorded as
+  `tailwindcss/theme.css` at the Tailwind version it was generated from, and is checked against the
+  installed Tailwind.
 
-Keep browser contrast findings visible. Optional visual tests may acknowledge only the approved
-roles and states, with a reason and measured evidence. Unexpected findings and
-changes outside that scope must still fail. Do not disable contrast checking for
-an entire page or hide accepted findings behind a claim of universal AA compliance.
+[Adding an assistant-ui element](assistant-ui.md) says how to copy and record one.
+
+## Contrast
+
+Chopin meets WCAG 2.2 AA everywhere, in light and dark: 4.5:1 for text and 3:1 for
+large text and for the controls, edges, dots and focus rings people need to see.
+Disabled controls are exempt. On 11 November 2026 the maintainer brought the former
+exceptions (quiet timestamps and metadata, loading and tool status, the pierre-light
+code and diff colours, the quaternary audit-page labels and the original destructive
+red) to AA; see the Contrast Rule in [DESIGN.md](../apps/web/DESIGN.md).
+
+Required CI holds it: `bun run design:behavior` runs `e2e/design/contrast.e2e.ts`, which
+walks every audit plate in both themes, composites each colour over what is really behind
+it and fails any pair below its threshold. Browser screenshot comparisons and the axe scans
+of `bun run design:browser` remain optional review tools; their scans now expect no
+contrast findings. See [rendered design checks](../e2e/design/README.md).
+
+A role that cannot reach AA is a design decision recorded in DESIGN.md, never an exception
+added to the walk or a check disabled for a page.
 New exceptions need an explicit design decision. This policy does not relax token,
 fluid typography, keyboard, focus, or layout enforcement.
 

@@ -2,6 +2,9 @@ services:
   app:
     build:
       context: .
+      args:
+        # The image running now, set by whoever deploys, so the build keeps its hashed files.
+        PREVIOUS_IMAGE: ${PREVIOUS_IMAGE:-no-previous}
     environment:
       # Coolify resolves default-bearing values from production before attaching
       # the preview env file, so preview-overridable values stay late-bound.
@@ -14,6 +17,7 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       JEV_API_KEY: ${JEV_API_KEY}
       APP_ORIGIN: ${APP_ORIGIN}
+      PREVIOUS_ORIGINS: ${PREVIOUS_ORIGINS}
       DATABASE_URL: postgresql://chopin:chopin@${SERVICE_NAME_DB:-db}:5432/chopin?sslmode=disable
       GITHUB_APP_SLUG: ${GITHUB_APP_SLUG}
       GITHUB_APP_CLIENT_ID: ${GITHUB_APP_CLIENT_ID}
@@ -31,7 +35,7 @@ services:
     expose:
       - "8787"
     restart: unless-stopped
-    stop_grace_period: 15s
+    stop_grace_period: 30s
 
   db:
     image: postgres:17-alpine

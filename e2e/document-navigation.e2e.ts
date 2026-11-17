@@ -374,8 +374,12 @@ test("sidebar Rename opens that document with its title ready to edit", async ({
 	let page = await join("ana");
 	let projects = sidebar(page);
 
-	await projects.getByRole("link", { name: otherTitle, exact: true }).hover();
-	await projects.getByRole("button", { name: `Actions for ${otherTitle}` }).click();
+	// Rows other tests create here can move this one from under the pointer; hover again.
+	await expect(async () => {
+		await projects.getByRole("link", { name: otherTitle, exact: true }).hover();
+		await projects.getByRole("button", { name: `Actions for ${otherTitle}` })
+			.click({ timeout: 1_000 });
+	}).toPass();
 	await page.getByRole("menuitem", { name: "Rename", exact: true }).click();
 	await expect(headerDocument(page)).toHaveAccessibleName(`Document: ${otherTitle}`);
 	let field = page.getByRole("textbox", { name: "Document title" });
@@ -576,9 +580,12 @@ test("a long description card stays inside the window beside a bottom row", asyn
 	await page.evaluate(() =>
 		new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
 	);
-	await link.hover();
 	let card = page.locator("[data-icon-tooltip]");
-	await expect(card).toBeVisible();
+	// Other projects' rows can arrive above this one and move it from under the pointer.
+	await expect(async () => {
+		await link.hover();
+		await expect(card).toBeVisible({ timeout: 1_000 });
+	}).toPass();
 	let box = (await card.boundingBox())!;
 	expect(box.height).toBeGreaterThan(100);
 	expect(box.y).toBeGreaterThanOrEqual(8);
@@ -634,6 +641,12 @@ test("document switches preserve navigation state and avoid catalogue reloads", 
 	});
 	let latestVisit = () =>
 		requested.findLast(request => request.method === "PATCH" && request.path === "/api/navigation");
+	// Documents other tests create here reread the catalogue; only those reads are allowed.
+	let catalogues = 0;
+	page.on("websocket", socket =>
+		socket.on("framereceived", ({ payload }) => {
+			if (typeof payload === "string" && payload.includes('"sidebar:catalogue"')) catalogues++;
+		}));
 	page = await join("ana");
 	let initialNavigationRequests =
 		requested.filter(request => request.method === "GET" && request.path === "/api/navigation")
@@ -644,6 +657,13 @@ test("document switches preserve navigation state and avoid catalogue reloads", 
 	let originalPath = await original.getAttribute("href");
 	expect(originalPath).toBeTruthy();
 
+	// A new document is announced to every sidebar watching its repository, its author's included,
+	// and each reads the catalogue once the burst has been quiet for 250 ms. That read belongs to the
+	// creation, not to a switch, and it lands whenever the test has got to by then.
+	let announced = page.waitForResponse(response =>
+		response.request().method() === "GET"
+		&& new URL(response.url()).pathname === "/api/repositories/octo-org/score/channels"
+	);
 	await projects.getByRole("button", { name: "New document", exact: true }).click();
 	await expect(page).toHaveURL(/\/documents\/octo-org\/score\/[a-z]+-[a-z]+(?:-\d+)?$/);
 	let created = projects.locator('a[aria-current="page"]');
@@ -659,6 +679,8 @@ test("document switches preserve navigation state and avoid catalogue reloads", 
 	).toHaveLength(initialNavigationRequests);
 	await expect.poll(() => latestVisit()?.documentId).not.toBeUndefined();
 	let createdDocumentId = latestVisit()!.documentId!;
+	await announced;
+	await expect(projects.getByText("Loading more…", { exact: true })).toHaveCount(0);
 
 	let documentRoutePattern = "**/api/repositories/octo-org/score/documents/*";
 	let release = Promise.withResolvers<void>();
@@ -722,8 +744,10 @@ test("document switches preserve navigation state and avoid catalogue reloads", 
 			.length
 	).toBe(2);
 	expect(latestVisit()?.documentId).toBe(createdDocumentId);
-	expect(requested.filter(request => request.path === "/api/repositories/octo-org/score/channels"))
-		.toHaveLength(0);
+	expect(
+		requested.filter(request => request.path === "/api/repositories/octo-org/score/channels")
+			.length,
+	).toBeLessThanOrEqual(catalogues);
 	expect(
 		requested.filter(request =>
 			request.path === "/api/repositories/octo-org/score/research-workspaces"
@@ -1010,7 +1034,7 @@ test("read-only visitors can browse documents and get creation guidance", async 
 	);
 	await expect(headerActions(page)).toHaveCount(0);
 	await expect(page.getByText("You have read-only access to this document.")).toBeVisible();
-	await expect(page.getByPlaceholder("Use @chopin to ask Chopin")).toHaveCount(0);
+	await expect(page.getByPlaceholder("Use @chopin to ask chopin")).toHaveCount(0);
 	await sidebar(page).getByRole("button", { name: "New document", exact: true }).click();
 	let creation = page.getByRole("dialog", { name: "New document", exact: true });
 	await expect(
@@ -1100,7 +1124,7 @@ test("writers can archive, restore, and permanently delete a document", async ({
 	).toBeVisible();
 	await expect(ana.getByText("Archived. Restore it to keep chatting."))
 		.toBeVisible();
-	await expect(ana.getByPlaceholder("Use @chopin to ask Chopin")).toHaveCount(0);
+	await expect(ana.getByPlaceholder("Use @chopin to ask chopin")).toHaveCount(0);
 	await expect(content(ana)).toHaveAttribute("contenteditable", "false");
 	await expect(content(bo)).toHaveAttribute("contenteditable", "false");
 	await expect(projects.getByRole("link", { name: title, exact: true })).toHaveCount(0);
@@ -1220,14 +1244,10 @@ test("archiving a sidebar row by keyboard moves focus to a neighbouring row", as
 			exact: true,
 		}),
 	).toBeVisible();
-	let names = (await links.allInnerTexts()).map(name => name.trim());
-	let index = await links.evaluateAll(
-		(elements, path) => elements.findIndex(element => element.getAttribute("href") === path),
-		roomPath(document),
+	let link = sidebar(page).locator(
+		`.project-sidebar-document-link[href="${roomPath(document)}"]`,
 	);
-	expect(index).toBeGreaterThanOrEqual(0);
-	let neighbour = names[index + 1] ?? names[index - 1];
-	let row = links.nth(index).locator(
+	let row = link.locator(
 		"xpath=ancestor::div[contains(@class,'project-sidebar-document')][1]",
 	);
 	await expect(row.getByRole("button", {
@@ -1243,8 +1263,15 @@ test("archiving a sidebar row by keyboard moves focus to a neighbouring row", as
 	await page.keyboard.press("ArrowDown");
 	await page.keyboard.press("ArrowDown");
 	await expect(page.getByRole("menuitem", { name: "Archive", exact: true })).toBeFocused();
+	// Other tests' documents reach this sidebar at any time, so read the neighbour last, by link.
+	let paths = await links.evaluateAll(elements =>
+		elements.map(element => element.getAttribute("href"))
+	);
+	let index = paths.indexOf(roomPath(document));
+	expect(index).toBeGreaterThanOrEqual(0);
+	let neighbour = paths[index + 1] ?? paths[index - 1];
 	await page.keyboard.press("Enter");
-	await expect(links).toHaveCount(names.length - 1);
-	await expect(sidebar(page).locator(".project-sidebar-document-link", { hasText: neighbour! }))
+	await expect(link).toHaveCount(0);
+	await expect(sidebar(page).locator(`.project-sidebar-document-link[href="${neighbour!}"]`))
 		.toBeFocused();
 });

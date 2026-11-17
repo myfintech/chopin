@@ -4,6 +4,7 @@ import { MCPClientError } from "@ai-sdk/mcp";
 import { tool } from "ai";
 import { z } from "zod";
 
+import { NAMES_AS_WRITTEN } from "../agent/identity";
 import * as webSearch from "../harness/web-search";
 import * as workerSession from "./worker-session";
 import { executionDiagnostic, JobExecutionError } from "./registry";
@@ -510,6 +511,75 @@ describe("research workspace execution", () => {
 		}
 	});
 
+	it.each([
+		{
+			scenario: "a credential GitHub refuses",
+			createClient: async () => {
+				throw new MCPClientError({
+					message:
+						"MCP HTTP Transport Error: POSTing to endpoint (HTTP 401): private provider payload",
+					statusCode: 401,
+					responseBody: "private provider payload",
+				});
+			},
+			reason: "web-search-credential-rejected",
+			webFailure: "local:connect:mcp-client:http:401",
+		},
+		{
+			scenario: "a connection that does not offer web_search",
+			createClient: async () => ({ tools: async () => ({}), close: async () => {} }),
+			reason: "web-search-not-offered",
+			webFailure: "local:tools:missing-tool",
+		},
+		{
+			scenario: "a service that cannot be reached",
+			createClient: async () => {
+				throw Object.assign(new Error("Unable to connect private provider payload"), {
+					code: "ConnectionRefused",
+				});
+			},
+			reason: "web-search-unavailable",
+			webFailure: "local:connect:error",
+		},
+	])("fails public research as $reason for $scenario and records why in its diagnostic", async (
+		{ createClient, reason, webFailure },
+	) => {
+		let originalWebSearch = webSearch.webSearchTool;
+		let snapshots: JobExecutionDiagnostic[] = [];
+		let web = spyOn(webSearch, "webSearchTool").mockImplementation((owner, deps) =>
+			originalWebSearch(owner, { ...deps, createClient, log: () => {} })
+		);
+		let opening = spyOn(workerSession, "openWorkerSession");
+		try {
+			let definition = researchEvidenceDefinition({ config: { agent: true, model: "test-model" } });
+			let error = await definition.execute({
+				...execution("research-evidence", {
+					workspaceId: WORKSPACE_ID,
+					turnId: TURN_ID,
+					query: QUERY,
+				}),
+				diagnostic: value => snapshots.push(executionDiagnostic(value)!),
+			}).then(() => undefined, error => error);
+			expect(error).toBeInstanceOf(JobExecutionError);
+			expect(error.progressReason).toBe(reason);
+			expect(error.diagnostic).toMatchObject({
+				stage: "public-web",
+				phase: "connecting-web",
+				webFailure,
+				webFailureDurationMs: expect.any(Number),
+				webCalls: 0,
+				webFailures: 0,
+			});
+			expect(Object.keys(error.diagnostic).length).toBeLessThanOrEqual(20);
+			expect(JSON.stringify(error.diagnostic)).not.toContain("private provider payload");
+			expect(error.message).toBe(`Background job execution failed: ${reason}.`);
+			expect(opening).not.toHaveBeenCalled();
+		} finally {
+			opening.mockRestore();
+			web.mockRestore();
+		}
+	});
+
 	it("keeps the public evidence worker input isolated and retries once", async () => {
 		let observed: unknown;
 		let progress: string[] = [];
@@ -758,6 +828,41 @@ describe("research workspace execution", () => {
 		}
 	});
 
+	it("tells the research stages a person reads to keep handles as written", async () => {
+		let agents = await import("../harness/agents");
+		let told = new Map<string, unknown>();
+		let opening = spyOn(workerSession, "openWorkerSession").mockResolvedValue({
+			session: {} as never,
+			close: async () => {},
+		});
+		let spies = [
+			spyOn(agents.researchPrivateAgent, "generate").mockImplementation(async call => {
+				told.set("private", call.options?.instructions);
+				return { output: { findings: [] } } as never;
+			}),
+			spyOn(agents.researchReportAgent, "generate").mockImplementation(async call => {
+				told.set("report", call.options?.instructions);
+				return { output: REPORT } as never;
+			}),
+			spyOn(agents.researchAnswerAgent, "generate").mockImplementation(async call => {
+				told.set("answer", call.options?.instructions);
+				return { output: { text: "It was.", sourceUrls: [PUBLIC_SOURCE.url] } } as never;
+			}),
+		];
+		try {
+			let definition = researchAnswerDefinition({
+				config: { agent: true, model: "research-model" },
+			});
+			await definition.execute(execution("research-answer", initialInput()));
+			await definition.execute(execution("research-answer", followUpInput()));
+			expect([...told.keys()].sort()).toEqual(["answer", "private", "report"]);
+			for (let instructions of told.values()) expect(instructions).toContain(NAMES_AS_WRITTEN);
+		} finally {
+			for (let spy of spies) spy.mockRestore();
+			opening.mockRestore();
+		}
+	});
+
 	it("rejects report and answer citations absent from supplied evidence", async () => {
 		let initial = researchAnswerDefinition({
 			config: { agent: true, model: "research-model" },
@@ -783,4 +888,20 @@ describe("research workspace execution", () => {
 		await expect(followUp.execute(execution("research-answer", followUpInput())))
 			.rejects.toMatchObject({ progressReason: "source-validation-failed" });
 	});
+});
+
+it("research artifacts record the attached client when the operator configured no model", async () => {
+	let definition = researchEvidenceDefinition({
+		config: { agent: true, model: "" },
+		engine: async () => ({ findings: [], sources: [] }),
+	});
+	let input = { workspaceId: "workspace", turnId: "turn", query: "Rate limiting a login endpoint" };
+	let artifact = await definition.execute({
+		job: { channelId: "channel" },
+		input,
+		progress: async () => {},
+	} as unknown as JobExecution<ResearchEvidenceInput>);
+
+	expect(artifact.model).toBe("attached-client");
+	expect(parseResearchEvidenceArtifact(artifact as unknown as JsonValue)).toEqual(artifact);
 });

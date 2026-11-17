@@ -22,7 +22,7 @@ function inspection(page: Page, messageId: string) {
 }
 
 function jobs(page: Page) {
-	return page.getByRole("group", { name: "Planner jobs" });
+	return page.getByRole("group", { name: "Background jobs" });
 }
 
 async function waitForRefine(page: Page, messageId: string, status: string) {
@@ -35,7 +35,7 @@ async function waitForRefine(page: Page, messageId: string, status: string) {
 	await expect(marker).toHaveAttribute("aria-expanded", "true");
 	let popoverId = await marker.getAttribute("aria-controls");
 	if (!popoverId) throw new Error("analysis marker did not identify its popover");
-	await expect(page.locator(`[id="${popoverId}"]`).getByRole("group", { name: "Planner jobs" }))
+	await expect(page.locator(`[id="${popoverId}"]`).getByRole("group", { name: "Background jobs" }))
 		.toContainText(`refine ${status}`);
 }
 
@@ -138,8 +138,8 @@ test("both collaborators wait for a short generated question and retain options 
 			await expect(
 				decision.getByText("A limited pilot lets the team learn before a wider release."),
 			).toBeVisible();
-			await expect(decision.getByText("Chopin is refining…", { exact: true })).toHaveCount(0);
-			await expect(page.getByText(`Chopin refined ${REFINED}`, { exact: true })).toBeVisible();
+			await expect(decision.getByText("chopin is refining…", { exact: true })).toHaveCount(0);
+			await expect(page.getByText(`chopin refined ${REFINED}`, { exact: true })).toBeVisible();
 		}
 		await waitForRefine(ana, messageId, "done");
 		await waitForRefine(bo, messageId, "done");
@@ -226,7 +226,7 @@ test("an archived held job becomes interrupted and retries only after the docume
 		await waitForRefine(page, messageId, "failed");
 		await waitForJob(page, messageId, "failed");
 		await expect(jobs(page)).toContainText("interrupted");
-		await expect(page.getByText(`Chopin refined ${REFINED}`, { exact: true })).toHaveCount(0);
+		await expect(page.getByText(`chopin refined ${REFINED}`, { exact: true })).toHaveCount(0);
 
 		await refineScript();
 		await jobs(page).getByRole("button", { name: "Retry refine job", exact: true }).click();

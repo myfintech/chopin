@@ -78,7 +78,13 @@ type MemorySession = {
 export type DelegatedSource = (rejected?: string) => Promise<{ token: string; expiresAt: Date }>;
 
 type SessionOptions = {
-	persistence?: { key: Uint8Array; origin: string; clientId: string };
+	persistence?: {
+		key: Uint8Array;
+		origin: string;
+		/** Origins the deployment moved from; a session stored under one is moved to `origin`. */
+		previousOrigins?: readonly string[];
+		clientId: string;
+	};
 	refresh?: (refreshToken: string) => Promise<GitHubTokenGrant>;
 	authorize?: (user: UserRecord, accessToken: string) => Promise<boolean>;
 	beforeRefresh?: (sessionId: string, revision: number) => Promise<void>;
@@ -233,6 +239,8 @@ export class Sessions {
 	readonly #refreshes = new Map<string, Promise<MemorySession | undefined>>();
 	readonly #revocations = new Map<string, Promise<boolean>>();
 	readonly #pendingDeletes = new Set<string>();
+	#refreshing = true;
+	#migrated = false;
 	readonly cookieName: string;
 
 	constructor(
@@ -333,11 +341,16 @@ export class Sessions {
 		return this.#resolve(current);
 	}
 
-	#aad(session: WebSession, secretHash: Uint8Array, revision: number): string {
+	#aad(
+		session: WebSession,
+		secretHash: Uint8Array,
+		revision: number,
+		origin = this.#options.persistence!.origin,
+	): string {
 		let scope = this.#options.persistence!;
 		return JSON.stringify([
 			SESSION_CONTEXT,
-			scope.origin,
+			origin,
 			scope.clientId,
 			session.id,
 			session.userId,
@@ -382,19 +395,25 @@ export class Sessions {
 		}
 	}
 
-	async #restore(id: string, proof: Uint8Array): Promise<MemorySession | undefined> {
+	async #restore(id: string, proof: Uint8Array, retry = true): Promise<MemorySession | undefined> {
 		let stored = await this.#storage.sessions.get(id, this.#clock());
 		if (!stored?.credentials || !equal(proof, stored.credentials.secretHash)) return undefined;
 		let { credentials, ...session } = stored;
+		let scope = this.#options.persistence!;
 		let payload: unknown;
-		try {
-			payload = await decrypted(
-				await this.#key!,
-				this.#aad(session, proof, credentials.revision),
-				credentials.ciphertext,
-			);
-		} catch {
-			return undefined;
+		let moved = false;
+		for (let origin of [scope.origin, ...scope.previousOrigins ?? []]) {
+			try {
+				payload = await decrypted(
+					await this.#key!,
+					this.#aad(session, proof, credentials.revision, origin),
+					credentials.ciphertext,
+				);
+				moved = origin !== scope.origin;
+				break;
+			} catch {
+				// Stored under another origin, or not at all.
+			}
 		}
 		if (!payload || typeof payload !== "object") return undefined;
 		let value = payload as Record<string, unknown>;
@@ -418,6 +437,20 @@ export class Sessions {
 			refreshExpiresAt: new Date(value.refreshExpiresAt),
 			revision: credentials.revision,
 		};
+		if (moved) {
+			// Stored again under the current origin as the next revision: one concurrent move wins,
+			// and a loser reads whatever the winner stored.
+			let next = { ...current, revision: current.revision + 1 };
+			if (!await this.#storage.sessions.rotate(id, current.revision, await this.#encrypt(next))) {
+				return retry ? this.#restore(id, proof, false) : undefined;
+			}
+			if (!this.#migrated) {
+				this.#migrated = true;
+				console.info("[sessions] moved a browser session's stored credentials to APP_ORIGIN");
+			}
+			if (this.#pendingDeletes.has(id) || this.#revocations.has(id)) return undefined;
+			current = next;
+		}
 		this.#sessions.set(id, current);
 		return current;
 	}
@@ -469,6 +502,15 @@ export class Sessions {
 				&& current.accessExpiresAt > this.#clock()
 			? current.accessToken
 			: undefined;
+	}
+
+	/**
+	 * Never ask GitHub to refresh a login again. A refresh token is single-use, so a refresh begun
+	 * while a replacement process restores the same login could spend the token the replacement
+	 * holds. A login keeps working on the access token it has until that expires.
+	 */
+	stopRefreshing(): void {
+		this.#refreshing = false;
 	}
 
 	/** Run one idempotent GitHub read, refreshing and retrying once after a 401. */
@@ -601,7 +643,7 @@ export class Sessions {
 			return this.#sessions.get(id);
 		}
 		if (current.source) return this.#rotateDelegated(current, rejectedRevision);
-		let refresh = this.#options.refresh;
+		let refresh = this.#refreshing ? this.#options.refresh : undefined;
 		if (!refresh) {
 			if (current.accessExpiresAt > now && rejectedRevision === undefined) return current;
 			throw new GitHubTokenError("GitHub token refresh is not configured");

@@ -73,23 +73,26 @@ export function chatAuthors(entries: readonly Pick<Chat.Entry, "author">[]): str
 }
 
 /**
- * The Planner, then people here, then people who have spoken in this Chat.
+ * The Planner, then people here, then the others who can read the document, then people who have
+ * spoken in this Chat.
  *
  * Logins are GitHub identities, so duplicates are case-insensitive. The
  * Planner's name is reserved: a person who happens to hold it would be
  * unreachable, because `@chopin` always addresses the Planner.
  */
 export function mentionCandidates(
-	{ authors, people, planner, self }: {
+	{ authors, people, readers = [], planner, self }: {
 		authors: readonly string[];
 		people: readonly string[];
+		/** Who can read the document, as the server listed them. */
+		readers?: readonly string[];
 		planner: boolean;
 		self: string;
 	},
 ): MentionCandidate[] {
 	let seen = new Set([self.toLowerCase(), PLANNER_LOGIN]);
 	let candidates: MentionCandidate[] = planner ? [{ kind: "planner", login: PLANNER_LOGIN }] : [];
-	for (let login of [...people, ...authors]) {
+	for (let login of [...people, ...readers, ...authors]) {
 		let identity = login.toLowerCase();
 		if (seen.has(identity)) continue;
 		seen.add(identity);
@@ -121,28 +124,10 @@ export function insertMention(
 	return { text: next, caret: trigger.start + token.length + 1 };
 }
 
-/** Tab also selects, as it does for `@` lists elsewhere; the `#` picker leaves Tab alone. */
+/** The `@` menu's keys are every composer menu's: Enter and Tab choose. */
 export function mentionKeyAction(
-	event: {
-		key: string;
-		keyCode?: number;
-		isComposing?: boolean;
-		shiftKey?: boolean;
-		altKey?: boolean;
-		ctrlKey?: boolean;
-		metaKey?: boolean;
-	},
+	event: Parameters<typeof referencePickerKeyAction>[0],
 	selectable: boolean,
 ): ReferencePickerKeyAction | undefined {
-	if (
-		event.key === "Tab"
-		&& selectable
-		&& !event.isComposing
-		&& event.keyCode !== 229
-		&& !event.shiftKey
-		&& !event.altKey
-		&& !event.ctrlKey
-		&& !event.metaKey
-	) return "select";
 	return referencePickerKeyAction(event, selectable);
 }

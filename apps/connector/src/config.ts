@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { SandboxSettings } from "./sandbox-policy";
 import type { ServiceProgram } from "./service";
 
 /** The service `chopin service install` set up, so status, restart and reinstall know it. */
@@ -33,6 +34,10 @@ export type ConnectSettings = {
 	env?: Record<string, string>;
 	/** `--keep-runs`: how many finished runs' worktrees to keep, 0 for all; absent keeps 15. */
 	keepRuns?: number;
+	/** `--require-sandbox`, `--no-sandbox`, `--sandbox-host`, `--sandbox-write` and `--sandbox-hide`. */
+	sandbox?: SandboxSettings;
+	/** `--no-planner-spare`: false, and no spare Planners start; absent runs them. */
+	plannerSpare?: false;
 };
 
 /**

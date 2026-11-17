@@ -9,10 +9,18 @@ import { migrate, verifyMigrations } from "./migrations";
 import { PostgresNavigationStore } from "./navigation";
 import { PostgresBackgroundJobStore } from "./jobs";
 import { PostgresExperimentStore } from "./experiments";
+import { PostgresChatAttachmentStore } from "./chat-attachments";
 import { PostgresImageStore } from "./images";
 import { PostgresRunStageStore } from "./run-stages";
+import { PostgresDecisionAnswerStore } from "./decision-answers";
 import { PostgresDocumentVersionStore } from "./versions";
 import { PostgresMachineStore } from "./machines";
+import { PostgresDeferredTurnStore } from "./deferred-turns";
+import { PostgresMcpSessionStore } from "./mcp-sessions";
+import { PostgresPlannerCredentialStore } from "./planner-credentials";
+import { PostgresChatThreadStore } from "./chat-threads";
+import { PostgresPlannerLinkHoldStore } from "./planner-holds";
+import { PostgresPlannerModelChoiceStore } from "./planner-model-choices";
 import { PostgresResearchWorkspaceStore } from "./research";
 import { PostgresPreferenceStore } from "../../user-preferences/postgres";
 import { PostgresProvenanceStore } from "../../document-provenance/postgres";
@@ -32,11 +40,13 @@ import type {
 	ChannelScanPage,
 	ChannelSnapshot,
 	ChannelUpdate,
+	ChannelWidthInput,
 	CommitChannel,
 	CommitResult,
 	CreateChannel,
 	JsonValue,
 	Lease,
+	LeasePeek,
 	PublishChannelDescription,
 	PublishChannelDescriptionResult,
 	RenameChannel,
@@ -97,6 +107,7 @@ type ChannelRow = {
 	createdAt: Timestamp;
 	updatedAt: Timestamp;
 	archivedAt: Timestamp | null;
+	fullWidth: boolean;
 	description: string | null;
 	descriptionRevision: Integer;
 	descriptionPlanRevision: Integer | null;
@@ -237,6 +248,7 @@ function channel(row: ChannelRow): ChannelRecord {
 	if (!row.slug) throw corrupt(`channel ${row.id} has no canonical slug`);
 	let {
 		archivedAt,
+		fullWidth,
 		parentChannelId,
 		description,
 		descriptionRevision,
@@ -289,6 +301,7 @@ function channel(row: ChannelRow): ChannelRecord {
 		updatedAt: date(row.updatedAt, "channel update time"),
 		...(archivedAt === null ? {} : { archivedAt: date(archivedAt, "channel archive time") }),
 		...(projected ? { description: projected } : {}),
+		...(fullWidth ? { fullWidth: true as const } : {}),
 		unansweredDecisions: integer(unansweredDecisions, "channel unanswered decisions"),
 	};
 }
@@ -390,6 +403,7 @@ const CHANNEL_COLUMNS = `
 	channels.created_at AS "createdAt",
 	channels.updated_at AS "updatedAt",
 	channels.archived_at AS "archivedAt",
+	channels.full_width AS "fullWidth",
 	channels.generated_description AS description,
 	channels.generated_description_revision AS "descriptionRevision",
 	channels.generated_description_plan_revision AS "descriptionPlanRevision",
@@ -416,6 +430,7 @@ const CHANNEL_RETURNING = `
 	created_at AS "createdAt",
 	updated_at AS "updatedAt",
 	archived_at AS "archivedAt",
+	full_width AS "fullWidth",
 	generated_description AS description,
 	generated_description_revision AS "descriptionRevision",
 	generated_description_plan_revision AS "descriptionPlanRevision",
@@ -539,7 +554,15 @@ export class PostgresStorage implements StorageAdapter {
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
 		);
+		this.chatAttachments = new PostgresChatAttachmentStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+		);
 		this.runStages = new PostgresRunStageStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+		);
+		this.decisionAnswers = new PostgresDecisionAnswerStore(
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
 		);
@@ -550,6 +573,34 @@ export class PostgresStorage implements StorageAdapter {
 		this.machines = new PostgresMachineStore(
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
+		);
+		this.plannerHolds = new PostgresPlannerLinkHoldStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
+		);
+		this.plannerModelChoices = new PostgresPlannerModelChoiceStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
+		);
+		this.chatThreads = new PostgresChatThreadStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
+		);
+		this.plannerCredentials = new PostgresPlannerCredentialStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+		);
+		this.mcpSessions = new PostgresMcpSessionStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+		);
+		this.deferredTurns = new PostgresDeferredTurnStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
 		);
 		this.jobs = new PostgresBackgroundJobStore(
 			this.#sql,
@@ -603,6 +654,18 @@ export class PostgresStorage implements StorageAdapter {
 				SELECT ${this.#sql.unsafe(USER_COLUMNS)} FROM users WHERE id = ${id}
 			`;
 				return found ? user(found) : undefined;
+			}),
+		byLogins: logins =>
+			this.#run("read users by login", async () => {
+				let wanted = [...new Set(logins.map(login => login.toLowerCase()))];
+				if (!wanted.length) return [];
+				let rows = await this.#sql<UserRow[]>`
+				SELECT DISTINCT ON (lower(login)) ${this.#sql.unsafe(USER_COLUMNS)}
+				FROM users
+				WHERE lower(login) IN ${this.#sql(wanted)}
+				ORDER BY lower(login), updated_at DESC
+			`;
+				return rows.map(user);
 			}),
 	};
 
@@ -675,10 +738,20 @@ export class PostgresStorage implements StorageAdapter {
 			this.#run("reset login sessions and owners", () =>
 				this.#sql.begin(async transaction => {
 					await this.#assertLease(transaction, held);
+					// A document whose Planner hold names a login this reset keeps stays owned by it.
 					await transaction`
 					UPDATE agent_state
 					SET owner_session_id = NULL, status = 'unavailable', updated_at = ${now}
 					WHERE owner_session_id IS NOT NULL
+						AND NOT EXISTS (
+							SELECT 1
+							FROM planner_link_holds hold
+							JOIN web_sessions kept ON kept.id = hold.owner_session_id
+							WHERE hold.channel_id = agent_state.channel_id
+								AND hold.owner_session_id = agent_state.owner_session_id
+								AND kept.credential_ciphertext IS NOT NULL
+								AND kept.expires_at > ${now}
+						)
 				`;
 					let deleted = await transaction<{ id: string }[]>`
 					DELETE FROM web_sessions
@@ -703,9 +776,17 @@ export class PostgresStorage implements StorageAdapter {
 	readonly jobs: BackgroundJobStore;
 	readonly research: ResearchWorkspaceStore;
 	readonly images: PostgresImageStore;
+	readonly chatAttachments: PostgresChatAttachmentStore;
 	readonly runStages: PostgresRunStageStore;
+	readonly decisionAnswers: PostgresDecisionAnswerStore;
 	readonly versions: PostgresDocumentVersionStore;
 	readonly machines: PostgresMachineStore;
+	readonly plannerHolds: PostgresPlannerLinkHoldStore;
+	readonly plannerModelChoices: PostgresPlannerModelChoiceStore;
+	readonly chatThreads: PostgresChatThreadStore;
+	readonly plannerCredentials: PostgresPlannerCredentialStore;
+	readonly mcpSessions: PostgresMcpSessionStore;
+	readonly deferredTurns: PostgresDeferredTurnStore;
 	readonly preferences: PreferenceStore;
 	readonly provenance: PostgresProvenanceStore;
 
@@ -752,6 +833,7 @@ export class PostgresStorage implements StorageAdapter {
 				return rows.map(row => row.slug);
 			}),
 		rename: input => this.#renameChannel(input),
+		setFullWidth: input => this.#setChannelWidth(input),
 		archive: input => this.#setChannelArchived(input, true),
 		restore: input => this.#setChannelArchived(input, false),
 		delete: id => this.#deleteChannel(id),
@@ -780,6 +862,7 @@ export class PostgresStorage implements StorageAdapter {
 	};
 
 	readonly leases: LeaseStore = {
+		peek: name => this.#peek(name),
 		acquire: (name, owner, ttlMs) => this.#acquire(name, owner, ttlMs),
 		renew: (held, ttlMs) => this.#renew(held, ttlMs),
 		release: held => this.#release(held),
@@ -935,6 +1018,33 @@ export class PostgresStorage implements StorageAdapter {
 					input.now,
 				);
 				return { channel: channel({ ...saved, slug }), changed: true };
+			}));
+	}
+
+	#setChannelWidth(input: ChannelWidthInput): Promise<RenameResult> {
+		return this.#run("set channel width", () =>
+			this.#sql.begin(async transaction => {
+				let [current] = await transaction<ChannelRow[]>`
+					SELECT ${transaction.unsafe(CHANNEL_COLUMNS)}
+					FROM channels
+					WHERE id = ${input.id}
+					FOR UPDATE
+				`;
+				if (!current) throw missing(`channel ${input.id} does not exist`);
+				let existing = channel(current);
+				if (existing.archivedAt) throw conflict(`channel ${input.id} is archived`);
+				if (!!existing.fullWidth === input.fullWidth) return { channel: existing, changed: false };
+				let updatedAt = input.now > existing.updatedAt
+					? input.now
+					: new Date(existing.updatedAt.getTime() + 1);
+				let [saved] = await transaction<ChannelRow[]>`
+					UPDATE channels
+					SET full_width = ${input.fullWidth}, updated_at = ${updatedAt}
+					WHERE id = ${input.id}
+					RETURNING ${transaction.unsafe(CHANNEL_RETURNING)}
+				`;
+				if (!saved) throw corrupt("setting a channel's width returned no record");
+				return { channel: channel({ ...saved, slug: existing.slug }), changed: true };
 			}));
 	}
 
@@ -1838,6 +1948,19 @@ export class PostgresStorage implements StorageAdapter {
 					: undefined;
 				return { revision, sequence, repeated: false, ...(saved ? { channel: saved } : {}) };
 			}));
+	}
+
+	#peek(name: string): Promise<LeasePeek | undefined> {
+		return this.#run("read storage lease", async () => {
+			let [found] = await this.#sql<Array<LeaseRow & { free: boolean }>>`
+				SELECT ${this.#sql.unsafe(LEASE_COLUMNS)}, expires_at <= clock_timestamp() AS free
+				FROM storage_leases
+				WHERE name = ${name}
+			`;
+			if (!found) return undefined;
+			let { free, ...row } = found;
+			return { lease: lease(row), free };
+		});
 	}
 
 	#acquire(name: string, owner: string, ttlMs: number): Promise<Lease | undefined> {

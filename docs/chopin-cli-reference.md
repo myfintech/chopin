@@ -41,6 +41,7 @@ it connects.
 | `runs/`           | Each job's worktree, extra worktrees, journal, and GitHub token file while it runs. See [Where things live](chopin-cli.md#where-things-live-on-this-machine).                           |
 | `planners/`       | Each Planner command's worktree.                                                                                                                                                        |
 | `repos/`          | A clone of each repository work needed with no checkout named, as `repos/<owner>/<repo>`.                                                                                               |
+| `sandbox/`        | MXC's sandbox executor, written out of the `chopin` binary on first use, as `sandbox/<hash>/`. See [Sandbox](chopin-cli.md#sandbox).                                                    |
 
 Chopin stores only a hash of the machine token, plus the machine's own GitHub
 authorization, encrypted like a browser login.
@@ -68,7 +69,7 @@ releases are made.
 ## Run without installing
 
 Every Chopin server also serves the connector as one script at
-`/connector.js`. It needs [Bun](https://bun.sh) 1.4.2. This is the command
+`/connector.js`. It needs [Bun](https://bun.sh) 1.4.4. This is the command
 Chopin shows when no local agent is connected:
 
 ```sh

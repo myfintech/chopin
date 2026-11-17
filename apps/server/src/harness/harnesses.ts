@@ -4,13 +4,26 @@ import { isAbsolute } from "node:path";
 import { ATOMIC_AUTH_MODES, createAtomicAdapter } from "./atomic/adapter";
 import { forgetWorkspaces, workflowJournal } from "./atomic/workspace";
 import { createCopilotSdk } from "./copilot-sdk/adapter";
+import { withModelOutput } from "./model-output";
 import { shutdownPlannerExtensions } from "../planner-extensions";
 import { atomicProviders } from "../atomic-providers";
 import { announceAtomicPlanner } from "../isolated-planner";
 import { createRemoteAdapter } from "./remote/adapter";
+import { readingOutput } from "../agent/reading-output";
+import { remoteCatalog, remoteCommands } from "./catalog";
+import { plannerWorkspace } from "./atomic/workspace";
+import { attachedLink } from "./remote/registry";
 
 import type { HarnessV1 } from "@ai-sdk/harness";
+import type { Chat as Wire } from "@chopin/protocol";
 import type { AtomicAuthMode } from "./atomic/adapter";
+
+/**
+ * Whether a harness's turn takes a person's message while it runs, through its prompt control's
+ * `submitUserMessage`: always, or for the document whose client the harness asks. One that has
+ * none is refused a message while a turn runs, since nothing is ever held for the next one.
+ */
+export type Steers = boolean | ((channelId: string) => boolean);
 
 const credentials = new Map<string, {
 	currentToken: () => string | undefined;
@@ -19,7 +32,7 @@ const credentials = new Map<string, {
 
 function createAtomicHarness(
 	settings: { auth?: string; extensions?: readonly string[] },
-): HarnessV1 & { shutdown(): Promise<void> } {
+): HarnessV1 & { shutdown(): Promise<void>; steers: true } {
 	// Atomic takes neither a GitHub credential nor a credit limit; only `auth` (validated by
 	// `harnessFor` below), the extensions, and the workflow journal reach the real adapter.
 	announceAtomicPlanner();
@@ -32,14 +45,24 @@ function createAtomicHarness(
 }
 
 /** The model runs in a client attached over the agent connection, so the server holds no credential. */
-function createRemoteHarness(): HarnessV1 & { shutdown(): Promise<void> } {
+function createRemoteHarness(): HarnessV1 & {
+	shutdown(): Promise<void>;
+	steers: (channelId: string) => boolean;
+} {
 	return createRemoteAdapter();
 }
 
+/** Each real harness shows the model `read_plan` and `read_child` as text; see `withModelOutput`. */
+function reading<Settings>(
+	create: (settings: Settings) => HarnessV1 & { shutdown(): Promise<void>; steers?: Steers },
+) {
+	return (settings: Settings) => withModelOutput(create(settings), readingOutput);
+}
+
 export const harnesses = {
-	"copilot-sdk": createCopilotSdk,
-	atomic: createAtomicHarness,
-	remote: createRemoteHarness,
+	"copilot-sdk": reading(createCopilotSdk),
+	atomic: reading(createAtomicHarness),
+	remote: reading(createRemoteHarness),
 } satisfies Record<
 	string,
 	(settings: {
@@ -52,7 +75,7 @@ export const harnesses = {
 
 export type HarnessName = keyof typeof harnesses;
 
-let selected: (HarnessV1 & { shutdown(): Promise<void> }) | undefined;
+let selected: (HarnessV1 & { shutdown(): Promise<void>; steers?: Steers }) | undefined;
 
 function loopback(host: string): boolean {
 	return host === "localhost" || host === "::1" || host === "[::1]"
@@ -124,6 +147,104 @@ export function harnessFor(config: {
 	});
 }
 
+/**
+ * The models a document's Planner can be set to run, or none where its harness cannot honor a
+ * choice: Atomic's runtime offers its models, a remote Planner offers what its attached client
+ * reported (an older client reported nothing), and every other harness offers nothing.
+ */
+export async function plannerCatalog(
+	harness: string,
+	channelId: string,
+	operatorModel: string | undefined,
+): Promise<Wire.ModelCatalog | undefined> {
+	if (harness === "remote") return remoteCatalog(attachedLink(channelId)?.catalog, operatorModel);
+	let atomic = selected as { catalog?: (model: string | undefined) => Promise<Wire.ModelCatalog> };
+	if (harness === "atomic" && atomic?.catalog) return atomic.catalog(operatorModel);
+	return undefined;
+}
+
+/**
+ * The commands a document's Planner offers beyond Chopin's own. A remote Planner offers what its
+ * attached client reports now, and nothing once that client has gone: the attached link is the only
+ * place they are held, so no other machine's, and no earlier client's, is ever offered. An Atomic
+ * Planner offers what a session in its working directory finds. Every other harness has none.
+ */
+export async function plannerCommands(
+	harness: string,
+	channelId: string,
+	repository: { owner: string; name: string },
+): Promise<Wire.CommandOption[] | undefined> {
+	if (harness === "remote") return remoteCommands(attachedLink(channelId)?.catalog);
+	let atomic = selected as { commands?: (cwd: string) => Promise<Wire.CommandOption[]> };
+	if (harness !== "atomic" || !atomic?.commands) return undefined;
+	let { cwd } = await plannerWorkspace(channelId, repository);
+	// Reading them builds a session, so a room full of people joining reads them once.
+	let held = atomicCommands.get(cwd);
+	if (!held || Date.now() - held.at > ATOMIC_COMMANDS_TTL_MS) {
+		held = { at: Date.now(), read: atomic.commands(cwd) };
+		atomicCommands.set(cwd, held);
+		held.read.catch(() => {
+			if (atomicCommands.get(cwd) === held) atomicCommands.delete(cwd);
+		});
+	}
+	let commands = await held.read;
+	return commands.length > 0 ? commands : undefined;
+}
+
+const ATOMIC_COMMANDS_TTL_MS = 30_000;
+let atomicCommands = new Map<string, { at: number; read: Promise<Wire.CommandOption[]> }>();
+
+/**
+ * Whether a message sent while the document's Planner works can reach its turn: the selected
+ * harness takes input mid-run (Atomic always, a remote Planner when its client offered
+ * `steer-turn`). Every other harness, the Copilot SDK among them, cannot, and the message is
+ * refused.
+ */
+export function plannerSteers(channelId: string): boolean {
+	let steers = selected?.steers;
+	return typeof steers === "function" ? steers(channelId) : steers === true;
+}
+
+/**
+ * Whether what the document's Planner offers is known now, though it may be nothing. A remote
+ * Planner's is known only while a client is attached and has told it, or offered no catalog to tell
+ * it with: with nobody attached (a machine that is away, a server that has just restarted) there is
+ * nobody to honor or to refuse a saved choice, and nothing is said of it. Every other harness knows.
+ */
+export function plannerOfferKnown(harness: string, channelId: string): boolean {
+	if (harness !== "remote") return true;
+	let link = attachedLink(channelId);
+	return link !== undefined && !link.catalogPending;
+}
+
+/**
+ * Whether the document's Planner's models are on their way, so a composer may wait for them: an
+ * attached remote client that offered its models and has yet to report them, or, with none
+ * attached, a Planner nobody holds (`held` false), which a machine may be starting. A Planner held
+ * while its client is away (a deploy's hand-over window, a machine that dropped) is not on its way:
+ * what it offered was told before it went, and the room sees nothing change until it is back.
+ * Never for any other harness, which always knows what it offers.
+ */
+export function plannerOfferIncoming(harness: string, channelId: string, held: boolean): boolean {
+	if (harness !== "remote") return false;
+	let link = attachedLink(channelId);
+	return link ? link.catalogPending : !held;
+}
+
+/**
+ * A turn has fallen back on a saved choice for want of a catalog its remote Planner's client
+ * offered and never reported. The wait is over for that client (`plannerOfferKnown` is then true
+ * until it leaves), so what the turn did can be told. False where no client is attached, and for
+ * every other harness, which knows what it offers.
+ */
+export function plannerRanWithoutOffer(harness: string, channelId: string): boolean {
+	if (harness !== "remote") return false;
+	let link = attachedLink(channelId);
+	if (!link) return false;
+	link.settleWithoutCatalog();
+	return true;
+}
+
 export function registerCredential(
 	id: string,
 	currentToken: () => string | undefined,
@@ -138,6 +259,7 @@ export function registerCredential(
 
 export async function shutdownHarnesses(): Promise<void> {
 	credentials.clear();
+	atomicCommands.clear();
 	await shutdownPlannerExtensions();
 	await selected?.shutdown();
 	selected = undefined;

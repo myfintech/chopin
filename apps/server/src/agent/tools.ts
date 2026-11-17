@@ -16,18 +16,23 @@ import {
 	answer,
 	applyAnchors,
 	applyBlockEdit,
+	currentPlan,
 	documentSnapshot,
-	documentView,
 	EDIT_OPERATIONS_SCHEMA,
+	readableView,
 } from "./document-ops";
 import * as Comments from "../comments/service";
 import * as edit from "../plan/edit";
 import * as Questions from "../questions/service";
 import { limits, ULID } from "@chopin/dialect";
+import { READING_IN_PARTS } from "../document-reading";
+import { readingModelOutput } from "./reading-output";
 import { implementationGraphs, implementationReadiness } from "../tasks/plan-graphs";
+import { planSourceFor } from "../tasks/plan-source";
 import { documentIdentity, implementationActive } from "../plan/service";
 import { childTools, Refusal, shielded } from "./child-tools";
 import { experimentTools } from "./experiment-tools";
+import { planImage } from "./plan-images";
 import type { InvestigationTools } from "./experiment-tools";
 
 import type { ActiveOwnerBinding } from "./active-owner";
@@ -100,6 +105,20 @@ const GRAPH_REFUSALS: Record<string, string> = {
 	"stale-plan": "The plan changed. Call read_implementation_graph again.",
 	"stale-graph": "The graph changed. Call read_implementation_graph again.",
 };
+
+/**
+ * What a saved draft means, for the Planner to say: there is no separate approval. A first build's
+ * Build plan press approves exactly this draft and starts it. A built document's Build carries its
+ * edits onto the pull requests from the document itself, so a draft there is not what it runs.
+ */
+function draftNote(plan: { live?: unknown }): string {
+	return plan.live
+		? "Saved as a draft. This document is already built: Build carries the document's edits "
+			+ "onto its pull requests from the document itself, not from this graph, and needs no "
+			+ "approval. Don't say the draft needs approval; say that Build builds the changes."
+		: "Saved as a draft. Pressing Build plan approves exactly this draft and starts it; there "
+			+ "is no other approval step. Don't say it needs approval; say that Build plan builds it.";
+}
 
 function sameMemberRequest(
 	current: ActiveMemberRequest | undefined,
@@ -179,6 +198,13 @@ export type DocumentRoom = {
 	checkReply?: (text: string, signal?: AbortSignal) => Promise<boolean>;
 	/** This root's children; absent in a child room and in tests that do not need them. */
 	children?: import("../chat/children").ChildDocuments;
+	/**
+	 * Stores an image in this document's own images, during a live Planner turn. Absent where the
+	 * session may not write the document.
+	 */
+	uploadImage?: (
+		image: { bytes: Uint8Array; mimeType: import("../images/format").ImageType; alt?: string },
+	) => Promise<{ path: string }>;
 };
 const roomContext = z.object({
 	room: z.custom<DocumentRoom>(value =>
@@ -200,17 +226,31 @@ export const documentTools = {
 	...experimentTools,
 	read_plan: tool({
 		contextSchema: roomContext,
-		description: "Read the plan: its revision, canonical source, the top-level blocks you can "
-			+ "address when editing, and the questions it holds. Read before editing — "
-			+ "`edit_plan` refuses a batch aimed at a revision that has moved on. `document.url` is "
-			+ "this document's current link; `document.earlier_urls`, when present, are links it had "
-			+ "before a rename, which still open it.",
-		inputSchema: jsonSchema({ type: "object", properties: {}, additionalProperties: false }),
+		description: "Read the plan as text: a short header (document id and url, revision, size), "
+			+ "the top-level blocks you can address when editing with their lines, the questions it "
+			+ "holds, then its canonical source with its real newlines, verbatim. Read before editing — "
+			+ "`edit_plan` refuses a batch aimed at a revision that has moved on. `url` is this "
+			+ "document's current link; `earlier urls`, when present, are links it had before a "
+			+ `rename, which still open it. ${READING_IN_PARTS}`,
+		inputSchema: jsonSchema({
+			type: "object",
+			properties: {
+				offset: { type: "integer", minimum: 1, description: "First line to read, from 1." },
+				limit: { type: "integer", minimum: 1, description: "Most lines to read." },
+				column: {
+					type: "integer",
+					minimum: 1,
+					description: "Character in line `offset` to start at.",
+				},
+			},
+			additionalProperties: false,
+		}),
 		// Reading the document the agent is here to write is not a decision
 		// anybody needs to approve.
 		metadata: { skipPermission: true },
-		execute: (_raw, { context: { room: context } }) =>
-			answer("read_plan", () => documentView(context.plan)),
+		execute: (raw, { context: { room: context } }) =>
+			answer("read_plan", () => readableView(context.plan, Arguments.readRange(raw, "read_plan"))),
+		toModelOutput: readingModelOutput("read_plan"),
 	}),
 
 	read_reference: tool({
@@ -283,6 +323,42 @@ export const documentTools = {
 					throw new Error("a current member request is required to create a research workspace");
 				}
 				return context.createResearch(question);
+			}),
+	}),
+
+	upload_plan_image: tool({
+		contextSchema: roomContext,
+		description: "Store an image you made, a PNG, JPEG, WebP or GIF of at most 16 MiB (one over "
+			+ "1 MiB is stored as a smaller copy), in this "
+			+ "document's images and get back the Markdown that shows it. Put that Markdown in a "
+			+ "decision option's `preview` (or a question body, or the plan) so people can compare "
+			+ "choices by looking. Only people who can read this document can load the image; the "
+			+ "same bytes twice give the same path. `alt` says what the image shows, in a sentence.",
+		inputSchema: jsonSchema({
+			type: "object",
+			properties: {
+				data: {
+					type: "string",
+					contentEncoding: "base64",
+					description: "Standard base64 image bytes, at most 16 MiB decoded.",
+				},
+				mimeType: { type: "string", enum: ["image/png", "image/jpeg", "image/webp", "image/gif"] },
+				alt: { type: "string", minLength: 1, maxLength: 200 },
+			},
+			required: ["data", "mimeType", "alt"],
+			additionalProperties: false,
+		}),
+		metadata: { skipPermission: true },
+		execute: (raw, { context: { room: context } }) =>
+			answer("upload_plan_image", async () => {
+				if (!context.uploadImage) throw new Error("images cannot be stored in this session");
+				let image = await planImage(raw, context.id);
+				let { path } = await context.uploadImage({
+					bytes: image.bytes,
+					mimeType: image.mimeType,
+					alt: (raw as { alt: string }).alt,
+				});
+				return { path, markdown: `![${image.alt}](${path})` };
 			}),
 	}),
 
@@ -536,8 +612,10 @@ export const documentTools = {
 			+ "independent questions into one call before waiting. Each question becomes a separate "
 			+ "card beside its related prose. The questionnaire is recorded in the plan and the "
 			+ "answer is attributed to whoever gave it. If current_plan is present after "
-			+ "an answer, it has read_plan's revision, source, and blocks; edit from that "
-			+ "revision. Otherwise call read_plan before editing. Reread if an edit is stale. "
+			+ "an answer, it is the view read_plan is built from, as JSON, with its revision, "
+			+ "source, and blocks; edit from that revision. When the document is large it says "
+			+ "`source_omitted` instead, with the revision: call read_plan before editing. "
+			+ "Reread if an edit is stale. "
 			+ "Ask only what the repository cannot tell you, and do not ask for permission "
 			+ "to proceed. Use the revision from "
 			+ "`read_plan` and relate every question to its returned blocks.",
@@ -607,7 +685,9 @@ export const documentTools = {
 						);
 					})().catch(() => undefined);
 					let current = await Promise.race([capture, stop.promise]);
-					return disposed || stopped() || !current ? result : { ...result, current_plan: current };
+					return disposed || stopped() || !current
+						? result
+						: { ...result, current_plan: currentPlan(current, "read_plan") };
 				} finally {
 					dispose();
 					clearTimeout(timer);
@@ -621,6 +701,8 @@ export const documentTools = {
 		description: "Read the current plan revision and implementation graph before drafting or "
 			+ "revising tasks. The returned plan_revision and graph_revision are required by "
 			+ "edit_implementation_graph; a newer plan or graph refuses the whole edit. "
+			+ "plan_source, when present, is the pushed commit holding the plan's files that a "
+			+ "build of this revision starts from. "
 			+ "When needs_revision is true, the graph is stale even if approved. Revise it "
 			+ "against plan_revision before calling it ready; replace an unchanged task if its content remains valid.",
 		inputSchema: jsonSchema({ type: "object", properties: {}, additionalProperties: false }),
@@ -628,6 +710,7 @@ export const documentTools = {
 		execute: (_raw, { context: { room: context } }) =>
 			answer("read_implementation_graph", () => {
 				let version = context.plan.graph?.versions.at(-1);
+				let planSource = planSourceFor(context.plan.planSources, context.plan.revision);
 				return {
 					plan_revision: context.plan.revision,
 					source: edit.source(context.plan),
@@ -635,6 +718,7 @@ export const documentTools = {
 					graph_plan_revision: version?.planRevision,
 					needs_revision: !!version && version.planRevision !== context.plan.revision,
 					graph: context.plan.graph,
+					...(planSource ? { plan_source: planSource } : {}),
 				};
 			}),
 	}),
@@ -644,7 +728,9 @@ export const documentTools = {
 		description: "Create or revise the draft implementation graph against the plan and graph "
 			+ "revisions from read_implementation_graph. Submit one atomic batch of add, replace, "
 			+ "reorder and remove operations. This never changes plan content. Only people may "
-			+ "approve, lock or start implementation.",
+			+ "approve, lock or start implementation: a person's Build plan press approves the saved "
+			+ "draft and starts it, so never tell people a draft still needs approval. Read the "
+			+ "result's note before you describe what happens next.",
 		inputSchema: jsonSchema({
 			type: "object",
 			properties: {
@@ -687,7 +773,7 @@ export const documentTools = {
 				let ready = implementationReadiness(context.plan, args.planRevision);
 				if (!ready.ok) return { ok: false, reason: "not-ready", blockers: ready.blockers };
 				let result = await implementationGraphs().revise(context.plan, args);
-				if (result.ok) return { ok: true, graph: result.value };
+				if (result.ok) return { ok: true, graph: result.value, note: draftNote(context.plan) };
 				let message = GRAPH_REFUSALS[result.reason];
 				return { ok: false, reason: result.reason, ...(message ? { message } : {}) };
 			}),

@@ -16,6 +16,7 @@ type MachineRow = {
 	label: string;
 	repositories: MachineRepository[] | string;
 	autoRun: boolean;
+	shared: boolean;
 	tokenHash: Uint8Array;
 	ciphertext: Uint8Array | null;
 	revision: string | number | null;
@@ -25,7 +26,7 @@ type MachineRow = {
 	revokedAt: Date | string | null;
 };
 
-const COLUMNS = `id, user_id AS "userId", label, repositories, auto_run AS "autoRun",
+const COLUMNS = `id, user_id AS "userId", label, repositories, auto_run AS "autoRun", shared,
 	token_hash AS "tokenHash", credential_ciphertext AS ciphertext, credential_revision AS revision,
 	created_at AS "createdAt", last_seen_at AS "lastSeenAt", reauthorize_at AS "reauthorizeAt",
 	revoked_at AS "revokedAt"`;
@@ -39,6 +40,7 @@ function machine(row: MachineRow): StoredMachine {
 			? JSON.parse(row.repositories)
 			: row.repositories,
 		autoRun: row.autoRun,
+		...(row.shared ? { shared: true } : {}),
 		tokenHash: new Uint8Array(row.tokenHash),
 		...(row.ciphertext && row.revision !== null
 			? {
@@ -61,13 +63,15 @@ export class PostgresMachineStore implements MachineStore {
 		return this.run("pair machine", async () => {
 			await this.sql`
 				INSERT INTO machines (
-					id, user_id, label, repositories, auto_run, token_hash, credential_ciphertext,
+					id, user_id, label, repositories, auto_run, shared, token_hash, credential_ciphertext,
 					credential_revision, created_at, last_seen_at
 				) VALUES (
 					${input.id}, ${input.userId}, ${input.label}, ${
 				JSON.stringify(input.repositories)
 			}::text::jsonb,
-					${input.autoRun}, ${input.tokenHash}, ${input.credentials?.ciphertext ?? null},
+					${input.autoRun}, ${input.shared ?? false}, ${input.tokenHash}, ${
+				input.credentials?.ciphertext ?? null
+			},
 					${input.credentials?.revision ?? null}, ${input.createdAt}, ${input.lastSeenAt}
 				)
 			`;
@@ -94,6 +98,16 @@ export class PostgresMachineStore implements MachineStore {
 			let rows = await this.sql<MachineRow[]>`
 				SELECT ${this.sql.unsafe(COLUMNS)} FROM machines
 				WHERE user_id = ${userId} AND revoked_at IS NULL
+				ORDER BY created_at DESC, id
+			`;
+			return rows.map(machine);
+		});
+	}
+	shared() {
+		return this.run("list shared machines", async () => {
+			let rows = await this.sql<MachineRow[]>`
+				SELECT ${this.sql.unsafe(COLUMNS)} FROM machines
+				WHERE shared AND revoked_at IS NULL
 				ORDER BY created_at DESC, id
 			`;
 			return rows.map(machine);
@@ -158,6 +172,22 @@ export class PostgresMachineStore implements MachineStore {
 				return updated.length > 0;
 			}));
 	}
+	share(id: string, userId: string, shared: boolean) {
+		return this.run("share machine", () =>
+			this.sql.begin(async transaction => {
+				let updated = await transaction<{ id: string }[]>`
+					UPDATE machines SET shared = ${shared}
+					WHERE id = ${id} AND user_id = ${userId} AND revoked_at IS NULL
+					RETURNING id
+				`;
+				if (updated.length && !shared) {
+					await transaction`
+						DELETE FROM machine_favorites WHERE machine_id = ${id} AND user_id <> ${userId}
+					`;
+				}
+				return updated.length > 0;
+			}));
+	}
 	serve(id: string, repository: MachineRepository) {
 		return this.run("record a machine's repository", async () => {
 			let entry = JSON.stringify([repository]);
@@ -189,11 +219,13 @@ export class PostgresMachineStore implements MachineStore {
 				`;
 				return;
 			}
-			// Only the person's own unrevoked machine; anything else is missing.
+			// The person's own unrevoked machine, or one its owner shares with teammates; anything
+			// else is missing.
 			let inserted = await this.sql<{ machineId: string }[]>`
 				INSERT INTO machine_choices (channel_id, user_id, machine_id, chosen_at)
 				SELECT ${choice.channelId}, ${choice.userId}, id, ${now} FROM machines
-				WHERE id = ${choice.machineId} AND user_id = ${choice.userId} AND revoked_at IS NULL
+				WHERE id = ${choice.machineId} AND (user_id = ${choice.userId} OR shared)
+					AND revoked_at IS NULL
 				ON CONFLICT (channel_id, user_id)
 				DO UPDATE SET machine_id = EXCLUDED.machine_id, chosen_at = EXCLUDED.chosen_at
 				RETURNING machine_id AS "machineId"
@@ -217,11 +249,14 @@ export class PostgresMachineStore implements MachineStore {
 				await this.sql`DELETE FROM machine_favorites WHERE user_id = ${favorite.userId}`;
 				return;
 			}
-			// Only the person's own unrevoked machine; anything else is missing.
+			// The person's own unrevoked machine, or one its owner shares with teammates; anything
+			// else is missing.
 			let inserted = await this.sql<{ machineId: string }[]>`
 				INSERT INTO machine_favorites (user_id, machine_id, chosen_at)
 				SELECT ${favorite.userId}, id, ${now} FROM machines
-				WHERE id = ${favorite.machineId} AND user_id = ${favorite.userId} AND revoked_at IS NULL
+				WHERE id = ${favorite.machineId} AND (user_id = ${favorite.userId} OR shared)
+					AND revoked_at IS NULL
+				FOR SHARE
 				ON CONFLICT (user_id)
 				DO UPDATE SET machine_id = EXCLUDED.machine_id, chosen_at = EXCLUDED.chosen_at
 				RETURNING machine_id AS "machineId"

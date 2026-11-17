@@ -1,14 +1,15 @@
 import { createHash } from "node:crypto";
 import { SQL } from "bun";
+import { e2ePort } from "./ports";
 import { ulid, withDocumentTitle } from "../packages/dialect/src/index";
 import { storedDocument, storedLegacyCallout } from "../apps/server/src/testing/plan";
 
 import type { SeedState } from "../apps/server/src/testing/plan";
 
 const DEFAULT_DATABASES: Record<number, string> = {
-	8788: "postgresql://chopin:chopin@127.0.0.1:5433/chopin?sslmode=disable",
-	8789: "postgresql://chopin:chopin@127.0.0.1:5434/chopin?sslmode=disable",
-	8792: "postgresql://chopin:chopin@127.0.0.1:5435/chopin?sslmode=disable",
+	[e2ePort(8788)]: "postgresql://chopin:chopin@127.0.0.1:5433/chopin?sslmode=disable",
+	[e2ePort(8789)]: "postgresql://chopin:chopin@127.0.0.1:5434/chopin?sslmode=disable",
+	[e2ePort(8792)]: "postgresql://chopin:chopin@127.0.0.1:5435/chopin?sslmode=disable",
 };
 
 export function testChannelSlug(id: string): string {
@@ -29,7 +30,7 @@ export function registerTestDatabase(port: number, databaseUrl: string): void {
 function url(port: number): string {
 	let own = ownDatabases.get(port);
 	if (own) return own;
-	let index = port === 8792 ? 2 : port === 8789 ? 1 : 0;
+	let index = port === e2ePort(8792) ? 2 : port === e2ePort(8789) ? 1 : 0;
 	return process.env[`E2E_DATABASE_URL_${index}`] || DEFAULT_DATABASES[port]!;
 }
 
@@ -267,6 +268,7 @@ async function seed(
 		transcript: state.transcript ?? [],
 		...(state.graph ? { graph: state.graph } : {}),
 		...(state.builds ? { builds: state.builds } : {}),
+		...(state.execution ? { execution: state.execution } : {}),
 		...(state.lifecycle ? { lifecycle: state.lifecycle } : {}),
 		...(state.workflowRuns ? { workflowRuns: state.workflowRuns } : {}),
 	};
@@ -295,6 +297,15 @@ async function seed(
 				)
 			`;
 		}
+	});
+}
+
+export async function readPlannerOwner(port: number, id: string): Promise<string | null> {
+	return sql(port, async database => {
+		let [row] = await database<{ owner: string | null }[]>`
+			SELECT owner_session_id AS owner FROM agent_state WHERE channel_id = ${id}
+		`;
+		return row?.owner ?? null;
 	});
 }
 

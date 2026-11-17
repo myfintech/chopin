@@ -12,13 +12,15 @@ import { SQL } from "bun";
 
 import { createChannel, registerTestDatabase, seedChannel, testChannelPath } from "./database";
 import { authenticate, expect, test } from "./room";
+import { e2eDatabaseName, e2ePort } from "./ports";
+import { GITHUB_APP_ENV } from "./github-app";
 import { HOST, ROOT } from "./servers";
 
 import type { Graph } from "../apps/server/src/tasks/graphs";
 
-const PORT = 8795;
+const PORT = e2ePort(8795);
 const ORIGIN = `http://${HOST}:${PORT}`;
-const DATABASE = "chopin_build_restart";
+const DATABASE = e2eDatabaseName("chopin_build_restart");
 
 function databaseUrls() {
 	let cluster = new URL(
@@ -51,6 +53,7 @@ const ENV = {
 	GITHUB_APP_SLUG: "chopin-e2e",
 	GITHUB_APP_CLIENT_ID: "e2e",
 	GITHUB_APP_CLIENT_SECRET: "e2e",
+	...GITHUB_APP_ENV,
 	GITHUB_ALLOWED_USERS: "",
 	GITHUB_ALLOWED_ORGANIZATIONS: "githubnext",
 	SESSION_ENCRYPTION_KEY: process.env.SESSION_ENCRYPTION_KEY!,
@@ -162,6 +165,7 @@ async function connector(env: Record<string, string>) {
 		join(ROOT, "apps/connector/src/main.ts"),
 		"connect",
 		root,
+		"--no-sandbox",
 		"--",
 		"bun",
 		join(ROOT, "apps/connector/src/testing/fake-implementer.ts"),
@@ -251,6 +255,8 @@ test("a build running across a Chopin restart finishes Built", async ({ page }) 
 	expect(built.build.error).toBeUndefined();
 	expect(chopin.log.text).toContain("after Chopin restarted");
 	expect(local.output()).not.toContain("ended this run");
+	// The connector said how long Chopin was out of reach once it answered again.
+	expect(local.output()).toMatch(/Back in contact with Chopin after \d+ s\./);
 
 	await page.reload();
 	await expect(page.getByRole("button", { name: /^Built/ })).toBeVisible();

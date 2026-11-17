@@ -121,6 +121,15 @@ session and each watched repository. A denied repository is unsubscribed, an
 unavailable answer keeps an existing subscription, an expired session closes the
 socket, and closing the socket drops every subscription.
 
+When a document is created, renamed, archived, restored or permanently deleted,
+by a person, the Planner or a coding agent over MCP, the server also publishes
+`sidebar:catalogue` to that repository's topic. It names the repository and the
+document but no title, so a sidebar learns nothing it couldn't read: it reads that
+repository's documents again through the usual access check, once a burst of
+changes has been quiet for 250 ms. A document someone else creates therefore
+shows in every sidebar watching its repository without a reload. Repositories
+past the watch cap still refresh every minute.
+
 When a commit changes a document's count, or a document is archived, restored or
 permanently deleted, the server publishes `sidebar:decisions` to that
 repository's topic, so every sidebar socket watching it receives the update. A
@@ -157,6 +166,16 @@ display title and canonical slug in one fenced transaction. Source changes advan
 the document revision. Stable UUID identity and old URL aliases survive a rename;
 submitting the current authored title is a no-op. Publication follows persistence,
 with the document delta preceding the metadata notification.
+
+The same route accepts `{ "fullWidth": true }` or `{ "fullWidth": false }` instead of a
+title: the document's Full width, a layout setting every reader shares, as Notion's page
+setting is. It is channel metadata (`channels.full_width`, added by migration 041, default
+off), not document content, so it takes no plan lock, leaves the document revision alone
+and has no Yjs history; like a rename it advances `updatedAt`, and an archived document
+refuses it. The channel record carries `fullWidth: true` only while it is on, and every
+socket in the room hears it in `session:hello` and the `session:channel` sent after the
+commit. Rollback drops the column: `ALTER TABLE channels DROP COLUMN full_width;` and
+`DELETE FROM chopin_migrations WHERE id = '041_document_full_width';`.
 
 Existing documents adopt their leading H1 on first product open, or initialize one
 from their display name when missing. This migration waits while an implementation
@@ -340,8 +359,14 @@ than simultaneous document panes.
 
 1. The HTTP upgrade validates the exact Origin, browser session, instance
    admission, App installation, repository identity, and pull access.
-2. `session:hello` establishes the socket's identity and edit capability.
-3. The editor asks `plan:open` when the transport becomes available. Questions,
+2. `session:hello` establishes the socket's identity and edit capability. It
+   and every `session:presence` name each member with the profile picture
+   GitHub's API returned at sign-in (`Member.avatarUrl`, stored in
+   `users.avatar_url`), never for a demo actor.
+3. The editor asks `plan:open` when the transport becomes available. Before its
+   snapshots, the socket is sent `session:people`: the stored pictures of the
+   people the document's Chat, comments, decisions and builds name who are not
+   in the room, so an author who has left is still drawn as themselves. Questions,
    comments, and Chat receive their own current snapshots.
 4. The open request supplies the client's epoch and Yjs state vector so the
    server can return only missing state when histories are compatible.
@@ -353,6 +378,17 @@ than simultaneous document panes.
 7. When a room becomes empty, the server removes its registry entry and starts
    an asynchronous final close and checkpoint. That close is not yet serialized
    against opening a replacement room for the same channel.
+
+Pictures travel only on frames for sockets joined to the room, which are the
+sockets allowed to read the document, and never on awareness, which clients write
+themselves. The browser keeps one map from login to picture; a face uses it first,
+then `github.com/<login>.png`, which does not exist for every account (an Enterprise
+Managed User's `name_company` has none), then the person's initial. `avatarUrl` and
+`session:people` are optional: an older client ignores them and an older server
+omits them, and the face falls back to the guess. A coding agent's message posted
+through `invoke_planner` introduces its caller to the room with a `session:people`
+frame, since the caller has no socket there. The history of a document's versions
+(`GET /api/channels/:id/versions`) already names each author with `avatarUrl`.
 
 Opening is driven by connection state, not only editor mount. This is what makes
 a late initial connection and a later reconnect both request missed state and

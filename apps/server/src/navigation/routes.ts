@@ -1,3 +1,4 @@
+import { ownOrigin } from "../auth/config";
 import { GitHubError } from "../github/client";
 import { StorageError } from "../storage/errors";
 
@@ -182,7 +183,7 @@ export function registerNavigationRoutes(
 	});
 
 	router.on("POST", "/api/navigation/projects", async request => {
-		if (request.headers.get("origin") !== auth.config.origin) {
+		if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 			return json({ error: "origin is not allowed" }, 403);
 		}
 		try {
@@ -217,8 +218,31 @@ export function registerNavigationRoutes(
 		}
 	});
 
+	/** Take a repository out of the person's projects. Their documents and access are unchanged. */
+	router.on("DELETE", "/api/navigation/projects/:repositoryId", async (request, _url, params) => {
+		if (!ownOrigin(auth.config, request.headers.get("origin"))) {
+			return json({ error: "origin is not allowed" }, 403);
+		}
+		try {
+			let session = await auth.sessions.authenticate(request);
+			if (!session) return json({ error: "authentication required" }, 401);
+			let repositoryId = params.repositoryId ?? "";
+			if (!/^[A-Za-z0-9_=-]{1,128}$/.test(repositoryId)) {
+				return json({ error: "project not found" }, 404);
+			}
+			let removed = await storage.navigation.removeProject(
+				session.user.id,
+				repositoryId,
+				auth.clock(),
+			);
+			return removed ? empty(204) : json({ error: "project not found" }, 404);
+		} catch (err) {
+			return failure(err);
+		}
+	});
+
 	router.on("PATCH", "/api/navigation", async request => {
-		if (request.headers.get("origin") !== auth.config.origin) {
+		if (!ownOrigin(auth.config, request.headers.get("origin"))) {
 			return json({ error: "origin is not allowed" }, 403);
 		}
 		try {

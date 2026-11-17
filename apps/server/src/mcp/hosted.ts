@@ -7,10 +7,13 @@ import {
 	parseDocumentPath,
 } from "@chopin/protocol/document-url";
 
+import { ownOrigin } from "../auth/config";
 import { documentUrl } from "../channels/document-url";
+import { CANNOT_STEER } from "../chat/steering";
 import { notAttachedMessage } from "../harness/remote/attachments";
 import { deterministicChannelId, isChannelId } from "../channels/id";
 import { documentSlug } from "../channels/slug";
+import { claimsMcpToken } from "../experiments/mcp-token";
 import { GitHubError } from "../github/client";
 import * as Plan from "../plan/service";
 import { codingAgent } from "../document-provenance";
@@ -18,11 +21,13 @@ import * as Rooms from "../rooms";
 import { claimImplementation, reportImplementationLifecycle } from "../tasks/plan-graphs";
 import { StorageError } from "../storage/errors";
 import { implementationLifecycle } from "../tasks/lifecycle";
+import { unapprovedContext } from "../tasks/open-decisions";
+import { planSourceFor, withPlanSource } from "../tasks/plan-source";
 import { imagePath } from "../images/format";
 
 import type { Server } from "bun";
 import type { HostedAuth } from "../auth/routes";
-import type { GitHubUser } from "../github/client";
+import type { GitHubUser, Repository as GitHubRepository } from "../github/client";
 import type { AuthenticatedSession } from "../auth/session";
 import type { HostedRepository } from "../agent/repository";
 import type {
@@ -31,6 +36,7 @@ import type {
 	ImplementationInput,
 	InvokePlannerError,
 	McpOptions,
+	RecordPlanSourceInput,
 	RenameDocumentInput,
 } from "../mcp";
 import type { UpdateClient, UpdateDocumentInput } from "./update";
@@ -39,11 +45,22 @@ import type { ChannelArchiveResult, ChannelRecord, Lease, StoredChannel } from "
 import type { ClaimResult, Run } from "../tasks/graphs";
 import type { SocketData } from "../wire";
 import type { VisualAdmission } from "../agent/visual-admission";
+import type { PlanSource } from "../tasks/plan-source";
 
 export type HostedCaller = {
 	oauthToken: string;
 	user: GitHubUser;
 	signal?: AbortSignal;
+	/**
+	 * A launch's MCP token: the documents it may reach, in one repository, and how that
+	 * repository's access is read (with the machine's own grant) instead of `oauthToken`.
+	 */
+	launch?: {
+		repository(owner: string, name: string): Promise<GitHubRepository | undefined>;
+		/** Whether the repository on GitHub has the commit, read with the machine's own grant. */
+		hasCommit(owner: string, name: string, sha: string): Promise<boolean>;
+		allows(channel: ChannelRecord): boolean;
+	};
 };
 
 export type PlannerInvocation = {
@@ -67,8 +84,12 @@ export type HostedCallbacks = {
 	isChannelDeleting?: (channelId: string) => boolean;
 	serializeDocument?: <T>(channelId: string, action: () => Promise<T>) => Promise<T>;
 	onChannelRenamed?: (channel: ChannelRecord) => void;
+	/** `create_document` created a document. */
+	onChannelCreated?: (channel: ChannelRecord) => void;
 	onDocumentPersisted?: (target: Plan.DocumentTarget) => void;
 	invokePlanner?: (input: PlannerInvocation) => Promise<InvokePlannerError | undefined>;
+	/** The caller an MCP token names while its launch is live; see `experiments/mcp-token.ts`. */
+	launchCaller?: (token: string) => Promise<HostedCaller | undefined>;
 	/** What `planner-not-attached` says for a document, at its URL; how to attach one by default. */
 	plannerNotAttached?: (channelId: string, url: string, repository: string) => Promise<string>;
 };
@@ -156,7 +177,13 @@ function exposed(
 			: { state: "idle" },
 		activity: lifecycle?.activity,
 		history: lifecycle?.history ?? [],
+		...unapprovedContext(state.records ?? []),
+		...withSource(planSourceFor(state.planSources ?? [], version.planRevision)),
 	};
+}
+
+function withSource(planSource: PlanSource | undefined) {
+	return planSource ? { planSource } : {};
 }
 
 function claimResult(value: ClaimResult) {
@@ -174,6 +201,7 @@ async function directRepositoryFor(
 	name: string,
 ) {
 	try {
+		if (caller.launch) return await caller.launch.repository(owner, name);
 		return await auth.github.repository(caller.oauthToken, owner, name);
 	} catch (err) {
 		if (err instanceof GitHubError && (err.status === 403 || err.status === 404)) {
@@ -185,16 +213,25 @@ async function directRepositoryFor(
 
 /**
  * The document a locator names, by id, legacy channel URL, or document URL,
- * with the caller's own repository access; "forbidden" when it cannot read it.
+ * with the caller's own repository access; "forbidden" when it cannot read it,
+ * or when the caller is a launch whose documents do not include it.
  */
 export async function locateDocument(auth: LocatorAuth, caller: HostedCaller, locator: string) {
+	let located = await locateAny(auth, caller, locator);
+	return typeof located === "object" && caller.launch && !caller.launch.allows(located.channel)
+		? "forbidden" as const
+		: located;
+}
+
+async function locateAny(auth: LocatorAuth, caller: HostedCaller, locator: string) {
 	let path: URL | undefined;
 	try {
 		path = new URL(locator, auth.config.origin);
 	} catch {
 		path = undefined;
 	}
-	let local = path?.origin === auth.config.origin ? path.pathname : undefined;
+	// A link from before the deployment moved names the same document.
+	let local = ownOrigin(auth.config, path?.origin) ? path!.pathname : undefined;
 	let child = local === undefined ? undefined : parseChildDocumentPath(local);
 	if (child) {
 		let repository = await directRepositoryFor(auth, caller, child.owner, child.repository);
@@ -221,9 +258,9 @@ export async function locateDocument(auth: LocatorAuth, caller: HostedCaller, lo
 		return channel ? { channel, repository } : undefined;
 	}
 
-	let legacy = path?.origin === auth.config.origin
-		? /^\/channels\/([0-9a-f-]{36})\/?$/i.exec(path.pathname)
-		: undefined;
+	let legacy = local === undefined
+		? undefined
+		: /^\/channels\/([0-9a-f-]{36})\/?$/i.exec(local);
 	let id = legacy?.[1]?.toLowerCase();
 	let channel = await auth.storage.channels.get(id && isChannelId(id) ? id : locator);
 	if (!channel) return undefined;
@@ -238,6 +275,12 @@ export async function locateDocument(auth: LocatorAuth, caller: HostedCaller, lo
 	}
 	return { channel, repository };
 }
+
+const MAX_MCP_SESSION_ID = 128;
+/** A session seen this recently is not written again. */
+const MCP_SESSION_TOUCH_MS = 60_000;
+/** An MCP session nobody used for this long is forgotten with the expired login sessions. */
+export const MCP_SESSION_IDLE_MS = 30 * 24 * 60 * 60_000;
 
 /** Bind the backend-neutral MCP surface to hosted GitHub authentication. */
 export function hosted(
@@ -321,6 +364,29 @@ export function hosted(
 	}
 
 	return {
+		sessions: {
+			async create(caller, id, client) {
+				let now = auth.clock();
+				await auth.storage.mcpSessions.create({
+					id,
+					userId: caller.user.id,
+					clientName: client.name,
+					clientVersion: client.version,
+					createdAt: now,
+					lastSeenAt: now,
+				});
+			},
+			async find(id) {
+				if (id.length > MAX_MCP_SESSION_ID) return undefined;
+				let found = await auth.storage.mcpSessions.find(id);
+				if (!found) return undefined;
+				let now = auth.clock();
+				if (now.getTime() - found.lastSeenAt.getTime() >= MCP_SESSION_TOUCH_MS) {
+					await auth.storage.mcpSessions.touch(id, now);
+				}
+				return { name: found.clientName, version: found.clientVersion };
+			},
+		},
 		invoke: callbacks.invokePlanner
 			? {
 				async invoke(caller, input) {
@@ -360,6 +426,7 @@ export function hosted(
 								?? notAttachedMessage(url, fullName),
 						};
 					}
+					if (code === "planner-busy") return { kind: "refused", code, message: CANNOT_STEER };
 					if (code) return { kind: "refused", code };
 					return { kind: "invoked", document: { ...summary(channel), url } };
 				},
@@ -369,6 +436,13 @@ export function hosted(
 			let match = request.headers.get("authorization")?.match(BEARER);
 			if (!match) return undefined;
 			let oauthToken = match[1]!;
+			if (claimsMcpToken(oauthToken)) {
+				let caller = await callbacks.launchCaller?.(oauthToken);
+				return caller && { ...caller, signal: request.signal };
+			}
+			// A GitHub App installation token reaches GitHub only, never Chopin's tools; a launch's own
+			// Planner or build credential reaches its link or its run, never `/mcp`.
+			if (oauthToken.startsWith("ghs_") || oauthToken.startsWith("chopin_")) return undefined;
 			try {
 				return { oauthToken, user: await auth.admission.user(oauthToken), signal: request.signal };
 			} catch (err) {
@@ -392,7 +466,9 @@ export function hosted(
 						cursor,
 						includeArchived,
 					);
-					documents.push(...page.channels.map(summary));
+					documents.push(
+						...page.channels.filter(channel => caller.launch?.allows(channel) ?? true).map(summary),
+					);
 					cursor = page.next;
 				} while (cursor);
 				return documents;
@@ -533,6 +609,8 @@ export function hosted(
 			async create(caller, input) {
 				let parts = input.repository.split("/");
 				if (parts.length !== 2 || !parts[0] || !parts[1]) return { kind: "forbidden" };
+				// A launch reaches only the documents it was started for, never a new one.
+				if (caller.launch) return { kind: "forbidden" };
 				let repository = await directRepository(caller, parts[0], parts[1]);
 				if (!repository || (!repository.permissions.push && !repository.permissions.admin)) {
 					return { kind: "forbidden" };
@@ -616,6 +694,7 @@ export function hosted(
 					if (!stored) return { kind: "title-taken" };
 					return replay(stored);
 				}
+				callbacks.onChannelCreated?.(created);
 				callbacks.onDocumentPersisted?.({
 					channelId: id,
 					revision: 0,
@@ -810,6 +889,40 @@ export function hosted(
 		},
 		...(persistence
 			? {
+				planSources: {
+					async record(caller: HostedCaller, input: RecordPlanSourceInput) {
+						let access = await writableChannel(caller, input.id);
+						if (access.kind !== "allowed") return access;
+						let { channel } = access;
+						if (channel.archivedAt) return { kind: "archived" as const };
+						let { revision, branch, commit } = input;
+						let owner = channel.repositoryOwner;
+						let name = channel.repositoryName;
+						let present = caller.launch
+							? await caller.launch.hasCommit(owner, name, commit)
+							: await auth.github.hasCommit?.(caller.oauthToken, owner, name, commit);
+						if (!present) return { kind: "unavailable-commit" as const };
+						return serializeDocument(channel.id, () =>
+							withPlan(channel.id, async plan => {
+								if (revision > plan.revision) {
+									return { kind: "revision-conflict" as const, revision: plan.revision };
+								}
+								let source = { revision, branch, commit };
+								let next = withPlanSource(plan.planSources, source);
+								if (next.changed) {
+									let previous = plan.planSources;
+									plan.planSources = next.sources;
+									try {
+										await Plan.persistExclusive(plan);
+									} catch (err) {
+										plan.planSources = previous;
+										throw err;
+									}
+								}
+								return { kind: "recorded" as const, source };
+							}));
+					},
+				},
 				implementations: {
 					async readImplementation(caller: HostedCaller, id: string) {
 						let located = await locatedChannel(caller, id);
@@ -822,10 +935,12 @@ export function hosted(
 								exposed(channel, {
 									source: Plan.source(live),
 									revision: live.revision,
+									records: [...live.records.values()],
 									...(live.creation ? { creation: live.creation } : {}),
 									...(live.graph ? { graph: live.graph } : {}),
 									...(live.execution ? { execution: live.execution } : {}),
 									lifecycle: live.lifecycle,
+									planSources: live.planSources,
 								}));
 						}
 						let stored = await auth.storage.collaboration.load(channel.id, auth.clock());

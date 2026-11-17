@@ -36,6 +36,39 @@ export type StoredImage = {
 
 export type PutImage = Omit<StoredImage, "size" | "createdAt"> & { now: Date };
 
+/**
+ * An image or text file uploaded to a document's Chat. It is only the uploader's until a message
+ * is sent with it (`entryId` is then that message's id, and `position` its place among the
+ * message's files); a person who can read the document reads it from then on.
+ */
+export type StoredChatAttachment = {
+	id: string;
+	channelId: string;
+	name: string;
+	kind: "image" | "file";
+	/** What the bytes are, as sniffed on arrival, never what the sender claimed. */
+	mimeType: string;
+	bytes: Uint8Array;
+	size: number;
+	uploadedBy: string;
+	createdAt: Date;
+	entryId?: string;
+	position?: number;
+	/** What an image was before the browser sent a smaller copy of it, as its sender said. */
+	original?: ChatAttachmentOriginal;
+};
+
+export type ChatAttachmentOriginal = { size: number; width: number; height: number };
+
+export type PutChatAttachment =
+	& Omit<StoredChatAttachment, "size" | "createdAt" | "entryId" | "position">
+	& {
+		now: Date;
+	};
+
+/** What a person has uploaded to one document and not yet sent. */
+export type StagedChatAttachments = { count: number; bytes: number };
+
 /** One stage of a workflow run whose card Chat shows, as its run last reported it. */
 export type RunStageRecord = {
 	id: string;
@@ -63,6 +96,23 @@ export type PutRunStages = {
 	stages: RunStageRecord[];
 	/** The run keeps only these stages, in this order, instead of adding them to its own. */
 	replace?: boolean;
+};
+
+/** A saved answer to a decision the Planner left open, waiting for a Planner turn to act on it. */
+export type DecisionAnswer = {
+	decisionId: string;
+	/** The decision's saved generation; a reopened and saved again decision has a newer one. */
+	generation: number;
+	savedAt: Date;
+	/** The turn claimed to carry it, whose notice id it is; absent while it waits for one. */
+	turnId?: string;
+};
+
+export type SaveDecisionAnswer = {
+	channelId: string;
+	decisionId: string;
+	generation: number;
+	savedAt: Date;
 };
 
 /**
@@ -187,6 +237,12 @@ export type StoredMachine = {
 	label: string;
 	repositories: MachineRepository[];
 	autoRun: boolean;
+	/**
+	 * The owner lets teammates choose this machine for a document: its Planner, builds and runs
+	 * then run here as the owner, and Default machine may run the Planner of a teammate's document
+	 * whose creator has no machine of their own that can. Off unless the owner turns it on.
+	 */
+	shared?: boolean;
 	tokenHash: Uint8Array;
 	credentials?: MachineCredentials;
 	createdAt: Date;
@@ -229,6 +285,8 @@ export type ChannelRecord = {
 	updatedAt: Date;
 	archivedAt?: Date;
 	description?: ChannelDescription;
+	/** Every block uses the sheet's full width, Notion's Full width. Absent: the readable column. */
+	fullWidth?: true;
 	unansweredDecisions: number;
 };
 
@@ -252,6 +310,7 @@ export type CreateChannel =
 		| "updatedAt"
 		| "archivedAt"
 		| "description"
+		| "fullWidth"
 		| "unansweredDecisions"
 	>
 	& {
@@ -263,6 +322,13 @@ export type CreateChannel =
 export type RenameChannel = {
 	id: string;
 	title: string;
+	now: Date;
+};
+
+/** Turns a document's Full width on or off; a change advances `updatedAt`, as a rename does. */
+export type ChannelWidthInput = {
+	id: string;
+	fullWidth: boolean;
 	now: Date;
 };
 
@@ -916,4 +982,138 @@ export type Lease = {
 	owner: string;
 	fencing: number;
 	expiresAt: Date;
+};
+
+/**
+ * A lease as a plain read finds it, without taking it or queueing behind its holder. `free` is
+ * judged on the storage's own clock: the lease was released or its time ran out.
+ */
+export type LeasePeek = { lease: Lease; free: boolean };
+
+/**
+ * A question a remote Planner's client still waits on, as a restart keeps it: the kind of request
+ * and the decisions it asked, which is what its answer is built from in the process that takes over.
+ */
+export type PlannerAskedInput = {
+	request: string;
+	method: "questionnaire" | "confirm" | "select" | "input" | "editor";
+	decisions: string[];
+};
+
+/** What one session of a remote Planner's client keeps across a link that dropped. */
+export type PlannerHeldSession = {
+	id: string;
+	/** Request ids of the questions the client still waits on. */
+	waiting: string[];
+	/** What each of those whose decisions exist needs to be answered again after a restart. */
+	asked?: PlannerAskedInput[];
+	/** Answers the client has not acknowledged. */
+	owed: JsonValue[];
+	/** Stops pressed while the link was down, for the client to hear first. */
+	stops: JsonValue[];
+};
+
+/**
+ * A document's remote Planner as its link left it, for the process that takes over to rebuild.
+ * Holds nothing a person typed and no secret: the owner's login is a session id.
+ */
+export type PlannerLinkHold = {
+	channelId: string;
+	userId: string;
+	login: string;
+	/**
+	 * The browser login session that owns the document's Planner; the hold goes with it. Absent
+	 * for a paired machine's hold, whose delegated login lasts only as long as one process: the
+	 * machine's next attach makes a new one, and the hold goes with the machine.
+	 */
+	ownerSessionId?: string;
+	/** The stored Planner owner's generation the hold was made under. */
+	generation: number;
+	/** The paired machine whose delegated login owns the document, by id and label. */
+	machineId?: string;
+	machine?: string;
+	/** Empty for a link that was live with nothing to resume. */
+	sessions: PlannerHeldSession[];
+	suspendedAt: Date;
+	/** Set when a cut closed the link: until then a returning client is not shown as gone. */
+	handoverUntil?: Date;
+};
+
+export type StoredPlannerLinkHold = PlannerLinkHold & {
+	/** The writer lease the hold was last written under. */
+	fencing: number;
+};
+
+/**
+ * The model and thinking level somebody chose for a document's Planner, one row per document and
+ * shared by everyone who opens it. A field left out means the Planner's own default. Nothing
+ * checks the strings here: the server resolves them against the catalog the harness reports at
+ * the turn that uses them, and a model that has gone stays stored until somebody chooses again.
+ */
+export type PlannerModelChoice = {
+	channelId: string;
+	model?: string;
+	/** The catalog's name for the chosen model, when known. */
+	modelName?: string;
+	thinkingLevel?: string;
+	/** Who chose it last. */
+	userId: string;
+	updatedAt: Date;
+};
+
+export type EntryForkPoint = {
+	atomicLeafId?: string | null;
+	remote?: { session: string; turn?: string };
+};
+
+export type ChatThreadForkState = {
+	/** Transcript entries of top-level Chat up to and including the root message at fork time. */
+	bootstrapEntries: import("@chopin/protocol").Chat.Entry[];
+	summary?: string;
+	/** Serialized Atomic `FileEntry[]` for this thread's branched session. */
+	atomicEntries?: JsonValue[];
+	atomicLeafId?: string | null;
+	/** Remote session and turn to branch from on the first turn, or continue from. */
+	remoteFrom?: { session: string; turn?: string };
+};
+
+export type ChatThreadRecord = {
+	channelId: string;
+	rootId: string;
+	root: import("@chopin/protocol").Chat.Entry;
+	forkedAt: number;
+	createdBy: string;
+	entries: import("@chopin/protocol").Chat.Entry[];
+	compactions: import("@chopin/protocol").Chat.CompactionRecord[];
+	usage?: import("@chopin/protocol").Chat.ContextUsage;
+	forkState: ChatThreadForkState;
+	updatedAt: Date;
+};
+
+export type ChatSessionState = {
+	channelId: string;
+	compactions: import("@chopin/protocol").Chat.CompactionRecord[];
+	usage?: import("@chopin/protocol").Chat.ContextUsage;
+	atomicEntries?: JsonValue[];
+	atomicLeafId?: string | null;
+	entryForks: Record<string, EntryForkPoint>;
+	updatedAt: Date;
+};
+
+/** A paired machine's Planner credential, known by the digest of its token and never the token. */
+export type PlannerCredential = {
+	/** SHA-256 of the credential. */
+	digest: Uint8Array;
+	machineId: string;
+	channelId: string;
+	expiresAt: Date;
+};
+
+export type McpSession = {
+	id: string;
+	userId: string;
+	clientName: string;
+	clientVersion: string;
+	createdAt: Date;
+	lastSeenAt: Date;
 };

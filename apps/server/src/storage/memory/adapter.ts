@@ -5,10 +5,18 @@ import { sidecarUnansweredDecisions } from "../../questions/unanswered";
 import { childSidecarWithoutConversation } from "../child-conversation";
 import { MemoryBackgroundJobStore } from "./jobs";
 import { MemoryExperimentStore } from "./experiments";
+import { MemoryChatAttachmentStore } from "./chat-attachments";
 import { MemoryImageStore } from "./images";
 import { MemoryRunStageStore } from "./run-stages";
+import { MemoryDecisionAnswerStore } from "./decision-answers";
 import { MemoryDocumentVersionStore } from "./versions";
 import { MemoryMachineStore } from "./machines";
+import { MemoryDeferredTurnStore } from "./deferred-turns";
+import { MemoryMcpSessionStore } from "./mcp-sessions";
+import { MemoryPlannerCredentialStore } from "./planner-credentials";
+import { MemoryChatThreadStore } from "./chat-threads";
+import { MemoryPlannerLinkHoldStore } from "./planner-holds";
+import { MemoryPlannerModelChoiceStore } from "./planner-model-choices";
 import { MemoryResearchWorkspaceStore } from "./research";
 import { MemoryPreferenceStore } from "../../user-preferences/memory";
 import { MemoryProvenanceStore } from "../../document-provenance/memory";
@@ -28,11 +36,13 @@ import type {
 	ChannelScanPage,
 	ChannelSnapshot,
 	ChannelUpdate,
+	ChannelWidthInput,
 	CommitChannel,
 	CommitResult,
 	CreateChannel,
 	JsonValue,
 	Lease,
+	LeasePeek,
 	PublishChannelDescription,
 	PublishChannelDescriptionResult,
 	RecordNavigationVisit,
@@ -51,12 +61,20 @@ import type {
 import type {
 	BackgroundJobStore,
 	ChannelStore,
+	ChatAttachmentStore,
+	ChatThreadStore,
 	CollaborationStore,
+	DecisionAnswerStore,
+	DeferredTurnStore,
 	DocumentVersionStore,
 	ImageStore,
 	LeaseStore,
 	MachineStore,
+	McpSessionStore,
 	NavigationStore,
+	PlannerCredentialStore,
+	PlannerLinkHoldStore,
+	PlannerModelChoiceStore,
 	ResearchWorkspaceStore,
 	RunStageStore,
 	SessionStore,
@@ -168,17 +186,53 @@ export class MemoryStorage implements StorageAdapter {
 		userExists: id => this.#users.has(id),
 	});
 	readonly images: ImageStore = this.#images;
+	readonly #chatAttachments = new MemoryChatAttachmentStore({
+		channelExists: id => this.#channels.has(id),
+		userExists: id => this.#users.has(id),
+	});
+	readonly chatAttachments: ChatAttachmentStore = this.#chatAttachments;
 	readonly #runStages = new MemoryRunStageStore(id => this.#channels.has(id));
 	readonly runStages: RunStageStore = this.#runStages;
+	readonly #decisionAnswers = new MemoryDecisionAnswerStore(id => this.#channels.has(id));
+	readonly decisionAnswers: DecisionAnswerStore = this.#decisionAnswers;
 	readonly #versions = new MemoryDocumentVersionStore({
 		channelExists: id => this.#channels.has(id),
 		user: id => this.#users.get(id),
 	});
 	readonly versions: DocumentVersionStore = this.#versions;
-	readonly machines: MachineStore = new MemoryMachineStore(
+	readonly #machines = new MemoryMachineStore(
 		id => this.#users.has(id),
 		id => this.#channels.has(id),
 	);
+	readonly machines: MachineStore = this.#machines;
+	readonly #plannerHolds = new MemoryPlannerLinkHoldStore({
+		channelExists: id => this.#channels.has(id),
+		userExists: id => this.#users.has(id),
+		sessionExists: id => this.#sessions.has(id),
+		machineExists: id => this.#machines.has(id),
+		assertLease: held => this.#assertLease(held),
+	});
+	readonly plannerHolds: PlannerLinkHoldStore = this.#plannerHolds;
+	readonly #plannerModelChoices = new MemoryPlannerModelChoiceStore({
+		channelExists: id => this.#channels.has(id),
+		userExists: id => this.#users.has(id),
+		assertLease: held => this.#assertLease(held),
+	});
+	readonly plannerModelChoices: PlannerModelChoiceStore = this.#plannerModelChoices;
+	readonly #chatThreads = new MemoryChatThreadStore({
+		channelExists: id => this.#channels.has(id),
+		assertLease: held => this.#assertLease(held),
+	});
+	readonly chatThreads: ChatThreadStore = this.#chatThreads;
+	readonly #plannerCredentials = new MemoryPlannerCredentialStore({
+		machineExists: id => this.#machines.has(id),
+		channelExists: id => this.#channels.has(id),
+	});
+	readonly plannerCredentials: PlannerCredentialStore = this.#plannerCredentials;
+	readonly mcpSessions: McpSessionStore = new MemoryMcpSessionStore();
+	readonly deferredTurns: DeferredTurnStore = new MemoryDeferredTurnStore({
+		assertLease: held => this.#assertLease(held),
+	});
 
 	readonly users: UserStore = {
 		put: input => {
@@ -194,6 +248,16 @@ export class MemoryStorage implements StorageAdapter {
 			return Promise.resolve(user(saved));
 		},
 		get: id => Promise.resolve(this.#users.get(id)).then(value => value && user(value)),
+		byLogins: logins => {
+			let wanted = new Set(logins.map(login => login.toLowerCase()));
+			let owners = new Map<string, UserRecord>();
+			for (let value of this.#users.values()) {
+				let key = value.login.toLowerCase();
+				let held = owners.get(key);
+				if (wanted.has(key) && (!held || held.updatedAt < value.updatedAt)) owners.set(key, value);
+			}
+			return Promise.resolve([...owners.values()].map(user));
+		},
 	};
 
 	readonly sessions: SessionStore = {
@@ -218,7 +282,10 @@ export class MemoryStorage implements StorageAdapter {
 		},
 		delete: id => {
 			let deleted = this.#sessions.delete(id);
-			if (deleted) this.#expireOwners(new Set([id]), new Date());
+			if (deleted) {
+				this.#expireOwners(new Set([id]), new Date());
+				this.#plannerHolds.deleteSessions([id]);
+			}
 			return Promise.resolve(deleted);
 		},
 		deleteExpired: now => {
@@ -230,18 +297,31 @@ export class MemoryStorage implements StorageAdapter {
 				}
 			}
 			this.#expireOwners(expired, now);
+			this.#plannerHolds.deleteSessions(expired);
 			return Promise.resolve(expired.size);
 		},
 		reset: async (now, held, ttlMs) => {
 			this.#assertLease(held);
-			this.#expireOwners(new Set(this.#sessions.keys()), now);
+			// A document whose Planner hold names a login this reset keeps stays owned by it.
+			this.#expireOwners(
+				new Set(this.#sessions.keys()),
+				now,
+				(channelId, sessionId) => {
+					let kept = this.#sessions.get(sessionId);
+					return this.#plannerHolds.holds(channelId, sessionId)
+						&& kept?.credentials !== undefined && kept.expiresAt > now;
+				},
+			);
 			let deleted = 0;
+			let removed: string[] = [];
 			for (let [id, value] of this.#sessions) {
 				if (!value.credentials || value.expiresAt <= now) {
 					this.#sessions.delete(id);
+					removed.push(id);
 					deleted++;
 				}
 			}
+			this.#plannerHolds.deleteSessions(removed);
 			let renewed = await this.#renew(held, ttlMs);
 			if (!renewed) throw conflict(`storage lease ${held.name} is no longer held`);
 			return { deleted, lease: renewed };
@@ -284,6 +364,8 @@ export class MemoryStorage implements StorageAdapter {
 			return Promise.resolve(undefined);
 		},
 		addProject: input => this.#addProject(input),
+		removeProject: (userId, repositoryId, now) =>
+			Promise.resolve(this.#removeProject(userId, repositoryId, now)),
 		get: userId => {
 			this.#requireUser(userId);
 			let found = this.#navigation.get(userId);
@@ -334,6 +416,7 @@ export class MemoryStorage implements StorageAdapter {
 			);
 		},
 		rename: input => this.#renameChannel(input),
+		setFullWidth: input => this.#setChannelWidth(input),
 		archive: input => this.#setChannelArchived(input, true),
 		restore: input => this.#setChannelArchived(input, false),
 		delete: id => this.#deleteChannel(id),
@@ -400,6 +483,7 @@ export class MemoryStorage implements StorageAdapter {
 	readonly provenance = new MemoryProvenanceStore();
 
 	readonly leases: LeaseStore = {
+		peek: name => this.#peek(name),
 		acquire: (name, owner, ttlMs) => this.#acquire(name, owner, ttlMs),
 		renew: (held, ttlMs) => this.#renew(held, ttlMs),
 		release: held => this.#release(held),
@@ -411,10 +495,17 @@ export class MemoryStorage implements StorageAdapter {
 
 	async close(): Promise<void> {}
 
-	#expireOwners(expired: Set<string>, now: Date): void {
+	#expireOwners(
+		expired: Set<string>,
+		now: Date,
+		keeps?: (channelId: string, sessionId: string) => boolean,
+	): void {
 		if (expired.size === 0) return;
 		for (let [id, state] of this.#agents) {
-			if (state.ownerSessionId && expired.has(state.ownerSessionId)) {
+			if (
+				state.ownerSessionId && expired.has(state.ownerSessionId)
+				&& !keeps?.(id, state.ownerSessionId)
+			) {
 				this.#agents.set(id, {
 					...state,
 					ownerSessionId: undefined,
@@ -444,6 +535,25 @@ export class MemoryStorage implements StorageAdapter {
 		};
 		this.#projects.set(input.userId, [...projects, saved]);
 		return Promise.resolve({ project: project(saved), added: true });
+	}
+
+	#removeProject(userId: string, repositoryId: string, now: Date): boolean {
+		this.#requireUser(userId);
+		let projects = this.#projects.get(userId) ?? [];
+		let kept = projects.filter(value => value.repositoryId !== repositoryId);
+		if (kept.length === projects.length) return false;
+		this.#projects.set(userId, kept);
+		let saved = this.#navigation.get(userId);
+		let last = saved?.lastDocumentId ? this.#channels.get(saved.lastDocumentId) : undefined;
+		if (saved && last?.repositoryId === repositoryId) {
+			this.#navigation.set(userId, {
+				...saved,
+				lastDocumentId: undefined,
+				revision: saved.revision + 1,
+				updatedAt: now,
+			});
+		}
+		return true;
 	}
 
 	async #setLastDocument(
@@ -536,6 +646,22 @@ export class MemoryStorage implements StorageAdapter {
 		return { channel: channel(saved), changed: true };
 	}
 
+	async #setChannelWidth(input: ChannelWidthInput): Promise<RenameResult> {
+		let found = this.#channels.get(input.id);
+		if (!found) throw missing(`channel ${input.id} does not exist`);
+		if (found.archivedAt) throw conflict(`channel ${input.id} is archived`);
+		if (!!found.fullWidth === input.fullWidth) return { channel: channel(found), changed: false };
+		let updatedAt = input.now > found.updatedAt
+			? new Date(input.now)
+			: new Date(found.updatedAt.getTime() + 1);
+		let { fullWidth: _, ...rest } = found;
+		let saved: ChannelRecord = input.fullWidth
+			? { ...rest, fullWidth: true, updatedAt }
+			: { ...rest, updatedAt };
+		this.#channels.set(saved.id, saved);
+		return { channel: channel(saved), changed: true };
+	}
+
 	async #setChannelArchived(
 		input: ChannelArchiveInput,
 		archived: boolean,
@@ -577,8 +703,14 @@ export class MemoryStorage implements StorageAdapter {
 		await this.#research.deleteChannel(id);
 		this.#jobs.deleteChannel(id);
 		this.#images.deleteChannel(id);
+		this.#chatAttachments.deleteChannel(id);
 		this.#runStages.deleteChannel(id);
+		this.#decisionAnswers.deleteChannel(id);
 		this.#versions.deleteChannel(id);
+		this.#plannerHolds.deleteChannel(id);
+		this.#plannerModelChoices.deleteChannel(id);
+		this.#chatThreads.deleteChannel(id);
+		this.#plannerCredentials.deleteChannel(id);
 		this.#snapshots.delete(id);
 		this.#sequences.delete(id);
 		this.#updates.delete(id);
@@ -1027,6 +1159,13 @@ export class MemoryStorage implements StorageAdapter {
 		};
 		operations.set(input.operationId, result);
 		return Promise.resolve(result);
+	}
+
+	#peek(name: string): Promise<LeasePeek | undefined> {
+		let existing = this.#leases.get(name);
+		return Promise.resolve(
+			existing && { lease: lease(existing), free: existing.expiresAt <= new Date() },
+		);
 	}
 
 	#acquire(name: string, owner: string, ttlMs: number): Promise<Lease | undefined> {

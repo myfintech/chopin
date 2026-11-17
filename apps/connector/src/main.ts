@@ -1,10 +1,19 @@
-import { appendFileSync, closeSync, existsSync, openSync, readSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import {
+	appendFileSync,
+	closeSync,
+	existsSync,
+	mkdtempSync,
+	openSync,
+	readSync,
+	rmSync,
+} from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { acpCommand, AGENTS, nodeMajor, nodeOlder } from "@chopin/protocol/agents";
 import type { CodingAgent } from "@chopin/protocol/agents";
 import { checkAgent } from "./acp";
+import { withoutGitHub } from "./github-token";
 import type { AgentInfo } from "./acp";
 import { ConnectorStopped, redacted, serveWork } from "./connection";
 import { remote } from "./mcp";
@@ -23,6 +32,7 @@ import {
 import { createOutput } from "./output";
 import { permissionMemory } from "./permission";
 import { commandWords, dispatchedPlanners, servePlanners } from "./planner";
+import { plannerSpares } from "./planner-spare";
 import { runWork } from "./run";
 import { implementationBridge } from "./implementation";
 import { readConfig, updateConfig } from "./config";
@@ -45,12 +55,15 @@ import { collectStatus, formatStatus, type ServerSource } from "./status";
 import { removeReplaced, update } from "./update";
 import { checkouts as machineCheckouts, registerCheckouts } from "./checkouts";
 import { VERSION } from "./version";
+import { createSandbox, inspectSandbox } from "./sandbox";
+import { type SandboxSettings, validHostEntry } from "./sandbox-policy";
+import { sandboxLabel } from "@chopin/protocol/connector";
 import {
 	chosenPlanners,
 	connectors,
-	githubFallback,
 	lockWorkspace,
 	pruneRuns,
+	spareStates,
 	startFailures,
 	stateDirectory,
 	workspace,
@@ -105,11 +118,17 @@ async function statusCommand(args: string[]) {
 	let parsed = parseArgs(args, { flags: ["json"] });
 	if (parsed.positional.length || parsed.rest) throw new Error(`Usage: ${SELF} status [--json]`);
 	let chosen = await chosenServer();
+	let directory = stateDirectory();
+	let config = await readConfig(directory);
 	let report = await collectStatus({
-		directory: stateDirectory(),
+		directory,
 		server: chosen.origin,
 		source: chosen.source,
 		host: systemHost(),
+		sandbox: (await inspectSandbox({
+			directory,
+			settings: (config.service?.settings ?? config.connect)?.sandbox,
+		})).report,
 	});
 	if (parsed.flags.has("json")) console.log(JSON.stringify(report, null, 2));
 	else createOutput().say(...formatStatus(report));
@@ -360,6 +379,38 @@ function runsToKeep(value: string | undefined) {
 }
 
 /**
+ * What the sandbox flags choose: `--require-sandbox` and `--no-sandbox` are opposites, each
+ * `--sandbox-host` is a host (`host`, `*.host` or `host:port`) agents may reach beyond the
+ * built-in list, each `--sandbox-write` an absolute directory they may write, and each
+ * `--sandbox-hide` a file or folder they may neither read nor write, wherever it is.
+ */
+function sandboxChoice(
+	require: boolean,
+	off: boolean,
+	hosts: string[],
+	writable: string[],
+	hidden: string[] = [],
+): SandboxSettings {
+	if (require && off) throw new Error("--require-sandbox and --no-sandbox can't be used together.");
+	for (let host of hosts) {
+		if (!validHostEntry(host)) {
+			throw new Error(
+				`--sandbox-host takes a host like example.com, *.example.com or example.com:8443; not "${host}".`,
+			);
+		}
+	}
+	let directories = writable.map(path => resolve(path));
+	let concealed = hidden.map(path => resolve(path));
+	return {
+		...(require ? { require } : {}),
+		...(off ? { off } : {}),
+		...(hosts.length ? { hosts } : {}),
+		...(directories.length ? { writable: directories } : {}),
+		...(concealed.length ? { hidden: concealed } : {}),
+	};
+}
+
+/**
  * `connect`. `--service` marks the connector the installed service runs, which runs what install
  * copied. `--install-service` installs the service once connected, then stops; `injected` stands
  * in for this machine's service manager and chopin in tests.
@@ -369,9 +420,16 @@ export async function connect(
 	injected: { host?: ServiceHost; executable?: string } = {},
 ) {
 	let parsed = parseArgs(args, {
-		flags: ["service", "install-service", "skip-check"],
+		flags: [
+			"service",
+			"install-service",
+			"skip-check",
+			"require-sandbox",
+			"no-sandbox",
+			"no-planner-spare",
+		],
 		options: ["planner-command", "key", "name", "keep-runs", "agent"],
-		lists: ["planner", "env", "checkout"],
+		lists: ["planner", "env", "checkout", "sandbox-host", "sandbox-write", "sandbox-hide"],
 	});
 	let service = parsed.flags.has("service");
 	let directory = stateDirectory();
@@ -382,7 +440,8 @@ export async function connect(
 			|| parsed.options.has("planner-command") || parsed.options.has("key")
 			|| parsed.options.has("name") || parsed.options.has("keep-runs")
 			|| parsed.options.has("agent") || parsed.flags.has("install-service")
-			|| parsed.flags.has("skip-check"))
+			|| parsed.flags.has("skip-check") || parsed.flags.has("require-sandbox")
+			|| parsed.flags.has("no-sandbox") || parsed.flags.has("no-planner-spare"))
 	) {
 		throw new Error(
 			`${SELF} connect --service takes no other arguments; it runs what ${SELF} service install saved.`,
@@ -427,6 +486,18 @@ export async function connect(
 	// A built-in agent's own variables come first, so an --env for one of them wins.
 	let env = saved?.env ?? environment([...builtIn?.env ?? [], ...parsed.lists.get("env") ?? []]);
 	let keepRuns = saved ? saved.keepRuns : runsToKeep(parsed.options.get("keep-runs"));
+	// `--no-planner-spare`, or CHOPIN_PLANNER_SPARE=0 in chopin's own environment: no spare Planners.
+	let spareOff = (saved ? saved.plannerSpare === false : parsed.flags.has("no-planner-spare"))
+		|| process.env.CHOPIN_PLANNER_SPARE === "0";
+	let sandboxSettings: SandboxSettings = saved
+		? saved.sandbox ?? {}
+		: sandboxChoice(
+			parsed.flags.has("require-sandbox"),
+			parsed.flags.has("no-sandbox"),
+			parsed.lists.get("sandbox-host") ?? [],
+			parsed.lists.get("sandbox-write") ?? [],
+			parsed.lists.get("sandbox-hide") ?? [],
+		);
 	if (!service) {
 		requireProgram(command, process.cwd());
 		if (plannerCommand.length) requireProgram(plannerCommand, process.cwd());
@@ -447,8 +518,21 @@ export async function connect(
 			return checkout;
 		}),
 	);
-	/** Where the agent's start check runs: a registered checkout, else the home folder. */
-	let cwd = Object.values(registered)[0] ?? homedir();
+	/**
+	 * Where the agent's start check runs: a registered checkout, else an empty folder of its own,
+	 * made when first asked for and removed when the connector exits. Not the home folder, which
+	 * holds the state directory and everything a person keeps.
+	 */
+	let neutral: string | undefined;
+	let checkDirectory = () => {
+		let first = Object.values(registered)[0];
+		if (first) return first;
+		if (!neutral) {
+			let made = neutral = mkdtempSync(join(tmpdir(), "chopin-check-"));
+			process.once("exit", () => rmSync(made, { recursive: true, force: true }));
+		}
+		return neutral;
+	};
 	// The service runs what a terminal's connect saves, by the full paths this shell found.
 	let saving = service ? { command, plannerCommand } : {
 		command: await savedCommand(command, process.cwd()),
@@ -467,6 +551,8 @@ export async function connect(
 				plannerCommand: saving.plannerCommand,
 				...(Object.keys(env).length ? { env } : {}),
 				...(keepRuns === undefined ? {} : { keepRuns }),
+				...(Object.keys(sandboxSettings).length ? { sandbox: sandboxSettings } : {}),
+				...(parsed.flags.has("no-planner-spare") ? { plannerSpare: false as const } : {}),
 			};
 		});
 	if (!service && (await connectors(directory)).some(item => item.service && item.running)) {
@@ -481,6 +567,8 @@ export async function connect(
 	let known = AGENTS.find(item => item.acp[0] === program);
 	/** This connection's token, once it has registered, to tell Chopin about the agent later. */
 	let connectionToken: string | undefined;
+	/** Where agents run, once the sandbox has been probed; checks before it start plainly. */
+	let sandbox: Awaited<ReturnType<typeof createSandbox>> | undefined;
 	/**
 	 * Keep the agent's name and version, as it answered ACP initialize, for the next connection to
 	 * send; told to Chopin at once when this one is connected, as at its first job.
@@ -503,10 +591,12 @@ export async function connect(
 		let at = programAt(started);
 		started[at] = which(started[at]!) ?? started[at]!;
 		void checkAgent(started, {
-			cwd,
-			env: { ...process.env, ...env },
+			cwd: checkDirectory(),
+			// Through the seam, as a run's agent starts: with nothing of the machine's GitHub setup.
+			env: withoutGitHub({ ...process.env, ...env }),
 			timeoutMs: 10_000,
 			signal,
+			...(sandbox ? { sandbox } : {}),
 			onInfo: agent => void rememberAgent(agent, token),
 		}).catch(() => {});
 	};
@@ -526,7 +616,7 @@ export async function connect(
 		let at = programAt(started);
 		started[at] = which(started[at]!) ?? started[at]!;
 		let failed = await checkAgent(started, {
-			cwd,
+			cwd: checkDirectory(),
 			env: { ...process.env, ...env },
 			timeoutMs: 10_000,
 			onInfo: agent => void rememberAgent(agent),
@@ -562,7 +652,7 @@ export async function connect(
 	let prune = () => pruneRuns(directory, keep).then(() => {}, () => {});
 	await prune();
 	let chosen = chosenPlanners(directory, directory);
-	let fallback = githubFallback(directory, directory);
+	let spareStatus = spareStates(directory, directory);
 	let checkouts = machineCheckouts({ directory, registered });
 	let abort = new AbortController();
 	// The first Ctrl-C reports running work as stopped, then disconnects; a second forces exit.
@@ -577,10 +667,37 @@ export async function connect(
 	let unwatch = service ? onStopRequest(directory, stop) : () => {};
 	let output = createOutput();
 	let permissions = permissionMemory();
-	// Said once for each repository, and kept for chopin status, when the GitHub App can't push there.
-	let githubRefused = (message: string, repository: string) => {
-		if (fallback.record(repository)) output.say(output.style.dim(message));
-	};
+	// Probed once, here: agents start in the system's process sandbox where one works, else plainly,
+	// and the line says which. Chopin hears it with every connection.
+	let told = new Set<string>();
+	sandbox = await createSandbox({
+		directory,
+		server: url,
+		settings: sandboxSettings,
+		refused(host, port) {
+			let entry = `${host}:${port}`;
+			if (told.has(entry)) return;
+			told.add(entry);
+			output.say(
+				output.style.dim(
+					`  The sandbox kept an agent from reaching ${entry}. To allow it: ${SELF} connect `
+						+ `--sandbox-host ${host}${port === 443 || port === 80 ? "" : `:${port}`}`
+						+ ", then service install again if it runs as a service.",
+				),
+			);
+		},
+		planted(files) {
+			output.say(
+				output.style.dim(
+					`  Removed ${files.join(", ")}: an agent made ${
+						files.length === 1 ? "it" : "them"
+					} in a checkout's git directory, where only a linked worktree has one, `
+						+ "and it would have sent git there to configuration the agent wrote.",
+				),
+			);
+		},
+	});
+	let report = sandbox.report;
 	try {
 		for (;;) {
 			// A machine paired once reconnects with its stored token; an unpaired one pairs first.
@@ -621,6 +738,22 @@ export async function connect(
 			// Planner backends run beside the work loop with this machine token and stop with it, so
 			// none outlives a revoked token and a machine paired again starts them with its new one.
 			let planners = new AbortController();
+			// One spare Planner per registered checkout's repository, with its code loaded, so a new
+			// document's Planner starts at once; it holds no credential until it is handed one.
+			let spares = plannerCommand.length
+				? plannerSpares({
+					url,
+					command: plannerCommand,
+					registered,
+					directory,
+					output,
+					signal: AbortSignal.any([abort.signal, planners.signal]),
+					env,
+					sandbox,
+					states: spareStatus,
+					off: spareOff,
+				})
+				: undefined;
 			let backends = {
 				url,
 				machine,
@@ -632,7 +765,8 @@ export async function connect(
 				signal: AbortSignal.any([abort.signal, planners.signal]),
 				failures,
 				env,
-				githubRefused,
+				sandbox,
+				...(spares ? { spares } : {}),
 			};
 			let planning = servePlanners(backends);
 			// The Planners Chopin asks for, of documents this machine's owner chose it for.
@@ -654,6 +788,7 @@ export async function connect(
 								planner: plannerDocuments.length > 0,
 								plannerCommand: plannerCommand.length > 0,
 								agent: (await readConfig(directory)).agents?.[program],
+								sandbox: report,
 							},
 						);
 						connectionToken = registration.token;
@@ -661,6 +796,15 @@ export async function connect(
 						probeAgent(connectionToken, AbortSignal.any([abort.signal, signal]));
 						if (!announced) {
 							output.connected(Object.keys(registered));
+							output.say(
+								report.engine === "none"
+									? `${sandboxLabel(report)} ${
+										sandboxSettings.require
+											? "Runs are refused (--require-sandbox is on)."
+											: "Runs go on without it."
+									}`
+									: output.style.dim(sandboxLabel(report)),
+							);
 							for (let repository of registration.refused) {
 								output.error(
 									`You can't push to ${repository} on GitHub, so Chopin won't run its work here.`,
@@ -694,7 +838,7 @@ export async function connect(
 							failures,
 							env,
 							machine,
-							githubRefused,
+							sandbox,
 						}).finally(prune),
 				});
 				break;
@@ -709,7 +853,7 @@ export async function connect(
 				output.say("This machine needs pairing with Chopin again.");
 			} finally {
 				planners.abort();
-				await Promise.all([planning, dispatched?.stop()]);
+				await Promise.all([planning, dispatched?.stop(), spares?.stop()]);
 			}
 		}
 	} catch (error) {
@@ -718,6 +862,7 @@ export async function connect(
 		process.removeListener("SIGINT", stop);
 		process.removeListener("SIGTERM", stop);
 		unwatch();
+		await sandbox.close();
 		await release();
 	}
 	if (install) {
@@ -834,7 +979,7 @@ const USAGE =
 	`Usage: CHOPIN_URL=https://your-instance ${SELF} connect [checkout] [--key <pairing key>] `
 	+ "[--name <label>] "
 	+ "[--planner <document URL>]... [--planner-command <command>] [--env KEY=VALUE]... "
-	+ "[--keep-runs <n>] "
+	+ "[--keep-runs <n>] [--no-planner-spare] "
 	+ "[--install-service [--skip-check]] (--agent <id> [-- <extra arguments>] | -- <ACP command>)";
 
 const HELP = [
@@ -870,6 +1015,9 @@ const HELP = [
 	"      in config.json, so keep secrets in the agent's own login. CHOPIN_* and PATH are refused.",
 	"      --keep-runs <n> keeps the worktrees of the n most recently finished runs (default 15, 0",
 	"      for all) and removes older ones as it starts and after each run.",
+	"      With a Planner command, a spare Planner runs for each registered checkout's repository,",
+	"      started ahead and waiting, so a new document's Planner is ready in about a second;",
+	"      --no-planner-spare (or CHOPIN_PLANNER_SPARE=0) starts every Planner when it is asked for.",
 	"      --install-service connects once, then stops and runs service install, so one command",
 	"      sets up the service. --skip-check passes on to it.",
 	"  status [--json]",

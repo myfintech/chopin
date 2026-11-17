@@ -1,11 +1,21 @@
 import { researchWorkspace } from "./research-inline-contract-fixtures";
 import { childChannelContract } from "./child-channel-contract";
 import { experimentContract } from "./experiment-contract";
+import { chatAttachmentContract } from "./chat-attachment-contract";
 import { imageContract } from "./image-contract";
 import { runStageContract } from "./run-stage-contract";
+import { decisionAnswerContract } from "./decision-answer-contract";
 import { versionContract } from "./version-contract";
 import { machineContract } from "./machine-contract";
 import { plannerAttachmentContract } from "./planner-attachment-contract";
+import { plannerHoldContract } from "./planner-hold-contract";
+import { plannerModelChoiceContract } from "./planner-model-choice-contract";
+import { chatThreadContract } from "./chat-thread-contract";
+import { plannerCredentialContract } from "./planner-credential-contract";
+import { deferredTurnContract } from "./deferred-turn-contract";
+import { mcpSessionContract } from "./mcp-session-contract";
+import { leasePeekContract } from "./lease-peek-contract";
+import { userContract } from "./user-contract";
 import { researchInlineContract } from "./research-inline-contract";
 import { describe, expect, it } from "bun:test";
 
@@ -40,11 +50,21 @@ function attempt<T>(action: () => Promise<T>): Promise<T> {
 export function storageContract(name: string, factory: Factory): void {
 	experimentContract(name, factory);
 	imageContract(name, factory);
+	chatAttachmentContract(name, factory);
 	runStageContract(name, factory);
+	decisionAnswerContract(name, factory);
 	versionContract(name, factory);
 	machineContract(name, factory);
 	childChannelContract(name, factory);
 	plannerAttachmentContract(name, factory);
+	plannerHoldContract(name, factory);
+	plannerModelChoiceContract(name, factory);
+	chatThreadContract(name, factory);
+	plannerCredentialContract(name, factory);
+	deferredTurnContract(name, factory);
+	mcpSessionContract(name, factory);
+	leasePeekContract(name, factory);
+	userContract(name, factory);
 	describe(`${name} storage`, () => {
 		it("supports expiring metadata-only sessions for local authentication", async () => {
 			let storage = await opened(factory);
@@ -229,6 +249,53 @@ export function storageContract(name: string, factory: Factory): void {
 					navigation: undefined,
 					lastDocumentRepositoryId: undefined,
 				});
+			} finally {
+				await storage.close();
+			}
+		});
+
+		it("removes a project, forgetting the last document only when it is in that repository", async () => {
+			let storage = await opened(factory);
+			try {
+				let now = new Date("2026-01-02T03:04:05.000Z");
+				let { userId, channelId, repositoryId } = await userAndChannel(storage);
+				let channel = (await storage.channels.get(channelId))!;
+				for (let [id, name] of [[repositoryId, channel.repositoryName], ["R_other", "other"]]) {
+					await storage.navigation.addProject({
+						userId,
+						repositoryId: id!,
+						repositoryOwner: channel.repositoryOwner,
+						repositoryName: name!,
+						now,
+					});
+				}
+				let visited = await storage.navigation.setLastDocument(userId, channelId, now);
+
+				// Another repository: the last document stays.
+				expect(await storage.navigation.removeProject(userId, "R_other", now)).toBe(true);
+				expect(await storage.navigation.get(userId)).toEqual(visited);
+				expect(await storage.navigation.removeProject(userId, "R_other", now)).toBe(false);
+
+				// The last document's own repository: it is forgotten, with a new revision.
+				let later = new Date(now.getTime() + 1);
+				expect(await storage.navigation.removeProject(userId, repositoryId, later)).toBe(true);
+				expect(await storage.navigation.projects(userId)).toEqual([]);
+				expect(await storage.navigation.get(userId)).toMatchObject({
+					lastDocumentId: undefined,
+					revision: visited.revision + 1,
+				});
+
+				// Visiting one of its documents adds it back.
+				await storage.navigation.recordVisit({
+					userId,
+					repositoryId,
+					repositoryOwner: channel.repositoryOwner,
+					repositoryName: channel.repositoryName,
+					documentId: channelId,
+					now: later,
+				});
+				expect((await storage.navigation.projects(userId)).map(value => value.repositoryId))
+					.toEqual([repositoryId]);
 			} finally {
 				await storage.close();
 			}
@@ -1007,6 +1074,60 @@ export function storageContract(name: string, factory: Factory): void {
 				});
 				expect(repeated.changed).toBe(false);
 				expect(repeated.channel.updatedAt).toEqual(now);
+			} finally {
+				await storage.close();
+			}
+		});
+
+		it("keeps a document's Full width with the document, readable column by default", async () => {
+			let storage = await opened(factory);
+			try {
+				let { channelId, repositoryId } = await userAndChannel(storage);
+				let before = (await storage.channels.get(channelId))!;
+				expect(before.fullWidth).toBeUndefined();
+
+				let now = new Date("2026-01-03T03:04:05.000Z");
+				let widened = await storage.channels.setFullWidth({ id: channelId, fullWidth: true, now });
+				expect(widened.changed).toBe(true);
+				expect(widened.channel.fullWidth).toBe(true);
+				expect(widened.channel.updatedAt).toEqual(now);
+				expect(widened.channel.revision).toBe(before.revision);
+				expect(widened.channel.slug).toBe(before.slug);
+				expect((await storage.channels.get(channelId))!.fullWidth).toBe(true);
+				expect(
+					(await storage.channels.list(repositoryId, 20)).channels.find(channel =>
+						channel.id === channelId
+					)?.fullWidth,
+				).toBe(true);
+
+				let repeated = await storage.channels.setFullWidth({
+					id: channelId,
+					fullWidth: true,
+					now: new Date("2026-01-04T03:04:05.000Z"),
+				});
+				expect(repeated.changed).toBe(false);
+				expect(repeated.channel.updatedAt).toEqual(now);
+
+				let narrowed = await storage.channels.setFullWidth({
+					id: channelId,
+					fullWidth: false,
+					now: new Date("2026-01-05T03:04:05.000Z"),
+				});
+				expect(narrowed.changed).toBe(true);
+				expect(narrowed.channel.fullWidth).toBeUndefined();
+				expect((await storage.channels.get(channelId))!.fullWidth).toBeUndefined();
+
+				await storage.channels.archive({ id: channelId, now: new Date("2026-01-06T00:00:00Z") });
+				await expect(storage.channels.setFullWidth({
+					id: channelId,
+					fullWidth: true,
+					now: new Date("2026-01-07T00:00:00Z"),
+				})).rejects.toMatchObject({ failure: "conflict" });
+				await expect(storage.channels.setFullWidth({
+					id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+					fullWidth: true,
+					now,
+				})).rejects.toMatchObject({ failure: "missing" });
 			} finally {
 				await storage.close();
 			}

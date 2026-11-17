@@ -205,7 +205,10 @@ describe("design audit specimens", () => {
 		expect(markup).toContain('aria-label="Add document"');
 		expect(markup).toContain("disabled");
 		expect(plate(markup, "selections")).toContain(
-			'aria-disabled="true" aria-label="githubnext/design-notes, added"',
+			'aria-checked="true" aria-label="githubnext/design-notes"',
+		);
+		expect(plate(markup, "selections")).toContain(
+			'aria-checked="false" aria-label="githubnext/chopin"',
 		);
 		expect(plate(markup, "selections")).toContain('class="navigation-palette-option"');
 		expect(markup).not.toContain("design-audit-selection-list");
@@ -271,12 +274,54 @@ describe("design audit specimens", () => {
 		expect(empty).toContain('<p class="project-sidebar-empty">No archived documents</p>');
 		expect(empty).toContain("No matching documents");
 		expect(markup).toContain('data-chat-entry="true"');
-		let chat = plate(markup, "chat");
+		// The apostrophe React escapes in text, written back, so copy reads as typed.
+		let chat = plate(markup, "chat").replaceAll("&#x27;", "'");
 		expect(chat).toContain('class="workspace-root');
-		expect(chat).toContain('class="composer-surface field"');
+		expect(chat).toContain('class="composer-surface"');
+		expect(chat).toContain('role="toolbar"');
 		expect(chat).toContain('class="composer-notice motion-feedback"');
-		expect(chat).toContain("Reconnect");
-		expect(chat).toContain('aria-label="Stop Chopin"');
+		// The connection is the offline bar alone, and announces nothing itself: the page's one live
+		// region does. The machine's state is never drawn in Chat: chopin's quiet note says a message
+		// couldn't be taken, and the machine button's dot and menu tell the rest.
+		expect(chat).toMatch(/class="offline-bar"[^>]*data-offline-bar=""[^>]*data-warning="true"/);
+		expect(chat).not.toMatch(/data-offline-bar=""[^>]*role="(alert|status)"/);
+		expect(chat).toContain('data-phase="reconnecting"');
+		expect(chat).toContain('data-phase="dropped"');
+		expect(chat).not.toContain('data-phase="resumed"');
+		expect(chat).not.toContain('data-layer="planner"');
+		expect(chat).not.toContain("Back. The reply kept going.");
+		expect(chat).toContain(">Reconnect</button>");
+		expect(chat).toContain("Couldn't finish the reply.");
+		expect(chat).toContain("429 Too Many Requests");
+		expect(chat).toContain("Retrying");
+		expect(chat).toContain('data-error-banner=""');
+		expect(chat).toContain('data-quiet-note=""');
+		expect(chat).toContain("Only visible to you");
+		expect(chat).toContain(">How to fix");
+		expect(chat).toContain("Can't connect to Build box");
+		expect(chat).toContain("Connecting to Build box");
+		expect(chat).toContain("Build box stepped away. Your work is kept until ");
+		expect(chat).toContain("No machine is connected.");
+		expect(chat).toContain('data-planner="starting"');
+		expect(chat).toContain('data-planner="failing"');
+		expect(chat).toContain('data-planner="away"');
+		// The machine button's dots beside each state: only a healthy one keeps the machine's green,
+		// and no machine connected has no dot at all.
+		let cells = chat.split('class="design-audit-planner-presence"')[1]!.split(
+			'<div class="design-audit-planner-glyph">',
+		).slice(1);
+		expect(cells).toHaveLength(6);
+		expect(cells[0]).toContain('data-state="connected"');
+		for (let cell of cells.slice(1)) expect(cell).not.toContain('data-state="connected"');
+		let none = cells.at(-1)!;
+		expect(none).toContain("No machine is connected.");
+		expect(none).not.toContain("status-dot");
+		// chopin's own presence, as the @ menu draws it.
+		let presence = chat.split('class="design-audit-planner-presence"')[2]!;
+		for (let state of ["active", "connecting", "failing", "away"]) {
+			expect(presence).toContain(`class="presence-dot" data-presence="${state}"`);
+		}
+		expect(chat).toContain('aria-label="Stop generating"');
 		expect(chat).toContain("Read-only access");
 		expect(chat).toContain("Document archived");
 		expect(chat).not.toContain("<textarea");
@@ -287,11 +332,11 @@ describe("design audit specimens", () => {
 		expect(plate(markup, "identity")).toContain('class="presence-more"');
 		expect(plate(markup, "identity")).toContain("People here: ");
 		expect(plate(markup, "decisions")).toContain('class="plan-decisions"');
-		expect(markup).toContain("Questions from Chopin will appear here");
+		expect(markup).toContain("Questions from chopin will appear here");
 		expect(markup).toContain('data-relation="orphaned"');
 		expect(markup).toContain('data-relation="empty"');
 		expect(plate(markup, "resolved-comments")).toContain('class="plan-resolved-comment"');
-		expect(plate(markup, "resolved-comments")).toContain("Resolved by Olivia");
+		expect(plate(markup, "resolved-comments")).toContain("Resolved by olivia");
 		expect(plate(markup, "resolved-comments")).toContain(">Reopen</button>");
 		expect(markup).toContain('role="alert"');
 		expect(markup).toMatch(

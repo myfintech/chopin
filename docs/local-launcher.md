@@ -18,18 +18,27 @@ requests appear in its terminal with the command or paths involved, and are
 declined when no interactive terminal is available. The agent retains its
 normal tools, project instructions and configured services.
 
-## Build a settled plan
+## Build a plan
 
-1. Resolve planning questions and accepted comments awaiting document updates.
-   Until then **Build plan** in the document header is inert and its tooltip
-   says what is left.
+1. Update the document for accepted comments, and finish any required
+   investigation. Until then **Build plan** in the document header is inert and
+   its tooltip says what is left. Open decisions do not wait: the agent builds
+   on its best judgment, is told which decisions are unanswered, and lists them
+   as assumed in each pull request. See
+   [open decisions never block a build](implementation-lifecycle.md#open-decisions-never-block-a-build).
 2. Select **Build plan**. When the tasks are missing or older than the
    document, it asks the hosted Planner to draft them without posting a Chat
    message, then starts them without a separate review. See
    [drafting tasks from Build plan](implementation-lifecycle.md#drafting-tasks-from-build-plan).
-3. The build runs on your own local agent: the server picks your idle
-   connection for the repository, preferring the one that last ran work for this
-   document, and derives the checkout from it. Without one, the header reads
+3. The build runs on the machine you chose for the document: the server picks
+   your idle connection for the repository, preferring the one that last ran work
+   for this document, and derives the checkout from it. If you chose a
+   teammate's shared machine, or made one your default and chose none, it runs
+   there instead, as that machine's owner (see
+   [Share a machine with teammates](chopin-cli.md#share-a-machine-with-teammates)):
+   the connection it queues on belongs to the owner, the build records you as
+   the person who asked, and only that connection claims and reports it, while
+   the machine is shared and its owner can push to the repository. Without one, the header reads
    **Build stopped**, and Build says your local agent isn't connected and shows
    the connector command to run in your project folder; **Retry** tries again
    once connected. Approval persists the document and graph
@@ -92,14 +101,23 @@ failed before the graph was claimed, **Retry** in the header creates a
 new attempt. Repeating that retry request returns
 the same attempt; it does not start duplicate work.
 
-If a claimed run stops or fails, its graph remains locked. After inspecting the
-retained checkout, choose **Return to planning**, enter a reason and confirm to
-record a revision request and release the editing lock. **Build plan** then asks
-the Planner to revise the tasks and builds the replacement.
-This action is unavailable while the agent is still running; select **Stop build**
-in Build first. Stop preserves existing commits and pull requests and rejects further
+If a claimed run stops or fails, it ends with its build: Chopin records a revision
+request with the build's error as the reason, releases the graph and opens the
+document for editing again. Its agent can no longer report on the run, so keeping
+the lock would only leave the document read-only. Build keeps the run's tasks,
+blocker and pull requests, and its card says how the build ended, in the same words
+as Chat's end line, the run's recorded reason and the connector's terminal:
+**Stopped by @login** and when, for a person's Stop; **Blocked**, with the task and
+the agent's reason, when its agent blocked a task and ended its turn; **Build
+failed** with the error; or **Returned for changes** with the reason, when the agent
+or a reviewer returned it. A build that delivered reads **Built**, and the connector
+prints **Finished** with its pull requests. The retained checkout is there to
+inspect. **Build plan** then asks the Planner to revise the tasks and
+builds the replacement. While the agent is still running the document stays locked;
+select **Stop build** in Build to end the run. Stop preserves existing commits and pull requests and rejects further
 reports from that run. The connector stops the agent on its next heartbeat (normally
-within 10 seconds) and stays connected. Ctrl-C in its terminal also stops the work
+within 10 seconds), printing **✗ Stopped in Chopin by @login.** rather than a failure,
+and stays connected. Ctrl-C in its terminal also stops the work
 and disconnects the connector. Reconnect with the updated connector to receive
 activity updates.
 Stop also cancels automatic rebuilds already waiting behind the run; a later

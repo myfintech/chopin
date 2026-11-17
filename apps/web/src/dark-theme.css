@@ -52,6 +52,18 @@
 	--color-lime-10: oklch(0.74 0.12 126);
 	--color-lime-11: oklch(0.83 0.11 124);
 	--color-lime-12: oklch(0.93 0.05 120);
+	--color-plum-1: oklch(0.2 0.012 305);
+	--color-plum-2: oklch(0.225 0.02 305);
+	--color-plum-3: oklch(0.27 0.05 305);
+	--color-plum-4: oklch(0.31 0.07 305);
+	--color-plum-5: oklch(0.35 0.08 305);
+	--color-plum-6: oklch(0.4 0.09 305);
+	--color-plum-7: oklch(0.46 0.11 304);
+	--color-plum-8: oklch(0.54 0.14 303);
+	--color-plum-9: oklch(0.64 0.17 301);
+	--color-plum-10: oklch(0.69 0.16 301);
+	--color-plum-11: oklch(0.8 0.11 302);
+	--color-plum-12: oklch(0.92 0.04 305);
 
 	--color-gray-50: oklch(0.25 0.006 95);
 	--color-gray-100: oklch(0.268 0.006 95);
@@ -118,6 +130,14 @@
 :root[data-theme="dark"] {
 	.workspace-frame .workspace-chat-panel {
 		border-color: var(--color-edge);
+	}
+
+	/*
+	 * A face's initial (`face.tsx`) is its person's colour mixed with a fifth of the primary ink,
+	 * which on a dark wash leaves coral and fern under AA; more ink brings every tone to 4.5:1.
+	 */
+	span.uppercase.place-items-center > span[aria-hidden="true"] {
+		color: color-mix(in srgb, currentcolor 70%, var(--color-text-primary));
 	}
 
 	.plan-content [data-plan-type] {
