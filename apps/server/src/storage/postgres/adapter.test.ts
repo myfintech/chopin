@@ -1103,6 +1103,8 @@ if (url) {
 				"039_plan_image_types",
 				"040_chat_attachment_originals",
 				"041_document_full_width",
+				"042_chat_thread_notes",
+				"043_chat_thread_seq",
 				"mantl_document_provenance",
 				"mantl_user_preferences",
 			]);

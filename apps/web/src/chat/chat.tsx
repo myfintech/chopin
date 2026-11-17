@@ -42,8 +42,10 @@ import {
 	outboxReducer,
 	passing,
 	refusalText,
+	refusedByChopin,
 	restoreOutbox,
 } from "./delivery";
+import { refusedWhileBusy } from "./assistant-ui/send-stop";
 import type { DraftInputHandle } from "./draft-input";
 import type { CSSProperties } from "react";
 import { keepFormatPreference, readFormatPreference } from "./format-preference";
@@ -57,6 +59,7 @@ import { silencesFailedSends } from "./connection-phase";
 import { ErrorState } from "./error-state";
 import { QuietNote } from "./quiet-note";
 import { PlannerPresenceContext } from "./presence";
+import { localRows } from "./chronology";
 import { failureBanner, sendFailureView, withoutFailure } from "./failure";
 import { TypingReporter } from "./typing";
 import { useSteadyCallback, useSteadyFields } from "./steady";
@@ -122,7 +125,6 @@ import {
 	runsCommand,
 	sendFailure,
 	shownSendFailure,
-	withNoticesAfter,
 } from "./references";
 import { runCounts, RunStack } from "./run-card";
 import type { BuildRun } from "../build-model";
@@ -503,7 +505,7 @@ export function Chat(
 	// chopin's ephemeral row: a message to it it could not take, said to this person alone.
 	let [note, setNote] = useState<{ text: string; code: string; ts: number }>();
 	let noteRefusal = (failure: SendFailure & { code?: string }) => {
-		if (failure.code !== "planner-not-attached" && failure.code !== "planner-busy") return;
+		if (!refusedByChopin(failure.code)) return;
 		setNote({ text: failure.text, code: failure.code, ts: Math.floor(Date.now() / 1000) });
 	};
 	let [researchBlock, setResearchBlock] = useState<ResearchLaunchBlock>();
@@ -611,8 +613,11 @@ export function Chat(
 		submitted: draft.submission?.to,
 	});
 	let plannerBound = outboxed && askingChopin;
-	let busyRefused = (askingChopin || alone) && sendError?.code === "planner-busy"
-		&& (busy || counts.active > 0);
+	let busyRefused = refusedWhileBusy(
+		askingChopin || alone,
+		sendError?.code,
+		busy || counts.active > 0,
+	);
 	// An image goes where people read it, and to the Planner only if its model does.
 	let imagesAllowed = !agent || !(askingChopin || alone)
 		|| modelReadsImages(modelControl?.catalog, modelControl?.choice);
@@ -805,7 +810,12 @@ export function Chat(
 				loaded = true;
 				synchronized.current = wire;
 				seen = new Set(frame.entries.map(entry => entry.id));
-				dispatchTranscript({ kind: "history", entries: frame.entries, turn: frame.turn });
+				dispatchTranscript({
+					kind: "history",
+					entries: frame.entries,
+					turn: frame.turn,
+					...(frame.seq === undefined ? {} : { seq: frame.seq }),
+				});
 				dispatchOutbox({ kind: "history", ids: frame.entries.map(entry => entry.id) });
 				dispatchIntents({ kind: "history", entries: frame.entries, handle });
 				setBusy(frame.busy);
@@ -840,7 +850,12 @@ export function Chat(
 				dispatchTranscript({ kind: "removed", ids: frame.ids });
 			}),
 			wire.on<Wire.Reactions>("chat:reactions", frame => {
-				dispatchTranscript({ kind: "reactions", id: frame.id, reactions: frame.reactions });
+				dispatchTranscript({
+					kind: "reactions",
+					id: frame.id,
+					reactions: frame.reactions,
+					...(frame.reactionsSeq === undefined ? {} : { reactionsSeq: frame.reactionsSeq }),
+				});
 				dispatchIntents({
 					kind: "settle",
 					id: frame.id,
@@ -853,7 +868,12 @@ export function Chat(
 				});
 			}),
 			wire.on<Wire.Delta>("chat:delta", frame => {
-				dispatchTranscript({ kind: "delta", id: frame.id, text: frame.text });
+				dispatchTranscript({
+					kind: "delta",
+					id: frame.id,
+					text: frame.text,
+					...(frame.at === undefined ? {} : { at: frame.at }),
+				});
 				response(true, frame.text);
 			}),
 			wire.on<Wire.Tool>("chat:tool", frame => {
@@ -1089,7 +1109,7 @@ export function Chat(
 					id: `unanswered-${payload.requestId}`,
 					author: { kind: "system" },
 					text: PLANNER_UNAVAILABLE_NOTICE,
-					ts: Date.now(),
+					ts: Math.floor(Date.now() / 1000),
 				},
 			}));
 		}
@@ -1155,7 +1175,7 @@ export function Chat(
 					dispatchOutbox({ kind: "trouble", id });
 					setTimeout(() => dispatchOutbox({ kind: "recovered" }), TROUBLE_RETRY_MS);
 				} else if (
-					(error.code === "planner-not-attached" || error.code === "planner-busy")
+					refusedByChopin(error.code)
 					&& next.draft
 					&& !draftRef.current.text.trim()
 					&& filesRef.current.files.length === 0
@@ -1402,11 +1422,9 @@ export function Chat(
 
 	let bannerId = useId();
 	// A message chopin could not take is its ephemeral row in the transcript, not a banner.
-	let refusedByChopin = shownSend?.code === "planner-not-attached"
-		|| shownSend?.code === "planner-busy";
 	let slot = bannerSlot(
 		banner?.view,
-		!!sendBanner && !refusedByChopin,
+		!!sendBanner && !refusedByChopin(shownSend?.code),
 		!!failed,
 		!readonly && !archived,
 	);
@@ -1489,11 +1507,12 @@ export function Chat(
 	// the same object while it means the same thing, so that the transcript is not rendered with it.
 	let hiddenFailure = slot.lead === "failure" ? failed?.entry : undefined;
 	let shownEntries = useMemo(
-		() => [
-			...withNoticesAfter(withoutFailure(entries, hiddenFailure), unanswered),
-			...echoes(outbox),
-		],
-		[entries, hiddenFailure, unanswered, outbox],
+		() => withoutFailure(entries, hiddenFailure),
+		[entries, hiddenFailure],
+	);
+	let localEntries = useMemo(
+		() => localRows(echoes(outbox), unanswered),
+		[outbox, unanswered],
 	);
 	let canStartThread = !readonly && !archived && transcriptReady;
 	let transcriptThreads = useMemo(
@@ -1529,22 +1548,26 @@ export function Chat(
 	let steadyChoose = useSteadyCallback(machine?.choose);
 	let noteRow = useMemo(
 		() =>
-			note && (
-				<QuietNote
-					fix={noteFix}
-					key={note.ts}
-					onChoose={steadyChoose}
-					onNavigate={navigateTo}
-					text={noteFix ? refusedSentence(noteFix) : note.text}
-					ts={note.ts}
-				/>
-			),
+			note && {
+				id: String(note.ts),
+				ts: note.ts,
+				row: (
+					<QuietNote
+						fix={noteFix}
+						onChoose={steadyChoose}
+						onNavigate={navigateTo}
+						text={noteFix ? refusedSentence(noteFix) : note.text}
+						ts={note.ts}
+					/>
+				),
+			},
 		// oxlint-disable-next-line react-hooks/exhaustive-deps -- noteFix is compared by its words
 		[note, noteFixWords, steadyChoose],
 	);
 	let transcriptView = (
 		<Transcript
-			tail={noteRow}
+			local={localEntries}
+			note={noteRow}
 			active={active}
 			canEdit={composerShown}
 			compacting={threadsState.topCompacting}

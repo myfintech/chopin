@@ -48,13 +48,16 @@ import {
 } from "../../testing/agent-link";
 import { refusedChoice } from "@chopin/protocol/model-choice";
 
+import { sessionModel } from "../../chat/model-choice";
 import { remoteCatalog } from "../catalog";
+import { plannerCatalog, plannerOffered, plannerOfferKnown } from "../harnesses";
 import { createRemoteAdapter } from "./adapter";
 import { admitAgent } from "./endpoint";
 import { remotePlanner } from "./registry";
 
 import type { AgentClient, AgentHandlers, TurnContext } from "@chopin/agent-link/client";
 import type { ActiveOwnerBinding } from "../../agent/active-owner";
+import type { PlannerChoice } from "../session";
 import type { PlannerTurn } from "../turn-level";
 import type { RemotePlanner } from "./registry";
 
@@ -1865,6 +1868,102 @@ describe("Agent connection capability catalog", () => {
 		}
 	});
 
+	/** A session opened through `openPlannerSession` on a client that offered `session-choice`. */
+	async function choosingSession(opens: { model?: string; choice?: PlannerChoice }) {
+		let f = await hostInputRoom();
+		cleanups.push(f.close);
+		let linked = await linkAuth(f.room.id);
+		let server = linkServer(linked.auth, 300);
+		cleanups.push(server.stop);
+		let starts: PlannerChoice[] = [];
+		let seen: PlannerChoice[] = [];
+		let client = await connectAgent({
+			url: server.url,
+			token: MEMBER_TOKEN,
+			document: f.room.id,
+			resumable: false,
+			capabilities: catalog,
+			sessionChoice: true,
+			handlers: {
+				start(message) {
+					starts.push({
+						...(message.model ? { model: message.model } : {}),
+						...(message.thinkingLevel ? { thinkingLevel: message.thinkingLevel } : {}),
+					});
+				},
+				async turn(context) {
+					seen.push({
+						...("model" in context.message ? { model: context.message.model } : {}),
+						...("thinkingLevel" in context.message
+							? { thinkingLevel: context.message.thinkingLevel }
+							: {}),
+					});
+					finishTurn(context);
+				},
+			},
+		});
+		cleanups.push(() => client.detach());
+		await until(() => !server.links.at(-1)!.catalogPending, 1_000);
+		let agent = createPlannerAgent(
+			createRemoteAdapter(sessionId => ({
+				link: server.links.at(-1)!,
+				planner: remotePlanner(sessionId)!,
+			})),
+		);
+		let owner = {
+			channelId: f.room.id,
+			token: "test-token",
+			repository: { id: "R_test", owner: "org", name: "repo", defaultBranch: "main" },
+			signal: new AbortController().signal,
+			currentToken: () => "test-token",
+			revalidate: async () => true,
+			release() {},
+		} as unknown as ActiveOwnerBinding;
+		let opened = await openPlannerSession(owner, {
+			room: f.room,
+			repository: owner.repository,
+			instructions: "Plan.",
+			harness: "remote",
+			...opens,
+		}, {
+			githubTools: async () => ({ ok: true, value: {} }),
+			createSandbox: async () => sandboxSession,
+			registerCredential: () => () => {},
+			agent,
+		});
+		if (!opened.ok) throw new Error("Planner unavailable");
+		let session = opened.value;
+		cleanups.push(() => session.destroy());
+		let run = async (choice?: PlannerChoice) => {
+			let result = await session.stream("go", new AbortController().signal, choice);
+			for await (let _part of result.fullStream);
+		};
+		return { starts, seen, run };
+	}
+
+	it("opens a session on the stored choice, and leaves out of a later turn a model or level set back to Default", async () => {
+		let { starts, seen, run } = await choosingSession({
+			choice: { model: "acme/large", thinkingLevel: "high" },
+		});
+		await run({ model: "acme/large", thinkingLevel: "high" });
+		await run();
+		await run({ model: "acme/large" });
+		expect(starts).toEqual([{ model: "acme/large", thinkingLevel: "high" }]);
+		expect(seen).toEqual([
+			{ model: "acme/large", thinkingLevel: "high" },
+			{},
+			{ model: "acme/large" },
+		]);
+	});
+
+	it("opens a session on the operator's MODEL where no model was chosen, as each such turn runs it", async () => {
+		let { starts, seen, run } = await choosingSession({ model: "acme/small" });
+		await run();
+		await run({ model: "acme/large", thinkingLevel: "high" });
+		expect(starts).toEqual([{ model: "acme/small" }]);
+		expect(seen).toEqual([{ model: "acme/small" }, { model: "acme/large", thinkingLevel: "high" }]);
+	});
+
 	it("carries a message's images and files to a client that offered attachments, and as words to one that did not", async () => {
 		let png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
 		let notes = new TextEncoder().encode("# Notes\n");
@@ -2129,6 +2228,111 @@ describe("Agent connection capability catalog", () => {
 			raw.send({ type: "detach" });
 			await raw.closed;
 		}
+	});
+
+	it("tells a client that offered session-choice the document's choice when it asks for a session", async () => {
+		let { server, channel } = await setup();
+		for (
+			let [header, told] of [
+				["capability-catalog", false],
+				["session-choice", false],
+				["capability-catalog, session-choice", true],
+			] as const
+		) {
+			let raw = await rawLink(server.url, undefined, header);
+			raw.send({ type: "attach", version: 1, document: channel.id });
+			await raw.next("attached");
+			let planner: RemotePlanner = {
+				channelId: channel.id,
+				isolated: false,
+				choice: { model: "acme/large", thinkingLevel: "high" },
+			};
+			let opening = adapterFor(server, planner).doStart({
+				sessionId: `session-choice-${header}`,
+				sandboxSession,
+				sessionWorkDir: "/tmp",
+			});
+			let start = await raw.next("start");
+			if (told) expect(start).toMatchObject({ model: "acme/large", thinkingLevel: "high" });
+			else {
+				expect("model" in start).toBe(false);
+				expect("thinkingLevel" in start).toBe(false);
+			}
+			raw.send({ type: "started", session: start.session });
+			let opened = await opening;
+			cleanups.push(() => opened.doDestroy());
+			raw.send({ type: "detach" });
+			await raw.closed;
+		}
+	});
+
+	it("opens a session on the stored choice when the client reports its catalog only after opening began", async () => {
+		let { server, channel } = await setup();
+		let raw = await rawLink(server.url, undefined, "capability-catalog, session-choice");
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		let deps = {
+			catalog: (id: string) => plannerCatalog("remote", id, undefined),
+			known: (id: string) => plannerOfferKnown("remote", id),
+			offered: (id: string) => plannerOffered("remote", id, 4_000),
+			storage: {
+				plannerModelChoices: {
+					get: async (channelId: string) => ({
+						channelId,
+						model: "acme/large",
+						modelName: "Large",
+						thinkingLevel: "high",
+						userId: "U_test",
+						updatedAt: new Date(),
+					}),
+				},
+			} as never,
+			lease: () => {
+				throw new Error("nothing is stored here");
+			},
+		};
+		let opening = sessionModel(deps, channel.id).then(choice =>
+			adapterFor(server, { channelId: channel.id, isolated: false, choice }).doStart({
+				sessionId: "opens-before-report",
+				sandboxSession,
+				sessionWorkDir: "/tmp",
+			})
+		);
+		await Bun.sleep(50);
+		expect(raw.messages.some(message => message.type === "start")).toBe(false);
+		raw.send({ type: "capabilities", catalog });
+		let start = await raw.next("start");
+		expect(start).toMatchObject({ model: "acme/large", thinkingLevel: "high" });
+		raw.send({ type: "started", session: start.session });
+		let opened = await opening;
+		cleanups.push(() => opened.doDestroy());
+		raw.send({ type: "detach" });
+		await raw.closed;
+	});
+
+	it("says a client's offer is settled once it reports, or once its link ends", async () => {
+		let { server, channel } = await setup();
+		let raw = await rawLink(server.url, undefined, "capability-catalog");
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		let link = server.links.at(-1)!;
+		let settled = false;
+		void link.offered.then(() => settled = true);
+		await Bun.sleep(20);
+		expect(settled).toBe(false);
+		raw.send({ type: "capabilities", catalog });
+		await until(() => settled, 1_000);
+		raw.send({ type: "detach" });
+		await raw.closed;
+
+		let gone = await rawLink(server.url, undefined, "capability-catalog");
+		gone.send({ type: "attach", version: 1, document: channel.id });
+		await gone.next("attached");
+		let ended = server.links.at(-1)!;
+		let waited = ended.offered;
+		gone.send({ type: "detach" });
+		await gone.closed;
+		await waited;
 	});
 });
 

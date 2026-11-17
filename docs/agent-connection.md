@@ -120,6 +120,7 @@ client must then use none of them.
 | `session-forks`            | A [`fork`](#server-to-client) message to branch a thread's Planner session from an earlier session and turn, multiplexed over the same connection                             |
 | `steer-turn`               | A [`steer`](#server-to-client) message: a person's message for the turn the client is running, read at its next step                                                          |
 | `retry-turn`               | A `turn`'s `message`, the Chat message it answers, and `retry` when it [runs a failed message again](#retrying-a-failed-turn)                                                 |
+| `session-choice`           | With `capability-catalog`, the document's chosen `model` and `thinkingLevel` in [`start` and `fork`](#server-to-client), so a session the client makes opens on them          |
 
 ### Pings
 
@@ -421,8 +422,8 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
 ## Server to client
 
 ```text
-{ "type": "start", "session": "", "mode": "planner" }
-{ "type": "fork", "session": "", "mode": "planner", "from": { "session": "", "turn?": "" } }
+{ "type": "start", "session": "", "mode": "planner", "model?": "", "thinkingLevel?": "" }
+{ "type": "fork", "session": "", "mode": "planner", "from": { "session": "", "turn?": "" }, "model?": "", "thinkingLevel?": "" }
 { "type": "turn", "session": "", "turn": "", "prompt": "", "instructions?": "", "model?": "", "thinkingLevel?": "", "attachments?": [{ "id": "", "name": "", "kind": "image", "mediaType": "", "size": 0, "data": "" }], "message?": "", "retry?": true, "tools": [], "responseFormat?": {} }
 { "type": "abort", "session": "", "turn": "" }
 { "type": "steer", "request": "", "session": "", "turn": "", "prompt": "" }
@@ -441,6 +442,25 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   session refused with `start-failed` or not answered in time gets `destroy`,
   and any question asked for it meanwhile is withdrawn and answered
   `cancelled`.
+- `model` and `thinkingLevel` on `start` and `fork` are sent only to a client
+  that offered both `capability-catalog` and `session-choice`: the document's
+  chosen model and level when the session opens, checked against the catalog
+  the client last reported, as it spelled them, and the same `model` and
+  `thinkingLevel` the session's first `turn` carries. Where nobody chose a
+  model, `model` is the operator's `MODEL` when it is set, as in `turn`. A
+  session that opens before a client that offered `capability-catalog` has sent
+  `capabilities`, such as the first after it attaches or resumes, waits for the
+  report, up to **10 seconds**, before `start` or `fork` is sent. They only
+  open the session: make it on them, so whatever it does before its first
+  turn, and any session the client makes again for the document on its own
+  (after its process restarts, say), starts on them. A field present is what
+  to run; a field absent means neither the document nor the operator names
+  one, or the catalog no longer offers it: use the client's own default. They
+  never outlast a turn. Every `turn` carries what it runs by the same rule, and
+  a turn's absent `model` or `thinkingLevel` means the client's own default for
+  it, even where `start` or `fork` named one: that is how a person choosing
+  Default, or clearing the level, reaches a session Chopin keeps, as no new
+  `start` is sent for it. Run each turn on its own fields alone.
 - `fork`, with `session-forks`, opens a thread's Planner session branched from
   `from.session` (and `from.turn` when named), preserving the conversation,
   tool results, compaction state and session memory up to that point. Answer
@@ -466,10 +486,17 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   `json`, the turn's text must be that JSON.
 - `abort` stops the turn. Answer with `turn-end`; after **10 seconds** the
   server ends the turn anyway. The server sends no `host-tool-result` for the
-  turn's calls after `abort`, so settle any call still waiting as failed.
+  turn's calls after `abort`, so settle any call still waiting as failed. A
+  question the turn asked while it ran, outside any workflow run, ends with it:
+  the server withdraws its Decision and answers its `input-request` with
+  `input-result` status `cancelled`, as a full Atomic Planner's Stop does, so a
+  client whose question is still waiting can end the turn. One the turn asks
+  after `abort`, before its `turn-end`, is answered `cancelled` at once, with its
+  method's `cancelled` value (see [Questions](#questions)), and opens no
+  Decision. A workflow run's question is the run's and stays open.
 - `steer`, with `steer-turn`, gives the turn that is running a message a person sent to Chopin
-  while it works. Chopin never holds a message for the next turn, so this is how a person talks to
-  a Planner mid-reply: `prompt` is the message as the model should read it (the sender's handle
+  while it works. Chopin never holds a message behind a turn that is working, so this is how a
+  person talks to a Planner mid-reply: `prompt` is the message as the model should read it (the sender's handle
   first, `@bo: ...`), to be read at the turn's next step, after the tool calls of the step it is
   in and before its next call to the model, as an ordinary user message in the same turn. Answer
   with `control-result` within **10 seconds**: `ok: true` once the turn has taken it, `ok: false`
@@ -477,7 +504,11 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   it on. A refusal is final: Chat then says the message was not read, and it is not sent again.
   A client that did not offer the feature never receives one, and a message sent while it works
   is refused in Chat ("chopin can't take messages while it works on this machine. Stop it to ask
-  now.") rather than kept for later.
+  now.") rather than kept for later. A message sent once its turn is being stopped or finishing
+  (after `abort`, or after its `turn-end` while Chopin finishes recording it) is kept, and starts
+  the next turn as that one ends, with the message as its `prompt`; one sent while that next turn waits to start is
+  refused ("chopin is about to answer another message and can't take more while it works on this
+  machine. Send yours again once it has answered.").
 - `host-tool-result` answers a `host-tool-call`. `output` is the tool's result
   as JSON. A failed call has `"isError": true` and `output`
   `{ "error": "<message>" }`; that includes a tool that threw, invalid input, a
@@ -671,14 +702,18 @@ level can therefore never be chosen, and a turn never carries one.
   workflow of that name, with the words after it as its input, for a `workflow`. Chopin checks the
   name and kind against the last report when the message is sent and refuses an unknown one.
 
-A person's choice reaches the client in the next turn: `model` is the chosen model's `id`, and
+A person's choice reaches the client in every turn, whoever or whatever started it, a background
+job's (in an `isolated` session) included: `model` is the chosen model's `id`, and
 `thinkingLevel` one of that model's levels (or the default model's, when no model was chosen),
 each exactly as the client spelled it. Neither is ever empty: an empty model `id` or level is
 skipped when the catalog is read (above), so no one can choose it, and a `model` that is absent
 means no model was chosen (an operator's empty `MODEL` reads the same way).
 Chopin checks both against the last catalog the client reported when it accepts the choice and
 again when the turn starts. A model the catalog no longer lists, or a level its model no longer
-lists, is not sent: the turn runs with the client's default, and the document's Chat says so. The
+lists, is not sent: the turn runs with the client's default, and the document's Chat says so. A
+turn that starts before a client that offered the feature has sent `capabilities`, such as the
+first after it attaches or resumes, waits for the report, up to **10 seconds**, before it checks
+the choice, so a client that reports promptly runs the choice from its first turn. The
 catalog name is saved with the choice so that notice can name it even after it disappears. The
 browser's `chat:model` state includes an optional `modelName` for that saved name; older choices
 without a name use the current catalog's name if known, otherwise the id. Older browsers can ignore

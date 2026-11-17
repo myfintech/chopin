@@ -20,13 +20,20 @@ import {
 	harnessFor,
 	plannerCatalog,
 	plannerCommands,
+	plannerOffered,
 	plannerOfferIncoming,
 	plannerOfferKnown,
 	plannerRanWithoutOffer,
 	plannerSteers,
 	shutdownHarnesses,
 } from "./harness/harnesses";
-import { chooseModel, publishModelState, turnModel, turnReadsImages } from "./chat/model-choice";
+import {
+	chooseModel,
+	publishModelState,
+	sessionModel,
+	turnModel,
+	turnReadsImages,
+} from "./chat/model-choice";
 import type { ModelChoiceDeps } from "./chat/model-choice";
 import * as Threads from "./chat/threads";
 import {
@@ -58,9 +65,7 @@ import * as Chat from "./chat/service";
 import { answerWake } from "./chat/wake";
 import { plannerAttachment } from "./chat/planner-attachment";
 import * as Initiative from "./chat/initiative";
-import * as Reactions from "./chat/reactions";
-import { respond as respondToReaction } from "./chat/reaction-reply";
-import { copiedFrom, reactInThread } from "./chat/thread-reactions";
+import { copiedFrom, reactInChat, reactInThread } from "./chat/thread-reactions";
 import { createChildDocuments } from "./chat/children";
 import { createRootChat } from "./chat/root";
 import { serverInstruction as runServerInstruction } from "./chat/server-instruction";
@@ -109,6 +114,8 @@ import { researchAnswerDefinition, researchEvidenceDefinition } from "./jobs/res
 import { JobService } from "./jobs/service";
 import { DocumentSummaryCoordinator } from "./jobs/summary-coordinator";
 import { invokeRouted, SystemTurns } from "./mcp/invoke";
+import { createNewDocument, NewDocumentLimits } from "./agent/new-documents";
+import type { NewDocumentDeps } from "./agent/new-documents";
 import { liveClassifier } from "./tasks/live-gate";
 import { LiveSyncCoordinator } from "./tasks/live-sync";
 import { heuristicJudge, jevJudge, SpikeScout } from "./experiments/spike-scout";
@@ -120,7 +127,8 @@ import { createVisualAdmission } from "./agent/visual-admission";
 import { locksEditing, requestBuild } from "./tasks/builds";
 import { pendingLinks, relinkInstruction } from "./tasks/relink";
 import { BuildReadiness } from "./tasks/readiness";
-import { MCP_SESSION_IDLE_MS } from "./mcp/hosted";
+import { createDocument as createHostedDocument, MCP_SESSION_IDLE_MS } from "./mcp/hosted";
+import { CANNOT_STEER } from "./chat/steering";
 import { registerMcpRoutes } from "./mcp/routes";
 import { registerNavigationRoutes } from "./navigation/routes";
 import { registerPreferenceRoutes } from "./user-preferences/routes";
@@ -265,6 +273,8 @@ let ownerBindings: ActiveOwnerBindings | undefined;
 let plannerAttachments: PlannerAttachments | undefined;
 /** Each document's recent automatic follow-ups through `invoke_planner`, for their hourly limit. */
 let systemTurns = new SystemTurns();
+/** How many documents each turn, and each person in an hour, had the Planner create. */
+let newDocumentLimits = new NewDocumentLimits();
 /** Browser sockets by login, so a login that ends closes them before another broadcast. */
 let sessionSockets = new SessionSockets(sessionId => hostedAuth.sessions.isLive(sessionId));
 const openSockets = new OpenSockets();
@@ -843,6 +853,7 @@ function conversation(
 				}),
 			}),
 		modelChoice: () => turnModel(modelChoices, room.id),
+		sessionChoice: () => sessionModel(modelChoices, room.id),
 		commands: () => modelChoices.commands?.(room.id) ?? Promise.resolve(undefined),
 		fileExists: (path, sessionId) => repositoryFiles.has(room.id, repository, sessionId, path),
 		readsImages: () => turnReadsImages(modelChoices, room.id),
@@ -1020,6 +1031,9 @@ function conversation(
 				evict(held.room);
 			};
 		},
+		createDocument: config.agent
+			? request => createNewDocument(plannerDocuments(), { ...request, sourceId: room.id })
+			: undefined,
 		createResearch: config.agent
 			? async request => {
 				let service = researchService;
@@ -1197,6 +1211,7 @@ const modelChoices: ModelChoiceDeps = {
 		});
 	},
 	known: channelId => plannerOfferKnown(config.harness, channelId),
+	offered: channelId => plannerOffered(config.harness, channelId),
 	incoming: channelId =>
 		plannerOfferIncoming(
 			config.harness,
@@ -1596,9 +1611,7 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 				let context = chat(room, ws);
 				let thread = frame.thread ?? copiedFrom(context, frame.id);
 				if (thread !== undefined) await reactInThread(context, ws, { ...frame, thread });
-				else {
-					await Reactions.react(context, ws, frame, reacted => respondToReaction(context, reacted));
-				}
+				else await reactInChat(context, ws, frame);
 			}
 			return;
 
@@ -2475,6 +2488,97 @@ async function resetOpenAgents(
 			room.plan ? Chat.resetAgent(room.plan.chat, sessionId, revision, reason) : Promise.resolve()
 		),
 	);
+}
+
+/** What follows a document's stored revision: its history, summary, live build and readiness. */
+function documentPersisted(target: Service.DocumentTarget): void {
+	void documentHistory.record(target);
+	if (summaryCoordinator) void summaryCoordinator.enqueueNow(target).catch(() => {});
+	liveSync?.schedule(target);
+	buildReadiness?.schedule(target);
+}
+
+/**
+ * The Planner's `create_document` for a turn in `sourceId`: stored as `create_document` over MCP
+ * stores one, with the person whose message drives the turn as its creator.
+ */
+function plannerDocuments(): NewDocumentDeps {
+	return {
+		channel: id => storage.channels.get(id),
+		deleting: id => deletingChannels.has(id) || archivingChannels.has(id),
+		login: async (userId, sessionId) => {
+			let own = sessionId ? await hostedAuth.sessions.resolve(sessionId) : undefined;
+			return own?.user.id === userId ? own : hostedAuth.sessions.forUser(userId);
+		},
+		repository: async (login, owner, name) =>
+			(await hostedAuth.sessions.use(
+				login,
+				token => hostedAuth.github.repositoryAccess(token, owner, name),
+			)).value,
+		branchHead: async (login, owner, name, branch) => {
+			let github = hostedAuth.github;
+			if (!github.branchHead) throw new Error("the base branch's commit can't be read");
+			return (await hostedAuth.sessions.use(
+				login,
+				token => github.branchHead!(token, owner, name, branch),
+			)).value;
+		},
+		origin: async channelId => Rooms.get(channelId)?.plan?.creation?.origin,
+		created: async channelId => {
+			let stored = await storage.collaboration.load(channelId, hostedAuth.clock());
+			return stored ? (await Service.readStored(stored)).creation?.origin : undefined;
+		},
+		create: (creator, input, instructed) =>
+			createHostedDocument(
+				hostedAuth,
+				{
+					visualAdmission,
+					isChannelDeleting: id => deletingChannels.has(id),
+					// One with an instruction is in use at once, so its Planner is started as New document's is.
+					onChannelCreated: instructed ? documentCreated : announceCatalogue,
+					onDocumentPersisted: documentPersisted,
+				},
+				creator,
+				input,
+			),
+		modelChoice: async (from, userId) => {
+			let choice = await storage.plannerModelChoices.get(from);
+			if (!choice || (choice.model === undefined && choice.thinkingLevel === undefined)) {
+				return undefined;
+			}
+			if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+			return {
+				lease: writerLease.held,
+				choice: {
+					...(choice.model !== undefined ? { model: choice.model } : {}),
+					...(choice.modelName !== undefined ? { modelName: choice.modelName } : {}),
+					...(choice.thinkingLevel !== undefined ? { thinkingLevel: choice.thinkingLevel } : {}),
+					userId,
+					updatedAt: hostedAuth.clock(),
+				},
+			};
+		},
+		invoke: input =>
+			invokeRouted({
+				channels: storage.channels,
+				deleting: id => deletingChannels.has(id) || archivingChannels.has(id),
+				transition: withDocumentTransition,
+				open: rootId => openRootChat(rootId, input.session?.session.id, input.repository),
+				plannerAccount: rootId => plannerAttachments?.holding(rootId)?.userId,
+				systemTurns,
+			}, input),
+		refusal: async (code, channel, url) => {
+			if (code === "planner-busy") return CANNOT_STEER;
+			if (code !== "planner-not-attached") return undefined;
+			return plannerNotAttached(
+				channel.id,
+				url,
+				`${channel.repositoryOwner}/${channel.repositoryName}`,
+			);
+		},
+		appOrigin: hostedAuth.config.origin,
+		limits: newDocumentLimits,
+	};
 }
 
 /** Tell every sidebar watching the document's repository that its documents changed. */
@@ -3392,12 +3496,7 @@ registerMcpRoutes(router, hostedAuth, {
 	isChannelDeleting: channelId => deletingChannels.has(channelId),
 	onChannelRenamed: announceChannel,
 	onChannelCreated: announceCatalogue,
-	onDocumentPersisted: target => {
-		void documentHistory.record(target);
-		if (summaryCoordinator) void summaryCoordinator.enqueueNow(target).catch(() => {});
-		liveSync?.schedule(target);
-		buildReadiness?.schedule(target);
-	},
+	onDocumentPersisted: documentPersisted,
 	restoreChannel,
 	serializeDocument: (channelId, action) =>
 		withDocumentTransition(channelId, () => withDocumentLock(channelId, action)),

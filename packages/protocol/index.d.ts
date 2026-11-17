@@ -235,19 +235,22 @@ export declare namespace Session {
 		 * Set for a refusal the client presents in full rather than as a generic
 		 * failure. `planner-not-attached`: a Planner request under `HARNESS=remote`
 		 * to a document no client is attached to; `message` says how to attach one.
-		 * `planner-busy`: a message to the Planner while its turn runs, and the harness cannot take
-		 * input mid-run (or the running turn is a background job's): it is refused, never held, and
-		 * `message` says to stop the turn to ask now. Final.
+		 * `planner-busy`: a message to the Planner while a turn runs on a harness taking no input
+		 * mid-run: it is refused, never held, and `message` says to stop the turn to ask now. Final.
+		 * `planner-starting`: a message to the Planner while another person's turn waits to start on a
+		 * harness taking no input mid-run: it is refused, never held, and `message` says to send again
+		 * once that turn has answered, and asks for no Stop. Final.
 		 * `temporarily-unavailable`: a refusal of a `chat:send` for a passing reason (storage busy,
 		 * the room changing, too many sends being handled, a lookup of a reference or of the open
-		 * child that failed, a turn only beginning or finishing). The message is fine and is sent
-		 * again, with the same request id, and is kept once even if an earlier attempt was saved
-		 * before its answer was lost. Any refusal of a send without a code, or with
-		 * `planner-not-attached` or `planner-busy`, is final.
+		 * child that failed). The message is fine and is sent again, with the same request id, and
+		 * is kept once even if an earlier attempt was saved before its answer was lost. Any refusal
+		 * of a send without a code, or with `planner-not-attached`, `planner-busy` or
+		 * `planner-starting`, is final.
 		 */
 		code?:
 			| "planner-not-attached"
 			| "planner-busy"
+			| "planner-starting"
 			| "temporarily-unavailable";
 	};
 

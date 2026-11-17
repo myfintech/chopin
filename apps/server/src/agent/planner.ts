@@ -209,6 +209,15 @@ reads a completed result.
 Do not create a workspace from a comment sent to you, stale context,
 background conversation, or an inferred desire to research.
 
+When a member's request splits into independent pieces of work, such as several
+features or one change across many parts of the app, prefer \`create_document\`:
+one new top-level document per piece, each with a complete first draft and brief,
+and an \`instruction\` when its own Planner should start on it now. One document
+holding every piece is too large to review; write one only when the member asks
+for it. Each new document has its own Chat and Planner and shares nothing with
+this one, so its draft and instruction must carry everything it needs. Tell the
+member what you created, with each link from the result.
+
 Even when intent is sparse, write a short provisional account of the known problem and what
 remains unknown. Then capture the missing intent as a written decision beside that paragraph.
 An open question never hides or replaces existing prose.
@@ -392,6 +401,7 @@ export function plannerInstructions(
 	bootstrap?: string,
 	workspace?: PlannerWorkspace | RemoteWorkspace,
 	visualRouting = false,
+	thread = false,
 ): string {
 	let visual = visualRouting
 		? `Visual explanations are a normal part of this document. For each new explanatory
@@ -431,8 +441,11 @@ terminal commands, or Atomic CLI commands, so never tell them to use \`/workflow
 tool result suggests it. When you start a workflow, say in plain words what it will do and
 where to follow it: Chat shows a card for each workflow run you start, with its stages and
 status, its questions appear under Decisions, **Stop Planner** pauses it, and **Resume Planner**
-resumes it. Offer to check on or steer a workflow run yourself with your \`workflow\` and
-\`intercom\` tools when someone asks. A Build is not a workflow run, and Chat shows no card for a
+resumes it. Offer to ${
+		"remote" in workspace
+			? "check on or steer a workflow run yourself with your `workflow` and\n`intercom` tools"
+			: "check on, pause or resume a workflow run yourself with your `workflow` tool"
+	} when someone asks. A Build is not a workflow run, and Chat shows no card for a
 Build or its tasks: each task's state and pull request show under **Build**, beside Decisions.`;
 	if ("remote" in workspace) {
 		let remote = `You run in a member's own session on their machine, attached to this document.
@@ -450,21 +463,25 @@ repository tools read.`
 this document. It is not a checkout and holds no repository files, so read
 ${repository} through the repository tools.`;
 	let implementing =
-		`Your own tools read files and the web but cannot edit files or run commands, so
-you do not implement the plan yourself. If a member asks to implement it
-now, rather than prepare its task graph, your \`intercom\` tool can reach other sessions on this
-machine: one working in a checkout of ${repository}, such as a session that handed you this
-document, can take the request along with what it needs to find this document. Tell the member
-where the work continues, or that no session could take it.
-
-An \`intercom\` ask returns once it is delivered and waits only a few seconds for the reply. A
-reply that comes after your turn ends waits unread until your next turn, so when you need
-another session's answer to tell the member, such as checking on a workflow run, ask with
-\`wait: { kind: "foreground", budgetMs: 600000 }\`.`;
-	return [prompt, visual, reading, place, questions, surface, implementing, extensions, bootstrap]
-		.filter(
-			Boolean,
-		).join(
-			"\n\n",
-		);
+		`Your own tools read files and the web but cannot edit files, run commands or reach other
+sessions, so you do not implement the plan yourself or hand it to another session. If a member
+asks to implement it now, say so plainly and offer to prepare its task graph instead.`;
+	let threaded = `You answer in a thread of this document's Chat. Use \`tell_chat_planner\` as its
+description says, so the Chat's Planner learns what was decided here.`;
+	return [
+		prompt,
+		visual,
+		reading,
+		place,
+		questions,
+		surface,
+		implementing,
+		thread ? threaded : undefined,
+		extensions,
+		bootstrap,
+	].filter(
+		Boolean,
+	).join(
+		"\n\n",
+	);
 }

@@ -171,7 +171,8 @@ durable.
   connection's own words and nothing is kept for later. A client that offers the
   optional `steer-turn` feature is given a message sent while its turn runs as a
   `steer` frame (`docs/agent-connection.md`); one that does not is refused such a
-  message. Signing out the owner's login, its expiry, or a Planner reset closes the link. A lost
+  message, except one sent once the turn is being stopped or finishing, which starts
+  its next turn. Signing out the owner's login, its expiry, or a Planner reset closes the link. A lost
   connection never ends work by itself: a link that offered
   `resumable-sessions` and then dropped unexpectedly keeps its sessions that hold
   a live run or an open question, however long it stays away, and holds any Stop
@@ -364,8 +365,17 @@ this message wasn't sent. Send it again in a moment."), or with none attached, r
 the connection's own words (`planner-not-attached`),
 mid-turn too; for a machine that is away they say the message was not sent and to send it again
 when the machine is back, and never that it is kept (the machine's own work is; the message is
-not). A message sent while a turn is only beginning or finishing has no session
-to be given to, and is answered as a passing trouble (`temporarily-unavailable`). If the
+not). A message sent while a turn is being stopped or finishing, or while one of Chopin's
+own turns is being handed the Chat, has no session to be given to; it is acknowledged at once
+and starts the next turn as that one winds down (`windingDown` in `chat/service.ts`), ahead of
+anything waiting. One sent while such a person's turn waits to start is acknowledged at once and
+given to that turn once it can take one (`chat.following`); a harness that takes no input
+mid-run refuses it with `planner-starting` and words that ask for no Stop ("chopin is about to answer
+another message and can't take more while it works on this machine. Send yours again once it has
+answered."). None is answered as a passing trouble, so no message waits in its browser's outbox
+behind another. A stopping process (`holdStarts`) keeps no such message: it refuses one in silence
+for the browser to send to the next process, and says in Chat that Chopin did not read any it had
+already kept for a turn it will not start. If the
 turn ends before it can read the message, an idle Chat starts a turn for it and any other
 says plainly that Chopin did not read it. A comment note, an `invoke_planner as system` call
 and a task draft need a turn of their own, so a running turn refuses them before anything is
@@ -381,22 +391,46 @@ its outbox (`apps/web/src/chat/delivery.ts`) as the person's own, saying Sending
 waiting, queued or a clock), until the server's entry for the same request ID arrives; from
 then it carries no mark. The outbox holds a message only for the browser's own connection:
 it sends one message at a time, oldest first, once the current connection's transcript has
-arrived, and only to a server that acknowledges sends. When `planner-not-attached` or
-`planner-busy` refuses a send and the composer holds no newer draft, the typed text (with its
-mention, references and staged files) returns to the composer draft and chopin says why in a row
-at the end of the transcript only that person sees (`chat/quiet-note.tsx`, with How to fix where
-the machine has something to fix), and while Chopin works the one button offers Stop so the
-person can stop Chopin and send it;
+arrived, and only to a server that acknowledges sends. When `planner-not-attached`,
+`planner-busy` or `planner-starting` refuses a send and the composer holds no newer draft, the
+typed text (with its mention, references and staged files) returns to the composer draft and
+chopin says why in a row only that person sees, placed at the time it was said
+(`chat/quiet-note.tsx`, with How to fix where the machine has something to fix), and for
+`planner-busy` while Chopin works the one button offers Stop so the person can stop Chopin and
+send it (`planner-starting` keeps Send, so it cannot stop the other person's turn);
 when a newer draft was already typed, or another refusal rejected the message, it says
 "Couldn't send" on the message with Try again and Delete (which act on the outbox alone, since
 the server kept nothing), and not while the page's offline bar
 shows. A refusal with a passing reason is not a refusal of the message: a storage, room or
-authorization trouble that will pass, or a turn that is only beginning or finishing
-(`temporarily-unavailable`). The browser keeps the message sending and sends it again, in order
+authorization trouble that will pass (`temporarily-unavailable`). The browser keeps the message sending and sends it again, in order
 and with the same request ID, in a moment. Only a refusal with neither code is final, and so
-are `planner-busy` and `planner-not-attached`. One the server kept, though the commit's answer
+are `planner-busy`, `planner-starting` and `planner-not-attached`. One the server kept, though the commit's answer
 was lost, is answered with its first answer when the same request is sent again, and is given
 to a turn once.
+
+Chat and every thread read in the order things happened: by `ts`, then by the server's `seq`.
+The server appends entries and never gives one an earlier second than the entry ahead of it, and
+gives each a sequence (its clock in milliseconds, or one more than the last it gave out) past every
+entry and history before it (`appendEntries` in `apps/server/src/chat/chronology.ts`). A thread's
+entry that Chat holds too is stamped once against both transcripts when it enters the thread,
+raising both transcripts' last sequence, and its copy into Chat keeps that time and sequence and
+takes its place by them. Each `chat:history` and opened thread carries `seq`, at least every entry
+it holds and smaller than any appended after it; it gives out no number, and a Retry's removal
+moves the last sequence past what it took out (`takeOut`). That last sequence is saved with the
+transcript (the sidecar's `transcriptSeq`, a thread's `last_seq`), so a restart whose clock is
+behind gives out no sequence a browser has seen. An entry saved before sequences existed
+keeps its stored place among those of its second. The browser (`transcript-state.ts`) places an
+entry by time and sequence, merges two copies of one entry by what the server only adds (text while
+it streams, images; reactions by `reactionsSeq`; a tool call is reported whole, with a fixed
+`order` among its entry's calls and a growing `rev`, so the larger `rev` wins and the calls keep
+the server's order), keeps a `chat:delta`
+past the text's end, and a tool or reaction frame for an entry not yet shown, until they fit,
+ignores a history older than one applied, drops an entry a history lacks though its `seq` covers
+it, and remembers what a Retry removed. So every frame and history, applied in any order, more
+than once, or after a reconnect, leaves the server's transcript (`transcript-replay.test.ts`).
+What only the browser has (a message still sending, the quiet note, a local notice under its send)
+joins the server's entries by its own time, after the entries of its second, in `group()`
+(`chat/chronology.ts`), so turn offsets still count the server's entries.
 
 A reply that fails is retried on the same message (`chat:retry`), never as a new one. Only the
 message's sender may, while its failure is the latest Planner turn and asking again can help. The
@@ -476,6 +510,27 @@ Question and comment relationships have four deliberate states: pending,
 linked, deliberately empty, and orphaned. Preserve the distinction. Empty means
 the Planner reviewed the decision and intentionally linked no prose; orphaned
 means a former target can no longer be identified safely.
+
+## Planner-created documents
+
+The Planner's `create_document` host tool (every harness) makes new top-level
+documents, one per piece of work that splits naturally, each with its own Chat,
+Decisions and Planner. Only a turn a person's message (in Chat or a thread)
+drives may call it: that person is the creator, and their own live browser login
+is rechecked for write access as for `chat:send`; a turn nobody typed and
+background jobs are refused. It reuses MCP `create_document`'s draft validation,
+visual assessment and creation (`createDocument` in `apps/server/src/mcp/hosted.ts`),
+keeps the creating document's repository and base branch, and is bounded per turn
+(counted on the turn's own member request, for as long as it runs) and per person
+per hour, with an idempotency key scoped to the creating document. The creating
+document's model choice is stored in the transaction that creates the new one
+(`CreateChannel.modelChoice`), so a retry never overwrites a choice made since.
+A retry is found in storage before the limits are counted, is compared against
+the base the first call recorded, and posts the linked line only if the first call
+could not save it. The document is stored before the sidebar, the asking Chat's
+one linked line (`Entry.document`) or its optional first instruction (posted as
+the creator's message, as `invoke_planner` does) hear of it. See
+[Creating documents](docs/hosted-agent.md#creating-documents).
 
 ## Research requests and child documents
 
@@ -786,10 +841,11 @@ run `bun run ci` and validate relative links with exact casing.
 When a disposable Planner session is created, diagnostics report available tool
 names and the external GitHub MCP contribution. Counts vary with SDK and remote
 MCP versions. A healthy boundary includes Chopin's document tools (currently
-plan-named), child document tools, repository tools, and allowed pull-request
+plan-named), `create_document`, child document tools, repository tools, and allowed pull-request
 tools, and excludes ambient capabilities such as `bash`, filesystem access, URL
 fetch, host Git, issues, and unrestricted search. The exception is an `atomic`
-Planner session, which deliberately adds Atomic's builtins and coding tools; its
+Planner session, which deliberately adds Atomic's builtins and coding tools but
+withholds `intercom` from its turns (a Chat thread's adds `tell_chat_planner`); its
 summary and research worker sessions must still show only their own tools.
 
 Treat a missing required tool or an unexpected ambient tool as a security or

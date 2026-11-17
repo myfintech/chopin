@@ -146,6 +146,12 @@ const MIGRATIONS = [{
 	id: "041_document_full_width",
 	path: join(import.meta.dir, "migrations/041_document_full_width.sql"),
 }, {
+	id: "042_chat_thread_notes",
+	path: join(import.meta.dir, "migrations/042_chat_thread_notes.sql"),
+}, {
+	id: "043_chat_thread_seq",
+	path: join(import.meta.dir, "migrations/043_chat_thread_seq.sql"),
+}, {
 	id: "mantl_user_preferences",
 	path: join(import.meta.dir, "migrations/mantl_user_preferences.sql"),
 }, {

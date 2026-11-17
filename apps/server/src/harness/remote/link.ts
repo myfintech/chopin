@@ -36,6 +36,7 @@ import type {
 import type { Chat as Wire } from "@chopin/protocol";
 import type { JsonValue, PlannerHeldSession } from "../../storage/model";
 import type { PlannerRuns } from "../atomic/full";
+import { withdrawnValue } from "../atomic/human-input";
 import type { AskedInput, HumanInput, HumanInputStatus, InputMethod } from "../atomic/human-input";
 import type { PlannerTurn } from "../turn-level";
 import type { RemotePlanner } from "./registry";
@@ -224,6 +225,8 @@ type Port = {
 	): Promise<void>;
 	/** Gives the client's running `turn` a person's message; rejects when it could not take it. */
 	steer(session: string, turn: string, prompt: string): Promise<void>;
+	/** Withdraws the questions `turn` asked for itself, outside any workflow run. */
+	withdraw(session: string, turn: string): void;
 	forget(session: string): void;
 	/** Whether the client's work in `session` goes on past a restart: it is kept, not destroyed. */
 	kept(session: string): boolean;
@@ -244,6 +247,7 @@ type Turn = {
 	hostIds: Set<string>;
 	hostCalls: Map<string, string>;
 	stopped: boolean;
+	withdrawn: boolean;
 	ended: boolean;
 	settle: PromiseWithResolvers<void>;
 	/** Aborted when the turn ends, so the server's host tools still running for it stop too. */
@@ -281,6 +285,8 @@ type Owed = {
 /** A request waiting on the document's members, and the decisions it asked once they exist. */
 type OpenInput = {
 	session: string;
+	/** The turn that asked it for itself; a workflow run's question belongs to its run instead. */
+	turn?: string;
 	controller: AbortController;
 	method: InputMethod;
 	decisions: string[];
@@ -410,14 +416,33 @@ class RemoteSession {
 		return this.#current !== undefined;
 	}
 
+	/** The id of the turn under way, if one is. */
+	get turn(): string | undefined {
+		let turn = this.#current;
+		return turn && !turn.ended ? turn.id : undefined;
+	}
+
+	get withdrawing(): boolean {
+		let turn = this.#current;
+		return turn !== undefined && turn.withdrawn && !turn.ended;
+	}
+
 	async start(): Promise<HarnessV1Session> {
 		let mode = this.planner.isolated ? "isolated" as const : "planner" as const;
 		let forkFrom = this.#port.features?.includes(AGENT_FEATURES.sessionForks)
 			? this.planner.forkFrom
 			: undefined;
+		let choice = this.#port.features?.includes(AGENT_FEATURES.sessionChoice)
+				&& this.#port.features.includes(AGENT_FEATURES.capabilityCatalog)
+			? this.planner.choice
+			: undefined;
+		let chosen = {
+			...(choice?.model ? { model: choice.model } : {}),
+			...(choice?.thinkingLevel ? { thinkingLevel: choice.thinkingLevel } : {}),
+		};
 		let message = forkFrom
-			? { type: "fork" as const, session: this.id, mode, from: forkFrom }
-			: { type: "start" as const, session: this.id, mode };
+			? { type: "fork" as const, session: this.id, mode, from: forkFrom, ...chosen }
+			: { type: "start" as const, session: this.id, mode, ...chosen };
 		if (!this.#port.send(message)) {
 			throw new Error("The agent connection is closed.");
 		}
@@ -864,10 +889,23 @@ class RemoteSession {
 		else turn.settle.resolve();
 	}
 
+	/**
+	 * Chopin stopped the turn. A question it asked for itself ends with it, as a full Atomic
+	 * Planner's does, so neither its card nor the session stays behind waiting on it. A workflow
+	 * run's question is the run's, and a server that is restarting withdraws nothing.
+	 */
+	#stopped(turn: Turn): void {
+		if (!turn.stopped && !turn.ended && !this.planner.stopping) {
+			turn.withdrawn = true;
+			this.#port.withdraw(this.id, turn.id);
+		}
+		this.#stop(turn);
+	}
+
 	#listen(turn: Turn, signal: AbortSignal | undefined): void {
 		if (!signal) return;
-		if (signal.aborted) return this.#stop(turn);
-		let abort = () => this.#stop(turn);
+		if (signal.aborted) return this.#stopped(turn);
+		let abort = () => this.#stopped(turn);
 		signal.addEventListener("abort", abort, { once: true });
 		turn.listeners.push(() => signal.removeEventListener("abort", abort));
 	}
@@ -951,6 +989,7 @@ class RemoteSession {
 			hostIds: new Set(),
 			hostCalls: new Map(),
 			stopped: false,
+			withdrawn: false,
 			ended: false,
 			settle: Promise.withResolvers<void>(),
 			...(hostTools ? { hostTools } : {}),
@@ -1102,6 +1141,8 @@ export class AgentLink {
 	#catalog: CapabilityCatalog | undefined;
 	/** Whether a turn has run without the catalog this client offered, so it is not waited for. */
 	#ranWithoutCatalog = false;
+	/** Settles once nothing is pending: the client reported, a turn ran without it, or the link ended. */
+	#offered = Promise.withResolvers<void>();
 	/** Set on a link rebuilt after a restart: told when its sessions are given back or end. */
 	#rebuilt: { ended(): void; resumed(): void } | undefined;
 
@@ -1112,6 +1153,13 @@ export class AgentLink {
 			send: message => this.#send(message),
 			control: (session, action, runId, sent) => this.#control(session, action, runId, sent),
 			steer: (session, turn, prompt) => this.#steer(session, turn, prompt),
+			withdraw: (session, turn) => {
+				for (let [request, input] of this.#inputs) {
+					if (input.session !== session || input.turn !== turn) continue;
+					input.controller.abort();
+					this.#inputs.delete(request);
+				}
+			},
 			forget: session => {
 				this.#sessions.delete(session);
 				this.#cancelInputs(session);
@@ -1347,6 +1395,16 @@ export class AgentLink {
 	 */
 	settleWithoutCatalog(): void {
 		this.#ranWithoutCatalog = true;
+		this.#offered.resolve();
+	}
+
+	/**
+	 * Settles when what the client offers is no longer pending (`catalogPending`): it reported, a
+	 * turn ran without it, or the link ended. Already settled for a client that offered no catalog.
+	 */
+	get offered(): Promise<void> {
+		if (!this.catalogPending) return Promise.resolve();
+		return this.#offered.promise;
 	}
 
 	/** Whether this link offered `resumable-sessions`. */
@@ -1615,6 +1673,7 @@ export class AgentLink {
 
 	/** Every session and open question this link still holds ends, as when any link closes. */
 	#teardown(): void {
+		this.#offered.resolve();
 		for (let session of this.#sessions.values()) session.linkClosed();
 		this.#sessions.clear();
 		if (!this.#stopping) { for (let input of this.#inputs.values()) input.controller.abort(); }
@@ -1669,6 +1728,7 @@ export class AgentLink {
 		let owed = this.#outbox;
 		this.#outbox = [];
 		this.#state = "closed";
+		this.#offered.resolve();
 		this.#successor = next;
 		next.#inputs = this.#inputs;
 		next.#inputIds = this.#inputIds;
@@ -1848,6 +1908,7 @@ export class AgentLink {
 					);
 				}
 				this.#catalog = catalog;
+				this.#offered.resolve();
 				this.#options.catalogChanged?.();
 				return;
 			}
@@ -1989,6 +2050,9 @@ export class AgentLink {
 		if (!session || !humanInput) {
 			return void reply("failed", undefined, "Decisions are not available to this session.");
 		}
+		if (message.workflowRunId === undefined && session.withdrawing) {
+			return void reply("cancelled", withdrawnValue(message.input.method));
+		}
 		if (this.#inputs.size >= MAX_OPEN_INPUTS) {
 			return void reply("failed", undefined, "Too many questions are already open.");
 		}
@@ -1996,8 +2060,10 @@ export class AgentLink {
 		// The session outlives the question until its answer reaches the client: an answer given
 		// to a session with nothing else to keep it would otherwise find it already let go.
 		delivered = session.planner.holdInput?.() ?? delivered;
+		let asking = message.workflowRunId === undefined ? session.turn : undefined;
 		let open: OpenInput = {
 			session: message.session,
+			...(asking ? { turn: asking } : {}),
 			controller,
 			method: message.input.method,
 			decisions: [],

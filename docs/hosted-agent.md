@@ -42,27 +42,36 @@ The server owns what can be chosen, never the browser. It builds a catalog from 
 sends it to the room in `chat:model` (with the stored choice) when somebody joins and when either
 changes:
 
-| Harness                     | Catalog                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Applied by                                                                                                                                                                                                                                                     |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `atomic`                    | The models of the Atomic model runtime the adapter builds: every chat model it has credentials for that `HARNESS_AUTH` would run, as `provider/model`, in the order the runtime reports them (the picker groups them by provider, in the order each first appears, and a model it reports twice is listed twice, a choice of that id being the first entry's), with each model's thinking levels as Atomic reads them (`xhigh` and `max` only where the model maps them) and its context size as the description. `MODEL` is the default. | The turn's `model` and `thinkingLevel`, set on the session; with no level chosen the model runs its own (the level saved for it in the operator's Atomic settings, else their default level, else `medium`), whichever model or level the session held before. |
-| `remote`                    | What the attached client reported in its [capability catalog](agent-connection.md#capability-catalog), with `MODEL` as the default when set. An older client, or one that reports no models, offers none.                                                                                                                                                                                                                                                                                                                                 | `model` and `thinkingLevel` in the `turn` message; the level only to a client that offered `capability-catalog`.                                                                                                                                               |
-| `copilot-sdk` and any other | None: the composer offers no control, because a choice nobody honors is not offered.                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Not applicable.                                                                                                                                                                                                                                                |
+| Harness                     | Catalog                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Applied by                                                                                                                                                                                                                                                                                                                     |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `atomic`                    | The models of the Atomic model runtime the adapter builds: every chat model it has credentials for that `HARNESS_AUTH` would run, as `provider/model`, in the order the runtime reports them (the picker groups them by provider, in the order each first appears, and a model it reports twice is listed twice, a choice of that id being the first entry's), with each model's thinking levels as Atomic reads them (`xhigh` and `max` only where the model maps them) and its context size as the description. `MODEL` is the default. | The turn's `model` and `thinkingLevel`, set on the session; with no level chosen the model runs its own (the level saved for it in the operator's Atomic settings, else their default level, else `medium`), never one an earlier turn set.                                                                                    |
+| `remote`                    | What the attached client reported in its [capability catalog](agent-connection.md#capability-catalog), with `MODEL` as the default when set. An older client, or one that reports no models, offers none.                                                                                                                                                                                                                                                                                                                                 | `model` and `thinkingLevel` in the `turn` message; the level only to a client that offered `capability-catalog`. With `session-choice` too, also in `start` and `fork`, so a session the client makes starts on them. Where nobody chose a model, `model` is `MODEL` when set; a field left out runs the client's own default. |
+| `copilot-sdk` and any other | None: the composer offers no control, because a choice nobody honors is not offered.                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Not applicable.                                                                                                                                                                                                                                                                                                                |
 
 The thinking level is a field of the turn the harness is given, beside `model` (`PlannerTurn` in
 `apps/server/src/harness/turn-level.ts`). `HarnessAgent` builds a turn from a fixed set of fields
 that has none for it, so the call that starts a Planner turn carries the level and the harness
-wrapper puts it on that turn; no turn can see another's, and a background job's turn has none.
+wrapper puts it on that turn; no turn can see another's.
 
 `chat:model` checks a choice against the catalog reported now, stores it under the writer lease
 and only then answers the sender and tells the room. It refuses a model or a level the catalog
 does not list (whatever its spelling or length: only the catalog decides, and what it lists is
 stored as written), a field that is not a string, a choice for a child document
 (which uses its root's), and every choice where no catalog is offered; choosing nothing goes back
-to the default. Every Planner turn a person started resolves the stored choice again. A model that
-has gone, or a level its model no longer lists, is not sent: the default runs, Chat says so once
+to the default. Every Planner turn resolves the stored choice again: one a person typed, one nobody
+did (initiative, readiness, decision follow-ups, a finished run) and a background job's alike. A
+Planner session that has to be made again (after a crash, a restart, a reset, or a link that could
+not resume) is opened with it too, so its first turn runs the chosen model and level, never the
+harness's default, and making it again never changes what is stored. A remote client that offered
+`session-choice` is told it in [`start` and `fork`](agent-connection.md#server-to-client), so a
+session it makes opens on it; each turn still carries its own, and one that names none, after a
+person chose Default or cleared the level, runs the default (`MODEL` for the model where it is set,
+else the client's own). A session opened, or a turn started, while an attached client has yet to
+report its catalog, such as the first after a restart, waits up to 10 seconds for the report rather
+than falling back for want of it. A model that has gone, or a level its model no longer lists, is not sent: the default runs, Chat says so once
 while the reason stands (and again if it changes, or comes back after the choice was honored), and
 the composer shows what will run. The stored choice is
-kept, so it returns to force if the model does. Background jobs never carry a choice.
+kept, so it returns to force if the model does.
 
 The composer says so even where nothing can be chosen any longer. When a client withdraws all its
 models, or an older client takes its place, there is no catalog and the picker is gone, but the
@@ -306,6 +315,9 @@ Chopin's tools available to the Planner under every harness are:
   [pages like `read_plan`](#reading-a-large-document). They are
   never offered to background jobs, and unexpected storage errors reach the
   model only as a generic message;
+- `create_document`, which makes new top-level documents for the person whose
+  message drives the turn (see [Creating documents](#creating-documents)); it is
+  never offered to background jobs;
 - bounded file and tree reads plus commit history using the session's default
   branch, or an explicitly supplied full commit ID when inspecting investigation evidence;
 - repository-scoped code search, post-filtered by repository node ID; and
@@ -398,7 +410,9 @@ their usual [bind rules](self-hosting.md#choose-and-trust-a-harness).
 
 The Planner's own turns offer only read-only tools beside Chopin's document and
 repository tools: `read`, `find` and `search` for the working directory,
-Atomic's web research tools, `ask_user_question`, `workflow`, and `intercom`,
+Atomic's web research tools, `ask_user_question`, and `workflow` (in a Chat
+thread, also `tell_chat_planner`; see
+[What a thread decided reaches the Chat](#what-a-thread-decided-reaches-the-chat)),
 plus the read-only tools the operator names in `chopin.plannerTools` of the
 agent directory's `settings.json`, such as a code search tool a package
 registers:
@@ -412,8 +426,13 @@ tools to a Planner, and a name that edits files, runs commands or starts agents
 (`bash`, `edit`, `write`, `kill`, `subagent`, `todo`) stops the Planner from
 starting. It cannot edit files, run commands, or start subagents itself, so it
 never implements the plan; a workflow it starts keeps the tools its stages
-declare. Atomic's workflows, MCP, web access, and Intercom run alongside
-Chopin's tools. The normal Atomic
+declare. Atomic's workflows, MCP, and web access run alongside Chopin's tools.
+Atomic's `intercom` is never offered to a Planner's turns, and they refuse it
+even from a codemode script, even when the operator names it in
+`chopin.plannerTools`: its model would choose the sessions and groups it
+reaches, so one document's Planner could list or message another's. Atomic's
+Intercom package stays loaded, so the stages of a workflow a Planner starts keep
+their run's own Intercom group. The normal Atomic
 agent directory (including `ATOMIC_CODING_AGENT_DIR` or the legacy
 `PI_CODING_AGENT_DIR` override) supplies extensions, skills, prompt templates,
 context files, and a read-only copy of its settings. A verified checkout's
@@ -455,18 +474,51 @@ instructions state which case applies: a verified checkout, or an empty
 directory with no repository files, in which case it reads the repository through
 Chopin's repository tools.
 
-The Planner still does not implement the plan. When a member asks to implement it
-now, its instructions note that its `intercom` tool can reach other sessions on
-the same machine, such as one working in a checkout of the document's
-repository, and that it can pass the request to one of them and tell the member
-where the work continues. Chopin does not track or verify that handoff.
+The Planner still does not implement the plan, and it cannot hand the request
+to another session. When a member asks to implement it now, its instructions
+tell it to say so and offer to prepare the task graph instead.
 
-An Intercom `ask` returns once it is delivered and waits only Atomic's automatic
-yield, a few seconds, for the reply. Chopin starts no turn it did not ask for, so
-a reply that arrives after the turn ends stays in the session unread until the
-next turn. The instructions therefore tell the Planner to ask with a foreground
-`wait` of up to ten minutes when it needs the answer for a member, such as when
-it checks on a workflow run.
+### What a thread decided reaches the Chat
+
+A Chat thread's Planner session is a fork of the Chat's session at the thread's
+root, and nothing said in the thread reaches the Chat's Planner by itself. Under
+`HARNESS=atomic` a thread's Planner turns are offered one more host tool,
+`tell_chat_planner`, its route to the Planner of the same document's Chat. It
+sends a short note: what was decided, by whom, and the thread it was decided in.
+The tool takes no target. The server fixes it from the thread's own document, so
+a Planner can reach only its own document's Chat Planner and never another
+document's. The route is Chopin's, not Atomic's Intercom broker: Atomic's
+Intercom delivers to a live session and starts a turn in an idle one, while a
+Chat Planner session lives only for its turn. Like every Planner, a thread's is
+not offered Atomic's `intercom` (see [Full Atomic Planner](#full-atomic-planner)),
+so `tell_chat_planner` is its only route to another session.
+
+The thread's Planner sends one note for each Decision card it asked in the
+thread that a person answered, naming the card, and the server refuses a second
+note for the same card. The server keeps the ids of the cards each thread's
+Planner asks with the thread (`ask_user_question`, `ask`, `open_decision` and
+`open_decisions` all count) and refuses a note naming a card asked anywhere
+else. The Planner may also note a choice a person settled in words that it acts
+on, and sends nothing when nothing was decided. The server checks that each
+person named took part in the thread or answered the card, and keeps at most 20
+unread notes per document. A note is saved with the Chat's session state before
+any Chat turn can be given it and before the tool says it was sent; one that
+could not be saved is reported as not sent and is never given to a turn. Every
+Chat turn reads the saved session state before it takes notes or saves the
+state, however it started (a browser message, a Retry, `invoke_planner`), so a
+turn in a room opened after a restart or eviction neither misses a waiting note
+nor forgets which cards were noted. The
+note starts no turn and is not posted in Chat. The Chat Planner's next turn is
+given every unread note, with the thread's words quoted as data rather than
+instructions: ahead of its prompt, or, when the turn opens with a skill or a
+prompt template that has to stand first, as a session message recorded before
+the command so later turns keep it. The notes a turn for a message was given are saved with the session
+state, so a Retry of that turn is given them again, after a restart too.
+`copilot-sdk` and `remote` Planners are not offered the tool. The `[agent] N
+tools:` line logged as an Atomic Planner session opens lists what Atomic
+registered, `intercom` included; the line after it, `[agent] Planner withholds
+intercom; route out: …`, says its turns refuse `intercom` and names
+`tell_chat_planner` for a thread's Planner, or `none`.
 
 Chopin implements Atomic's `HostInput`, bound through
 `extensionBindings.humanInput`; it does not intercept tools. `ask_user_question`,
@@ -810,7 +862,10 @@ through the same path as the [full Atomic Planner](#full-atomic-planner): the sa
 verbatim text, the same 30-minute expiry, cancellation that withdraws open
 cards, and answers to a workflow question held while the client reports that
 run's root as paused. `input-result` returns what Atomic would have received in
-process, with a status that tells an expiry from a cancellation.
+process, with a status that tells an expiry from a cancellation. Stopping a turn
+withdraws the questions it asked while it ran outside any workflow run, as Stop
+does an Atomic Planner's, and cancels at once any it asks before it ends, so a
+Decision the turn waited on never keeps its session for the next message.
 
 **Runs.** The client reports its workflow runs with `runs`; Chat shows those
 cards and keeps the session after its turn while any run is live or paused, as
@@ -1193,12 +1248,21 @@ Nothing a person sends to the Planner is held for later. A message is never "wai
   machine's own work is, and the status beside the composer says so (_Your work is kept._), but
   the message is not.
 
-A message sent while a turn is only beginning or finishing has no session to be given to just
-now. It is answered as a passing trouble (`temporarily-unavailable`), and its browser sends it
-again, with the same request ID, in a moment. If a turn ends between a message being posted and
-the turn reading it, an idle Chat starts a turn for the message; otherwise Chat says that Chopin
-did not read it, and it is not sent again on its own. A process that is stopping starts no turn and
-says nothing, so the browser sends the message again to the next process. Sends are admitted one
+A message sent while a turn is being stopped or finishing, or while one of Chopin's own turns is
+being handed the Chat, has no session to be given to just now. It is saved and acknowledged at
+once, and starts the next turn as that one winds down, ahead of anything waiting, as a message
+that preempts a job does. A message sent while such a person's turn waits to start is saved and
+acknowledged at once too, and given to that turn once it can take one; a harness that takes no
+input mid-run refuses it with `planner-starting` and words that ask for no Stop, since nothing is
+running for Stop to end: "chopin is about to answer another message and can't take more while it
+works on this machine. Send yours again once it has answered." None of these is answered as a passing
+trouble, so no message waits in its browser's outbox behind another. If a turn ends between a
+message being posted and the turn reading it, an idle Chat starts a turn for the message; otherwise
+Chat says that Chopin did not read it, and it is not sent again on its own. A process that is
+stopping starts no turn and says nothing, so the browser sends the message again to the next
+process. A message it had already kept for a turn that has not started yet is not lost silently:
+the stopping process says in Chat that Chopin did not read it ("chopin did not read @bo's message.
+Send it again to ask."), before it hands over. Sends are admitted one
 at a time, and at most 20 are processed at once (past that a send is answered
 `temporarily-unavailable`).
 
@@ -1221,11 +1285,13 @@ at that point, and none counts against what a person may send.
 **What a person sees.** The message is in Chat at once, as theirs, with no mark. While only the
 browser has it, in an outbox that sends it by itself, in order and once, when the page's connection
 is back, it says **Sending**; never waiting, queued or a clock. When the server refuses it because
-no machine took it or the running turn cannot take input mid-run, and the composer holds no newer
+no machine took it or the harness cannot take input mid-run (`planner-not-attached`,
+`planner-busy`, `planner-starting`), and the composer holds no newer
 draft, the message's words (with its mention, references and staged files) return to the composer
-draft, chopin says why in a row at the end of the transcript only that person sees (with _How
-to fix_ where the machine has something to fix), so nothing typed is lost, and while Chopin works the composer's
-one button offers Stop so the person can stop Chopin and send it. When a newer draft was already
+draft, chopin says why in a row only that person sees, at the time it was said (with _How
+to fix_ where the machine has something to fix), so nothing typed is lost, and for `planner-busy`
+while Chopin works the composer's one button offers Stop so the person can stop Chopin and send it
+(`planner-starting` keeps Send, so it never stops the waiting person's turn). When a newer draft was already
 typed, or another refusal turned the message down, it says **Couldn't send** on itself, with the
 reason, **Try again** and **Delete**, which act on the outbox alone since the server kept nothing.
 While the page's offline bar shows, both give way to it and return with the connection. The
@@ -1253,11 +1319,10 @@ The one exception is an atomic Planner session that still owns Atomic workflow
 runs when its turn ends. A workflow the Planner starts outlives the turn that
 launched it, and its runs belong to that session, so Chopin keeps the session
 and its owner binding, and keeps the document loaded, until every run has
-finished. The next turn reuses that session, so the Planner can still see and
-steer its runs over Intercom; people steer through Chat and Decisions, never a
-stage directly. Since Atomic 0.9.44 such a message reaches a busy stage after
-its current tool calls finish rather than cancelling them, unless the Planner
-sends it as an `interrupt`. **Stop Planner** also pauses the session's live runs, resumably,
+finished. The next turn reuses that session, so the Planner can still see,
+pause and resume its runs with its `workflow` tool; it cannot message their
+stages, since it has no `intercom`. People steer through Chat and Decisions,
+never a stage directly. **Stop Planner** also pauses the session's live runs, resumably,
 through Atomic's session run control, and **Resume Planner** resumes the runs it
 paused. A run waiting on a question pauses too: Atomic withdraws the question
 from Decisions while the run is paused and presents it again on Resume, and an
@@ -1319,9 +1384,9 @@ server's process environment is left unchanged. An operator's non-empty
 `ATOMIC_STORAGE` selections do not move a Planner session's journal, and
 neither does the shared top-level `storage` setting, including an adapter named
 by package such as the libSQL selection `atomic storage join` writes. That
-setting does reach the Planner's Intercom: its sessions use the machine's
-Intercom broker, which keeps its routing in the selected database and so can
-reach sessions on every machine that selects the same one. Atomic
+setting does reach the Intercom of the workflow stages a Planner starts: they
+use the machine's Intercom broker, which keeps its routing in the selected
+database and so can reach sessions on every machine that selects the same one. Atomic
 still checks every set `ATOMIC_STORAGE`, `ATOMIC_SESSIONS_STORAGE`, and
 `ATOMIC_WORKFLOWS_JOURNAL` when it creates a session, so an invalid value fails
 every Atomic turn with a `StorageConfigError` naming the variable. A Build is not a workflow run and has no card in Chat: its tasks, their
@@ -1338,6 +1403,62 @@ attempt. `AGENT=off` prevents those turns and disables the background-job
 runner. For the `copilot-sdk` adapter this also avoids starting Copilot CLI.
 `AGENT=off` does not disable `/mcp`, and the prototype UI may still contain
 Planner-oriented explanatory copy.
+
+## Creating documents
+
+When a request splits into separate pieces of work (several features, or one
+change across the whole app), the Planner can open one new document per piece
+with `create_document` instead of writing one document too large to review. Its
+instructions prefer separate documents unless the person asks for one.
+
+The tool takes an `idempotencyKey`, a `title`, a `brief` (MCP's
+`create_document` brief), the whole first `document` in the dialect, and an
+optional `instruction`. It is a host tool, so it is offered under every harness
+(`copilot-sdk`, `atomic` and `remote`), and it is among the Planner's tools the
+Copilot SDK adapter checks a session against. `apps/server/src/agent/new-documents.ts`
+holds its rules:
+
+- **Who creates it.** Only a turn a person's Chat message, thread reply or
+  `invoke_planner` message drives may create documents; a turn nobody typed, a comment turn and a
+  background job are refused. That person is the creator. Their own live browser
+  login is asked again for push or administration access to the repository, as
+  `chat:send` is, both before and after the visual assessment; the Planner owner's
+  credential never authorizes a new document. A person with no live login is
+  refused.
+- **What it makes.** A top-level document in the creating document's repository,
+  with its own Chat, Decisions and Planner session, sharing no transcript with the
+  creating one. Its recorded base is the creating document's own (from its MCP
+  creation), or else the repository's default branch at its current commit. The
+  draft goes through MCP's `prepare` and the same visual assessment
+  (`createDocument` in `apps/server/src/mcp/hosted.ts` serves both). It is given
+  the creating document's model and thinking level, stored with the creator as
+  its chooser in the same transaction that creates the document, fenced by the
+  writer lease (`CreateChannel.modelChoice`). A choice that can't be stored
+  creates nothing, so a retry creates the document with it; a retry of a
+  document already made never writes a choice, and so keeps any chosen since.
+- **Bounds.** At most 10 documents a turn and 30 an hour for one person, counted
+  in the process. A turn's count is kept with the turn itself (its active member
+  request) for as long as it runs, a turn waiting on a Decision included, and
+  goes with it. The idempotency key is scoped to the creating document, so a
+  retried call returns the document the first made and creates and starts
+  nothing again; the same key with a different draft is a conflict. A retry is
+  looked up in storage first: it is compared against the base the first call
+  recorded, so a default branch that moved since is no conflict, and it is
+  answered even after the limits are spent, since it counts toward neither.
+- **Order.** The document is stored first. Then the sidebar hears of it through
+  `/ws/sidebar`, the Chat or thread whose turn asked gets one system line naming
+  it with a link (`Chat.Entry.document`), saved before it is shown, and, if an
+  `instruction` was given, it is posted in the new document's Chat as the
+  creator's message, exactly as `invoke_planner` posts one, starting that
+  document's Planner under the same machine rules as any other document. A
+  refused instruction (no machine attached, for one) leaves the document in place
+  and is reported to the model. A line that could not be saved is reported too
+  (`announced: false`), and the same call again posts it; one the Chat already
+  holds is never posted twice, so a retry after a crash between the two posts
+  the missing line and nothing else.
+
+The result gives each new document's `id` and absolute `url`, so the model, or a
+workflow it started, can follow up on it.
 
 ## Background jobs
 

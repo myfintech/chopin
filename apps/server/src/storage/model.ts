@@ -317,6 +317,8 @@ export type CreateChannel =
 		now: Date;
 		/** A complete revision-zero checkpoint published in the channel's creation transaction. */
 		initial?: InitialChannel;
+		/** A Planner model choice stored in the creation transaction, fenced by the writer lease. */
+		modelChoice?: { lease: Lease; choice: Omit<PlannerModelChoice, "channelId"> };
 	};
 
 export type RenameChannel = {
@@ -1084,10 +1086,31 @@ export type ChatThreadRecord = {
 	forkedAt: number;
 	createdBy: string;
 	entries: import("@chopin/protocol").Chat.Entry[];
+	/**
+	 * The last sequence the thread gave out (`Entry.seq`), which taking entries out moves past.
+	 * Absent on a thread saved before it existed, whose entries' own sequences are all it gave.
+	 */
+	lastSeq?: number;
 	compactions: import("@chopin/protocol").Chat.CompactionRecord[];
 	usage?: import("@chopin/protocol").Chat.ContextUsage;
 	forkState: ChatThreadForkState;
+	/** Decision cards this thread's Planner asked: the only cards it may tell the Chat's Planner about. */
+	askedQuestions?: string[];
 	updatedAt: Date;
+};
+
+/** What a thread's Planner told the document's Chat Planner a person decided in the thread. */
+export type ChatThreadNote = {
+	id: string;
+	/** The thread's root message id. */
+	rootId: string;
+	/** Who wrote the root message, and its opening words, when the note was sent. */
+	root: { author: string; excerpt: string };
+	decision: string;
+	decidedBy: string[];
+	/** The answered Decision card the note is about; one card is noted at most once. */
+	question?: string;
+	ts: number;
 };
 
 export type ChatSessionState = {
@@ -1097,6 +1120,12 @@ export type ChatSessionState = {
 	atomicEntries?: JsonValue[];
 	atomicLeafId?: string | null;
 	entryForks: Record<string, EntryForkPoint>;
+	/** Notes from threads that the Chat Planner has not read yet, oldest first. */
+	threadNotes?: ChatThreadNote[];
+	/** Every Decision card a thread's Planner has sent a note for, read or not. */
+	notedQuestions?: string[];
+	/** The notes the Chat Planner's latest turn for a message was given, for a Retry of it. */
+	givenNotes?: { entryId: string; notes: ChatThreadNote[] };
 	updatedAt: Date;
 };
 

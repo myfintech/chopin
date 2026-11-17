@@ -1,5 +1,5 @@
 import { finalizeTitleReceipt } from "../title";
-import { conflict, missing } from "../errors";
+import { conflict, missing, unavailable } from "../errors";
 import { documentSlug, documentSlugCandidate } from "../../channels/slug";
 import { sidecarUnansweredDecisions } from "../../questions/unanswered";
 import { childSidecarWithoutConversation } from "../child-conversation";
@@ -591,7 +591,18 @@ export class MemoryStorage implements StorageAdapter {
 	}
 
 	#createChannel(input: CreateChannel): ChannelRecord {
+		if (input.modelChoice) {
+			try {
+				this.#assertLease(input.modelChoice.lease);
+			} catch (err) {
+				throw unavailable("a document's model choice needs the writer lease", err);
+			}
+		}
 		if (!this.#users.has(input.createdBy)) throw missing(`user ${input.createdBy} does not exist`);
+		let chosen = input.modelChoice?.choice;
+		if (chosen && !this.#users.has(chosen.userId)) {
+			throw missing(`user ${chosen.userId} does not exist`);
+		}
 		if (this.#channels.has(input.id)) throw conflict(`channel ${input.id} already exists`);
 		if (input.parentChannelId !== undefined) {
 			if (input.parentChannelId.length === 0) throw missing("parent channel id is required");
@@ -604,7 +615,7 @@ export class MemoryStorage implements StorageAdapter {
 				throw conflict(`channel ${input.parentChannelId} cannot parent another child`);
 			}
 		}
-		let { initial, now, ...record } = input;
+		let { initial, now, modelChoice: _modelChoice, ...record } = input;
 		let slug = this.#reserveSlug(input.repositoryId, input.id, input.title);
 		let saved: ChannelRecord = {
 			...record,
@@ -629,6 +640,7 @@ export class MemoryStorage implements StorageAdapter {
 			});
 			if (initial.provenance) this.provenance.record(saved.id, initial.provenance, now);
 		}
+		if (chosen) this.#plannerModelChoices.create({ ...chosen, channelId: saved.id });
 		return channel(saved);
 	}
 

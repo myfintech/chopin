@@ -28,6 +28,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fullPlanner, settleEndedRuns, workflowRuns } from "./full";
 import { atomicThinkingLevels } from "../catalog";
+import { THREAD_NOTE_TOOL_NAME } from "../tool-names";
 
 import type {
 	HarnessV1,
@@ -66,11 +67,11 @@ export const ATOMIC_DEFAULT_SYSTEM_PROMPT =
 
 /**
  * What a full Planner's own turns may call besides Chopin's tools: reading the
- * checkout and the web, asking Decisions, running workflows, Intercom, and
- * codemode. Codemode scripts call only the tools this turn already offers, plus
- * non-LLM models such as classifiers and image generators, so it adds no file
- * edits or commands. The Planner cannot edit files or run commands, so
- * implementing the plan goes to another session.
+ * checkout and the web, asking Decisions, running workflows, and codemode.
+ * Codemode scripts call only the tools this turn already offers, plus non-LLM
+ * models such as classifiers and image generators, so it adds no file edits or
+ * commands. The Planner cannot edit files or run commands, so it never
+ * implements the plan itself.
  */
 export const FULL_PLANNER_TOOLS: ReadonlySet<string> = new Set([
 	"read",
@@ -82,9 +83,15 @@ export const FULL_PLANNER_TOOLS: ReadonlySet<string> = new Set([
 	"get_search_content",
 	"ask_user_question",
 	"workflow",
-	"intercom",
 	"codemode",
 ]);
+
+/**
+ * What no full Planner's turn may call, however it is reached: Atomic's `intercom` lets the model
+ * pick its target and group, so one document's Planner could reach another's. A thread's one route
+ * out is Chopin's `tell_chat_planner`, to its own document's Chat Planner.
+ */
+export const PLANNER_WITHHELD_TOOLS: ReadonlySet<string> = new Set(["intercom"]);
 
 /** Atomic tools that change files, run commands or start agents, which no setting gives a Planner's own turns. */
 const WRITING_TOOLS: ReadonlySet<string> = new Set([
@@ -274,6 +281,8 @@ export type TurnPolicy = {
 	systemPrompt: string;
 	result?: { value: unknown };
 	full?: boolean;
+	/** Tools refused in this session however they are reached, a codemode script included. */
+	withheld?: ReadonlySet<string>;
 };
 
 /**
@@ -321,6 +330,9 @@ export function atomicTurnExtension(policy: TurnPolicy): ExtensionFactory {
 			if (stage) {
 				if (event.toolName !== ATOMIC_RESULT_TOOL_NAME) return;
 				return { block: true, reason: `${event.toolName} is not available in a workflow stage.` };
+			}
+			if (policy.withheld?.has(event.toolName)) {
+				return { block: true, reason: `${event.toolName} is not available to a Chopin Planner.` };
 			}
 			if (policy.full && event.toolName !== ATOMIC_RESULT_TOOL_NAME) return;
 			if (activeNames(policy).includes(event.toolName)) return;
@@ -593,6 +605,8 @@ type Run = {
 	stop: () => void;
 	/** Gives the model a person's message at its next step, between a step's tool calls and its next call. */
 	steer: (text: string) => Promise<void>;
+	/** Settles once Atomic has begun the turn's prompt, or the turn is over. */
+	begun: PromiseWithResolvers<void>;
 	done: Promise<void>;
 };
 
@@ -720,6 +734,7 @@ export function createAtomicAdapter(
 			let settingsManager = SettingsManager.inMemory(SETTINGS);
 			let policy: TurnPolicy = {
 				full: !!full,
+				...(full ? { withheld: PLANNER_WITHHELD_TOOLS } : {}),
 				hostNames: [],
 				structured: false,
 				systemPrompt: ATOMIC_DEFAULT_SYSTEM_PROMPT,
@@ -775,6 +790,7 @@ export function createAtomicAdapter(
 					}
 					return;
 				}
+				if (event.type === "agent_start") run.begun.resolve();
 				if (event.type === "turn_start") {
 					let offered = session.agent.state.tools.map(tool => tool.name);
 					if (!full && !sameNames(offered, activeNames(policy))) {
@@ -978,6 +994,11 @@ export function createAtomicAdapter(
 					}
 					let registered = session.getAllTools().map(tool => tool.name);
 					console.log(`[agent] ${registered.length} tools: ${registered.sort().join(", ")}`);
+					if (policy.withheld) {
+						let route = hostNames.includes(THREAD_NOTE_TOOL_NAME) ? THREAD_NOTE_TOOL_NAME : "none";
+						let withheld = [...policy.withheld].join(", ");
+						console.log(`[agent] Planner withholds ${withheld}; route out: ${route}`);
+					}
 					live = {
 						session,
 						signature,
@@ -1053,8 +1074,9 @@ export function createAtomicAdapter(
 					let structured = turn.responseFormat?.type === "json";
 					let names = full
 						? agent.getAllTools().map(tool => tool.name).filter(name =>
-							FULL_PLANNER_TOOLS.has(name) || plannerTools.has(name)
-							|| policy.hostNames.includes(name)
+							!policy.withheld?.has(name)
+							&& (FULL_PLANNER_TOOLS.has(name) || plannerTools.has(name)
+								|| policy.hostNames.includes(name))
 						)
 						: policy.hostNames;
 					let expected = structured ? [...names, ATOMIC_RESULT_TOOL_NAME] : names;
@@ -1086,7 +1108,12 @@ export function createAtomicAdapter(
 							run.pending.clear();
 							void bounded(agent.abort(), "Atomic abort timed out.").catch(() => {});
 						},
+						begun: Promise.withResolvers<void>(),
 						steer: async text => {
+							// A message given as the turn opens waits for Atomic to begin its prompt.
+							if (!run.stopped && current === run && !agent.isStreaming) {
+								await bounded(run.begun.promise, "Atomic turn did not begin.");
+							}
 							// Atomic would start a turn of its own for a message it is given while idle, and
 							// Chopin never starts one it did not ask for.
 							if (run.stopped || current !== run || !agent.isStreaming) {
@@ -1105,10 +1132,18 @@ export function createAtomicAdapter(
 							if (!run.stopped) {
 								run.emit({ type: "stream-start", modelId: agent.model?.id });
 								await agent.agent.waitForIdle();
-								await agent.prompt(text, {
-									expandPromptTemplates: !!full,
-									...(images.length ? { images } : {}),
-								});
+								if (full && turn.context && !run.stopped) {
+									await agent.sendCustomMessage(
+										{ customType: "chopin.turn_context", content: turn.context, display: false },
+										{ triggerTurn: false },
+									);
+								}
+								if (!run.stopped) {
+									await agent.prompt(text, {
+										expandPromptTemplates: !!full,
+										...(images.length ? { images } : {}),
+									});
+								}
 							}
 							if (run.failure) throw run.failure;
 							if (run.stopped) return;
@@ -1174,6 +1209,7 @@ export function createAtomicAdapter(
 							});
 						} finally {
 							if (current === run) current = undefined;
+							run.begun.resolve();
 						}
 					})();
 					listen(run, turn.abortSignal);

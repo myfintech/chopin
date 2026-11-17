@@ -10,6 +10,7 @@ import {
 	BACKGROUND_TOOL_NAMES,
 	PLANNER_TOOL_NAMES,
 	REACTION_TOOL_NAMES,
+	THREAD_NOTE_TOOL_NAME,
 	VISUAL_PLANNER_TOOL_NAMES,
 } from "./tool-names";
 import { remotePlanner } from "./remote/registry";
@@ -434,6 +435,48 @@ describe("Planner workspaces", () => {
 		return { registered: registered!, instructions };
 	}
 
+	it("offers tell_chat_planner only to a thread's full Atomic Planner session", async () => {
+		let opened: string[] = [];
+		let tools: Array<readonly string[] | undefined> = [];
+		let tellChat = async () => "Sent.";
+		let cases = [
+			{ harness: "atomic", tellChat },
+			{ harness: "atomic" },
+			{ harness: "copilot-sdk", tellChat },
+			{ harness: "remote", tellChat },
+		];
+		let agent = (name: string) =>
+			({
+				createSession: async () => {
+					opened.push(name);
+					return { destroy: async () => {} };
+				},
+			}) as never;
+		for (let given of cases) {
+			let { owner, channel, deps } = fixture();
+			let session = await openPlannerSession(owner, {
+				...channel,
+				...given,
+				room: { id: "channel", plan: {}, server: {}, visual: {} } as never,
+			}, {
+				...deps,
+				agent: undefined,
+				visualAgent: agent("planner"),
+				threadVisualAgent: agent("thread"),
+			});
+			if (!session.ok) throw new Error("the Planner session did not open");
+			tools.push(session.value.activeTools);
+			await session.value.destroy();
+		}
+		expect(opened).toEqual(["thread", "planner", "planner", "planner"]);
+		expect(tools).toEqual([
+			[...VISUAL_PLANNER_TOOL_NAMES, THREAD_NOTE_TOOL_NAME],
+			VISUAL_PLANNER_TOOL_NAMES,
+			VISUAL_PLANNER_TOOL_NAMES,
+			VISUAL_PLANNER_TOOL_NAMES,
+		]);
+	});
+
 	it("reuses a channel's remembered checkout for every later atomic session while it verifies", async () => {
 		let path = await checkout("workgit:owner/repo.git");
 		rememberCheckout("channel", path);
@@ -445,9 +488,8 @@ describe("Planner workspaces", () => {
 			expect(instructions).toContain("a withdrawn question is not an answer or approval");
 			expect(instructions).toContain("never tell them to use `/workflow connect`");
 			expect(instructions).toContain("Chat shows a card for each workflow run you start");
-			expect(instructions).toContain("`intercom` tool can reach other sessions");
-			expect(instructions).toContain("one working in a checkout of owner/repo");
-			expect(instructions).toContain('wait: { kind: "foreground", budgetMs: 600000 }');
+			expect(instructions).toContain("cannot edit files, run commands or reach other\nsessions");
+			expect(instructions).not.toContain("intercom");
 			expect(instructions).not.toContain("You have no shell");
 		}
 		let git = Bun.spawn(["git", "-C", path, "remote", "set-url", "origin", "workgit:other/repo"], {
@@ -520,7 +562,7 @@ describe("Planner workspaces", () => {
 			expect(instructions).toContain("a withdrawn question is not an answer or approval");
 			expect(instructions).toContain("never tell them to use `/workflow connect`");
 			expect(instructions).toContain("Chat shows a card for each workflow run you start");
-			expect(instructions).toContain("one working in a checkout of owner/repo");
+			expect(instructions).not.toContain("intercom");
 		}
 		forgetWorkspaces();
 		expect((await stat(first.registered!.cwd)).isDirectory()).toBe(true);
