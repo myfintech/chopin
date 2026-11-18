@@ -513,11 +513,7 @@ export function bindTopLevel(
 		...context,
 		sessionForks: {
 			prepareTurn(currentEntryId, retry) {
-				if (retry && currentEntryId) {
-					rewind(state, context.chat.entries, currentEntryId);
-					if (state.given?.entryId === currentEntryId) state.notes.unshift(...state.given.notes);
-					state.given = undefined;
-				}
+				if (retry && currentEntryId) rewind(state, context.chat.entries, currentEntryId);
 				let hasAtomic = !!state.atomicEntries?.length;
 				let untrackedEntries = hasAtomic
 					? context.chat.entries.filter(
@@ -550,10 +546,13 @@ export function bindTopLevel(
 			async load() {
 				await ensureLoaded(context, override);
 			},
-			takeNotes(currentEntryId) {
+			takeNotes(currentEntryId, retry) {
 				return inSessionQueue(state, async () => {
 					await ensureLoaded(context, override);
-					let notes = state.notes;
+					let replayed = retry && currentEntryId && state.given?.entryId === currentEntryId
+						? state.given.notes
+						: [];
+					let notes = [...replayed, ...state.notes];
 					if (!notes.length) return undefined;
 					state.notes = [];
 					state.given = currentEntryId ? { entryId: currentEntryId, notes } : undefined;

@@ -278,6 +278,11 @@ export function holdStarts(held = true): void {
 	startsHeld = held;
 }
 
+/** Whether the process has stopped starting turns. */
+export function startsAreHeld(): boolean {
+	return startsHeld;
+}
+
 /**
  * What a Chat that has closed says to a request. A process that is stopping says nothing at all:
  * the request was not taken, its browser keeps it and sends it again, with the same id, to the
@@ -931,8 +936,9 @@ export type Room = {
 		/**
 		 * What threads told the Chat's Planner since its last turn, for this turn, once: resolves
 		 * after every note already being saved is saved or refused. Absent on a thread's own room.
+		 * `retry`: the notes the failed attempt of `currentEntryId` was given come first, again.
 		 */
-		takeNotes?: (currentEntryId?: string) => Promise<string | undefined>;
+		takeNotes?: (currentEntryId?: string, retry?: boolean) => Promise<string | undefined>;
 	};
 	/** Called when harness-reported context usage or compactions change. */
 	onSessionMetaChanged?: () => Promise<void> | void;
@@ -3511,7 +3517,7 @@ async function run(
 			prompt = compose(backscroll, handle, text, references, available, !!context.invokedBy);
 			let focus = chat.focus;
 			if (focus && !opening) prompt = `${focusContext(focus)}\n\n${prompt}`;
-			let notes = await context.sessionForks?.takeNotes?.(member?.entryId);
+			let notes = await context.sessionForks?.takeNotes?.(member?.entryId, !!member?.retry);
 			if (notes && opening) turnContext = notes;
 			else if (notes) prompt = `${notes}\n\n${prompt}`;
 			if (member && chat.entries.find(value => value.id === member.entryId)?.attachments?.length) {
