@@ -7,7 +7,7 @@
 //   and bills. Where it is silent, the vendor figure noted on the model.
 // - Behavior flags (thinking, temperature, signatures): Pi's newer catalog
 //   entries for the same models (@earendil-works/pi-ai 1.0.0), the catalog
-//   format Atomic's @bastani/pi-ai shares.
+//   format Atomic's @bastani/atomic-ai shares.
 // Prices are USD per million tokens and only affect usage reporting.
 // Atomic sends maxTokens as each request's max_tokens; every value here was
 // verified against the gateway.

@@ -100,7 +100,7 @@ The MANTL file shows the method:
    at `GET /model/info`. `GET /v1/models` lists the exact IDs.
 2. Fill gaps from the vendor's published model card, and note the source in a comment.
 3. Copy behavior flags (`thinkingLevelMap`, `compat`) from the catalog entry for the same
-   model behind a similar gateway, in Atomic's `@bastani/pi-ai` or a newer
+   model behind a similar gateway, in Atomic's `@bastani/atomic-ai` or a newer
    `@earendil-works/pi-ai` release, which often already lists models the installed one lacks.
 4. Verify each model with a real turn that makes a tool call. Watch for a rejected
    `max_tokens`, an unsupported thinking setting, or no response.
