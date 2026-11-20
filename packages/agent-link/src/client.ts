@@ -35,6 +35,10 @@ export const WIRE = {
 	sessionForks: "session-forks",
 	steerTurn: "steer-turn",
 	retryTurn: "retry-turn",
+	sessionChoice: "session-choice",
+	aiCredentials: "ai-credentials",
+	/** The header a runner sends the launch's own credential in, to Chopin's credential proxy. */
+	aiLaunchHeader: "x-chopin-launch",
 	/** How often a client retries a `resume` refused with `retry`, after a `restarting` notice. */
 	restartResumeRetryMs: 250,
 } as const;
@@ -91,6 +95,11 @@ export type AgentHandlers = {
 	 * answered without calling it.
 	 */
 	steer?(message: ServerMessageOf<"steer">): void | Promise<void>;
+	/**
+	 * Takes a session's new AI grants, which replace those its `start`, `fork` or an earlier `ai`
+	 * carried. Having it asks for `ai-credentials`: `start` and `fork` then carry `ai` too.
+	 */
+	ai?(message: ServerMessageOf<"ai">): void | Promise<void>;
 };
 
 export type AgentOptions = {
@@ -135,6 +144,13 @@ export type AgentOptions = {
 	 * the client can drop what the earlier turns for that message left in what it keeps.
 	 */
 	retryTurns?: boolean;
+	/**
+	 * Asks for `session-choice`, which takes effect only with `capabilities`: `start` and `fork` then
+	 * carry the document's chosen `model` and `thinkingLevel`, so a session the client makes starts
+	 * on them. They only open the session; each turn's own `model` and `thinkingLevel` still decide
+	 * what it runs, and a turn without them runs the client's defaults.
+	 */
+	sessionChoice?: boolean;
 };
 
 /** A question this client asked and still waits on, which a later link may carry on. */
@@ -259,6 +275,8 @@ export function linkSocket(
 	sessionForks = false,
 	steering = false,
 	retryTurns = false,
+	sessionChoice = false,
+	aiCredentials = false,
 ): WebSocket {
 	return new (WebSocket as unknown as HeaderWebSocket)(url, {
 		headers: {
@@ -272,6 +290,8 @@ export function linkSocket(
 				...(sessionForks ? [WIRE.sessionForks] : []),
 				...(steering ? [WIRE.steerTurn] : []),
 				...(retryTurns ? [WIRE.retryTurn] : []),
+				...(sessionChoice ? [WIRE.sessionChoice] : []),
+				...(aiCredentials ? [WIRE.aiCredentials] : []),
 			].join(", "),
 		},
 		protocols: [WIRE.subprotocol],
@@ -478,6 +498,8 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 		sessionForks,
 		options.handlers.steer !== undefined,
 		options.retryTurns === true,
+		options.sessionChoice === true,
+		options.handlers.ai !== undefined,
 	);
 	let turns = new Map<string, TurnState>();
 	let asks = new Map<string, PendingAsk>();
@@ -674,6 +696,14 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 				}
 				return;
 			}
+			case "ai":
+				if (!sessions.has(message.session)) return;
+				try {
+					await options.handlers.ai?.(message);
+				} catch (error) {
+					console.error("[agent] the session's AI grants could not be applied:", reason(error));
+				}
+				return;
 			case "host-tool-result": {
 				let calls = turns.get(`${message.session}/${message.turn}`)?.calls;
 				calls?.get(message.toolCallId)?.({

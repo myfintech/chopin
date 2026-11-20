@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { documentSlug } from "../../channels/slug";
 import { storageContract } from "../contract";
 import { ResearchProjectionConflict } from "../model";
-import { contractId, userAndChannel } from "../contract-support";
+import { contractId, testLease, userAndChannel } from "../contract-support";
 import { PostgresStorage } from "./adapter";
 import { PostgresPlannerModelChoiceStore } from "./planner-model-choices";
 import { turnModel } from "../../chat/model-choice";
@@ -281,7 +281,11 @@ if (url) {
 				lease: lease!,
 			});
 			await storage.navigation.setLastDocument(userId, channelId, new Date(now.getTime() + 7));
-			await storage.channels.archive({ id: channelId, now: new Date(now.getTime() + 8) });
+			await storage.channels.archive({
+				id: channelId,
+				now: new Date(now.getTime() + 8),
+				lease: await testLease(storage),
+			});
 			expect(await storage.channels.delete(channelId)).toBe(true);
 		} finally {
 			await storage.close();
@@ -1103,6 +1107,14 @@ if (url) {
 				"039_plan_image_types",
 				"040_chat_attachment_originals",
 				"041_document_full_width",
+				"042_chat_thread_notes",
+				"043_chat_thread_seq",
+				"044_ai_credentials",
+				"045_ai_usage",
+				"046_ai_placeholder_owner",
+				"047_ai_subscriptions",
+				"048_machine_databases",
+				"049_mcp_invocations",
 				"mantl_document_provenance",
 				"mantl_user_preferences",
 			]);

@@ -120,6 +120,8 @@ client must then use none of them.
 | `session-forks`            | A [`fork`](#server-to-client) message to branch a thread's Planner session from an earlier session and turn, multiplexed over the same connection                             |
 | `steer-turn`               | A [`steer`](#server-to-client) message: a person's message for the turn the client is running, read at its next step                                                          |
 | `retry-turn`               | A `turn`'s `message`, the Chat message it answers, and `retry` when it [runs a failed message again](#retrying-a-failed-turn)                                                 |
+| `session-choice`           | With `capability-catalog`, the document's chosen `model` and `thinkingLevel` in [`start` and `fork`](#server-to-client), so a session the client makes opens on them          |
+| `ai-credentials`           | An [AI launch](#models-through-chopin) in `start` and `fork`, and an `ai` message whenever it changes: stand-ins for the person's own AI accounts, reached through Chopin     |
 
 ### Pings
 
@@ -421,8 +423,9 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
 ## Server to client
 
 ```text
-{ "type": "start", "session": "", "mode": "planner" }
-{ "type": "fork", "session": "", "mode": "planner", "from": { "session": "", "turn?": "" } }
+{ "type": "start", "session": "", "mode": "planner", "model?": "", "thinkingLevel?": "", "ai?": {} }
+{ "type": "fork", "session": "", "mode": "planner", "from": { "session": "", "turn?": "" }, "model?": "", "thinkingLevel?": "", "ai?": {} }
+{ "type": "ai", "session": "", "ai": { "launch?": "", "expiresAt?": 0, "providers": [], "withheld": [] } }
 { "type": "turn", "session": "", "turn": "", "prompt": "", "instructions?": "", "model?": "", "thinkingLevel?": "", "attachments?": [{ "id": "", "name": "", "kind": "image", "mediaType": "", "size": 0, "data": "" }], "message?": "", "retry?": true, "tools": [], "responseFormat?": {} }
 { "type": "abort", "session": "", "turn": "" }
 { "type": "steer", "request": "", "session": "", "turn": "", "prompt": "" }
@@ -441,6 +444,27 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   session refused with `start-failed` or not answered in time gets `destroy`,
   and any question asked for it meanwhile is withdrawn and answered
   `cancelled`.
+- `model` and `thinkingLevel` on `start` and `fork` are sent only to a client
+  that offered both `capability-catalog` and `session-choice`: the document's
+  chosen model and level when the session opens, checked against the catalog
+  the client last reported, as it spelled them, and the same `model` and
+  `thinkingLevel` the session's first `turn` carries. Where nobody chose a
+  model, `model` is the operator's `MODEL` when it is set, as in `turn`. A
+  session that opens before a client that offered `capability-catalog` has sent
+  `capabilities`, such as the first after it attaches or resumes, waits for the
+  report, up to **10 seconds**, before `start` or `fork` is sent. They only
+  open the session: make it on them, so whatever it does before its first
+  turn, and any session the client makes again for the document on its own
+  (after its process restarts, say), starts on them. A field present is what
+  to run; a field absent means neither the document nor the operator names
+  one, or the catalog no longer offers it: use the client's own default. They
+  never outlast a turn. Every `turn` carries what it runs by the same rule, and
+  a turn's absent `model` or `thinkingLevel` means the client's own default for
+  it, even where `start` or `fork` named one: that is how a person choosing
+  Default, or clearing the level, reaches a session Chopin keeps, as no new
+  `start` is sent for it. Run each turn on its own fields alone.
+- `ai` on `start` and `fork`, and the `ai` message, are sent only to a client that
+  offered `ai-credentials`: see [Models through Chopin](#models-through-chopin).
 - `fork`, with `session-forks`, opens a thread's Planner session branched from
   `from.session` (and `from.turn` when named), preserving the conversation,
   tool results, compaction state and session memory up to that point. Answer
@@ -466,10 +490,17 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   `json`, the turn's text must be that JSON.
 - `abort` stops the turn. Answer with `turn-end`; after **10 seconds** the
   server ends the turn anyway. The server sends no `host-tool-result` for the
-  turn's calls after `abort`, so settle any call still waiting as failed.
+  turn's calls after `abort`, so settle any call still waiting as failed. A
+  question the turn asked while it ran, outside any workflow run, ends with it:
+  the server withdraws its Decision and answers its `input-request` with
+  `input-result` status `cancelled`, as a full Atomic Planner's Stop does, so a
+  client whose question is still waiting can end the turn. One the turn asks
+  after `abort`, before its `turn-end`, is answered `cancelled` at once, with its
+  method's `cancelled` value (see [Questions](#questions)), and opens no
+  Decision. A workflow run's question is the run's and stays open.
 - `steer`, with `steer-turn`, gives the turn that is running a message a person sent to Chopin
-  while it works. Chopin never holds a message for the next turn, so this is how a person talks to
-  a Planner mid-reply: `prompt` is the message as the model should read it (the sender's handle
+  while it works. Chopin never holds a message behind a turn that is working, so this is how a
+  person talks to a Planner mid-reply: `prompt` is the message as the model should read it (the sender's handle
   first, `@bo: ...`), to be read at the turn's next step, after the tool calls of the step it is
   in and before its next call to the model, as an ordinary user message in the same turn. Answer
   with `control-result` within **10 seconds**: `ok: true` once the turn has taken it, `ok: false`
@@ -477,7 +508,11 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   it on. A refusal is final: Chat then says the message was not read, and it is not sent again.
   A client that did not offer the feature never receives one, and a message sent while it works
   is refused in Chat ("chopin can't take messages while it works on this machine. Stop it to ask
-  now.") rather than kept for later.
+  now.") rather than kept for later. A message sent once its turn is being stopped or finishing
+  (after `abort`, or after its `turn-end` while Chopin finishes recording it) is kept, and starts
+  the next turn as that one ends, with the message as its `prompt`; one sent while that next turn waits to start is
+  refused ("chopin is about to answer another message and can't take more while it works on this
+  machine. Send yours again once it has answered.").
 - `host-tool-result` answers a `host-tool-call`. `output` is the tool's result
   as JSON. A failed call has `"isError": true` and `output`
   `{ "error": "<message>" }`; that includes a tool that threw, invalid input, a
@@ -671,14 +706,18 @@ level can therefore never be chosen, and a turn never carries one.
   workflow of that name, with the words after it as its input, for a `workflow`. Chopin checks the
   name and kind against the last report when the message is sent and refuses an unknown one.
 
-A person's choice reaches the client in the next turn: `model` is the chosen model's `id`, and
+A person's choice reaches the client in every turn, whoever or whatever started it, a background
+job's (in an `isolated` session) included: `model` is the chosen model's `id`, and
 `thinkingLevel` one of that model's levels (or the default model's, when no model was chosen),
 each exactly as the client spelled it. Neither is ever empty: an empty model `id` or level is
 skipped when the catalog is read (above), so no one can choose it, and a `model` that is absent
 means no model was chosen (an operator's empty `MODEL` reads the same way).
 Chopin checks both against the last catalog the client reported when it accepts the choice and
 again when the turn starts. A model the catalog no longer lists, or a level its model no longer
-lists, is not sent: the turn runs with the client's default, and the document's Chat says so. The
+lists, is not sent: the turn runs with the client's default, and the document's Chat says so. A
+turn that starts before a client that offered the feature has sent `capabilities`, such as the
+first after it attaches or resumes, waits for the report, up to **10 seconds**, before it checks
+the choice, so a client that reports promptly runs the choice from its first turn. The
 catalog name is saved with the choice so that notice can name it even after it disappears. The
 browser's `chat:model` state includes an optional `modelName` for that saved name; older choices
 without a name use the current catalog's name if known, otherwise the id. Older browsers can ignore
@@ -766,6 +805,72 @@ With `retry-turn`, every `turn` that a person's Chat message began names it:
 
 Nothing here changes an existing message for a client that did not offer the feature, so the
 subprotocol stays `chopin.agent.v1`.
+
+### Models through Chopin
+
+People connect their AI accounts in Chopin once (see
+[AI credentials](hosted-agent.md#ai-credentials)). A client that offers
+`ai-credentials` runs its sessions' models on the account of the person the link
+acts for, without a key or sign-in of its own: the account that attached, which for
+a paired machine's [Planner credential](#credential) is the machine's owner. Each
+session is one launch, prepared before its `start` or `fork` and carried in `ai`:
+
+```json
+{
+	"launch": "chopin_launch_…",
+	"expiresAt": 1700000000000,
+	"providers": [
+		{
+			"provider": "openai",
+			"baseUrl": "https://chopin.example/api/v1/ai/openai/v1",
+			"placeholder": "chopin_ai_…",
+			"keyVariable": "OPENAI_API_KEY"
+		}
+	],
+	"withheld": [{ "provider": "github-copilot", "reason": "no-copilot-access" }]
+}
+```
+
+- Each of `providers` is a provider the session may call: send its requests to
+  `baseUrl` with `placeholder` as the key, where the provider takes it
+  (`Authorization: Bearer`, or `x-api-key` for Anthropic). `keyVariable` is the
+  environment variable that provider's clients read their key from, for an agent
+  that takes its key from there. `withheld` names each provider the person
+  connected that the launch was not given, and why.
+- `launch` is the launch's own credential. The client adds it, in
+  `x-chopin-launch`, to every request to Chopin's credential proxy, and keeps it
+  in its own process: it is never in the environment, files or arguments of the
+  agent's tools, so a stand-in copied out of them reaches nothing. `launch` and
+  `expiresAt`, the launch's deadline in milliseconds since the epoch (12 hours
+  after it began), are present exactly when `providers` is not empty.
+- A session whose person has no AI account Chopin can use (no Copilot seat and no
+  key) is never started: Chopin sends no `start` or `fork` for it, and the turn that
+  needed it says why, as a message from such a person is refused. A `start` or `fork`
+  always carries at least one provider.
+- An `ai` message replaces the session's grants whole: when what a launch for the
+  person may be given changes (they connect, replace or remove a provider, a provider
+  refuses one of their keys as invalid, or GitHub confirms their Copilot seat lost or
+  back), half an hour before the launch's deadline, and after a
+  [resume](#resuming-after-a-dropped-link), because the launch a session held may have
+  ended with its link or with the server's process. A change while the session starts
+  is sent once the client answers `started`, as the accounts are then. The earlier
+  launch ends once the new one is sent, so use the new grants from then on: a request
+  still waiting at Chopin on the earlier one is refused. An empty `providers` says the
+  session has no grant now.
+- A launch ends with its session (`destroy`, or a link that closes for good), and
+  when its machine is revoked or its document archived; Chopin's proxy then answers
+  `launch-ended`, or `unknown-placeholder` once its placeholders are gone (401, `{
+  "error": { "type": "chopin_proxy", "code": … } }`). To tell an ended launch from a
+  stand-in sent wrong, ask `GET /api/v1/ai/launch` with `x-chopin-launch`, which
+  answers `{ "state": "live" }` or `{ "state": "ended" }` (see
+  [Handing launches to runners](hosted-agent.md#handing-launches-to-runners)). A
+  session a server restart keeps for a resume keeps its launch: the next server
+  replaces it when the client resumes, or ends it with the session. A launch that
+  Chopin could not prepare (the person's accounts kept changing) fails the session's
+  start with the reason, which can be tried again.
+
+A client that does not offer the feature is sent none of this and uses its own
+models, as before.
 
 ### Stream parts
 
@@ -1567,7 +1672,7 @@ POST /api/connector/planner
 Authorization: Bearer <machine token>
 { "document": "<document id or URL>" }
 
-200 { "token": "chopin_p_…", "expiresAt": <milliseconds since the epoch>, "document": { "id": "", "url": "" } }
+200 { "token": "chopin_p_…", "expiresAt": <milliseconds since the epoch>, "document": { "id": "", "url": "" }, "ai?": "chopin" }
 ```
 
 Chopin issues it only when it runs `HARNESS=remote` with `AGENT` on and not
@@ -1602,6 +1707,17 @@ pull request (see
   [environment](#environment). The token is never in its arguments; do not log
   it.
 - Keep any worktree of its own at `CHOPIN_WORKTREE`.
+- To run its models on its owner's AI accounts in Chopin, rather than a sign-in
+  of the machine's, offer `ai-credentials` and use each session's
+  [grants](#models-through-chopin), adding the launch's credential itself. When
+  Chopin hands its Planners' sessions AI launches, it says so in the Planner
+  credential's answer and in `/api/connector/version` (`"ai": "chopin"`), and the
+  connector starts the backend, cold or as a spare, with
+  `CHOPIN_AI=chopin` and nothing of its owner's agent setup: an allow-listed
+  environment, its agents' state in `<worktree>.agent`, and none of the owner's agent
+  directories in sight (see
+  [AI accounts through Chopin](chopin-cli.md#ai-accounts-through-chopin)). Such a
+  backend has no models but its grants.
 - Open `/api/v1/agent` on `CHOPIN_URL` offering the `chopin.agent.v1`
   subprotocol, with `Authorization: Bearer <CHOPIN_PLANNER_TOKEN>`, and `attach`
   to `CHOPIN_DOCUMENT`.

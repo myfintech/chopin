@@ -277,6 +277,13 @@ differs. `update_document` later replaces that canonical source against the
 plan revision last read, with the same dialect validation and an idempotency key
 that returns the original applied result on replay.
 
+The Planner's `create_document` tool goes through the same creation transaction
+from a member's turn: its draft is validated and assessed for visuals as MCP's,
+its repository and base branch are the creating document's (the base it recorded,
+else the default branch's current commit), and its idempotency key is scoped to
+the creating document. See
+[Creating documents](hosted-agent.md#creating-documents).
+
 ## Generated descriptions
 
 The optional channel description is generated catalogue metadata, not authored
@@ -359,7 +366,9 @@ than simultaneous document panes.
 
 1. The HTTP upgrade validates the exact Origin, browser session, instance
    admission, App installation, repository identity, and pull access.
-2. `session:hello` establishes the socket's identity and edit capability. It
+2. `session:hello` establishes the socket's identity and edit capability, and
+   carries the server's clock (`now`), from which the client places the edits
+   its typing reports on the server's clock. It
    and every `session:presence` name each member with the profile picture
    GitHub's API returned at sign-in (`Member.avatarUrl`, stored in
    `users.avatar_url`), never for a demo actor.
@@ -374,7 +383,10 @@ than simultaneous document panes.
    reconnect.
 6. The server rechecks the session, admission, installation, repository role,
    and archive state while the socket remains open. A lost mutation role or
-   archival makes the connection read-only; lost read access closes it.
+   archival makes the connection read-only; lost read access closes it. Typing
+   presence does not wait for that recheck: a typing report, each roster a
+   member is told and each writer a roster names are checked against the
+   socket's current grant first.
 7. When a room becomes empty, the server removes its registry entry and starts
    an asynchronous final close and checkpoint. That close is not yet serialized
    against opening a replacement room for the same channel.

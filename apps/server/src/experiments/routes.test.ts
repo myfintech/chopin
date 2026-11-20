@@ -13,6 +13,7 @@ import {
 	CONNECTOR_SANDBOX_HEADER,
 	CONNECTOR_SANDBOX_REASON_HEADER,
 	CONNECTOR_SERVICE_HEADER,
+	CONNECTOR_STORE_PROBLEM_HEADER,
 	CONNECTOR_UPDATE_REQUIRED,
 	CONNECTOR_VERSION_HEADER,
 } from "@chopin/protocol/connector";
@@ -28,7 +29,12 @@ import type { GitHubApp } from "../github/app";
 import { hosted, locateDocument } from "../mcp/hosted";
 import { credentialDigest } from "./mcp-token";
 import { Connections } from "./connections";
+import { testLease } from "../storage/contract-support";
 import type { ImplementationConnector } from "../tasks/connector";
+import type { AiCredentials, AiLaunch, AiLaunchGrants } from "../ai/credentials";
+import { AI_ACCOUNT_UNCHECKED_RUN, NO_AI_ACCOUNT_RUN } from "@chopin/protocol/ai-credentials";
+import { MachineStores } from "../machine-store/service";
+import { FakeMachineStoreServer } from "../machine-store/fake-server.test-fixtures";
 
 function text(value: { result: { content: Array<{ text: string }> } }) {
 	return JSON.parse(value.result.content[0].text);
@@ -46,11 +52,14 @@ const CURRENT = {
 
 async function setup(
 	shared?: { storage: MemoryStorage; lease: unknown },
-	{ durable = true, ...extra }: {
+	{ durable = true, origin = "https://chopin.test", ...extra }: {
 		implementations?: () => ImplementationConnector | undefined;
+		origin?: string;
 		/** Whether machines hold their own GitHub authorization, as everywhere but AUTH_MODE=local. */
 		durable?: boolean;
 		app?: GitHubApp;
+		ai?: () => AiCredentials | undefined;
+		machineStores?: MachineStores;
 	} = {},
 ) {
 	let storage = shared?.storage ?? new MemoryStorage();
@@ -127,7 +136,7 @@ async function setup(
 			(/^[a-f]/.test(name) ? name[0]! : "c").repeat(40),
 	} as unknown as GitHub;
 	let config = {
-		origin: "https://chopin.test",
+		origin,
 		appSlug: "test",
 		clientId: "test",
 		clientSecret: "secret",
@@ -151,6 +160,8 @@ async function setup(
 				refreshExpiresIn: 15_897_600,
 			};
 		},
+		lease: () => lease,
+		revoked: async id => await extra.machineStores?.disable(id),
 	});
 	let router = new Router();
 	let lock = { locked: false, documents: new Set<string>() };
@@ -674,7 +685,7 @@ test("a claim refuses a document in another repository and interrupts archived o
 
 	let second = await document();
 	let archived = await queued(second);
-	await storage.channels.archive({ id: second, now: new Date() });
+	await storage.channels.archive({ id: second, now: new Date(), lease: await testLease(storage) });
 	expect(error(await tool(connection.token, "claim_experiment", { id: archived })))
 		.toStartWith("invalid-state");
 	expect((await runtime.service.store.get(archived))?.state).toBe("interrupted");
@@ -2208,6 +2219,157 @@ test("a launch's MCP token reaches Chopin's tools only for its own documents, wh
 	expect((await caller("token"))?.user).toMatchObject({ login: "alice" });
 });
 
+test("a build's AI launch is for whoever asked for it, on the build's machine and document, and only that machine ends it", async () => {
+	let builds = new Map<string, { repository: string; starter: string; machineId?: string }>();
+	let launched: AiLaunch[] = [];
+	let ended: string[] = [];
+	/** What storage keeps of each launch: its id and machine, by its credential. */
+	let held = new Map<string, { launchId: string; machineId?: string }>();
+	let credentials = {
+		async launch(input: AiLaunch) {
+			launched.push(input);
+			held.set(`chopin_launch_${launched.length}`, {
+				launchId: `launch-${launched.length}`,
+				...(input.machineId ? { machineId: input.machineId } : {}),
+			});
+			return {
+				launchId: `launch-${launched.length}`,
+				launchToken: `chopin_launch_${launched.length}`,
+				grants: [{
+					provider: "openai",
+					baseUrl: "https://chopin.test/api/v1/ai/openai/v1",
+					placeholder: `chopin_ai_${launched.length}`,
+					keyVariable: "OPENAI_API_KEY",
+				}],
+				withheld: [{ provider: "github-copilot", reason: "no-copilot-access" }],
+			};
+		},
+		async endHeld(launchToken: string, machineId: string) {
+			let found = held.get(launchToken);
+			if (!found || found.machineId !== machineId) return false;
+			held.delete(launchToken);
+			ended.push(found.launchId);
+			return true;
+		},
+	} as unknown as AiCredentials;
+	let options = {
+		ai: () => credentials,
+		implementations: () =>
+			({
+				build: async (document: string, id: string) => builds.get(`${document} ${id}`),
+			}) as unknown as ImplementationConnector,
+	};
+	let { alice, documentId, request, pair, runtime, storage, lease } = await setup(
+		undefined,
+		options,
+	);
+	let connection = await pair(alice.cookie);
+	let other = await pair(alice.cookie);
+	let id = crypto.randomUUID();
+	builds.set(`${documentId} ${id}`, {
+		repository: "org/repo",
+		starter: "bob",
+		machineId: connection.machine,
+	});
+	let runToken = runtime.connections.runToken(connection.id, documentId, id, 1, "implementation");
+	let ask = (path: string, body: unknown, machineToken = connection.machineToken) =>
+		request(path, body, undefined, machineToken).then(response => response.json());
+	let grants = await ask("/api/connector/ai-launch", { run: runToken });
+	expect(launched).toEqual([{
+		userId: "bob",
+		machineId: connection.machine,
+		channelId: documentId,
+		expiresAt: expect.any(Date),
+		owner: `run:${id}`,
+	}]);
+	expect(launched[0]!.expiresAt.getTime()).toBeGreaterThan(Date.now() + 4 * 60 * 60_000);
+	// The runner gets its stand-ins and its own credential, never the launch's id.
+	expect(grants).toEqual({
+		launch: "chopin_launch_1",
+		expiresAt: launched[0]!.expiresAt.getTime(),
+		providers: [{
+			provider: "openai",
+			baseUrl: "https://chopin.test/api/v1/ai/openai/v1",
+			placeholder: "chopin_ai_1",
+			keyVariable: "OPENAI_API_KEY",
+		}],
+		withheld: [{ provider: "github-copilot", reason: "no-copilot-access" }],
+	});
+	// Another machine can't ask for it, nor end it.
+	expect((await ask("/api/connector/ai-launch", { run: runToken }, other.machineToken)).error)
+		.toBeOneOf(["credential-invalid", "run-unknown"]);
+	expect(await ask("/api/connector/ai-launch/end", { launch: grants.launch }, other.machineToken))
+		.toEqual({ ended: false });
+	expect(ended).toEqual([]);
+	// The process that handed it out is gone: its successor, on the same storage, ends it.
+	let successor = await setup({ storage, lease }, options);
+	let end = (machineToken: string) =>
+		successor.request(
+			"/api/connector/ai-launch/end",
+			{ launch: grants.launch },
+			undefined,
+			machineToken,
+		)
+			.then(response => response.json());
+	expect(await end(connection.machineToken)).toEqual({ ended: true });
+	expect(ended).toEqual(["launch-1"]);
+	expect(await end(connection.machineToken)).toEqual({ ended: false });
+	// A build that has ended gets nothing.
+	builds.delete(`${documentId} ${id}`);
+	expect(await ask("/api/connector/ai-launch", { run: runToken })).toMatchObject({
+		error: "run-unknown",
+	});
+	expect(launched).toHaveLength(1);
+});
+
+test("a build whose launch would be given no provider is refused before its agent starts, saying why, and one whose document ended is refused as ended", async () => {
+	let builds = new Map<string, { repository: string; starter: string; machineId?: string }>();
+	let answer: Pick<AiLaunchGrants, "withheld" | "ended"> = { withheld: [] };
+	let credentials = {
+		async launch() {
+			return { launchId: "launch-1", launchToken: "chopin_launch_1", grants: [], ...answer };
+		},
+	} as unknown as AiCredentials;
+	let { alice, documentId, request, pair, runtime } = await setup(undefined, {
+		ai: () => credentials,
+		implementations: () =>
+			({
+				build: async (document: string, id: string) => builds.get(`${document} ${id}`),
+			}) as unknown as ImplementationConnector,
+	});
+	let connection = await pair(alice.cookie);
+	let id = crypto.randomUUID();
+	builds.set(`${documentId} ${id}`, {
+		repository: "org/repo",
+		starter: "bob",
+		machineId: connection.machine,
+	});
+	let runToken = runtime.connections.runToken(connection.id, documentId, id, 1, "implementation");
+	let ask = async () => {
+		let response = await request(
+			"/api/connector/ai-launch",
+			{ run: runToken },
+			undefined,
+			connection.machineToken,
+		);
+		return { status: response.status, body: await response.json() };
+	};
+	answer = { withheld: [{ provider: "github-copilot", reason: "no-copilot-access" }] };
+	expect(await ask()).toEqual({
+		status: 409,
+		body: { error: "no-ai-account", message: NO_AI_ACCOUNT_RUN },
+	});
+	answer = { withheld: [{ provider: "github-copilot", reason: "copilot-unavailable" }] };
+	let unchecked = await ask();
+	expect(unchecked).toEqual({
+		status: 409,
+		body: { error: "no-ai-account", message: AI_ACCOUNT_UNCHECKED_RUN },
+	});
+	expect(unchecked.body.message).not.toMatch(/subscription/i);
+	answer = { withheld: [], ended: true };
+	expect(await ask()).toMatchObject({ status: 409, body: { error: "launch-ended" } });
+});
+
 test("a build's MCP token acts as whoever asked for it, on the build's machine, until it ends", async () => {
 	let builds = new Map<string, { repository: string; starter: string; machineId?: string }>();
 	let { alice, documentId, request, pair, runtime, auth } = await setup(undefined, {
@@ -2240,4 +2402,219 @@ test("a build's MCP token acts as whoever asked for it, on the build's machine, 
 	expect((await caller())?.user).toMatchObject({ id: "bob", login: "bob" });
 	builds.delete(`${documentId} ${id}`);
 	expect(await caller()).toBeUndefined();
+});
+
+async function storeSetup(origin?: string) {
+	let storage = new MemoryStorage();
+	let lease = (await storage.leases.acquire("writer", "test", 60_000))!;
+	let server = new FakeMachineStoreServer();
+	let machineStores = new MachineStores({
+		storage,
+		server,
+		key: new Uint8Array(32).fill(5),
+		clock: () => new Date(),
+	});
+	let context = await setup({ storage, lease }, { machineStores, ...(origin ? { origin } : {}) });
+	return { ...context, server, machineStores };
+}
+
+test("a paired machine asks for its own database login and gets the same one each time", async () => {
+	let { alice, bob, pair, request, server } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	let desk = await pair(bob.cookie);
+	let ask = (token: string) => request("/api/connector/machine-store", {}, undefined, token);
+	let first = await ask(laptop.machineToken);
+	expect(first.status).toBe(200);
+	expect(first.headers.get("cache-control")).toBe("no-store");
+	let login = await first.json();
+	let role = `m_${laptop.machine.replaceAll("-", "")}`;
+	expect(login.url).toBe(`postgresql://${role}@db.example.com:5432/${role}?sslmode=verify-full`);
+	expect(server.passwords.get(role)).toBe(login.password);
+	expect(await (await ask(laptop.machineToken)).json()).toEqual(login);
+	let theirs = await (await ask(desk.machineToken)).json();
+	expect(theirs.url).not.toBe(login.url);
+	expect(theirs.password).not.toBe(login.password);
+	expect((await ask("chopin_m_" + "x".repeat(43))).status).toBe(401);
+	let listed = await (await request("/api/connector/machines", undefined, alice.cookie)).json();
+	expect(listed.machines.find((value: { id: string }) => value.id === laptop.machine).store)
+		.toEqual({ state: "ready" });
+});
+
+test("a failed login is said on the Machines page and pairing still works", async () => {
+	let { alice, pair, request, server } = await storeSetup();
+	server.refuse = "a machine could still connect to the database template1";
+	let laptop = await pair(alice.cookie);
+	expect(laptop.token).toBeString();
+	let refused = await request("/api/connector/machine-store", {}, undefined, laptop.machineToken);
+	expect(refused.status).toBe(503);
+	expect(await refused.json()).toEqual({
+		error: "machine-store-unavailable",
+		message: "a machine could still connect to the database template1",
+	});
+	let listed = await (await request("/api/connector/machines", undefined, alice.cookie)).json();
+	expect(listed.machines[0].store).toEqual({
+		state: "failed",
+		reason: "a machine could still connect to the database template1",
+	});
+});
+
+test("only a machine's owner rotates its login, and the old password stops working", async () => {
+	let { alice, bob, pair, request, server } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	let ask = () => request("/api/connector/machine-store", {}, undefined, laptop.machineToken);
+	let before = await (await ask()).json();
+	let rotate = (cookie: string) =>
+		request(`/api/connector/machines/${laptop.machine}/store/rotate`, {}, cookie);
+	expect((await rotate(bob.cookie)).status).toBe(404);
+	expect((await request(`/api/connector/machines/${laptop.machine}/store/rotate`, {})).status)
+		.toBe(401);
+	expect(await (await rotate(alice.cookie)).json()).toEqual({ rotated: true });
+	let after = await (await ask()).json();
+	let role = new URL(after.url).username;
+	expect(after.password).not.toBe(before.password);
+	expect(await server.accepts(role, before.password)).toBe(false);
+	expect(await server.accepts(role, after.password)).toBe(true);
+});
+
+test("revoking or unpairing a machine turns its login off before Chopin answers", async () => {
+	let { alice, pair, request, server } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	let desk = await pair(alice.cookie);
+	let ask = (token: string) => request("/api/connector/machine-store", {}, undefined, token);
+	let first = await (await ask(laptop.machineToken)).json();
+	let second = await (await ask(desk.machineToken)).json();
+	let revoked = await request(`/api/connector/machines/${laptop.machine}/revoke`, {}, alice.cookie);
+	expect(revoked.status).toBe(200);
+	expect(server.enabled.has(new URL(first.url).username)).toBe(false);
+	expect((await ask(laptop.machineToken)).status).toBe(401);
+	let unpaired = await request("/api/connector/machine/revoke", {}, undefined, desk.machineToken);
+	expect(unpaired.status).toBe(200);
+	expect(server.enabled.has(new URL(second.url).username)).toBe(false);
+});
+
+test("a revocation whose login stays on says so, and revoking again finishes it", async () => {
+	let { alice, pair, request, server } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	let desk = await pair(alice.cookie);
+	let ask = (token: string) => request("/api/connector/machine-store", {}, undefined, token);
+	let role = new URL((await (await ask(laptop.machineToken)).json()).url).username;
+	let deskRole = new URL((await (await ask(desk.machineToken)).json()).url).username;
+	server.refuse = "Chopin couldn't reach the database server at db.example.com:5432";
+	let revoke = () => request(`/api/connector/machines/${laptop.machine}/revoke`, {}, alice.cookie);
+	let refused = await revoke();
+	expect(refused.status).toBe(503);
+	let said = await refused.json();
+	expect(said.error).toBe("machine-store-unavailable");
+	expect(said.message).toContain("couldn't turn off its database login");
+	expect(said.message).toContain("db.example.com:5432");
+	expect(server.enabled.has(role)).toBe(true);
+	expect((await ask(laptop.machineToken)).status).toBe(401);
+	let unpair = () => request("/api/connector/machine/revoke", {}, undefined, desk.machineToken);
+	expect((await unpair()).status).toBe(503);
+	delete server.refuse;
+	expect((await revoke()).status).toBe(200);
+	expect(server.enabled.has(role)).toBe(false);
+	let unpaired = await unpair();
+	expect(unpaired.status).toBe(401);
+	expect((await unpaired.json()).error).toBe("machine-revoked");
+	expect(server.enabled.has(deskRole)).toBe(false);
+});
+
+test("a machine revoked before its first login asks for one gets none", async () => {
+	let { alice, pair, request, server } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	let role = `m_${laptop.machine.replaceAll("-", "")}`;
+	let release!: () => void;
+	server.provisioning = new Promise<void>(resolve => {
+		release = resolve;
+	});
+	let asked = request("/api/connector/machine-store", {}, undefined, laptop.machineToken);
+	let revoked = request(`/api/connector/machines/${laptop.machine}/revoke`, {}, alice.cookie);
+	await Bun.sleep(5);
+	release();
+	expect((await asked).status).toBe(503);
+	expect((await revoked).status).toBe(200);
+	expect(server.calls).not.toContain(`provision ${role}`);
+	expect(server.enabled.has(role)).toBe(false);
+});
+
+test("a setup problem the connector reports is kept for the Machines page until it reports none", async () => {
+	let { alice, pair, request, storage } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	expect((await request("/api/connector/machine-store", {}, undefined, laptop.machineToken)).status)
+		.toBe(200);
+	let connect = (extra: Record<string, string>) =>
+		request(
+			"/api/connector/connections",
+			{ repository: "org/repo", commit: "a".repeat(40), label: "Laptop" },
+			undefined,
+			laptop.machineToken,
+			{ ...CURRENT, ...extra },
+		);
+	let listed = async () =>
+		(await (await request("/api/connector/machines", undefined, alice.cookie)).json()).machines[0]
+			.store;
+	expect(
+		(await connect({ [CONNECTOR_STORE_PROBLEM_HEADER]: "Couldn't install the adapter" })).status,
+	)
+		.toBe(200);
+	expect((await storage.machineDatabases.get(laptop.machine))!.connectorProblem)
+		.toBe("Couldn't install the adapter");
+	expect(await listed()).toEqual({ state: "failed", reason: "Couldn't install the adapter" });
+	expect((await connect({})).status).toBe(200);
+	expect(await listed()).toEqual({ state: "ready" });
+});
+
+test("a setup problem reported before Chopin made any login is said on the Machines page", async () => {
+	let { alice, pair, request, storage, tool } = await storeSetup("http://chopin.test");
+	let laptop = await pair(alice.cookie);
+	let asked = await request("/api/connector/machine-store", {}, undefined, laptop.machineToken);
+	expect(asked.status).toBe(503);
+	let refusal = (await asked.json()).message;
+	expect(await storage.machineDatabases.get(laptop.machine)).toBeUndefined();
+	let connect = () =>
+		request(
+			"/api/connector/connections",
+			{ repository: "org/repo", commit: "a".repeat(40), label: "Laptop" },
+			undefined,
+			laptop.machineToken,
+			{ ...CURRENT, [CONNECTOR_STORE_PROBLEM_HEADER]: refusal },
+		);
+	let listed = async () =>
+		(await (await request("/api/connector/machines", undefined, alice.cookie)).json()).machines[0]
+			.store;
+	let connected = await connect();
+	expect(connected.status).toBe(200);
+	expect(await listed()).toEqual({ state: "failed", reason: refusal });
+	await tool((await connected.json()).token, "disconnect_workspace", {});
+	expect(await listed()).toEqual({ state: "failed", reason: refusal });
+});
+
+test("a setup problem a pairing reports is said on the Machines page before the machine connects", async () => {
+	let { alice, pair, request } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	let report = (token: string, body: unknown) =>
+		request("/api/connector/machine-store", body, undefined, token);
+	let listed = async () =>
+		(await (await request("/api/connector/machines", undefined, alice.cookie)).json()).machines[0]
+			.store;
+	expect((await report(laptop.machineToken, {})).status).toBe(200);
+	expect(await listed()).toEqual({ state: "ready" });
+	let problem = "its storage adapter couldn't be set up: EEXIST: file already exists";
+	let reported = await report(laptop.machineToken, { problem });
+	expect(reported.status).toBe(200);
+	expect(await reported.json()).toEqual({ reported: true });
+	expect(await listed()).toEqual({ state: "failed", reason: problem });
+	expect((await report("chopin_m_" + "x".repeat(43), { problem })).status).toBe(401);
+	expect((await report(laptop.machineToken, { problem: "" })).status).toBe(409);
+	expect(await listed()).toEqual({ state: "failed", reason: problem });
+});
+
+test("without MACHINE_STORE_URL a machine is told there is no database login", async () => {
+	let { alice, pair, request } = await setup();
+	let laptop = await pair(alice.cookie);
+	let asked = await request("/api/connector/machine-store", {}, undefined, laptop.machineToken);
+	expect(asked.status).toBe(404);
+	let listed = await (await request("/api/connector/machines", undefined, alice.cookie)).json();
+	expect(listed.machines[0].store).toBeNull();
 });

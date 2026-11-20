@@ -268,6 +268,27 @@ describe("design audit specimens", () => {
 		expect(navigation).toContain("Loading documents…");
 		expect(navigation).not.toContain("Archived draft");
 		expect(plate(markup, "lists")).toContain('class="navigation-palette-option"');
+		let accounts = plate(markup, "ai-accounts").replaceAll("&#x27;", "'");
+		for (
+			let label of [
+				"Connected",
+				"No Copilot access",
+				"Checking…",
+				"Not checked",
+				"Needs reconnecting",
+			]
+		) {
+			expect(accounts).toContain(`>${label}</span>`);
+		}
+		expect(accounts).toContain("Your GitHub account has no Copilot subscription.");
+		expect(accounts).toContain(
+			"Chopin couldn't check for Copilot access through your GitHub sign-in. It checks again when you open this page.",
+		);
+		expect(accounts).not.toContain("Check again");
+		expect(accounts).toContain(">Get Copilot</a>");
+		expect(accounts).toContain("Key ending 7Qxa");
+		expect(accounts).toContain('class="btn btn-md btn-primary"');
+		expect(accounts).toContain('role="alert"');
 		expect(plate(markup, "lists")).toContain('class="document-status-badge">Archived<');
 		let empty = plate(markup, "empty");
 		expect(empty).toContain('<p class="project-sidebar-empty">No documents</p>');

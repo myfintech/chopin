@@ -12,7 +12,11 @@ import { plannerHoldContract } from "./planner-hold-contract";
 import { plannerModelChoiceContract } from "./planner-model-choice-contract";
 import { chatThreadContract } from "./chat-thread-contract";
 import { plannerCredentialContract } from "./planner-credential-contract";
+import { machineDatabaseContract } from "./machine-database-contract";
+import { aiCredentialContract } from "./ai-credential-contract";
+import { aiUsageContract } from "./ai-usage-contract";
 import { deferredTurnContract } from "./deferred-turn-contract";
+import { mcpInvocationContract } from "./mcp-invocation-contract";
 import { mcpSessionContract } from "./mcp-session-contract";
 import { leasePeekContract } from "./lease-peek-contract";
 import { userContract } from "./user-contract";
@@ -23,6 +27,7 @@ import {
 	backgroundJob,
 	contractId as id,
 	openedStorage as opened,
+	testLease,
 	userAndChannel,
 } from "./contract-support";
 import { researchPublicationContract } from "./research-publication-contract";
@@ -61,8 +66,12 @@ export function storageContract(name: string, factory: Factory): void {
 	plannerModelChoiceContract(name, factory);
 	chatThreadContract(name, factory);
 	plannerCredentialContract(name, factory);
+	machineDatabaseContract(name, factory);
+	aiCredentialContract(name, factory);
+	aiUsageContract(name, factory);
 	deferredTurnContract(name, factory);
 	mcpSessionContract(name, factory);
+	mcpInvocationContract(name, factory);
 	leasePeekContract(name, factory);
 	userContract(name, factory);
 	describe(`${name} storage`, () => {
@@ -512,6 +521,7 @@ export function storageContract(name: string, factory: Factory): void {
 				await storage.channels.archive({
 					id: parentChannelId,
 					now: new Date("2026-01-05T03:04:05.000Z"),
+					lease: await testLease(storage),
 				});
 				await expect(storage.channels.delete(parentChannelId))
 					.rejects.toMatchObject({ failure: "conflict" });
@@ -537,6 +547,7 @@ export function storageContract(name: string, factory: Factory): void {
 				archivedChild = (await storage.channels.archive({
 					id: archivedChild.id,
 					now: new Date("2026-01-04T03:04:05.000Z"),
+					lease: await testLease(storage),
 				})).channel;
 				let archivedParent = await storage.channels.create({
 					id: id("archived-parent"),
@@ -560,6 +571,7 @@ export function storageContract(name: string, factory: Factory): void {
 				archivedParent = (await storage.channels.archive({
 					id: archivedParent.id,
 					now: new Date("2026-01-07T03:04:05.000Z"),
+					lease: await testLease(storage),
 				})).channel;
 
 				let first = await storage.channels.list(repositoryId, 1);
@@ -640,12 +652,14 @@ export function storageContract(name: string, factory: Factory): void {
 				await storage.channels.archive({
 					id: archivedChild.id,
 					now: new Date("2026-01-07T03:04:05.000Z"),
+					lease: await testLease(storage),
 				});
 				let archived = await channel({ title: "Archived decisions" });
 				await commit(archived.id, { questions: [decisionRecord("open", "open", "g", "h", "i")] });
 				await storage.channels.archive({
 					id: archived.id,
 					now: new Date("2026-01-07T03:04:05.000Z"),
+					lease: await testLease(storage),
 				});
 				let elsewhere = await channel({ title: "Elsewhere", repository: id("repository") });
 				await commit(elsewhere.id, { questions: [decisionRecord("open", "open", "j")] });
@@ -700,6 +714,7 @@ export function storageContract(name: string, factory: Factory): void {
 				await storage.channels.archive({
 					id: channelId,
 					now: new Date("2026-01-09T03:04:05.000Z"),
+					lease: await testLease(storage),
 				});
 				expect(await storage.channels.unansweredDecisions(repositoryId)).toBe(0);
 			} finally {
@@ -730,7 +745,11 @@ export function storageContract(name: string, factory: Factory): void {
 					now: original.updatedAt,
 				});
 
-				let archived = await storage.channels.archive({ id: channelId, now: original.updatedAt });
+				let archived = await storage.channels.archive({
+					id: channelId,
+					now: original.updatedAt,
+					lease: await testLease(storage),
+				});
 				expect(archived).toMatchObject({
 					changed: true,
 					channel: {
@@ -746,6 +765,7 @@ export function storageContract(name: string, factory: Factory): void {
 					await storage.channels.archive({
 						id: channelId,
 						now: new Date("2026-01-05T03:04:05.000Z"),
+						lease: await testLease(storage),
 					}),
 				).toEqual({ channel: archived.channel, changed: false });
 
@@ -939,6 +959,7 @@ export function storageContract(name: string, factory: Factory): void {
 				await storage.channels.archive({
 					id: channelId,
 					now: new Date("2026-01-09T03:04:05.000Z"),
+					lease: await testLease(storage),
 				});
 				expect(await storage.channels.delete(channelId)).toBe(true);
 				expect(await storage.channels.delete(channelId)).toBe(false);
@@ -1117,7 +1138,11 @@ export function storageContract(name: string, factory: Factory): void {
 				expect(narrowed.channel.fullWidth).toBeUndefined();
 				expect((await storage.channels.get(channelId))!.fullWidth).toBeUndefined();
 
-				await storage.channels.archive({ id: channelId, now: new Date("2026-01-06T00:00:00Z") });
+				await storage.channels.archive({
+					id: channelId,
+					now: new Date("2026-01-06T00:00:00Z"),
+					lease: await testLease(storage),
+				});
 				await expect(storage.channels.setFullWidth({
 					id: channelId,
 					fullWidth: true,
@@ -1751,7 +1776,11 @@ export function storageContract(name: string, factory: Factory): void {
 			try {
 				let { channelId, lease } = await userAndChannel(storage);
 				let archivedAt = new Date("2026-01-04T03:04:05.000Z");
-				await storage.channels.archive({ id: channelId, now: archivedAt });
+				await storage.channels.archive({
+					id: channelId,
+					now: archivedAt,
+					lease: await testLease(storage),
+				});
 
 				await expect(attempt(() =>
 					storage.collaboration.commit({
@@ -2176,6 +2205,7 @@ export function storageContract(name: string, factory: Factory): void {
 				await storage.channels.archive({
 					id: channelB,
 					now: new Date("2026-01-16T03:04:05.000Z"),
+					lease: await testLease(storage),
 				});
 				expect(
 					(await storage.research.listRepository(repositoryId, 10)).channels
@@ -2383,6 +2413,7 @@ export function storageContract(name: string, factory: Factory): void {
 				await storage.channels.archive({
 					id: channelId,
 					now: new Date("2026-01-08T03:04:05.000Z"),
+					lease: await testLease(storage),
 				});
 
 				expect(await storage.research.create(create)).toMatchObject({
@@ -2803,6 +2834,7 @@ export function storageContract(name: string, factory: Factory): void {
 				await storage.channels.archive({
 					id: channelId,
 					now: new Date(now.getTime() + 1),
+					lease: await testLease(storage),
 				});
 
 				let cancellation = {

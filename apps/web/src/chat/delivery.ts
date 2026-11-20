@@ -28,6 +28,24 @@ export function passing(code: Session.Failure["code"]): boolean {
 	return code === "temporarily-unavailable";
 }
 
+/** The refusals that say the Planner could not take the message. */
+export type ChopinRefusal = Extract<
+	Session.Failure["code"],
+	"planner-not-attached" | "planner-busy" | "planner-starting" | "no-ai-account"
+>;
+
+/**
+ * Whether a refusal says the Planner could not take the message (`planner-not-attached`,
+ * `planner-busy`, `planner-starting`, `no-ai-account`). When nothing newer was typed, the words
+ * return from the outbox to the composer draft and chopin says why in its quiet row.
+ */
+export function refusedByChopin(code: unknown): code is ChopinRefusal {
+	return code === "planner-not-attached"
+		|| code === "planner-busy"
+		|| code === "planner-starting"
+		|| code === "no-ai-account";
+}
+
 const NO_MACHINE = "No machine is connected to reply.";
 /**
  * What the server says of a machine that is only away: that this message was not sent, which is
@@ -46,6 +64,12 @@ export function refusalText(code: string | undefined, message: string): string {
 		return MACHINE_AWAY.test(trimmed) || MACHINE_RECONNECTING.test(trimmed)
 			? trimmed
 			: NO_MACHINE;
+	}
+	if (
+		(code === "planner-busy" || code === "planner-starting" || code === "no-ai-account")
+		&& message.trim()
+	) {
+		return message.trim();
 	}
 	let detail = message.trim();
 	if (!detail) return "The server turned it down.";
@@ -170,7 +194,7 @@ export function nextToSend(outbox: readonly Outgoing[]): Outgoing | undefined {
 	return undefined;
 }
 
-/** The outbox as transcript entries, after everything the server has sent. */
+/** The outbox as transcript entries, each placed by its own time (`chronology.ts`). */
 export function echoes(outbox: readonly Outgoing[]): LocalEntry[] {
 	return outbox.map(item => ({
 		id: item.payload.requestId,

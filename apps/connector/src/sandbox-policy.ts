@@ -1,4 +1,6 @@
+import { isIPv6 } from "node:net";
 import { isAbsolute, posix, win32 } from "node:path";
+import { fileURLToPath } from "node:url";
 import { windowsArgument } from "./windows-argument";
 
 /** The process sandbox each system gives through MXC. */
@@ -231,6 +233,18 @@ export function validHostEntry(entry: string) {
 }
 
 /**
+ * An entry the connector allows as it runs, as its database's `host:port`: one an owner may add,
+ * or an IPv6 address in brackets, as a URL writes it; any port is 1 to 65535.
+ */
+export function validAllowedEntry(entry: string) {
+	let match = entry.match(/^(?:\[([0-9a-f:]+)\]|([^:[\]]+))(?::(\d{1,5}))?$/i);
+	if (!match) return false;
+	let [, address, name, port] = match;
+	if (port !== undefined && (Number(port) < 1 || Number(port) > 65_535)) return false;
+	return address === undefined ? validHostEntry(name!) : isIPv6(address);
+}
+
+/**
  * Where a person keeps credentials and personal data an agent has no need of: SSH and GPG keys,
  * cloud and GitHub logins, container registry logins, and browser profiles. The agent's own
  * model login is not here; it stays readable.
@@ -287,6 +301,76 @@ export function secretPaths(platform: NodeJS.Platform, home: string): string[] {
 		under(".mozilla"),
 		under("snap", "firefox"),
 		under("snap", "chromium"),
+	];
+}
+
+/**
+ * Where the owner keeps their own agents' configuration, logins and sessions: Atomic's agent
+ * directory and journal, and the Copilot, Claude, Codex and Gemini directories, with any of them
+ * the owner's environment moved elsewhere (Atomic's sessions, workflow artifacts and journal
+ * included, and Copilot's sign-in under `XDG_CONFIG_HOME`), as the agents read that variable: `~` is a home (the
+ * one given and the environment's own), a `file:` URL its path, and a relative path is taken from
+ * `cwd`, where the owner's agents started with that environment. A launch given an agent state
+ * directory of its own (see `Launch.agentHome`) may not read any of them.
+ */
+export function ownerAgentPaths(
+	platform: NodeJS.Platform,
+	home: string,
+	env: Record<string, string | undefined> = {},
+	cwd?: string,
+): string[] {
+	let path = platform === "win32" ? win32 : posix;
+	let under = (...parts: string[]) => path.join(home, ...parts);
+	let homes = [
+		...new Set(
+			[home, platform === "win32" ? env.USERPROFILE : env.HOME].filter(
+				(value): value is string => !!value && path.isAbsolute(value),
+			),
+		),
+	];
+	let located = (value: string): string[] => {
+		if (value === "~") return homes;
+		if (value.startsWith("~/") || (platform === "win32" && value.startsWith("~\\"))) {
+			return homes.map(each => path.join(each, value.slice(2)));
+		}
+		if (/^file:\/\//i.test(value)) {
+			try {
+				return [fileURLToPath(value)];
+			} catch {
+				return [];
+			}
+		}
+		if (path.isAbsolute(value)) return [path.normalize(value)];
+		return cwd && path.isAbsolute(cwd) ? [path.resolve(cwd, value)] : [];
+	};
+	let moved = [
+		"ATOMIC_CODING_AGENT_DIR",
+		"PI_CODING_AGENT_DIR",
+		// Where Atomic keeps sessions, workflow artifacts and its journal outside its directory.
+		"ATOMIC_CODING_AGENT_SESSION_DIR",
+		"ATOMIC_WORKFLOW_ARTIFACT_DIR",
+		"ATOMIC_WORKFLOW_JOURNAL_PATH",
+		"COPILOT_HOME",
+		"CLAUDE_CONFIG_DIR",
+		"CODEX_HOME",
+	].flatMap(name => {
+		let value = env[name]?.trim();
+		return value ? located(value) : [];
+	});
+	// Copilot's editor sign-in is read from the configuration directory the environment names.
+	let config = env.XDG_CONFIG_HOME?.trim();
+	if (config) moved.push(...located(config).map(each => path.join(each, "github-copilot")));
+	return [
+		under(".atomic", "agent"),
+		under(".atomic", "workflows"),
+		under(".pi", "agent"),
+		under(".copilot"),
+		under(".claude"),
+		under(".claude.json"),
+		under(".codex"),
+		under(".gemini"),
+		under(".config", "github-copilot"),
+		...moved,
 	];
 }
 

@@ -5,7 +5,7 @@ import { MAX_LINK_MESSAGE_BYTES, MAX_LINK_NOTE_LENGTH, parseClientMessage } from
 
 import type { ServerWebSocket } from "bun";
 import type { AgentHandlers, HostToolResult, TurnContext } from "./client";
-import type { ClientMessage, ClientMessageOf, ServerMessage } from "./protocol";
+import type { ClientMessage, ClientMessageOf, ServerMessage, ServerMessageOf } from "./protocol";
 
 let stops: Array<() => unknown> = [];
 afterEach(async () => {
@@ -525,6 +525,98 @@ describe("Agent connection client", () => {
 			ok: true,
 		});
 		expect(steered).toEqual(["@bo: Also X"]);
+	});
+
+	it("asks for session-choice only when told to, and hands a session's start its chosen model", async () => {
+		let capabilities = {
+			models: { available: [{ id: "acme/large", name: "Large", thinkingLevels: ["high"] }] },
+		};
+		let plain = fakeServer();
+		let unasked = await connectAgent({
+			url: plain.url,
+			token: "t",
+			document: "d",
+			handlers: { turn() {} },
+			capabilities,
+		});
+		stops.push(() => unasked.detach());
+		expect(plain.asked[0]).toContain("capability-catalog");
+		expect(plain.asked[0]).not.toContain("session-choice");
+
+		let server = fakeServer({ features: ["capability-catalog", "session-choice"] });
+		let started = Promise.withResolvers<ServerMessageOf<"start">>();
+		let client = await connectAgent({
+			url: server.url,
+			token: "t",
+			document: "d",
+			handlers: { turn() {}, start: message => started.resolve(message) },
+			capabilities,
+			sessionChoice: true,
+		});
+		stops.push(() => client.detach());
+		expect(server.asked[0]?.split(", ")).toEqual(
+			expect.arrayContaining(["capability-catalog", "session-choice"]),
+		);
+		expect(client.features).toEqual(["capability-catalog", "session-choice"]);
+		server.send({
+			type: "start",
+			session: "s",
+			mode: "planner",
+			model: "acme/large",
+			thinkingLevel: "high",
+		});
+		expect(await started.promise).toMatchObject({ model: "acme/large", thinkingLevel: "high" });
+		await server.next("started");
+	});
+
+	it("asks for ai-credentials only with an ai handler, and hands it a session's new grants", async () => {
+		let plain = fakeServer();
+		let unasked = await connectAgent({
+			url: plain.url,
+			token: "t",
+			document: "d",
+			handlers: { turn() {} },
+		});
+		stops.push(() => unasked.detach());
+		expect(plain.asked[0]).not.toContain("ai-credentials");
+
+		let ai = {
+			launch: "chopin_launch_x",
+			expiresAt: 1_700_000_000_000,
+			providers: [{
+				provider: "anthropic",
+				baseUrl: "https://chopin.example/api/v1/ai/anthropic",
+				placeholder: "chopin_ai_x",
+				keyVariable: "ANTHROPIC_API_KEY",
+			}],
+			withheld: [],
+		};
+		let server = fakeServer({ features: ["ai-credentials"] });
+		let started = Promise.withResolvers<ServerMessageOf<"start">>();
+		let changed: Array<ServerMessageOf<"ai">> = [];
+		let client = await connectAgent({
+			url: server.url,
+			token: "t",
+			document: "d",
+			handlers: {
+				turn() {},
+				start: message => started.resolve(message),
+				ai: message => void changed.push(message),
+			},
+		});
+		stops.push(() => client.detach());
+		expect(server.asked[0]?.split(", ")).toContain("ai-credentials");
+		// Grants for a session the client does not hold are not its own.
+		server.send({ type: "ai", session: "other", ai });
+		server.send({ type: "start", session: "s", mode: "planner", ai });
+		expect((await started.promise).ai).toEqual(ai);
+		await server.next("started");
+		let ended = { providers: [], withheld: [] };
+		server.send({ type: "ai", session: "s", ai: ended });
+		for (let deadline = Date.now() + 2000; !changed.length; await Bun.sleep(5)) {
+			if (Date.now() > deadline) throw new Error("The grants never arrived.");
+		}
+		expect(changed).toEqual([{ type: "ai", session: "s", ai: ended }]);
 	});
 
 	it("answers a steer for a turn that has ended, or that its handler refuses, with ok false", async () => {

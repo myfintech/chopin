@@ -674,12 +674,13 @@ greyed out.
 [Where chopin keeps its files](chopin-cli-reference.md#where-chopin-keeps-its-files)
 lists them all.
 
-| Path                                    | Holds                                            | Removed                                         |
-| --------------------------------------- | ------------------------------------------------ | ----------------------------------------------- |
-| `runs/<run id>`                         | A job's worktree, for you to inspect             | Once 15 newer runs have finished                |
-| `runs/<run id>-worktrees/`              | Extra worktrees an unsandboxed build adds        | When the run ends, uncommitted changes included |
-| `planners/<owner>/<repo>/<document id>` | A Planner command's worktree for one document    | Never                                           |
-| `repos/<owner>/<repo>`                  | A clone of a repository you named no checkout of | Never                                           |
+| Path                                    | Holds                                                             | Removed                                         |
+| --------------------------------------- | ----------------------------------------------------------------- | ----------------------------------------------- |
+| `runs/<run id>`                         | A job's worktree, for you to inspect                              | Once 15 newer runs have finished                |
+| `runs/<run id>-worktrees/`              | Extra worktrees an unsandboxed build adds                         | When the run ends, uncommitted changes included |
+| `planners/<owner>/<repo>/<document id>` | A Planner command's worktree for one document                     | Never                                           |
+| `repos/<owner>/<repo>`                  | A clone of a repository you named no checkout of                  | Never                                           |
+| `agent-store/`                          | This machine's database login for agent sessions, and the adapter | Its password with `chopin unpair`               |
 
 `--keep-runs <n>` keeps `n` finished runs instead of 15, and `--keep-runs 0`
 keeps them all. `chopin` never removes a run that is going or waiting to start.
@@ -713,10 +714,10 @@ instead.
 
 |             | In the sandbox                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Writes      | Only the worktree the connector made for it (a run's, or a Planner's own; never your checkout), the repository's git directory in the few places commits and refs go and that worktree's entry (see [Git in the sandbox](#git-in-the-sandbox)), the agent's own state (`~/.atomic` or `~/.copilot` for the built-in agents), a private temporary directory, and what you add with `--sandbox-write`. Nothing else.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Writes      | Only the worktree the connector made for it (a run's, or a Planner's own; never your checkout), the repository's git directory in the few places commits and refs go and that worktree's entry (see [Git in the sandbox](#git-in-the-sandbox)), the agent's own state (`~/.atomic` or `~/.copilot` for the built-in agents, or a state directory of its own for a run Chopin hands [AI grants](#ai-accounts-through-chopin)), a private temporary directory, and what you add with `--sandbox-write`. Nothing else.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | Reads       | The rest of the disk on Linux and macOS, except `~/.ssh`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `.netrc`, `.git-credentials` and browser profiles, which read as empty or unreadable, and the connector's state directory (`--base-dir`), of which it sees only its own worktree and the folder of its own tokens. The machine token and every other run's and Planner's files, tokens included, are out of its sight, those made after it started too; so is the state directory when a working directory holds it, as a home does. **On Windows a ProcessContainer reads only what it is given, so it is not the rest of the disk:** your profile folder (the same names are unreadable), the directories on `PATH` and those that `PYTHONHOME`, `GOROOT`, `GOPATH`, `CARGO_HOME`, `RUSTUP_HOME`, `JAVA_HOME`, `DOTNET_ROOT`, `NODE_PATH`, `VIRTUAL_ENV`, `CONDA_PREFIX` and the other tool variables in MXC's own baseline name, the programs installed per user in `%LOCALAPPDATA%\Programs`, its working directory and its worktree, the repository's git directory whole (its configuration, hooks, objects and every worktree's entry, since a worktree's `.git` leads into it), and what Windows lets every container read (`C:\Windows`, `C:\Program Files`). A folder on another drive, in another user's profile or anywhere else, a checkout among them, is not readable, but for the checkout a Planner runs in, and for a run's checkout's git directory, which is read without that checkout's files. |
 | Network     | Only through a proxy on your machine that allows the hosts below and refuses the rest. A direct connection fails, IPv6 is blocked, and the proxy resolves names.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| Environment | Everything it has today but GitHub credentials (see [Which GitHub account pushes](#which-github-account-pushes)), and `--env` values. `TMPDIR` points at the private directory, `PATH` names each directory by its real path, and `NODE_USE_ENV_PROXY=1` makes Node's own `fetch` use the proxy; the proxy variables come from MXC. On Linux and macOS it reaches the sandbox in a `0600` file that a shell exports and deletes before the agent starts, so no value is on any process's command line.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Environment | Everything it has today but GitHub credentials (see [Which GitHub account pushes](#which-github-account-pushes)), and `--env` values; an agent that runs on Chopin's AI accounts gets only an allow-list of it (see [AI accounts through Chopin](#ai-accounts-through-chopin)). `TMPDIR` points at the private directory, `PATH` names each directory by its real path, and `NODE_USE_ENV_PROXY=1` makes Node's own `fetch` use the proxy; the proxy variables come from MXC. On Linux and macOS it reaches the sandbox in a `0600` file that a shell exports and deletes before the agent starts, so no value is on any process's command line.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 Hosts an agent may reach (the full list is `HOST_GROUPS` in
 [`apps/connector/src/sandbox-policy.ts`](../apps/connector/src/sandbox-policy.ts)):
@@ -785,6 +786,146 @@ corporate registry is.
 | `--sandbox-host <host>` | Allows an agent to reach one more host. Repeat it.                                                                                      |
 | `--sandbox-write <dir>` | Allows an agent to write one more directory, such as a package cache or a local remote, but never your checkout (see below). Repeat it. |
 | `--sandbox-hide <path>` | Hides one more file or folder from every agent, even inside a `--sandbox-write` directory, such as a tool's own sign-in. Repeat it.     |
+
+### AI accounts through Chopin
+
+The agent of a build, investigation or prototype runs on the AI accounts that the
+person it runs for connected in Chopin (see
+[AI credentials](hosted-agent.md#ai-credentials)), never on yours. The connector asks
+Chopin for the run's launch with the run's credential before the agent starts, and
+the agent runs on those accounts with nothing of yours:
+
+- **Stand-ins, not keys.** The agent's environment sets each granted provider's
+  key variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `COPILOT_GITHUB_TOKEN`, and
+  for a ChatGPT or Claude sign-in `CHATGPT_ACCESS_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN`)
+  to a random stand-in that works only through Chopin, and `OPENAI_BASE_URL` and
+  `ANTHROPIC_BASE_URL` to a relay in the connector on `127.0.0.1`, which the
+  sandbox's proxy allows. Without an OpenAI key, a ChatGPT sign-in also takes
+  `OPENAI_API_KEY` and `OPENAI_BASE_URL`; without an Anthropic key, a Claude sign-in
+  takes `ANTHROPIC_BASE_URL`. Atomic finds a sign-in as its `openai` or `anthropic`
+  provider, ahead of a key, which keeps `openai-api` or `anthropic-api`. The relay adds the launch's own credential
+  (`x-chopin-launch`) to each request and forwards it to that provider's base URL
+  on Chopin and nowhere else; the credential stays in the connector's memory and is
+  never in the agent's environment, files or command line. A stand-in copied out of
+  the sandbox reaches nothing.
+- **Each provider's base URL with its key, for any agent.** `CHOPIN_AI_PROVIDERS`
+  holds, as JSON, one entry per granted provider, Copilot included, with what an
+  agent needs to reach it and nothing else (an example follows the list): `provider`,
+  `baseUrl`, `apiKey`, `keyVariable` and, for Copilot, `headers`. Send `apiKey` as the provider takes its key (`Authorization: Bearer`, or
+  `x-api-key` for Anthropic) to `baseUrl` with the provider's own paths after it
+  (Copilot's `/models` and `/chat/completions`, OpenAI's and ChatGPT's `/v1/…`, and
+  Anthropic's and Claude's `/v1/…`; a Claude stand-in goes as `Authorization: Bearer`,
+  and Chopin adds the headers and the leading system block a Claude subscription
+  needs, as Atomic sends them), with `headers` added. Each `baseUrl` is on the relay; the launch's own credential is
+  in none of it. An agent that reads no provider's variables, any agent that is not
+  Atomic, reaches every granted provider with its pair alone.
+- **Only what it needs of your environment.** The agent's environment is built from
+  an allow-list, not by taking known secrets out: of the connector's own environment
+  it gets where the system, your account and your tools are (`PATH`, `HOME`, the
+  locale, `JAVA_HOME`, `CARGO_HOME`, `VIRTUAL_ENV` and the like), its certificates and
+  its proxy, and nothing else, whatever a variable is called, so a provider key or
+  another service's token in the connector's environment never reaches it. Your
+  `--env` values reach it, but for GitHub credentials and your agents' own model keys
+  and directories.
+- **A state directory of its own.** The agent keeps its state in
+  `<worktree>.agent`, which goes with the run's worktree:
+  `ATOMIC_CODING_AGENT_DIR`, `COPILOT_HOME`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME`
+  point there. It reads none of your agents' configuration, logins or sessions:
+  `~/.atomic/agent`, `~/.atomic/workflows`, `~/.pi/agent`, `~/.copilot`,
+  `~/.claude`, `~/.claude.json`, `~/.codex`, `~/.gemini`,
+  `~/.config/github-copilot` and the places your environment or your `--env` values
+  move them to (`ATOMIC_CODING_AGENT_DIR`, `PI_CODING_AGENT_DIR`, Atomic's sessions,
+  workflow artifacts and journal in `ATOMIC_CODING_AGENT_SESSION_DIR`,
+  `ATOMIC_WORKFLOW_ARTIFACT_DIR` and `ATOMIC_WORKFLOW_JOURNAL_PATH`, `COPILOT_HOME`,
+  `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `github-copilot` under `XDG_CONFIG_HOME`;
+  `~` and `~/…` from your home, a `file:` URL, a relative path from where the
+  connector started) are unreadable. A folder of yours like that which holds the
+  run's own (your agent directory holding the connector's state directory, say) is
+  hidden around it: everything in it but the run's worktree, state and tokens. One
+  that is your home, or holds it, can't be hidden without taking your tools from the
+  agent, so the run is refused and says which variable to point elsewhere. Without a
+  working sandbox none of this is enforced on disk.
+- **Atomic** finds a generated `models.json` there that sends each granted
+  provider (and `openai-api` and `anthropic-api`) to its base URL on the relay,
+  with `apiKey` naming the provider's key variable, and reads the model catalog
+  through Chopin (`ATOMIC_MODEL_CATALOG_URL`).
+- **When it ends.** The connector ends the launch when the run ends; Chopin also ends
+  it when the run ends there, if that end never arrives. When Chopin ends it first
+  (your machine revoked, the document archived, its deadline), the relay hears it from
+  Chopin with the launch's own credential once the proxy refuses a request, and the
+  connector stops the run, once.
+
+`CHOPIN_AI_PROVIDERS`, for a run granted Copilot and Anthropic:
+
+```json
+[
+	{
+		"provider": "github-copilot",
+		"baseUrl": "http://127.0.0.1:43123/…/github-copilot",
+		"apiKey": "chopin_ai_…",
+		"keyVariable": "COPILOT_GITHUB_TOKEN",
+		"headers": { "Copilot-Integration-Id": "vscode-chat" }
+	},
+	{
+		"provider": "anthropic",
+		"baseUrl": "http://127.0.0.1:43123/…/anthropic",
+		"apiKey": "chopin_ai_…",
+		"keyVariable": "ANTHROPIC_API_KEY"
+	}
+]
+```
+
+A run whose person has no AI account Chopin can use never starts its agent: no
+Copilot seat and no API key, Chopin says so (`no-ai-account`), and the run ends in its
+words, "chopin needs an AI account to run this, so it didn't start. Add one, then start
+it again.", or, where GitHub couldn't be asked about their Copilot access, that the
+check couldn't finish. Your own sign-ins and keys are never used in its place, on your
+machine or a shared one. Only a run against a Chopin from before AI launches (which
+answers 404) starts its agent on your own setup, as before.
+
+A Planner backend gets its sessions' grants over the
+[agent connection](agent-connection.md#models-through-chopin). When Chopin says its
+Planners' sessions run on people's AI accounts (`"ai": "chopin"` in
+`/api/connector/version`, which the connector reads as it starts, and in each Planner
+credential's answer), the connector starts the backend, cold or as a spare, the same
+way: an allow-listed environment, its agents' state in `<worktree>.agent`, none of your
+agents' setup in sight, and `CHOPIN_AI=chopin`, so its models come only from the grants
+it is handed. A spare started otherwise is replaced, never handed such a document.
+Against a Chopin that says nothing of it, a backend starts as before. Give a backend
+what it needs in its own `--planner-command` or in `--env`, not in the connector's
+environment, which it then gets only an allow-list of.
+
+### Agent sessions in Chopin's database
+
+Where the Chopin you connect to gives machines a database for their agents' Atomic
+sessions, pairing and `chopin connect` set it up with nothing more to do: the
+connector asks Chopin for this machine's own login, saves it in `agent-store/` in its
+base dir (the password apart, only you can read it), installs the
+`@bastani/atomic-storage-postgres` adapter there once with `npm`, and says so:
+
+```
+Agents here keep their sessions in this machine's own database at db.example.com:5432.
+```
+
+Each agent that runs on Chopin's AI accounts, and each such Planner, then finds in its
+own Atomic directory (`<worktree>.agent/atomic`) a copy of the adapter, its
+`storage-password` (mode `0600`) and a `settings.json` whose `storage` selects the
+database by a URL without the password. A Planner started once the machine has no
+database login (Chopin stopped giving one, or this connect couldn't set it up) finds
+that `storage` and its password taken out again, the rest of its settings kept, and
+keeps its sessions on the machine. Your own `~/.atomic` is never touched, and an
+agent that runs on your own models keeps its sessions as before. The sandbox's proxy
+allows the database's host and port, which Atomic's adapter reaches through
+`HTTPS_PROXY`.
+
+If Chopin can't make the login, or the adapter can't be installed, the connector says
+why and connects anyway; the Machines page shows it too, until a connect reports it
+set up, even while the machine is away. `chopin pair` on its own, which connects
+nothing, tells Chopin at once. Agents keep their sessions
+on the machine until a later connect sets it up. When Chopin can't be reached, the
+saved login is used. `chopin unpair` removes the saved password, and Chopin turns the
+login off. The sandbox's proxy allows the database's host and port whether the URL
+names a host, an IPv4 address or an IPv6 address in brackets (`[2001:db8::1]:5432`).
 
 ### Git in the sandbox
 

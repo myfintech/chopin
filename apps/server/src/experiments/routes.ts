@@ -5,7 +5,7 @@ import type { Investigation, InvestigationProvenance } from "@chopin/experiment/
 import type { HostedAuth } from "../auth/routes";
 import { AdmissionDenied } from "../auth/admission";
 import { ownOrigin } from "../auth/config";
-import { MachineError } from "../auth/machines";
+import { MachineCutoffError, MachineError } from "../auth/machines";
 import type {
 	GitHubInstallation,
 	GitHubTokenGrant,
@@ -27,6 +27,7 @@ import {
 	CONNECTOR_PLATFORM_HEADER,
 	CONNECTOR_PROTOCOL_HEADER,
 	CONNECTOR_SERVICE_HEADER,
+	CONNECTOR_STORE_PROBLEM_HEADER,
 	CONNECTOR_UPDATE_REQUIRED,
 	CONNECTOR_VERSION_HEADER,
 	parseSandboxReport,
@@ -41,13 +42,23 @@ import type { MachinePlanners } from "../harness/remote/machine-planners";
 import { ANY_REPOSITORY_PROTOCOL, checkoutOf, Connections, serves } from "./connections";
 import { launchGitHubToken, machineGitHubToken } from "./machine-github";
 import type { GitHubIdentity, LaunchRun } from "./machine-github";
-import { liveMcpLaunch, McpTokens, mintMcpToken } from "./mcp-token";
+import { liveMcpLaunch, liveRun, McpTokens, mintMcpToken } from "./mcp-token";
+import { AiCredentialError } from "../ai/credentials";
+import { AiLaunchRefused, handOut, RUN_AI_LAUNCH_MS } from "../ai/launches";
+import { AI_ACCOUNT_UNCHECKED_RUN, NO_AI_ACCOUNT_RUN } from "@chopin/protocol/ai-credentials";
+import type { AiCredentials } from "../ai/credentials";
 import type { HostedCaller } from "../mcp/hosted";
 import type { GitHubApp } from "../github/app";
 import type { About, Connection } from "./connections";
 import type { Source } from "@chopin/experiment";
 import type { PlanSource } from "@chopin/protocol/implementation";
 import { PairingKeys } from "./pairing-keys";
+import { MachineStoreRefusal } from "../machine-store/server";
+import type { MachineStores } from "../machine-store/service";
+import {
+	MACHINE_STORE_REASON_LIMIT,
+	type MachineStoreStatus,
+} from "@chopin/protocol/machine-store";
 import { Experiments, fail } from "./service";
 import { datasetCsv } from "./export";
 import { investigationSummary } from "./document";
@@ -63,6 +74,9 @@ import { spikeReport, spikeSubmissionSchema } from "./spikes";
 
 export type ExperimentRuntime = ReturnType<typeof registerExperimentRoutes>;
 type Options = {
+	/** People's AI credentials, from which a run on a paired machine is handed stand-ins. */
+	ai?: () => AiCredentials | undefined;
+	machineStores?: MachineStores;
 	implementations?: () => ImplementationConnector | undefined;
 	lease: () => Lease;
 	context: (id: string) => Promise<{ source: string; revision: number } | undefined>;
@@ -134,6 +148,8 @@ function aboutMachine(request: Request): About {
 		version: header(CONNECTOR_AGENT_VERSION_HEADER),
 	});
 	let sandbox = parseSandboxReport(header);
+	let storeProblem = plainText(header(CONNECTOR_STORE_PROBLEM_HEADER) ?? "")
+		.slice(0, MACHINE_STORE_REASON_LIMIT);
 	return {
 		...(hostname && /^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$/.test(hostname) ? { hostname } : {}),
 		...(os && arch && !extra && OSES.has(os) && ARCHES.has(arch) ? { platform: { os, arch } } : {}),
@@ -142,6 +158,7 @@ function aboutMachine(request: Request): About {
 		plannerCommand: header(CONNECTOR_PLANNER_COMMAND_HEADER) === "1",
 		...(agent.success ? { agent: agent.data } : {}),
 		...(sandbox ? { sandbox } : {}),
+		...(storeProblem ? { storeProblem } : {}),
 	};
 }
 const label = z.string().trim().min(1).max(100);
@@ -383,6 +400,15 @@ function json(value: unknown, status = 200) {
 	});
 }
 
+function machineStore(
+	status: MachineStoreStatus | undefined,
+	live: Connection[],
+): MachineStoreStatus | null {
+	if (!status) return null;
+	let problem = live.at(-1)?.about?.storeProblem;
+	return status.state !== "failed" && problem ? { state: "failed", reason: problem } : status;
+}
+
 /** A machine's newest connection's account of it; null where none said. */
 function described(live: Connection[]) {
 	let about = live.at(-1)?.about ?? {};
@@ -448,10 +474,20 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 	/** Revoke a machine, and forget everyone's favorite of it with the revocation. */
 	function revokeMachine(machineId: string, userId: string) {
 		return changingFavorites(machineId, async () => {
-			let revoked = await auth.machines.revoke(machineId, userId);
+			let revoked = await auth.machines.revoke(machineId, userId).catch((error: unknown) => {
+				if (error instanceof MachineCutoffError) return error;
+				throw error;
+			});
 			if (revoked) connections.unfavor(machineId);
 			return revoked;
 		});
+	}
+	function cutoffIncomplete(error: MachineCutoffError, again: string) {
+		return json({
+			error: "machine-store-unavailable",
+			message: "The machine is disconnected, but Chopin couldn't turn off its database login yet ("
+				+ `${error.reason}). Chopin keeps trying; ${again} to check now.`,
+		}, 503);
 	}
 	let keys = new PairingKeys(() => auth.clock().getTime());
 	auth.pairings.authorized = (userId, sessionId, grant) => keys.authorize(userId, sessionId, grant);
@@ -1402,7 +1438,13 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 	}
 	/** What a connector should run: the protocols spoken here and the recommended release. */
 	let versions = { protocol: CONNECTOR_PROTOCOLS, version: options.connectorVersion ?? null };
-	route("GET", "/api/connector/version", async () => json(versions));
+	// `ai` says the Planners this Chopin asks machines to run take their sessions' models from
+	// people's AI accounts in it, so a connector starts its spare Planners that way from the start.
+	route("GET", "/api/connector/version", async () =>
+		json({
+			...versions,
+			...(options.ai?.() && options.planners && auth.machines.durable ? { ai: "chopin" } : {}),
+		}));
 	route("POST", "/api/connector/pairings", async request => {
 		compatible(request, auth.config.origin, options.connectorVersion);
 		let { key, ...input } = pairingSchema.parse(await body(request));
@@ -1569,6 +1611,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		compatible(request, auth.config.origin, options.connectorVersion);
 		let machine = await machineRefusal(() => auth.machines.authenticate(bearer(request)));
 		let input = connectionSchema.parse(await body(request));
+		let about = aboutMachine(request);
 		let protocol = protocolOf(request);
 		let anyRepository = protocol >= ANY_REPOSITORY_PROTOCOL;
 		if (!anyRepository && input.checkouts.length !== 1) fail("invalid-request");
@@ -1603,9 +1646,15 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 			},
 			input.label,
 			checkouts,
-			aboutMachine(request),
+			about,
 		);
 		await auth.machines.seen(machine);
+		await options.machineStores?.report(machine.id, about.storeProblem).catch((error: unknown) => {
+			console.error(
+				`chopin: could not note the database setup of machine ${machine.id} -`,
+				error instanceof Error ? error.message : "unknown error",
+			);
+		});
 		// Remembered, so `chopin status` and the Machines page can say which checkouts it has.
 		for (let checkout of checkouts) {
 			if (machine.repositories.some(value => value.repositoryId === checkout.repositoryId)) {
@@ -1684,7 +1733,9 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 			trail.lastLaunch = auth.clock().getTime();
 			options.plannerStatus?.(channel.id);
 		}
-		// The repository says which of the machine's checkouts the Planner runs in.
+		// The repository says which of the machine's checkouts the Planner runs in. `ai` says its
+		// sessions run on people's AI accounts in Chopin, handed over the agent connection: the
+		// connector starts its backend with nothing of the owner's agent setup.
 		return json({
 			...issued,
 			document: {
@@ -1692,6 +1743,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 				url,
 				repository: `${channel.repositoryOwner}/${channel.repositoryName}`,
 			},
+			...(options.ai?.() ? { ai: "chopin" } : {}),
 		});
 	});
 	/**
@@ -1811,6 +1863,62 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		let minted = await mintMcpToken(mcpSources, machine, from);
 		await auth.machines.seen(machine);
 		return json(minted);
+	});
+	/**
+	 * What a run on this machine is handed for the models its agent calls, in place of any key of
+	 * the machine's: a launch for the person the run acts for (whoever started it, on their own
+	 * machine or a teammate's), on this machine and the run's document, owned by the run, so it ends
+	 * with the run. Its answer is the launch's own credential, its deadline and one stand-in per
+	 * granted provider (see `handOut`). A launch that would be given nothing is refused, and the run
+	 * starts no agent: `no-ai-account`, with words its end says (and never that a Copilot check that
+	 * couldn't finish means no subscription), or `launch-ended` when its document or machine ended
+	 * first; accounts changing meanwhile are `unavailable`, which may be tried again.
+	 */
+	route("POST", "/api/connector/ai-launch", async request => {
+		let credentials = options.ai?.();
+		if (!credentials || !auth.machines.durable) fail("not-found");
+		compatible(request, auth.config.origin, options.connectorVersion);
+		let machine = await machineRefusal(() => auth.machines.authenticate(bearer(request)));
+		let { run } = z.object({ run: z.string().min(1).max(1024) }).strict().parse(
+			await body(request),
+		);
+		let live = await liveRun(mcpSources, machine, run);
+		let expiresAt = auth.clock().getTime() + RUN_AI_LAUNCH_MS;
+		let handed;
+		try {
+			handed = await handOut(credentials, {
+				userId: live.userId,
+				machineId: machine.id,
+				channelId: live.documentId,
+				expiresAt: new Date(expiresAt),
+				owner: `run:${live.runId}`,
+			});
+		} catch (error) {
+			if (error instanceof AiCredentialError) fail("unavailable", error.message);
+			if (error instanceof AiLaunchRefused && error.code === "no-ai-account") {
+				fail("no-ai-account", error.unchecked ? AI_ACCOUNT_UNCHECKED_RUN : NO_AI_ACCOUNT_RUN);
+			}
+			if (error instanceof AiLaunchRefused) {
+				fail("launch-ended", "This run's document or machine ended before it could start.");
+			}
+			throw error;
+		}
+		await auth.machines.seen(machine);
+		return json(handed.grants);
+	});
+	/**
+	 * A run's machine ends the AI launch it was handed, with the launch's own credential. Storage
+	 * keeps which machine a launch was handed to, so a process that started since ends it too.
+	 */
+	route("POST", "/api/connector/ai-launch/end", async request => {
+		let credentials = options.ai?.();
+		if (!credentials || !auth.machines.durable) fail("not-found");
+		compatible(request, auth.config.origin, options.connectorVersion);
+		let machine = await machineRefusal(() => auth.machines.authenticate(bearer(request)));
+		let { launch } = z.object({ launch: z.string().min(1).max(256) }).strict().parse(
+			await body(request),
+		);
+		return json({ ended: await credentials.endHeld(launch, machine.id) });
 	});
 	/** The `/mcp` caller an MCP token names, while its launch and its machine are live. */
 	async function mcpCaller(token: string): Promise<HostedCaller | undefined> {
@@ -1940,10 +2048,64 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		let machine = await auth.storage.machines.byToken(
 			new Uint8Array(createHash("sha256").update(bearer(request)).digest()),
 		);
-		if (!machine || machine.revokedAt) fail("machine-revoked");
-		await revokeMachine(machine.id, machine.userId);
+		if (!machine) fail("machine-revoked");
+		let revoked = await revokeMachine(machine.id, machine.userId);
 		await disconnectMachine(machine.id);
+		if (revoked instanceof MachineCutoffError) {
+			return cutoffIncomplete(revoked, "run `chopin unpair` again");
+		}
+		if (machine.revokedAt) fail("machine-revoked");
 		return json({ revoked: true });
+	});
+	let privateOrigin = (() => {
+		let origin = new URL(auth.config.origin);
+		return origin.protocol === "https:"
+			|| ["localhost", "127.0.0.1", "[::1]"].includes(origin.hostname);
+	})();
+	async function machineStoreAnswer(action: () => Promise<Response>) {
+		try {
+			return await action();
+		} catch (error) {
+			if (!(error instanceof MachineStoreRefusal)) throw error;
+			return json({ error: "machine-store-unavailable", message: error.message }, 503);
+		}
+	}
+	route("POST", "/api/connector/machine-store", async request => {
+		let stores = options.machineStores;
+		if (!stores) fail("not-found");
+		compatible(request, auth.config.origin, options.connectorVersion);
+		let machine = await machineRefusal(() => auth.machines.authenticate(bearer(request)));
+		let { problem } = z.object({ problem: z.string().max(4_000).optional() }).strict().parse(
+			await body(request),
+		);
+		// A machine that couldn't set up the login it was handed says why, as `chopin pair` does
+		// before any connection would.
+		if (problem !== undefined) {
+			let reported = plainText(problem).slice(0, MACHINE_STORE_REASON_LIMIT);
+			if (!reported) fail("invalid-request");
+			await stores.report(machine.id, reported);
+			return json({ reported: true });
+		}
+		if (!privateOrigin) {
+			return json({
+				error: "machine-store-unavailable",
+				message: "Chopin is served over plain HTTP, so it sends no database password",
+			}, 503);
+		}
+		return machineStoreAnswer(async () => json(await stores.login(machine)));
+	});
+	route("POST", "/api/connector/machines/:id/store/rotate", async (request, params) => {
+		let stores = options.machineStores;
+		if (!stores) fail("not-found");
+		let session = await auth.sessions.authenticate(request);
+		if (!session) fail("authentication-required");
+		z.object({}).strict().parse(await body(request));
+		let machine = (await auth.machines.list(session.user.id)).find(value => value.id === params.id);
+		if (!machine) fail("not-found");
+		return machineStoreAnswer(async () => {
+			await stores.rotate(machine);
+			return json({ rotated: true });
+		});
 	});
 	/**
 	 * Add the repositories a token can push to among its GitHub App installations to `into`, as
@@ -2086,6 +2248,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		let session = await auth.sessions.authenticate(request);
 		if (!session) fail("authentication-required");
 		let machines = await auth.machines.list(session.user.id);
+		let stores = await options.machineStores?.statuses(machines.map(machine => machine.id));
 		// Teammates' machines shared with them, in the repositories both can push to.
 		let others = await sharedByOthers(session.user.id);
 		let teammates = others.length ? await listedTo(session, others) : [];
@@ -2118,6 +2281,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 					version: connections.machine(machine.id).find(value => value.version)?.version ?? null,
 					...described(connections.machine(machine.id)),
 					reauthorize: !!machine.reauthorizeAt,
+					store: machineStore(stores?.get(machine.id), connections.machine(machine.id)),
 				})),
 				...await Promise.all(teammates.map(async ({ machine, repositories }) => ({
 					...await teammateFacts(machine),
@@ -2251,8 +2415,12 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		let session = await auth.sessions.authenticate(request);
 		if (!session) fail("authentication-required");
 		z.object({}).strict().parse(await body(request));
-		if (!await revokeMachine(params.id, session.user.id)) fail("not-found");
+		let revoked = await revokeMachine(params.id, session.user.id);
+		if (!revoked) fail("not-found");
 		await disconnectMachine(params.id);
+		if (revoked instanceof MachineCutoffError) {
+			return cutoffIncomplete(revoked, "disconnect it again");
+		}
 		return json({ revoked: true });
 	});
 	/** Whether a Planner backend of the machine is attached, or was cut by a deploy and is expected back. */
@@ -3207,5 +3375,11 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		mcpCaller,
 		/** The GitHub identity of a person a launch token was last issued for, to credit them. */
 		identity: (userId: string) => identities.get(userId),
+		/**
+		 * Whether a run on a machine still runs: a build, investigation or prototype Chopin still has
+		 * on its document. Its AI launch ends with it.
+		 */
+		runLive: async (runId: string, documentId: string | undefined) =>
+			(await launchRun(runId, documentId)) !== undefined,
 	};
 }

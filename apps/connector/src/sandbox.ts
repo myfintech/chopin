@@ -28,6 +28,7 @@ import {
 	type Disk,
 	inside,
 	mxcRequest,
+	ownerAgentPaths,
 	type Policy,
 	readableRoots,
 	readGrantsAround,
@@ -35,9 +36,11 @@ import {
 	sandboxPath,
 	type SandboxSettings,
 	secretPaths,
+	validAllowedEntry,
 	windowsReadRoots,
 } from "./sandbox-policy";
 import { type Proxy, startProxy } from "./sandbox-proxy";
+import { type AiRelay, startAiRelay } from "./ai-relay";
 
 /** What one agent or Planner process is started with, and what it may touch. */
 export type Launch = {
@@ -64,6 +67,19 @@ export type Launch = {
 	 * directory, but for where commits go (see `gitAccess`).
 	 */
 	own?: string[];
+	/**
+	 * The agent's own state directory, made for this launch and among `own`, in place of the owner's:
+	 * it writes there and nowhere else of an agent's, and reads none of the owner's agents'
+	 * configuration, logins or sessions (see `ownerAgentPaths`), wherever the owner's environment or
+	 * `ownerEnv` keeps them. Without it an agent keeps its state where the owner's agents do, as
+	 * before.
+	 */
+	agentHome?: string;
+	/**
+	 * The owner's `--env` values, which the owner's own agents may run with too: a directory of theirs
+	 * one of these moves is the owner's as much as one the connector's environment moves.
+	 */
+	ownerEnv?: Record<string, string | undefined>;
 };
 
 /** A started process: its stdout and stderr are always pipes. */
@@ -74,6 +90,9 @@ export type Sandbox = {
 	report: SandboxReport;
 	/** Start `launch` in the sandbox. Throws a `SandboxRefused` when the owner requires one and there is none. */
 	spawn(launch: Launch): Spawned;
+	/** The loopback relay through which its launches reach Chopin's credential proxy. */
+	aiRelay?: AiRelay;
+	allow?(entry: string): void;
 	close(): Promise<void>;
 };
 
@@ -247,13 +266,15 @@ export type SandboxOptions = {
 
 /** The sandbox that doesn't confine: where none works or the owner turned it off. */
 function unconfined(report: SandboxReport, refusal?: string): Sandbox {
+	let aiRelay = startAiRelay();
 	return {
 		report,
 		spawn(launch) {
 			if (refusal) throw new SandboxRefused(refusal);
 			return plainSpawn(launch);
 		},
-		close: async () => {},
+		aiRelay,
+		close: () => aiRelay.close(),
 	};
 }
 
@@ -304,14 +325,23 @@ export async function createSandbox(options: SandboxOptions): Promise<Sandbox> {
 		return unconfined(report, refusal);
 	}
 	let engine = report.engine;
+	let aiRelay = startAiRelay();
+	let hosts = [...allowedHosts(options.server, settings.hosts), aiRelay.host];
 	let proxy: Proxy = await startProxy({
-		hosts: allowedHosts(options.server, settings.hosts),
+		hosts,
 		refused: (name, port) => options.refused?.(name, port),
 	});
 	return {
 		report,
 		spawn: launch => spawnConfined(executor, engine, host, proxy, options, launch),
-		close: () => proxy.close(),
+		aiRelay,
+		allow(entry) {
+			if (validAllowedEntry(entry) && !hosts.includes(entry)) hosts.push(entry);
+		},
+		close: async () => {
+			await proxy.close();
+			await aiRelay.close();
+		},
 	};
 }
 
@@ -464,6 +494,50 @@ function writtenPlaces(launch: Pick<Launch, "cwd" | "writable" | "own">) {
 	];
 }
 
+/**
+ * What denies `path` and keeps each of `kept` inside it: `path` itself where it holds none of them,
+ * else each entry in it but those, gone through in turn down to them. So nothing in it is read but
+ * what the launch itself works in.
+ */
+function deniedAround(path: string, kept: readonly string[], platform: NodeJS.Platform): string[] {
+	let within = kept.filter(place => inside(place, path, platform));
+	if (!within.length) return [path];
+	if (within.some(place => place === path)) return [];
+	return disk.list(path).flatMap(name => deniedAround(join(path, name), within, platform));
+}
+
+/**
+ * The owner's agent setup a launch with a state directory of its own may not read, wherever their
+ * environment keeps it (see `ownerAgentPaths`), by the path it is named by and its real path. A
+ * place of the owner's that holds what the launch works in (its worktree, its own state, its
+ * tokens, its temporary directory, the checkout it reads) is denied around them: everything else in
+ * it. One that is the home or holds it can't be, without taking the person's tools from the agent,
+ * so the launch is refused, saying which.
+ */
+function ownerAgentDenials(
+	platform: NodeJS.Platform,
+	home: string,
+	env: Record<string, string | undefined>,
+	launchPlaces: readonly string[],
+) {
+	let homes = [home, env.HOME, env.USERPROFILE]
+		.filter((value): value is string => !!value)
+		.map(real);
+	let kept = [...new Set(launchPlaces.map(real))];
+	let denied = new Set<string>();
+	for (let path of ownerAgentPaths(platform, home, env, process.cwd())) {
+		let resolved = real(path);
+		if (homes.some(place => inside(place, resolved, platform))) {
+			throw new SandboxRefused(
+				`Not run: ${path} holds your home folder, and your environment keeps an agent's settings there, so chopin can't keep your own agents' sign-ins from this agent. Give that agent a folder of its own.`,
+			);
+		}
+		if (!kept.some(place => inside(place, resolved, platform))) denied.add(path);
+		for (let each of deniedAround(resolved, kept, platform)) denied.add(each);
+	}
+	return [...denied];
+}
+
 /** The policy for one launch, from what is on the disk now. */
 export function launchPolicy(
 	engine: SandboxEngine,
@@ -475,7 +549,9 @@ export function launchPolicy(
 ): Policy {
 	let { platform } = host;
 	let home = options.home ?? homedir();
-	let state = agentStateDirectories(launch.command, launch.env, home, platform);
+	let state = launch.agentHome
+		? [launch.agentHome]
+		: agentStateDirectories(launch.command, launch.env, home, platform);
 	for (let directory of state) {
 		try {
 			mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -562,7 +638,19 @@ export function launchPolicy(
 		...repository ? named(repository.commonDir) : [],
 	].filter(path => !written.has(real(path)));
 	let readonlyInside = [...git?.readonlyInside ?? [], ...reopened];
-	let denied = [...secretPaths(platform, home), ...concealed].filter(path => exists(path));
+	let denied = [
+		...secretPaths(platform, home),
+		...launch.agentHome
+			? ownerAgentDenials(platform, home, { ...host.env, ...launch.ownerEnv }, [
+				...places,
+				...state,
+				...launch.own ?? [],
+				temporary,
+				...theirs,
+			])
+			: [],
+		...concealed,
+	].filter(path => exists(path));
 	let env: Record<string, string | undefined> = { ...launch.env };
 	let pathKey = Object.keys(env).find(key => key.toUpperCase() === "PATH") ?? "PATH";
 	env[pathKey] = sandboxPath(env[pathKey], platform, real);

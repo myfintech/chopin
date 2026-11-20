@@ -20,13 +20,20 @@ import {
 	harnessFor,
 	plannerCatalog,
 	plannerCommands,
+	plannerOffered,
 	plannerOfferIncoming,
 	plannerOfferKnown,
 	plannerRanWithoutOffer,
 	plannerSteers,
 	shutdownHarnesses,
 } from "./harness/harnesses";
-import { chooseModel, publishModelState, turnModel, turnReadsImages } from "./chat/model-choice";
+import {
+	chooseModel,
+	publishModelState,
+	sessionModel,
+	turnModel,
+	turnReadsImages,
+} from "./chat/model-choice";
 import type { ModelChoiceDeps } from "./chat/model-choice";
 import * as Threads from "./chat/threads";
 import {
@@ -46,6 +53,8 @@ import { documentUrl } from "./channels/document-url";
 import { ActiveOwnerBindings } from "./agent/active-owner";
 import { registerAuthRoutes } from "./auth/routes";
 import { registerExperimentRoutes } from "./experiments/routes";
+import { PostgresMachineStoreServer } from "./machine-store/server";
+import { MachineStores } from "./machine-store/service";
 import { attachmentLimits } from "./attachments/limits";
 import { registerAttachmentRoutes } from "./attachments/routes";
 import { registerImageRoutes } from "./images/routes";
@@ -58,9 +67,8 @@ import * as Chat from "./chat/service";
 import { answerWake } from "./chat/wake";
 import { plannerAttachment } from "./chat/planner-attachment";
 import * as Initiative from "./chat/initiative";
-import * as Reactions from "./chat/reactions";
-import { respond as respondToReaction } from "./chat/reaction-reply";
-import { copiedFrom, reactInThread } from "./chat/thread-reactions";
+import * as Typing from "./chat/typing";
+import { copiedFrom, reactInChat, reactInThread } from "./chat/thread-reactions";
 import { createChildDocuments } from "./chat/children";
 import { createRootChat } from "./chat/root";
 import { serverInstruction as runServerInstruction } from "./chat/server-instruction";
@@ -109,6 +117,8 @@ import { researchAnswerDefinition, researchEvidenceDefinition } from "./jobs/res
 import { JobService } from "./jobs/service";
 import { DocumentSummaryCoordinator } from "./jobs/summary-coordinator";
 import { invokeRouted, SystemTurns } from "./mcp/invoke";
+import { createNewDocument, NewDocumentLimits } from "./agent/new-documents";
+import type { NewDocumentDeps } from "./agent/new-documents";
 import { liveClassifier } from "./tasks/live-gate";
 import { LiveSyncCoordinator } from "./tasks/live-sync";
 import { heuristicJudge, jevJudge, SpikeScout } from "./experiments/spike-scout";
@@ -120,10 +130,19 @@ import { createVisualAdmission } from "./agent/visual-admission";
 import { locksEditing, requestBuild } from "./tasks/builds";
 import { pendingLinks, relinkInstruction } from "./tasks/relink";
 import { BuildReadiness } from "./tasks/readiness";
-import { MCP_SESSION_IDLE_MS } from "./mcp/hosted";
+import { createDocument as createHostedDocument, MCP_SESSION_IDLE_MS } from "./mcp/hosted";
+import { CANNOT_STEER } from "./chat/steering";
 import { registerMcpRoutes } from "./mcp/routes";
 import { registerNavigationRoutes } from "./navigation/routes";
 import { registerPreferenceRoutes } from "./user-preferences/routes";
+import { AI_PROXY_PATH } from "@chopin/protocol/ai-credentials";
+import { AiCredentials } from "./ai/credentials";
+import { aiAccountRefusal } from "./ai/account-check";
+import { aiProxy } from "./ai/proxy";
+import { copilotTokenExchange } from "./ai/copilot";
+import { githubSignIn, registerAiRoutes } from "./ai/routes";
+import { AiUsage } from "./ai/usage";
+import { endLaunch, handOut, PLANNER_AI_LAUNCH_MS } from "./ai/launches";
 import * as Edit from "./plan/edit";
 import * as Service from "./plan/service";
 import * as DocumentProvenance from "./document-provenance";
@@ -184,7 +203,7 @@ import { SERVICE_RESTART } from "@chopin/protocol/restart";
 import { PLANNER_NAME } from "@chopin/protocol/address";
 
 import type { Server, ServerWebSocket } from "bun";
-import type { AgentSocketData } from "./harness/remote/endpoint";
+import type { AgentAi, AgentSocketData } from "./harness/remote/endpoint";
 import type { RepositoryAuthorizer, WatchTopics } from "./socket/decision-watch";
 import type { DocumentSummaryInput } from "./jobs/document-summary";
 import type { JobDefinition } from "./jobs/registry";
@@ -261,10 +280,29 @@ let implementations: ReturnType<typeof registerImplementationRoutes> | undefined
 let experimentTimer: ReturnType<typeof setInterval> | undefined;
 let sessionCleanup: ReturnType<typeof setInterval> | undefined;
 let cleaningSessions: Promise<void> | undefined;
+let aiCredentials: AiCredentials | undefined;
+/** Whether AI launches nothing owns are ended with each sweep: once holds and runs are back. */
+let aiRetiring = false;
+let aiUsage: AiUsage | undefined;
+let machineStores = config.machineStore
+	? new MachineStores({
+		storage,
+		server: new PostgresMachineStoreServer(config.machineStore),
+		key: config.auth.encryptionKey,
+		clock: () => new Date(),
+		...(config.machineStore.retentionMs === undefined
+			? {}
+			: { retentionMs: config.machineStore.retentionMs }),
+	})
+	: undefined;
+/** What a remote Planner client that offered `ai-credentials` hands its sessions' models. */
+let plannerAi: AgentAi | undefined;
 let ownerBindings: ActiveOwnerBindings | undefined;
 let plannerAttachments: PlannerAttachments | undefined;
 /** Each document's recent automatic follow-ups through `invoke_planner`, for their hourly limit. */
 let systemTurns = new SystemTurns();
+/** How many documents each turn, and each person in an hour, had the Planner create. */
+let newDocumentLimits = new NewDocumentLimits();
 /** Browser sockets by login, so a login that ends closes them before another broadcast. */
 let sessionSockets = new SessionSockets(sessionId => hostedAuth.sessions.isLive(sessionId));
 const openSockets = new OpenSockets();
@@ -730,11 +768,48 @@ async function plan(room: Rooms.Room, server: Server<SocketData>): Promise<Servi
 	try {
 		let opened = await opening;
 		opened.chat.initiativeEnabled = config.agent && !opened.parentChannelId;
+		if (!opened.parentChannelId && !opened.chat.typists) watchTyping(room, opened);
 		conversationRuntime.wake(opened);
 		return opened;
 	} finally {
 		if (room.opening === opening) room.opening = undefined;
 	}
+}
+
+/**
+ * Who is writing in a document's Chat and threads, told to everyone in its room who can read it,
+ * readers included, each without themselves. Access is the socket's current grant, asked of GitHub
+ * as initiative and reactions ask it (`refreshAccess(…, true)`), never the one cached since its last
+ * check: before each roster a member is told, and before a roster names a writer. A socket whose
+ * access is refused closes and leaves the room, and a writer who can no longer write stops writing
+ * everywhere.
+ */
+function watchTyping(room: Rooms.Room, opened: Service.Plan): void {
+	let here = (member: Socket) =>
+		Rooms.get(room.id) === room && room.plan === opened && !room.closing
+		&& !deletingChannels.has(room.id) && !member.data.closed
+		&& room.members.get(member.data.client) === member;
+	let typists = Typing.createTypingPresence({
+		threadExists: rootId => opened.chat.entries.some(entry => entry.id === rootId),
+		members: () => Rooms.get(room.id) === room && room.plan === opened ? room.members.values() : [],
+		reads: async member => {
+			if (!here(member)) return "denied";
+			let access = await refreshAccess(member, true);
+			if (access === "denied" && !member.data.closed) member.close(4403, "authorization expired");
+			return access === "allowed" && !here(member) ? "denied" : access;
+		},
+		writes: async client => {
+			let member = room.members.get(client);
+			if (!member || !here(member)) return "denied";
+			let access = await refreshAccess(member, true);
+			if (access !== "allowed") return access;
+			return member.data.canEdit && here(member) && !archivingChannels.has(room.id)
+				? "allowed"
+				: "denied";
+		},
+	});
+	opened.chat.typists = typists;
+	opened.chat.composing = (turn, writing) => typists.composing(undefined, turn, writing);
 }
 
 /** Who is in a document's conversation now; readers are not (see `Initiative.people`). */
@@ -825,6 +900,10 @@ function conversation(
 			}
 			: undefined,
 		plannerStarting: plannerAttachments ? () => plannerStarting(room.id) : undefined,
+		aiAccount: plannerAttachments
+			? userId =>
+				aiCredentials ? aiAccountRefusal(aiCredentials, userId) : Promise.resolve(undefined)
+			: undefined,
 		// A message sent while a turn runs reaches it only where the harness takes input mid-run.
 		steers: () => plannerSteers(room.id),
 		persist: chat => Service.persist(opened, chat),
@@ -843,6 +922,7 @@ function conversation(
 				}),
 			}),
 		modelChoice: () => turnModel(modelChoices, room.id),
+		sessionChoice: () => sessionModel(modelChoices, room.id),
 		commands: () => modelChoices.commands?.(room.id) ?? Promise.resolve(undefined),
 		fileExists: (path, sessionId) => repositoryFiles.has(room.id, repository, sessionId, path),
 		readsImages: () => turnReadsImages(modelChoices, room.id),
@@ -1020,6 +1100,9 @@ function conversation(
 				evict(held.room);
 			};
 		},
+		createDocument: config.agent
+			? request => createNewDocument(plannerDocuments(), { ...request, sourceId: room.id })
+			: undefined,
 		createResearch: config.agent
 			? async request => {
 				let service = researchService;
@@ -1065,6 +1148,17 @@ async function retireHeldMessages(): Promise<void> {
 		console.log(
 			`chopin: ${retired} message(s) an earlier release held for a Planner were left as ordinary messages`,
 		);
+	}
+}
+
+/**
+ * An AI request an earlier release sent and never recorded the end of is marked unknown: its
+ * process stopped between the send and the record. Only the holder of the writer lease does it.
+ */
+async function retireAiRequests(): Promise<void> {
+	let retired = await aiUsage?.retire() ?? 0;
+	if (retired > 0) {
+		console.log(`chopin: ${retired} AI request(s) an earlier release sent ended unrecorded`);
 	}
 }
 
@@ -1197,6 +1291,7 @@ const modelChoices: ModelChoiceDeps = {
 		});
 	},
 	known: channelId => plannerOfferKnown(config.harness, channelId),
+	offered: channelId => plannerOffered(config.harness, channelId),
 	incoming: channelId =>
 		plannerOfferIncoming(
 			config.harness,
@@ -1318,7 +1413,9 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 		return;
 	}
 	if (!VIEWER_ALLOWED.has(frame.kind)) {
-		let access = await refreshAccess(ws);
+		// A typing report shows its writer to the room at once, so it is taken on the socket's current
+		// grant, not the one cached since its last check.
+		let access = await refreshAccess(ws, frame.kind === "chat:typing");
 		if (access === "unavailable") {
 			if (frame.rid) fail(ws, frame.rid, "authorization is temporarily unavailable", PASSING);
 			return;
@@ -1378,6 +1475,8 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 					await Threads.greetThreads(chat(room, ws), ws).catch(err =>
 						console.error("chopin: could not send thread summaries -", err)
 					);
+					let typists = opened.chat.typists;
+					if (typists && !ws.data.closed) typists.greet(ws);
 				}
 				// What the Planner can be set to run, and what it is set to, for the composer.
 				if (!parent) {
@@ -1414,14 +1513,21 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 			if (room.plan) Service.departed(room.plan, ws);
 			return;
 
+		case "chat:pacing":
+			if (!room.plan || room.plan.parentChannelId || typeof frame.active !== "boolean") return;
+			if (archivingChannels.has(room.id) || room.closing || ws.data.closed) return;
+			Initiative.pacing(chat(room, ws), ws, frame.active);
+			return;
+
 		case "chat:typing": {
 			if (!room.plan || room.plan.parentChannelId || typeof frame.active !== "boolean") return;
 			if (archivingChannels.has(room.id) || room.closing || ws.data.closed) return;
-			Initiative.initiative(chat(room, ws))?.typing(
-				ws.data.client,
-				Initiative.actor(ws),
-				frame.active,
-			);
+			Typing.typed(chat(room, ws), ws, {
+				active: frame.active,
+				thread: frame.thread,
+				seq: frame.seq,
+				at: frame.at,
+			});
 			return;
 		}
 
@@ -1480,6 +1586,7 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 		}
 
 		case "chat:send":
+			room.plan?.chat.typists?.sent(ws.data.client, frame.thread);
 			try {
 				if (!await plannerWritable(room, ws, frame.rid)) return;
 				await Threads.sendMessage(chat(room, ws), ws, frame);
@@ -1596,9 +1703,7 @@ async function receive(ws: Socket, raw: string): Promise<void> {
 				let context = chat(room, ws);
 				let thread = frame.thread ?? copiedFrom(context, frame.id);
 				if (thread !== undefined) await reactInThread(context, ws, { ...frame, thread });
-				else {
-					await Reactions.react(context, ws, frame, reacted => respondToReaction(context, reacted));
-				}
+				else await reactInChat(context, ws, frame);
 			}
 			return;
 
@@ -1933,7 +2038,10 @@ function scheduleSidebarRecheck(ws: SidebarSocket): void {
 }
 
 async function refreshAccess(ws: Socket, forceGitHub = false): Promise<AuthorizationResult> {
-	return refreshAuthorization(ws.data, forceGitHub, forced => checkAccess(ws, forced));
+	let access = await refreshAuthorization(ws.data, forceGitHub, forced => checkAccess(ws, forced));
+	// A connection refused can no longer write: what it was writing ends, whoever asked.
+	if (access === "denied") Rooms.get(ws.data.room)?.plan?.chat.typists?.retire(ws.data.client);
+	return access;
 }
 
 function applyChannelAccess(
@@ -1978,8 +2086,10 @@ function applyChannelAccess(
 	data.channelArchivedAt = archivedAt;
 	if (channel.fullWidth) data.channelFullWidth = true;
 	else delete data.channelFullWidth;
+	let lostWrite = data.canEdit && !canEdit;
 	data.canEdit = canEdit;
 	data.canManage = canManage;
+	if (lostWrite) Rooms.get(data.room)?.plan?.chat.typists?.retire(data.client);
 }
 
 async function checkAccess(ws: Socket, forceGitHub: boolean): Promise<AuthorizationResult> {
@@ -2096,6 +2206,7 @@ function openRoomSocket(ws: Socket): void {
 			? { transcription: { provider: "OpenAI", maxBytes: config.transcription.maxBytes } }
 			: {}),
 		...(CLIENT_BUILD && !config.devClient ? { build: CLIENT_BUILD } : {}),
+		now: Date.now(),
 	});
 	if (plannerAttachments) {
 		tell(ws, { kind: "session:planner", ts: 0, planner: plannerAttachments.status(room.id) });
@@ -2125,6 +2236,7 @@ function closeRoomSocket(ws: Socket): void {
 	if (!room) return;
 	if (room.plan) {
 		room.plan.chat.initiative?.depart(ws.data.client);
+		room.plan.chat.typists?.depart(ws.data.client);
 		if (!room.members.size) room.plan.chat.initiative?.cancel();
 		announceAlone(room);
 		Service.departed(room.plan, ws);
@@ -2186,10 +2298,12 @@ async function route(
 		if ("status" in outcome) return refused(outcome);
 		return upgraded(req, self, outcome.data);
 	}
-	// An MCP call stops its tool work when its caller goes away; a request the cut abandons is
-	// the same to it.
+	// An MCP call stops its tool work when its caller goes away, and a request to the AI proxy
+	// sends nothing once it does; a request the cut abandons is the same to both.
 	let routed = await router.handle(
-		url.pathname === "/mcp" ? abandonable(req, abandoned) : req,
+		url.pathname === "/mcp" || url.pathname.startsWith(`${AI_PROXY_PATH}/`)
+			? abandonable(req, abandoned)
+			: req,
 		url,
 	);
 	if (routed) return routed;
@@ -2223,6 +2337,7 @@ function listen(): Server<SocketData> {
 						pongTimeoutMs: config.agentConnectionTimeoutMs,
 						maxSilenceMs: config.agentConnectionMaxSilenceMs,
 						catalogChanged: announceModel,
+						...(plannerAi ? { ai: plannerAi } : {}),
 					});
 					return;
 				}
@@ -2421,6 +2536,7 @@ function drain(graceful: boolean): Promise<void> {
 			})`,
 		);
 		await attempt(() => shutdownHarnesses());
+		await attempt(async () => await machineStores?.close());
 		await attempt(() => storage.close());
 		if (errors.length > 0) throw new AggregateError(errors, "Chopin shutdown failed.");
 	})();
@@ -2456,9 +2572,19 @@ function cleanSessions(): void {
 	}).then(async () => {
 		let now = hostedAuth.clock();
 		await storage.mcpSessions.deleteIdle(new Date(now.getTime() - MCP_SESSION_IDLE_MS));
+		await storage.mcpInvocations.deleteExpired(now);
 		await storage.plannerCredentials.deleteExpired(now);
+		await aiCredentials?.sweep();
+		// Once this process serves, so its holds are rebuilt and its runs recovered: a launch nothing
+		// owns now ends, whichever process handed it out.
+		if (aiRetiring) await aiCredentials?.retire();
+		await aiUsage?.sweep();
+		await machineStores?.sweep();
 	}).catch(err => {
-		console.error("chopin: could not delete idle MCP sessions or expired credentials -", err);
+		console.error(
+			"chopin: could not delete idle MCP sessions, expired idempotency keys or credentials -",
+			err,
+		);
 	}).finally(() => {
 		cleaningSessions = undefined;
 	});
@@ -2475,6 +2601,97 @@ async function resetOpenAgents(
 			room.plan ? Chat.resetAgent(room.plan.chat, sessionId, revision, reason) : Promise.resolve()
 		),
 	);
+}
+
+/** What follows a document's stored revision: its history, summary, live build and readiness. */
+function documentPersisted(target: Service.DocumentTarget): void {
+	void documentHistory.record(target);
+	if (summaryCoordinator) void summaryCoordinator.enqueueNow(target).catch(() => {});
+	liveSync?.schedule(target);
+	buildReadiness?.schedule(target);
+}
+
+/**
+ * The Planner's `create_document` for a turn in `sourceId`: stored as `create_document` over MCP
+ * stores one, with the person whose message drives the turn as its creator.
+ */
+function plannerDocuments(): NewDocumentDeps {
+	return {
+		channel: id => storage.channels.get(id),
+		deleting: id => deletingChannels.has(id) || archivingChannels.has(id),
+		login: async (userId, sessionId) => {
+			let own = sessionId ? await hostedAuth.sessions.resolve(sessionId) : undefined;
+			return own?.user.id === userId ? own : hostedAuth.sessions.forUser(userId);
+		},
+		repository: async (login, owner, name) =>
+			(await hostedAuth.sessions.use(
+				login,
+				token => hostedAuth.github.repositoryAccess(token, owner, name),
+			)).value,
+		branchHead: async (login, owner, name, branch) => {
+			let github = hostedAuth.github;
+			if (!github.branchHead) throw new Error("the base branch's commit can't be read");
+			return (await hostedAuth.sessions.use(
+				login,
+				token => github.branchHead!(token, owner, name, branch),
+			)).value;
+		},
+		origin: async channelId => Rooms.get(channelId)?.plan?.creation?.origin,
+		created: async channelId => {
+			let stored = await storage.collaboration.load(channelId, hostedAuth.clock());
+			return stored ? (await Service.readStored(stored)).creation?.origin : undefined;
+		},
+		create: (creator, input, instructed) =>
+			createHostedDocument(
+				hostedAuth,
+				{
+					visualAdmission,
+					isChannelDeleting: id => deletingChannels.has(id),
+					// One with an instruction is in use at once, so its Planner is started as New document's is.
+					onChannelCreated: instructed ? documentCreated : announceCatalogue,
+					onDocumentPersisted: documentPersisted,
+				},
+				creator,
+				input,
+			),
+		modelChoice: async (from, userId) => {
+			let choice = await storage.plannerModelChoices.get(from);
+			if (!choice || (choice.model === undefined && choice.thinkingLevel === undefined)) {
+				return undefined;
+			}
+			if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+			return {
+				lease: writerLease.held,
+				choice: {
+					...(choice.model !== undefined ? { model: choice.model } : {}),
+					...(choice.modelName !== undefined ? { modelName: choice.modelName } : {}),
+					...(choice.thinkingLevel !== undefined ? { thinkingLevel: choice.thinkingLevel } : {}),
+					userId,
+					updatedAt: hostedAuth.clock(),
+				},
+			};
+		},
+		invoke: input =>
+			invokeRouted({
+				channels: storage.channels,
+				deleting: id => deletingChannels.has(id) || archivingChannels.has(id),
+				transition: withDocumentTransition,
+				open: rootId => openRootChat(rootId, input.session?.session.id, input.repository),
+				plannerAccount: rootId => plannerAttachments?.holding(rootId)?.userId,
+				systemTurns,
+			}, input),
+		refusal: async (code, channel, url) => {
+			if (code === "planner-busy") return CANNOT_STEER;
+			if (code !== "planner-not-attached") return undefined;
+			return plannerNotAttached(
+				channel.id,
+				url,
+				`${channel.repositoryOwner}/${channel.repositoryName}`,
+			);
+		},
+		appOrigin: hostedAuth.config.origin,
+		limits: newDocumentLimits,
+	};
 }
 
 /** Tell every sidebar watching the document's repository that its documents changed. */
@@ -2544,7 +2761,10 @@ async function archiveChannelLocked(channelId: string, now: Date) {
 	}
 	archivingChannels.add(channelId);
 	let room = Rooms.get(channelId);
-	for (let ws of room?.members.values() ?? []) ws.data.canEdit = false;
+	for (let ws of room?.members.values() ?? []) {
+		ws.data.canEdit = false;
+		room?.plan?.chat.typists?.retire(ws.data.client);
+	}
 	try {
 		await summaryCoordinator?.suspend(channelId);
 		let result = await withDocumentLock(channelId, async () => {
@@ -2565,7 +2785,7 @@ async function archiveChannelLocked(channelId: string, now: Date) {
 				});
 				await Service.persist(active);
 			}
-			return storage.channels.archive({ id: channelId, now });
+			return storage.channels.archive({ id: channelId, now, lease: heldLease() });
 		});
 		// An archived document keeps no Planner, not even one whose connection dropped.
 		await plannerAttachments?.documentEnded(channelId);
@@ -3076,12 +3296,16 @@ let hostedAuth = registerAuthRoutes(router, {
 	setupAgents: config.setupAgents,
 	onSessionRevoked: sessionRevoked,
 	onCredentialsWillRotate: credentialsWillRotate,
+	lease: heldLease,
+	onMachineRevoked: async id => await machineStores?.disable(id),
 });
 // A paired machine's Planner backend attaches with a credential from the connector routes.
 let machinePlanners = config.agent && config.harness === "remote"
 	? new MachinePlanners(hostedAuth)
 	: undefined;
 experiments = registerExperimentRoutes(router, hostedAuth, {
+	ai: () => aiCredentials,
+	...(machineStores ? { machineStores } : {}),
 	...(config.auth.app ? { app: new GitHubAppClient(config.auth.app) } : {}),
 	planners: machinePlanners,
 	attachments: () => plannerAttachments,
@@ -3148,6 +3372,8 @@ if (config.agent && config.harness === "remote") {
 				},
 			},
 		}),
+		endAi: launchId => plannerAi?.end(launchId),
+		aiHeld: (launchId, holding) => plannerAi?.held?.(launchId, holding),
 		// A question a rebuilt hold's client asks keeps its document open until it is answered.
 		openDocument: async channelId => {
 			if (deletingChannels.has(channelId) || archivingChannels.has(channelId)) {
@@ -3392,12 +3618,7 @@ registerMcpRoutes(router, hostedAuth, {
 	isChannelDeleting: channelId => deletingChannels.has(channelId),
 	onChannelRenamed: announceChannel,
 	onChannelCreated: announceCatalogue,
-	onDocumentPersisted: target => {
-		void documentHistory.record(target);
-		if (summaryCoordinator) void summaryCoordinator.enqueueNow(target).catch(() => {});
-		liveSync?.schedule(target);
-		buildReadiness?.schedule(target);
-	},
+	onDocumentPersisted: documentPersisted,
 	restoreChannel,
 	serializeDocument: (channelId, action) =>
 		withDocumentTransition(channelId, () => withDocumentLock(channelId, action)),
@@ -3518,6 +3739,58 @@ registerResearchWorkspaceRoutes(router, hostedAuth, {
 });
 registerNavigationRoutes(router, hostedAuth, { storage });
 registerPreferenceRoutes(router, hostedAuth, { storage });
+/** The AI launches a Planner session of this process holds now: those its owner still owns. */
+let heldPlannerLaunches = new Set<string>();
+let connectedAi = new AiCredentials({
+	storage,
+	key: config.auth.encryptionKey,
+	origin: config.auth.origin,
+	clock: hostedAuth.clock,
+	githubToken: githubSignIn(hostedAuth),
+	copilotToken: copilotTokenExchange(),
+	writer: () => writerLease.holds(),
+	lease: heldLease,
+	// A run's launch lasts while Chopin still has the run; a session's while a session of this
+	// process holds it, a restart's hold included once it is rebuilt.
+	ownerLive: async ({ launchId, owner, channelId }) => {
+		if (owner?.startsWith("run:")) {
+			return await experiments?.runLive(owner.slice("run:".length), channelId) ?? false;
+		}
+		if (owner?.startsWith("session:")) return heldPlannerLaunches.has(launchId);
+		return true;
+	},
+});
+aiCredentials = connectedAi;
+plannerAi = {
+	launch: ({ sessionId, ...input }) =>
+		handOut(connectedAi, {
+			...input,
+			owner: `session:${sessionId}`,
+			expiresAt: new Date(hostedAuth.clock().getTime() + PLANNER_AI_LAUNCH_MS),
+		}),
+	end: launchId => endLaunch(connectedAi, launchId),
+	onChanged: listener => connectedAi.onChanged(listener),
+	held: (launchId, holding) => {
+		if (holding) heldPlannerLaunches.add(launchId);
+		else heldPlannerLaunches.delete(launchId);
+	},
+};
+hostedAuth.machines.onEnded(machineId => {
+	void connectedAi.machineEnded(machineId).catch(err =>
+		console.error("chopin: could not end a machine's AI placeholders -", err)
+	);
+});
+let recordedAi = new AiUsage({
+	storage,
+	lease: () => writerLease.held,
+	clock: hostedAuth.clock,
+});
+aiUsage = recordedAi;
+registerAiRoutes(router, hostedAuth, {
+	credentials: connectedAi,
+	proxy: aiProxy({ credentials: connectedAi, usage: recordedAi }),
+	usage: recordedAi,
+});
 registerImageRoutes(router, hostedAuth);
 registerAttachmentRoutes(router, hostedAuth, { limits: chatAttachmentLimits });
 registerTranscriptionRoutes(
@@ -3682,6 +3955,15 @@ try {
 		// Off the readiness path: a message an earlier release held is left as an ordinary one.
 		void retireHeldMessages().catch(err =>
 			console.error("chopin: could not close the messages an earlier release held -", err)
+		);
+		void retireAiRequests().catch(err =>
+			console.error("chopin: could not mark an earlier release's unfinished AI requests -", err)
+		);
+		// Holds are rebuilt and runs recovered: an AI launch an earlier process left with no run or
+		// session, its end lost with it, ends now, and with each sweep from here on.
+		aiRetiring = true;
+		void connectedAi.retire().catch(err =>
+			console.error("chopin: could not end the AI launches nothing owns -", err)
 		);
 		let held = requests.release();
 		console.log(

@@ -16,8 +16,13 @@ import { PostgresDecisionAnswerStore } from "./decision-answers";
 import { PostgresDocumentVersionStore } from "./versions";
 import { PostgresMachineStore } from "./machines";
 import { PostgresDeferredTurnStore } from "./deferred-turns";
+import { PostgresMcpInvocationStore } from "./mcp-invocations";
 import { PostgresMcpSessionStore } from "./mcp-sessions";
 import { PostgresPlannerCredentialStore } from "./planner-credentials";
+import { PostgresMachineDatabaseStore } from "./machine-databases";
+import { PostgresAiCredentialStore, PostgresAiPlaceholderStore } from "./ai-credentials";
+import { PostgresAiUsageStore } from "./ai-usage";
+import { AiCutoffs } from "../ai-cutoffs";
 import { PostgresChatThreadStore } from "./chat-threads";
 import { PostgresPlannerLinkHoldStore } from "./planner-holds";
 import { PostgresPlannerModelChoiceStore } from "./planner-model-choices";
@@ -533,6 +538,7 @@ function leaseConnection(url: string): LeaseConnection {
 export class PostgresStorage implements StorageAdapter {
 	readonly driver = "postgres";
 	readonly #sql: SQL;
+	readonly #aiCutoffs = new AiCutoffs();
 	readonly #url: string;
 	// Renewal has its own connection so a busy pool cannot delay it past the lease.
 	#renewal: LeaseConnection;
@@ -573,6 +579,8 @@ export class PostgresStorage implements StorageAdapter {
 		this.machines = new PostgresMachineStore(
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
+			() => this.#aiCutoffs.cut(),
 		);
 		this.plannerHolds = new PostgresPlannerLinkHoldStore(
 			this.#sql,
@@ -593,9 +601,35 @@ export class PostgresStorage implements StorageAdapter {
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
 		);
+		this.machineDatabases = new PostgresMachineDatabaseStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+		);
+		this.aiCredentials = new PostgresAiCredentialStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
+			this.#aiCutoffs,
+		);
+		this.aiPlaceholders = new PostgresAiPlaceholderStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
+			this.#aiCutoffs,
+		);
+		this.aiUsage = new PostgresAiUsageStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
+		);
 		this.mcpSessions = new PostgresMcpSessionStore(
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
+		);
+		this.mcpInvocations = new PostgresMcpInvocationStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
 		);
 		this.deferredTurns = new PostgresDeferredTurnStore(
 			this.#sql,
@@ -785,7 +819,12 @@ export class PostgresStorage implements StorageAdapter {
 	readonly plannerModelChoices: PostgresPlannerModelChoiceStore;
 	readonly chatThreads: PostgresChatThreadStore;
 	readonly plannerCredentials: PostgresPlannerCredentialStore;
+	readonly machineDatabases: PostgresMachineDatabaseStore;
+	readonly aiCredentials: PostgresAiCredentialStore;
+	readonly aiPlaceholders: PostgresAiPlaceholderStore;
+	readonly aiUsage: PostgresAiUsageStore;
 	readonly mcpSessions: PostgresMcpSessionStore;
+	readonly mcpInvocations: PostgresMcpInvocationStore;
 	readonly deferredTurns: PostgresDeferredTurnStore;
 	readonly preferences: PreferenceStore;
 	readonly provenance: PostgresProvenanceStore;
@@ -834,7 +873,8 @@ export class PostgresStorage implements StorageAdapter {
 			}),
 		rename: input => this.#renameChannel(input),
 		setFullWidth: input => this.#setChannelWidth(input),
-		archive: input => this.#setChannelArchived(input, true),
+		archive: input =>
+			this.#setChannelArchived(input, true, input.lease).finally(() => this.#aiCutoffs.cut()),
 		restore: input => this.#setChannelArchived(input, false),
 		delete: id => this.#deleteChannel(id),
 		publishDescription: input => this.#publishChannelDescription(input),
@@ -909,6 +949,11 @@ export class PostgresStorage implements StorageAdapter {
 		transaction: TransactionSQL,
 		input: CreateChannel,
 	): Promise<ChannelRecord> {
+		if (input.modelChoice) {
+			await this.#assertLease(transaction, input.modelChoice.lease).catch((err: unknown) => {
+				throw unavailable("a document's model choice needs the writer lease", err);
+			});
+		}
 		await this.#lockChannelTitles(transaction, input.repositoryId);
 		if (input.parentChannelId !== undefined) {
 			if (input.parentChannelId.length === 0) throw missing("parent channel id is required");
@@ -974,6 +1019,18 @@ export class PostgresStorage implements StorageAdapter {
 			if (input.initial.provenance) {
 				await this.provenance.record(transaction, input.id, input.initial.provenance, input.now);
 			}
+		}
+		let chosen = input.modelChoice?.choice;
+		if (chosen && (chosen.model !== undefined || chosen.thinkingLevel !== undefined)) {
+			await transaction`
+				INSERT INTO planner_model_choices (
+					channel_id, model, model_name, thinking_level, user_id, updated_at, fencing
+				) VALUES (
+					${input.id}, ${chosen.model ?? null}, ${chosen.modelName ?? null},
+					${chosen.thinkingLevel ?? null}, ${chosen.userId}, ${chosen.updatedAt},
+					${input.modelChoice!.lease.fencing}
+				)
+			`;
 		}
 		return channel({ ...saved, slug });
 	}
@@ -1051,11 +1108,14 @@ export class PostgresStorage implements StorageAdapter {
 	#setChannelArchived(
 		input: ChannelArchiveInput,
 		archived: boolean,
+		lease?: Lease,
 	): Promise<ChannelArchiveResult> {
 		return this.#run(
 			archived ? "archive channel" : "restore channel",
 			() =>
 				this.#sql.begin(async transaction => {
+					// An archive ends AI authority, which only the writer lease's holder counts.
+					if (lease) await this.#assertLease(transaction, lease);
 					let [current] = await transaction<ChannelRow[]>`
 					SELECT ${transaction.unsafe(CHANNEL_COLUMNS)}
 					FROM channels
@@ -1073,11 +1133,15 @@ export class PostgresStorage implements StorageAdapter {
 					let archivedAt = archived ? updatedAt : null;
 					let [saved] = await transaction<ChannelRow[]>`
 					UPDATE channels
-					SET archived_at = ${archivedAt}, updated_at = ${updatedAt}
+					SET archived_at = ${archivedAt}, updated_at = ${updatedAt},
+						archive_generation = archive_generation + ${archived ? 1 : 0}
 					WHERE id = ${input.id}
 					RETURNING ${transaction.unsafe(CHANNEL_RETURNING)}
 				`;
 					if (!saved) throw corrupt("changing channel archival returned no record");
+					if (archived) {
+						await transaction`DELETE FROM ai_placeholders WHERE channel_id = ${input.id}`;
+					}
 					return { channel: channel({ ...saved, slug: existing.slug }), changed: true };
 				}),
 		);

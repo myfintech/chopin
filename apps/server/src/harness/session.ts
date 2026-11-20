@@ -2,6 +2,7 @@ import {
 	BACKGROUND_TOOL_NAMES,
 	PLANNER_TOOL_NAMES,
 	REACTION_TOOL_NAMES,
+	THREAD_NOTE_TOOL_NAME,
 	VISUAL_PLANNER_TOOL_NAMES,
 } from "./tool-names";
 import { createJustBashNetworkSandboxSession } from "@ai-sdk/sandbox-just-bash";
@@ -12,6 +13,8 @@ import {
 	prosePlannerAgent,
 	reactionPlannerAgent,
 	refinePlannerAgent,
+	threadPlannerAgent,
+	threadVisualPlannerAgent,
 	visualPlannerAgent,
 } from "./agents";
 import { extensionTools } from "../planner-extensions";
@@ -31,6 +34,7 @@ import { type PlannerWorkspace, plannerWorkspace } from "./atomic/workspace";
 import { registerRemotePlanner, type RemotePlanner } from "./remote/registry";
 import { promptWithAttachments } from "../chat/attachment-prompt";
 import type { SentAttachment } from "../chat/attachment-prompt";
+import type { TellChat } from "../chat/thread-notes";
 import { startingTurn } from "./turn-level";
 
 import type { HarnessAgent } from "@ai-sdk/harness/agent";
@@ -67,6 +71,13 @@ export type PlannerChannel = {
 		) => string);
 	model?: string;
 	/**
+	 * The document's chosen model and thinking level when the session opens, already checked against
+	 * the harness's catalog. A remote client that offered `session-choice` makes its session on it,
+	 * with `model` as the model where none was chosen, as each turn has; every turn still passes its
+	 * own `choice` to `stream`.
+	 */
+	choice?: PlannerChoice;
+	/**
 	 * `atomic` runs the session as a full Atomic session in the channel's workspace;
 	 * `remote` runs it in the client attached to the channel.
 	 */
@@ -78,6 +89,11 @@ export type PlannerChannel = {
 	>;
 	/** Session-tree and remote fork hooks for Chat threads. */
 	fork?: PlannerForkHooks;
+	/**
+	 * A thread's full Atomic Planner only: sends the Chat Planner of the same document a note of
+	 * what was decided in the thread, offered to its turns as `tell_chat_planner`.
+	 */
+	tellChat?: TellChat;
 	/** An answer to a reader's reaction: no tools, isolated on every harness. */
 	reader?: true;
 };
@@ -110,7 +126,10 @@ export type PlannerSession = {
 	/**
 	 * Runs one turn. `choice` is what a person chose for the document, already checked against the
 	 * harness's catalog: the model replaces the channel's, and the thinking level goes to the
-	 * harness that offers one. Background jobs never pass one.
+	 * harness that offers one. Every turn passes it, a background job's included. `context` is what
+	 * cannot go before a prompt that opens with a command: an Atomic session records it in the
+	 * session before the command so later turns keep it, and any other harness adds it to the turn's
+	 * instructions.
 	 */
 	stream: (
 		prompt: string,
@@ -118,6 +137,7 @@ export type PlannerSession = {
 		choice?: PlannerChoice,
 		files?: PlannerFiles,
 		message?: PlannerTurnMessage,
+		context?: string,
 	) => ReturnType<PlannerAgent["stream"]>;
 	destroy: () => Promise<void>;
 	/**
@@ -198,6 +218,9 @@ export type PlannerSessionDependencies = {
 	followupAgent?: PlannerAgent;
 	reactionAgent?: PlannerAgent;
 	visualAgent?: PlannerAgent;
+	/** A thread's full Atomic Planner, which is offered `tell_chat_planner`. */
+	threadAgent?: PlannerAgent;
+	threadVisualAgent?: PlannerAgent;
 	githubTools?: typeof githubTools;
 	extensionTools?: typeof extensionTools;
 	createSandbox?: () => Promise<Sandbox>;
@@ -289,9 +312,14 @@ export async function openPlannerSession(
 		}
 		let remote: RemotePlanner | undefined;
 		if (channel.harness === "remote") {
+			let opensOn: PlannerChoice = {
+				...(channel.model ? { model: channel.model } : {}),
+				...channel.choice,
+			};
 			let held: RemotePlanner = {
 				channelId: channel.room.id,
 				isolated,
+				...(opensOn.model || opensOn.thinkingLevel ? { choice: opensOn } : {}),
 				...(channel.fork?.remoteFrom ? { forkFrom: { ...channel.fork.remoteFrom } } : {}),
 				...(channel.fork?.onRemoteTurn ? { onRemoteTurn: channel.fork.onRemoteTurn } : {}),
 			};
@@ -319,6 +347,7 @@ export async function openPlannerSession(
 			remote = held;
 			unregisterRemote = registerRemotePlanner(sessionId, held);
 		}
+		let noting = !!channel.tellChat && !!planner;
 		let agent = deps.agent ?? (job?.kind === "heading"
 			? deps.headingAgent ?? headingPlannerAgent
 			: job?.kind === "refine" || job?.kind === "suggest"
@@ -329,6 +358,10 @@ export async function openPlannerSession(
 			? deps.followupAgent ?? decisionFollowupPlannerAgent
 			: channel.reader
 			? deps.reactionAgent ?? reactionPlannerAgent
+			: noting && channel.room.visual
+			? deps.threadVisualAgent ?? threadVisualPlannerAgent
+			: noting
+			? deps.threadAgent ?? threadPlannerAgent
 			: channel.room.visual
 			? deps.visualAgent ?? visualPlannerAgent
 			: plannerAgent);
@@ -345,6 +378,7 @@ export async function openPlannerSession(
 			void opening.then(late => late.destroy()).catch(() => {});
 			throw cause;
 		}
+		let { choice: _opened, ...callOptions } = channel;
 		let instructions = typeof channel.instructions === "function"
 			? channel.instructions(
 				workspace
@@ -386,6 +420,7 @@ export async function openPlannerSession(
 				: channel.room.visual
 				? VISUAL_PLANNER_TOOL_NAMES
 				: PLANNER_TOOL_NAMES),
+			...(noting ? [THREAD_NOTE_TOOL_NAME] : []),
 		]);
 		return {
 			ok: true,
@@ -414,31 +449,38 @@ export async function openPlannerSession(
 						},
 					}
 					: {}),
-				stream: (prompt, abortSignal, choice, files, message) => {
+				stream: (prompt, abortSignal, choice, files, message, context) => {
 					// The remote turn aborts it when the turn ends or the link drops mid-tool.
 					let hostTools = remote ? new AbortController() : undefined;
 					if (remote) {
 						remote.hostTools = hostTools;
 						remote.turnMessage = message;
 					}
-					// The level is on this turn alone, as the model is: nothing is left for the next one.
-					return startingTurn(choice?.thinkingLevel, () =>
-						agent.stream({
-							session: active,
-							prompt: files?.attachments.length
-								? [promptWithAttachments(prompt, files.attachments, files.readsImages)]
-								: prompt,
-							abortSignal,
-							options: {
-								...channel,
-								...(choice?.model ? { model: choice.model } : {}),
-								instructions,
-								owner: current,
-								githubTools: tools,
-								extensionTools: extensions,
-								...(hostTools ? { toolSignal: hostTools.signal } : {}),
-							},
-						}));
+					// The level is on this turn alone, as the model is; an Atomic session records `context`
+					// in the session before a command prompt so later turns still have it.
+					return startingTurn(
+						choice?.thinkingLevel,
+						() =>
+							agent.stream({
+								session: active,
+								prompt: files?.attachments.length
+									? [promptWithAttachments(prompt, files.attachments, files.readsImages)]
+									: prompt,
+								abortSignal,
+								options: {
+									...callOptions,
+									...(choice?.model ? { model: choice.model } : {}),
+									instructions: context && !planner
+										? `${instructions}\n\n${context}`
+										: instructions,
+									owner: current,
+									githubTools: tools,
+									extensionTools: extensions,
+									...(hostTools ? { toolSignal: hostTools.signal } : {}),
+								},
+							}),
+						planner ? context : undefined,
+					);
 				},
 				...(job ? {} : { steer: (text: string) => active.experimental_steerTurn(text) }),
 				destroy: () =>
