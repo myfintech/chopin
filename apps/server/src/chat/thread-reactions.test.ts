@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 
 import { ActiveOwnerBindings } from "../agent/active-owner";
 import { decideReplying } from "../conversation-plan/decisions.test-fixtures";
@@ -10,6 +10,7 @@ import { createResponder } from "./reaction-reply";
 import { sessionContextOf } from "./session-context";
 import * as Chat from "./service";
 import { copiedFrom, reactInChat, reactInThread } from "./thread-reactions";
+import { createTypingPresence } from "./typing";
 import * as Threads from "./threads";
 
 import type { Chat as Wire } from "@chopin/protocol";
@@ -23,8 +24,23 @@ afterEach(async () => {
 	for (let cleanup of cleanups.splice(0).toReversed()) await cleanup();
 });
 
-/** A room whose Planner answers every prompt with its last line, and whose frames are kept. */
-async function world() {
+type Parts = (prompt: string) => AsyncGenerator<never>;
+
+/** A Planner that answers every prompt with its first line. */
+async function* answering(prompt: string): AsyncGenerator<never> {
+	let id = crypto.randomUUID();
+	yield { type: "text-start", id } as never;
+	yield { type: "text-delta", id, text: `Answer to: ${prompt.split("\n")[0]}` } as never;
+	yield { type: "text-end", id } as never;
+	yield {
+		type: "finish",
+		finishReason: { unified: "stop", raw: undefined },
+		totalUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+	} as never;
+}
+
+/** A room whose Planner answers each prompt as `parts` does, and whose frames are kept. */
+async function world(parts: Parts = answering, destroy: () => Promise<void> = async () => {}) {
 	let { auth, storage, channel, logins } = await linkAuth();
 	let lease = (await storage.leases.acquire("writer", "test", 60_000))!;
 	let broadcasts: Wire.Outgoing[] = [];
@@ -53,20 +69,9 @@ async function world() {
 		let session: PlannerSession = {
 			stream: prompt => {
 				prompts.push({ instructions, prompt });
-				async function* parts() {
-					let id = crypto.randomUUID();
-					yield { type: "text-start", id } as never;
-					yield { type: "text-delta", id, text: `Answer to: ${prompt.split("\n")[0]}` } as never;
-					yield { type: "text-end", id } as never;
-					yield {
-						type: "finish",
-						finishReason: { unified: "stop", raw: undefined },
-						totalUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-					} as never;
-				}
-				return { fullStream: parts() } as never;
+				return { fullStream: parts(prompt) } as never;
 			},
-			destroy: async () => {},
+			destroy,
 		};
 		return { ok: true, value: session };
 	};
@@ -583,4 +588,238 @@ test("an answer to a Chat reaction is still not answered again after a reload", 
 
 	expect(w.prompts).toHaveLength(prompts);
 	expect(agents(restored)).toHaveLength(1);
+});
+
+/** A Planner whose reply waits for `release`, then lands, or fails where `fails`. */
+function held(fails = false) {
+	let gate = Promise.withResolvers<void>();
+	async function* parts(): AsyncGenerator<never> {
+		let id = crypto.randomUUID();
+		yield { type: "text-start", id } as never;
+		yield { type: "text-delta", id, text: "Thinking it over" } as never;
+		await gate.promise;
+		if (fails) {
+			yield { type: "error", error: new Error("429 Too Many Requests") } as never;
+			return;
+		}
+		yield { type: "text-end", id } as never;
+		yield {
+			type: "finish",
+			finishReason: { unified: "stop", raw: undefined },
+			totalUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+		} as never;
+	}
+	return { parts, release: () => gate.resolve() };
+}
+
+function named(told: Wire.Typists | undefined): string[] {
+	return (told?.typists ?? []).map(typist =>
+		`${typist.author.kind === "agent" ? "chopin" : typist.author.handle}${
+			typist.thread ? `@${typist.thread}` : ""
+		}`
+	);
+}
+
+/** Who a reader of the document is told is writing, as `who@thread`. */
+function watching(w: Awaited<ReturnType<typeof world>>) {
+	let reader = w.socket("rae");
+	let typists = createTypingPresence({
+		threadExists: rootId => w.plan.chat.entries.some(entry => entry.id === rootId),
+		members: () => [reader.ws],
+		reads: async () => "allowed",
+		writes: async () => "allowed",
+	});
+	w.plan.chat.typists = typists;
+	w.plan.chat.composing = (turn, writing) => typists.composing(undefined, turn, writing);
+	let rosters = (frames: Array<Record<string, unknown>>) =>
+		frames.filter(frame => frame.kind === "chat:typists") as unknown as Wire.Typists[];
+	return Object.assign(() => named(rosters(reader.frames).at(-1)), {
+		every: () => rosters(reader.frames).map(named),
+		/** Once what has changed is told, after each access check. */
+		settled: () => Bun.sleep(0),
+		/** What someone joining now is told. */
+		joining: async () => {
+			let cy = w.socket("cy");
+			typists.greet(cy.ws);
+			await Bun.sleep(0);
+			return named(rosters(cy.frames).at(-1));
+		},
+	});
+}
+
+test("while chopin answers a reaction in its thread, it is shown writing there and not in Chat, until its answer lands", async () => {
+	let planner = held();
+	let w = await world(planner.parts);
+	let shown = watching(w);
+	let ana = w.socket("ana");
+	let root = plannerRoot(w);
+
+	await w.reactInChatAs(ana.ws, root, "\u2753");
+	await until(() => shown().includes(`chopin@${root}`));
+	await shown.settled();
+	expect(shown()).toEqual([`chopin@${root}`]);
+
+	planner.release();
+	let thread = w.plan.chat.childChats!.get(root)!;
+	await until(() => agents(thread).some(entry => !entry.streaming) && !thread.busy);
+	await shown.settled();
+	expect(shown()).toEqual([]);
+});
+
+test("a reaction's answer that fails stops showing chopin writing in its thread", async () => {
+	let errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(() => errors.mockRestore());
+	let planner = held(true);
+	let w = await world(planner.parts);
+	let shown = watching(w);
+	let ana = w.socket("ana");
+	let root = plannerRoot(w);
+
+	await w.reactInChatAs(ana.ws, root, "\u2753");
+	await until(() => shown().includes(`chopin@${root}`));
+
+	planner.release();
+	let thread = w.plan.chat.childChats!.get(root)!;
+	await until(() => !thread.busy);
+	await shown.settled();
+	expect(shown()).toEqual([]);
+});
+
+test("chopin writing its reply in Chat is shown in Chat until the reply lands", async () => {
+	let planner = held();
+	let w = await world(planner.parts);
+	let shown = watching(w);
+	let ana = w.socket("ana");
+
+	await w.send(ana.ws, "@chopin which index?");
+	await until(() => shown().includes("chopin"));
+	await shown.settled();
+	expect(shown()).toEqual(["chopin"]);
+
+	planner.release();
+	await until(() => agents(w.plan.chat).some(entry => !entry.streaming) && !w.plan.chat.busy);
+	await shown.settled();
+	expect(shown()).toEqual([]);
+});
+
+test("chopin is shown writing a reaction's answer only once its turn begins, and reactions answered together show it once", async () => {
+	let planner = held();
+	let w = await world(planner.parts);
+	w.plan.chat.reactions = createResponder({ delayMs: 200 });
+	let shown = watching(w);
+	let ana = w.socket("ana");
+	let bo = w.socket("bo");
+	let root = plannerRoot(w);
+
+	await w.reactInChatAs(ana.ws, root, "\u2753");
+	await w.reactInChatAs(bo.ws, root, "\ud83d\udc4e");
+	await shown.settled();
+	expect(shown()).toEqual([]);
+	await until(() => shown().includes(`chopin@${root}`));
+
+	planner.release();
+	let thread = w.plan.chat.childChats!.get(root)!;
+	await until(() => !thread.busy);
+	await Bun.sleep(500);
+	await until(() => !thread.busy);
+	await shown.settled();
+	expect(shown()).toEqual([]);
+	expect(shown.every().every(names => names.filter(name => name.startsWith("chopin")).length <= 1))
+		.toBe(true);
+});
+
+test("stopping chopin's answer to a reaction stops showing it writing at once, while its turn is still ending", async () => {
+	let planner = held();
+	let w = await world(planner.parts);
+	let shown = watching(w);
+	let ana = w.socket("ana");
+	let root = plannerRoot(w);
+
+	await w.reactInChatAs(ana.ws, root, "\u2753");
+	await until(() => shown().includes(`chopin@${root}`));
+	let thread = w.plan.chat.childChats!.get(root)!;
+
+	await Threads.controlMessage(w.context, ana.ws, {
+		kind: "chat:abort",
+		rid: crypto.randomUUID(),
+		ts: 0,
+		thread: root,
+	});
+	expect(thread.entries.some(entry => entry.text === "@ana stopped the turn.")).toBe(true);
+	expect(thread.busy).toBe(true);
+	await shown.settled();
+	expect(shown()).toEqual([]);
+	expect(await shown.joining()).toEqual([]);
+	let told = shown.every().length;
+
+	planner.release();
+	await until(() => !thread.busy);
+	await shown.settled();
+	expect(shown.every().slice(told - 1).every(names => names.length === 0)).toBe(true);
+	expect(await shown.joining()).toEqual([]);
+});
+
+test("a reaction's answer that fails stops showing chopin writing before its session has closed", async () => {
+	let errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(() => errors.mockRestore());
+	let planner = held(true);
+	let closing = Promise.withResolvers<void>();
+	let w = await world(planner.parts, () => closing.promise);
+	let shown = watching(w);
+	let ana = w.socket("ana");
+	let root = plannerRoot(w);
+
+	await w.reactInChatAs(ana.ws, root, "\u2753");
+	await until(() => shown().includes(`chopin@${root}`));
+	let thread = w.plan.chat.childChats!.get(root)!;
+
+	planner.release();
+	await until(() => thread.entries.some(entry => !!entry.turnFailure));
+	expect(thread.busy).toBe(true);
+	await shown.settled();
+	expect(shown()).toEqual([]);
+	expect(await shown.joining()).toEqual([]);
+
+	closing.resolve();
+	await until(() => !thread.busy);
+	await shown.settled();
+	expect(shown()).toEqual([]);
+});
+
+test("once chopin's answer to a reaction is out, it is no longer shown writing, though its turn still checks the answer", async () => {
+	let checked = Promise.withResolvers<void>();
+	async function* parts(): AsyncGenerator<never> {
+		let id = crypto.randomUUID();
+		yield { type: "text-start", id } as never;
+		yield { type: "text-delta", id, text: "It moved to the router." } as never;
+		yield { type: "text-end", id } as never;
+		await checked.promise;
+		yield {
+			type: "finish",
+			finishReason: { unified: "stop", raw: undefined },
+			totalUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+		} as never;
+	}
+	let w = await world(parts);
+	let shown = watching(w);
+	let ana = w.socket("ana");
+	let root = plannerRoot(w);
+
+	await w.reactInChatAs(ana.ws, root, "\u2753");
+	await until(() =>
+		(w.plan.chat.childChats?.get(root)?.entries ?? []).some(entry =>
+			entry.author.kind === "agent" && !entry.streaming
+		)
+	);
+	let thread = w.plan.chat.childChats!.get(root)!;
+	expect(thread.busy).toBe(true);
+	await shown.settled();
+	expect(shown()).toEqual([]);
+	expect(await shown.joining()).toEqual([]);
+	expect(shown.every().some(names => names.includes(`chopin@${root}`))).toBe(true);
+
+	checked.resolve();
+	await until(() => !thread.busy);
+	await shown.settled();
+	expect(shown()).toEqual([]);
 });

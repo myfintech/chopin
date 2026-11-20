@@ -344,6 +344,12 @@ export type ChannelArchiveInput = {
 	now: Date;
 };
 
+/**
+ * An archive, which ends the AI authority of the document's launches: only the writer lease's holder
+ * counts that cutoff, so it is written under `lease`, checked in the same transaction.
+ */
+export type ChannelArchive = ChannelArchiveInput & { lease: Lease };
+
 export type ChannelArchiveResult = {
 	channel: ChannelRecord;
 	changed: boolean;
@@ -1013,6 +1019,11 @@ export type PlannerHeldSession = {
 	owed: JsonValue[];
 	/** Stops pressed while the link was down, for the client to hear first. */
 	stops: JsonValue[];
+	/**
+	 * The AI launch the client holds for the session, so the next process ends it with the session
+	 * or replaces it when the client resumes. An id, not a credential.
+	 */
+	aiLaunchId?: string;
 };
 
 /**
@@ -1129,6 +1140,22 @@ export type ChatSessionState = {
 	updatedAt: Date;
 };
 
+export type MachineDatabaseState = "pending" | "ready" | "failed" | "disabled" | "dropped";
+
+export type StoredMachineDatabase = {
+	machineId: string;
+	role: string;
+	revision: number;
+	ciphertext: Uint8Array;
+	candidate?: { revision: number; ciphertext: Uint8Array };
+	state: MachineDatabaseState;
+	failure?: string;
+	connectorProblem?: string;
+	updatedAt: Date;
+	disabledAt?: Date;
+	droppedAt?: Date;
+};
+
 /** A paired machine's Planner credential, known by the digest of its token and never the token. */
 export type PlannerCredential = {
 	/** SHA-256 of the credential. */
@@ -1138,6 +1165,124 @@ export type PlannerCredential = {
 	expiresAt: Date;
 };
 
+/**
+ * A provider a person connected for their launches' agents. `ciphertext` holds their key, encrypted
+ * by the server, and `suffix` its last four characters, to tell keys apart; a GitHub sign-in has
+ * neither, as Chopin reads the sign-in it already holds. `lastUsedAt` is when a launch last sent a
+ * request with this credential, since it was connected, and `rejectedAt` when its provider answered
+ * a request with it that the key itself is invalid, after which no launch is given it until it is
+ * connected again.
+ */
+export type AiCredentialRecord = {
+	userId: string;
+	provider: import("@chopin/protocol/ai-credentials").AiProvider;
+	kind: import("@chopin/protocol/ai-credentials").AiCredentialKind;
+	/**
+	 * The secret as it was connected, encrypted: a key, or a sign-in's tokens. Every connect makes it
+	 * anew, so it names the connection.
+	 */
+	ciphertext?: Uint8Array;
+	/** A sign-in's tokens as its latest refresh returned them, encrypted; absent until one has. */
+	tokens?: Uint8Array;
+	suffix?: string;
+	updatedAt: Date;
+	lastUsedAt?: Date;
+	rejectedAt?: Date;
+};
+
+/**
+ * A placeholder one launch was handed for one provider, known by its digest and never the
+ * placeholder itself. It stands for the credential of the person the launch runs for.
+ */
+export type AiPlaceholder = {
+	/** SHA-256 of the placeholder. */
+	digest: Uint8Array;
+	launchId: string;
+	/** SHA-256 of the credential the launch's runner presents beside the placeholder. */
+	launchDigest: Uint8Array;
+	userId: string;
+	provider: import("@chopin/protocol/ai-credentials").AiProvider;
+	/** The paired machine the launch runs on, whose revocation ends it. */
+	machineId?: string;
+	/** The document the launch works on, whose archiving or deletion ends it. */
+	channelId?: string;
+	/**
+	 * With `channelId`, the document's archive generation the launch was prepared in: how many times
+	 * it had been archived. A placeholder is stored only while the document is open in that
+	 * generation, so one prepared before an archive is never stored after it, a restore included.
+	 */
+	generation?: number;
+	/**
+	 * What the launch is for, whose end ends it: `run:<id>` for a run on a paired machine, or
+	 * `session:<id>` for a Planner session. Absent on a launch prepared before owners were kept.
+	 */
+	owner?: string;
+	expiresAt: Date;
+};
+
+/**
+ * The token counts a provider reported for one request: `input` is what was read without the
+ * cache, `cacheRead` what was read from it and `cacheWrite` what was written to it. A count the
+ * provider didn't report is absent.
+ */
+export type AiTokenCounts = {
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+};
+
+/**
+ * Where a proxied request stands: `pending` from before it is sent until its answer ends, `ok` or
+ * `error` once it was sent and has ended, `unsent` when the proxy refused it, or couldn't record or
+ * check it, before the send, and `unknown` when the process that recorded it stopped before
+ * recording how it ended.
+ */
+export type AiAttemptOutcome = "pending" | "ok" | "error" | "unsent" | "unknown";
+
+/** What a proxied request is recorded with before it is sent. */
+export type AiAttemptStart = {
+	id: string;
+	launchId: string;
+	userId: string;
+	provider: import("@chopin/protocol/ai-credentials").AiProvider;
+	/** The model the request named, when it named one. */
+	model?: string;
+	startedAt: Date;
+};
+
+/** How a proxied request ended: the provider's status, if it answered, and a short error code. */
+export type AiAttemptResult = {
+	outcome: "ok" | "error" | "unsent";
+	status?: number;
+	error?: string;
+	tokens: AiTokenCounts;
+	completedAt: Date;
+};
+
+export type AiAttempt = AiAttemptStart & {
+	outcome: AiAttemptOutcome;
+	status?: number;
+	error?: string;
+	tokens: AiTokenCounts;
+	completedAt?: Date;
+};
+
+/**
+ * One person's requests to one provider's model since a time: those sent that ended (`ok` or
+ * `error`), those of them that ended in an error, those still pending and those whose end is
+ * unknown, which are not among the sent, and the tokens the providers reported.
+ */
+export type AiModelTotals = {
+	provider: import("@chopin/protocol/ai-credentials").AiProvider;
+	model?: string;
+	requests: number;
+	errors: number;
+	pending: number;
+	unknown: number;
+	tokens: Required<AiTokenCounts>;
+};
+
 export type McpSession = {
 	id: string;
 	userId: string;
@@ -1145,4 +1290,36 @@ export type McpSession = {
 	clientVersion: string;
 	createdAt: Date;
 	lastSeenAt: Date;
+};
+
+/** One caller's idempotency key for one document's `invoke_planner` calls. */
+export type McpInvocationScope = {
+	userId: string;
+	channelId: string;
+	key: string;
+};
+
+/** What a call answers once its instruction's turn starts, given again to every retry. */
+export type McpInvocationResult = {
+	document: { id: string; title: string; description?: string; url: string };
+};
+
+export type McpInvocation = McpInvocationScope & {
+	fingerprint: string;
+	/** The Chat entry, or system notice, the instruction is posted as. */
+	entryId: string;
+	/** Fixed when the key is claimed, so a retry is given what the first call was. */
+	result: McpInvocationResult;
+	createdAt: Date;
+	expiresAt: Date;
+	/**
+	 * Set once the instruction reached a turn, before the call answers. Until then the
+	 * instruction may be posted or not, which only the document's Chat says.
+	 */
+	invokedAt?: Date;
+	/**
+	 * Set instead when the instruction was given to a running turn that did not confirm taking it:
+	 * it may have been read, so it is never delivered again under the key.
+	 */
+	uncertainAt?: Date;
 };

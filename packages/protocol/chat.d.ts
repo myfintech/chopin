@@ -24,7 +24,8 @@ export declare namespace Chat {
 		| Request<React>
 		| Request<SetParticipation>
 		| Request<SetModel>
-		| Request<Typing>;
+		| Request<Typing>
+		| Request<Pacing>;
 
 	export type Outgoing =
 		| History
@@ -46,7 +47,8 @@ export declare namespace Chat {
 		| Reactions
 		| ParticipationState
 		| ModelState
-		| ModelUnreadable;
+		| ModelUnreadable
+		| Typists;
 
 	/** Who said something. The agent is not a member, so it is named apart. */
 	export type Author =
@@ -348,12 +350,15 @@ export declare namespace Chat {
 	 * reached, and `dropped` the machine's connection going while it replied (the connection's to
 	 * tell, not a failure to retry). `request` is the member message that began the turn, and
 	 * `focus` the child document that was open when it was sent, so a retry is the same turn.
+	 * `code` is `no-ai-account` where the session was not started because the account its AI
+	 * launch is for has no AI account Chopin can use, as a message is refused with that code.
 	 */
 	export type TurnFailure = {
 		kind: "error" | "refused" | "tool" | "timed-out" | "unreachable" | "dropped";
 		detail?: string;
 		request?: string;
 		focus?: string;
+		code?: "no-ai-account";
 	};
 
 	/** One emoji on a message and everyone who used it. The emoji is kept exactly as sent. */
@@ -525,8 +530,62 @@ export declare namespace Chat {
 	 */
 	export type SetModel = KIND<"chat:model"> & ModelChoice;
 
-	/** Ephemeral composer activity, with no draft content. */
-	export type Typing = KIND<"chat:typing"> & { active: boolean };
+	/**
+	 * Ephemeral composer activity, with no draft content, for the person and document of the
+	 * connection it is sent on. `active` is true from an edit and false once the sender sends, clears
+	 * the draft, leaves the field or makes no edit for five seconds. While edits keep coming a report
+	 * is sent at most every two seconds, the last of them carrying the latest edit. `at`, required
+	 * while active, is when that edit was made in the server's milliseconds: the client places it by
+	 * taking the `now` of its connection's `session:hello` as the server's time when the hello arrived,
+	 * so it is never later than the edit was on the server's clock (but for the client's clock gaining
+	 * since) and earlier by the hello's transit at most. The writer is shown until five seconds after
+	 * `at`: a report that arrives later than that shows no one and changes nothing, and so does one
+	 * whose `at` is more than a second past the server's clock (one within it counts as now).
+	 * `thread` names the thread's root message when the composer is a thread's, and is absent for
+	 * Chat. `seq` rises with each report a tab sends: the server keeps each connection's newest per
+	 * place and ignores an older or repeated one. A report is never kept to send again on another
+	 * connection. It is shown and nothing more: automatic participation reads `Pacing`.
+	 */
+	export type Typing = KIND<"chat:typing"> & {
+		active: boolean;
+		thread?: string;
+		seq?: number;
+		at?: number;
+	};
+
+	/**
+	 * Whether the sender is writing in Chat, for automatic participation alone: who counts as alone
+	 * with the Planner and when a reply waiting for silence starts. Sent by Chat's composer while
+	 * automatic participation is on, with no draft content: `true` on an edit, at most every two
+	 * seconds while edits keep coming, and `false` once the sender sends, leaves the field or makes
+	 * no edit for two and a half seconds. Never shown.
+	 */
+	export type Pacing = KIND<"chat:pacing"> & { active: boolean };
+
+	/**
+	 * Someone writing in Chat (`thread` absent) or in a thread: a person whose composer says so, or
+	 * the Planner while a turn there is writing its reply. `since` is when they began, in the server's
+	 * milliseconds, and orders them.
+	 */
+	export type Typist = {
+		author: { kind: "member"; handle: string } | { kind: "agent" };
+		thread?: string;
+		since: number;
+	};
+
+	/**
+	 * Everyone writing in Chat and its threads now, but the person it is sent to: presence, never
+	 * saved. Sent to everyone who can read the document when it changes, and on join after the
+	 * history, empty or not, each time once a fresh check of the recipient's access allows it; a
+	 * roster names a person only once a fresh check finds they can still write. Each replaces the one
+	 * before. They are ordered by `generation`, which a later opening of the document's room has
+	 * larger, then by `seq`, which rises with each change: an older one is ignored.
+	 */
+	export type Typists = KIND<"chat:typists"> & {
+		generation: number;
+		seq: number;
+		typists: Typist[];
+	};
 
 	/** Everything said so far, sent on join. */
 	export type History = KIND<"chat:history"> & {
@@ -583,8 +642,9 @@ export declare namespace Chat {
 	 * person's turn waits to start, it is saved and given to that turn once it can take one.
 	 * Otherwise it is refused and saves nothing: `planner-busy` where a harness that takes no input
 	 * mid-run cannot be given it while a turn runs, `planner-starting` where another person's turn
-	 * waits to start on such a harness, `planner-not-attached` where no machine can take it. A
-	 * refusal is never kept to send later. The same write access as starting a turn is required.
+	 * waits to start on such a harness, `planner-not-attached` where no machine can take it,
+	 * `no-ai-account` where the sender has no AI account the Planner can use. A refusal is never
+	 * kept to send later. The same write access as starting a turn is required.
 	 */
 	export type Send = KIND<"chat:send"> & {
 		requestId: string;
@@ -630,8 +690,8 @@ export declare namespace Chat {
 	 * with `Retried`, tells the room with `Removed`, and runs the turn for `message` as it began the
 	 * first time. The agent is given the message once and nothing of the failed attempt (see
 	 * `retry-turn` in the agent connection). It takes the same write access as `Send`, and is
-	 * refused like it (`planner-not-attached` or a passing trouble) and while a turn runs; nothing
-	 * is held.
+	 * refused like it (`planner-not-attached`, `no-ai-account` or a passing trouble) and while a
+	 * turn runs; nothing is held.
 	 */
 	export type Retry = KIND<"chat:retry"> & {
 		message: string;

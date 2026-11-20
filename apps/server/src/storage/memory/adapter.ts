@@ -12,8 +12,13 @@ import { MemoryDecisionAnswerStore } from "./decision-answers";
 import { MemoryDocumentVersionStore } from "./versions";
 import { MemoryMachineStore } from "./machines";
 import { MemoryDeferredTurnStore } from "./deferred-turns";
+import { MemoryMcpInvocationStore } from "./mcp-invocations";
 import { MemoryMcpSessionStore } from "./mcp-sessions";
 import { MemoryPlannerCredentialStore } from "./planner-credentials";
+import { MemoryMachineDatabaseStore } from "./machine-databases";
+import { MemoryAiCredentialStore, MemoryAiPlaceholderStore } from "./ai-credentials";
+import { MemoryAiUsageStore } from "./ai-usage";
+import { AiCutoffs } from "../ai-cutoffs";
 import { MemoryChatThreadStore } from "./chat-threads";
 import { MemoryPlannerLinkHoldStore } from "./planner-holds";
 import { MemoryPlannerModelChoiceStore } from "./planner-model-choices";
@@ -59,6 +64,9 @@ import type {
 	UserRecord,
 } from "../model";
 import type {
+	AiCredentialStore,
+	AiPlaceholderStore,
+	AiUsageStore,
 	BackgroundJobStore,
 	ChannelStore,
 	ChatAttachmentStore,
@@ -69,7 +77,9 @@ import type {
 	DocumentVersionStore,
 	ImageStore,
 	LeaseStore,
+	MachineDatabaseStore,
 	MachineStore,
+	McpInvocationStore,
 	McpSessionStore,
 	NavigationStore,
 	PlannerCredentialStore,
@@ -181,6 +191,8 @@ export class MemoryStorage implements StorageAdapter {
 	#operations = new Map<string, Map<string, Operation>>();
 	#agents = new Map<string, AgentState>();
 	#leases = new Map<string, Lease>();
+	/** How many times each document has been archived, which a restore never takes back. */
+	#archiveGenerations = new Map<string, number>();
 	readonly #images = new MemoryImageStore({
 		channelExists: id => this.#channels.has(id),
 		userExists: id => this.#users.has(id),
@@ -200,9 +212,12 @@ export class MemoryStorage implements StorageAdapter {
 		user: id => this.#users.get(id),
 	});
 	readonly versions: DocumentVersionStore = this.#versions;
+	readonly #aiCutoffs = new AiCutoffs();
 	readonly #machines = new MemoryMachineStore(
 		id => this.#users.has(id),
 		id => this.#channels.has(id),
+		held => this.#assertLease(held),
+		() => this.#aiCutoffs.cut(),
 	);
 	readonly machines: MachineStore = this.#machines;
 	readonly #plannerHolds = new MemoryPlannerLinkHoldStore({
@@ -229,7 +244,37 @@ export class MemoryStorage implements StorageAdapter {
 		channelExists: id => this.#channels.has(id),
 	});
 	readonly plannerCredentials: PlannerCredentialStore = this.#plannerCredentials;
+	readonly machineDatabases: MachineDatabaseStore = new MemoryMachineDatabaseStore({
+		machineExists: id => this.#machines.has(id),
+		machineRevoked: id => this.#machines.isRevoked(id),
+	});
+	readonly aiCredentials: AiCredentialStore = new MemoryAiCredentialStore({
+		userExists: id => this.#users.has(id),
+		assertLease: held => this.#assertLease(held),
+		cutoffs: this.#aiCutoffs,
+	});
+	readonly #aiPlaceholders = new MemoryAiPlaceholderStore({
+		userExists: id => this.#users.has(id),
+		assertLease: held => this.#assertLease(held),
+		machineExists: id => this.#machines.has(id),
+		channelExists: id => this.#channels.has(id),
+		generation: id => {
+			let found = this.#channels.get(id);
+			return found && !found.archivedAt ? this.#archiveGenerations.get(id) ?? 0 : undefined;
+		},
+		cutoffs: this.#aiCutoffs,
+	});
+	readonly aiPlaceholders: AiPlaceholderStore = this.#aiPlaceholders;
+	readonly aiUsage: AiUsageStore = new MemoryAiUsageStore({
+		userExists: id => this.#users.has(id),
+		assertLease: held => this.#assertLease(held),
+	});
 	readonly mcpSessions: McpSessionStore = new MemoryMcpSessionStore();
+	readonly #mcpInvocations = new MemoryMcpInvocationStore({
+		channelExists: id => this.#channels.has(id),
+		assertLease: held => this.#assertLease(held),
+	});
+	readonly mcpInvocations: McpInvocationStore = this.#mcpInvocations;
 	readonly deferredTurns: DeferredTurnStore = new MemoryDeferredTurnStore({
 		assertLease: held => this.#assertLease(held),
 	});
@@ -417,7 +462,10 @@ export class MemoryStorage implements StorageAdapter {
 		},
 		rename: input => this.#renameChannel(input),
 		setFullWidth: input => this.#setChannelWidth(input),
-		archive: input => this.#setChannelArchived(input, true),
+		archive: async input => {
+			this.#assertLease(input.lease);
+			return this.#setChannelArchived(input, true);
+		},
 		restore: input => this.#setChannelArchived(input, false),
 		delete: id => this.#deleteChannel(id),
 		publishDescription: input => this.#publishChannelDescription(input),
@@ -689,6 +737,8 @@ export class MemoryStorage implements StorageAdapter {
 		let saved: ChannelRecord;
 		if (archived) {
 			saved = { ...found, updatedAt, archivedAt: new Date(updatedAt) };
+			this.#archiveGenerations.set(input.id, (this.#archiveGenerations.get(input.id) ?? 0) + 1);
+			this.#aiPlaceholders.deleteChannel(input.id);
 		} else {
 			let { archivedAt: _, ...active } = found;
 			saved = { ...active, updatedAt };
@@ -723,6 +773,9 @@ export class MemoryStorage implements StorageAdapter {
 		this.#plannerModelChoices.deleteChannel(id);
 		this.#chatThreads.deleteChannel(id);
 		this.#plannerCredentials.deleteChannel(id);
+		this.#aiPlaceholders.deleteChannel(id);
+		this.#mcpInvocations.deleteChannel(id);
+		this.#archiveGenerations.delete(id);
 		this.#snapshots.delete(id);
 		this.#sequences.delete(id);
 		this.#updates.delete(id);

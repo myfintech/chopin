@@ -29,6 +29,14 @@
 			"types": "./attachment.ts",
 			"default": "./attachment.ts"
 		},
+		"./ai-credentials": {
+			"types": "./ai-credentials.ts",
+			"default": "./ai-credentials.ts"
+		},
+		"./ai-usage": {
+			"types": "./ai-usage.ts",
+			"default": "./ai-usage.ts"
+		},
 		"./commands": {
 			"types": "./commands.ts",
 			"default": "./commands.ts"
@@ -44,6 +52,10 @@
 		"./connector": {
 			"types": "./connector.ts",
 			"default": "./connector.ts"
+		},
+		"./machine-store": {
+			"types": "./machine-store.ts",
+			"default": "./machine-store.ts"
 		},
 		"./document-url": {
 			"types": "./document-url.ts",

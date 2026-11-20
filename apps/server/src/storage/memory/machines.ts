@@ -2,6 +2,7 @@ import { conflict, missing } from "../errors";
 
 import type {
 	CreateMachine,
+	Lease,
 	MachineChoice,
 	MachineFavorite,
 	MachineRepository,
@@ -26,7 +27,11 @@ export class MemoryMachineStore implements MachineStore {
 	#favorites = new Map<string, string>();
 	constructor(
 		private userExists: (id: string) => boolean,
-		private channelExists: (id: string) => boolean = () => true,
+		private channelExists: (id: string) => boolean,
+		/** Throws unless `lease` is held now, as a revocation must be written under it. */
+		private assertLease: (lease: Lease) => void,
+		/** Told once a machine is revoked, before its caller hears so. */
+		private revoked: () => void,
 	) {}
 	async create(input: CreateMachine) {
 		if (!this.userExists(input.userId)) throw missing(`user ${input.userId} does not exist`);
@@ -40,6 +45,9 @@ export class MemoryMachineStore implements MachineStore {
 	}
 	has(id: string): boolean {
 		return this.#machines.has(id);
+	}
+	isRevoked(id: string): boolean {
+		return !!this.#machines.get(id)?.revokedAt;
 	}
 	async get(id: string) {
 		let found = this.#machines.get(id);
@@ -101,13 +109,15 @@ export class MemoryMachineStore implements MachineStore {
 		}
 		return true;
 	}
-	async revoke(id: string, userId: string, now: Date) {
+	async revoke(lease: Lease, id: string, userId: string, now: Date) {
+		this.assertLease(lease);
 		let found = this.#machines.get(id);
 		if (!found || found.userId !== userId || found.revokedAt) return false;
 		delete found.credentials;
 		found.revokedAt = new Date(now);
 		for (let [key, choice] of this.#choices) if (choice.machineId === id) this.#choices.delete(key);
 		this.#unfavor(id);
+		this.revoked();
 		return true;
 	}
 	/** Forget everyone's favorite of a machine, except `keep`'s: its owner's own stays. */

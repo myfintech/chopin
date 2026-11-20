@@ -35,6 +35,7 @@ import type {
 import { verifiedCheckout } from "../harness/atomic/checkout";
 import { rememberCheckout } from "../harness/atomic/workspace";
 import { plannerInstructions } from "../agent/planner";
+import type { AiAccountRefusal } from "../ai/account-check";
 import type { ActiveOwnerBinding } from "../agent/active-owner";
 import type { DocumentRoom, ResearchWorkspaceRequest } from "../agent/tools";
 import type { NewDocumentRequest, NewDocumentResult, TurnDocuments } from "../agent/new-documents";
@@ -189,7 +190,11 @@ export type ActiveMemberRequest = {
 };
 
 /** `retry` runs the message's turn again after it failed: the same message, once in context. */
-type MemberRequest = Pick<ActiveMemberRequest, "entryId" | "userId" | "focus"> & { retry?: true };
+type MemberRequest = Pick<ActiveMemberRequest, "entryId" | "userId" | "focus"> & {
+	retry?: true;
+	/** Told once whether the turn started, or was let go of before it could. */
+	delivered?: (started: boolean) => void;
+};
 
 /** How a turn started by an instruction finished, for whoever started it. */
 export type Ended = {
@@ -387,6 +392,12 @@ export type Chat = {
 	 */
 	preempting?: Parameters<typeof run>;
 	/**
+	 * Instructions handed to a turn whose callers wait to hear whether they reached one
+	 * (`InvokedEntry.delivered`). Each is told once and leaves; a Chat that closes tells every one
+	 * still here, so none waits on a Chat that will start nothing more.
+	 */
+	deliveries?: Set<Waiter>;
+	/**
 	 * Messages posted while `preempting` waits to start, given to that turn once it can take them,
 	 * in the order they were sent.
 	 */
@@ -499,6 +510,16 @@ export type Chat = {
 	forkBootstrap?: Wire.Entry[];
 	/** Open thread `Chat` instances owned by this top-level Chat, closed when it closes. */
 	childChats?: Map<string, Chat>;
+	/** Who is writing in a root document's Chat and its threads; presence, never saved. */
+	typists?: import("./typing").TypingPresence;
+	/** Hears whether the Planner's turn is writing its reply in this Chat now, once it changes. */
+	composing?: (turn: string, writing: boolean) => void;
+	/** The turn the Planner was last said to be writing its reply in here. */
+	composedTurn?: string;
+	/** The running turn whose reply is out, until it writes another. */
+	repliedTurn?: string;
+	/** The running turn that was stopped or failed: it writes nothing more, however long it takes to end. */
+	retiredTurn?: string;
 	/** The last sequence given to an entry or a snapshot (`chronology.ts`). */
 	lastSeq?: number;
 	/** For a thread Chat: the top-level Chat an entry appended here is copied into, if it is. */
@@ -756,6 +777,24 @@ function state(chat: Chat, server: Server<SocketData>, room: string): void {
 		...(chat.turn ? { turn: chat.turn } : {}),
 		...(chat.runs ? { runs: chat.runs } : {}),
 	});
+	composed(chat);
+}
+
+/**
+ * The Planner is writing its reply from the moment a turn people watch begins, and again whenever
+ * it starts another message, until the message is out or the turn ends, fails, is stopped or gives
+ * way. A quiet turn (a background job's, or one whose words are all out) writes nothing for people.
+ */
+function composed(chat: Chat): void {
+	let writing = chat.busy && chat.turn && !chat.turn.quiet && !chat.closed
+			&& chat.repliedTurn !== chat.turn.id && chat.retiredTurn !== chat.turn.id
+		? chat.turn.id
+		: undefined;
+	let before = chat.composedTurn;
+	if (writing === before) return;
+	chat.composedTurn = writing;
+	if (before !== undefined) chat.composing?.(before, false);
+	if (writing !== undefined) chat.composing?.(writing, true);
 }
 
 /** Only visible Planner prose ends the working projection. */
@@ -826,6 +865,12 @@ export type Room = {
 	 * Planner ownership.
 	 */
 	plannerNotAttached?: () => Promise<string | undefined>;
+	/**
+	 * Why a person's own message to the Planner, or their Retry, cannot start work for them: they
+	 * have no AI account it can use, or their accounts could not be read just now. Undefined when
+	 * they have one. Checked after `plannerNotAttached`, before anything is posted.
+	 */
+	aiAccount?: (userId: string) => Promise<AiAccountRefusal | undefined>;
 	/**
 	 * Under `HARNESS=remote`, waits a bounded time for a Planner a machine is starting for this
 	 * document, before an `@chopin` message or `invoke_planner` is checked for one.
@@ -1077,10 +1122,13 @@ function windingDown(chat: Chat): boolean {
  */
 function preempt(context: Room, turn: Parameters<typeof run>): void {
 	let { chat } = context;
-	if (chat.closed) return;
+	if (chat.closed) return turn[6]?.delivered?.(false);
 	// The job ended while the message was saved: nothing is in the way.
 	if (!chat.busy && !chat.starting) {
-		if (startsHeld) return void notRead(context, turn[1]);
+		if (startsHeld) {
+			turn[6]?.delivered?.(false);
+			return void notRead(context, turn[1]);
+		}
 		return startRun(...turn);
 	}
 	chat.preempting = turn;
@@ -1096,6 +1144,9 @@ function preempt(context: Room, turn: Parameters<typeof run>): void {
 	void Promise.resolve(chat.jobWriting).catch(() => {}).then(() => controller.abort());
 }
 
+/** An instruction's caller waiting to hear whether it reached a turn; `sent` once it was steered. */
+type Waiter = { tell: (outcome: Reached) => void; sent: boolean };
+
 /** A message posted to the transcript for the Planner turn that is running to read. */
 type Given = {
 	entry: string;
@@ -1106,6 +1157,8 @@ type Given = {
 	userId: string;
 	/** An MCP caller's instruction, which reaches the model as written. */
 	invoked?: boolean;
+	/** Whoever waits to hear whether it reached a turn. */
+	waiter?: Waiter;
 };
 
 /**
@@ -1113,20 +1166,30 @@ type Given = {
  * every message given before it: one with files to read never lets a later one reach the turn
  * first. The session may not be ready for it yet, so this waits for it. When the turn ends first
  * or cannot take it, the message is not lost to a queue: a Planner that is idle by then starts a
- * turn for it, and any other says plainly that it was not read.
+ * turn for it, and any other says plainly that it was not read. It resolves with whether the
+ * message reached a turn. An instruction its turn may have taken, because the turn's session did
+ * not confirm the message, is never given again, to that turn or a new one.
  */
-function give(context: Room, message: Given): Promise<void> {
+function give(context: Room, message: Given): Promise<Reached> {
 	let { chat } = context;
 	let way = chat.steering;
 	let given = chat.giving.then(() => deliver(context, message, way));
-	chat.giving = given.catch(() => {});
+	chat.giving = given.then(() => {}, () => {});
 	return given;
 }
 
-async function deliver(context: Room, message: Given, way: Steering | undefined): Promise<void> {
+/** Whether the message reached a turn: the running one took it, or one started for it. */
+async function deliver(
+	context: Room,
+	message: Given,
+	way: Steering | undefined,
+): Promise<Reached> {
 	let { chat } = context;
 	let session = await way?.ready;
-	if (session?.steer && chat.steering === way && !chat.closed) {
+	// An instruction is not given to a turn that is being stopped, which would never read it.
+	let stopping = message.invoked && !!chat.turnController?.signal.aborted;
+	if (session?.steer && chat.steering === way && !chat.closed && !stopping) {
+		let sent = false;
 		try {
 			let references = message.references ?? [];
 			retainReferences(chat, references);
@@ -1159,13 +1222,16 @@ async function deliver(context: Room, message: Given, way: Steering | undefined)
 				}
 				if (parts.length) prompt = `${prompt}\n\n${parts.join("\n\n")}`;
 			}
+			sent = true;
+			if (message.waiter) message.waiter.sent = true;
 			await session.steer(prompt);
-			return;
+			return "reached";
 		} catch (err) {
 			console.error("[chat] a message could not be given to the running turn:", err);
+			if (sent && message.invoked) return "unknown";
 		}
 	}
-	if (chat.closed) return;
+	if (chat.closed) return "unread";
 	if (!occupied(chat)) {
 		startRun(
 			{ ...context, ...(message.invoked ? { invokedBy: message.userId } : {}) },
@@ -1181,9 +1247,10 @@ async function deliver(context: Room, message: Given, way: Steering | undefined)
 			},
 			message.references,
 		);
-		return;
+		return "reached";
 	}
 	await notRead(context, message.handle);
+	return "unread";
 }
 
 async function notRead(context: Room, handle: string): Promise<void> {
@@ -1197,6 +1264,28 @@ async function notRead(context: Room, handle: string): Promise<void> {
 }
 
 /**
+ * Whether an instruction reached a turn: its own turn started, or the person's turn running took
+ * it (`reached`); neither, and none will (`unread`); or it was given to the running turn, whose
+ * session did not confirm taking it (`unknown`), so it may have been read and is never given again.
+ */
+export type Reached = "reached" | "unread" | "unknown";
+
+/** Where an MCP instruction is posted, and who hears whether it reached a turn. */
+export type InvokedEntry = {
+	/**
+	 * The id its Chat entry, or system notice, takes. One Chat already holds was saved by an earlier
+	 * call whose turn never started: it is not posted again, and only its turn is started.
+	 */
+	entryId: string;
+	/**
+	 * Told once, after `invoke` answers nothing, whether the instruction reached a turn. A turn it
+	 * waits behind can end first, and a stopping process or a closing Chat starts none, so either
+	 * can leave it unread. Never told when `invoke` refuses.
+	 */
+	delivered?: (outcome: Reached) => void;
+};
+
+/**
  * Accept an MCP instruction without waiting for its Planner turn.
  *
  * The caller is attributed on the posted message, and the turn runs under the
@@ -1206,6 +1295,11 @@ async function notRead(context: Room, handle: string): Promise<void> {
  * and the text goes to the Planner alone, as for any other instruction. While a turn
  * runs, a message is given to it when its harness takes input mid-run, and an instruction
  * that needs a turn of its own is refused: nothing is held for later.
+ *
+ * It answers nothing (`undefined`) once the instruction's turn has started, or the message has been
+ * handed to the person's turn running or to its own turn waiting behind a job; `invoked.delivered`
+ * then hears whether it reached a turn. A turn it starts holds the Chat from before its entry is
+ * saved, so no other turn takes the Chat meanwhile.
  */
 export async function invoke(
 	context: Room,
@@ -1216,6 +1310,7 @@ export async function invoke(
 	/** Called once, when the invoked turn ends or the message has been given to the one running; never when this refuses. */
 	settled?: () => void,
 	notice?: string,
+	invoked: InvokedEntry = { entryId: ulid() },
 ): Promise<
 	| "planner-unavailable"
 	| "planner-not-attached"
@@ -1245,16 +1340,46 @@ export async function invoke(
 		if (chat.closed) return "planner-unavailable" as const;
 		// A process that is stopping starts no turn: its caller asks again, of the next one.
 		if (startsHeld && !chat.busy && !chat.starting) return "planner-unavailable" as const;
+		let posted = chat.entries.find(value => value.id === invoked.entryId);
+		// The turn holds the Chat from here, as a message's does, so no other turn starts while its
+		// entry is saved; one that would have waits behind it. People are told it runs once the
+		// machine has its prompt, so letting go of a turn whose entry can't be saved tells nobody.
+		let reserve = () => {
+			chat.busy = true;
+			chat.turn = begin(user.login, chat.entries.length + (posted ? 0 : 1));
+		};
+		let unreserve = () => {
+			chat.busy = false;
+			chat.turn = undefined;
+		};
 		if (notice !== undefined) {
 			// An automatic follow-up needs a turn of its own, which a running one cannot give it.
 			if (occupied(chat)) return "planner-busy" as const;
+			reserve();
+			if (!posted) {
+				try {
+					await postNotice(context, notice, undefined, invoked.entryId);
+				} catch (error) {
+					unreserve();
+					throw error;
+				}
+			}
+			if (chat.closed) return "planner-unavailable" as const;
 			if (verified) rememberCheckout(room, verified);
-			await instruct(context, user.login, text, notice, {
-				quiet: true,
-				asked: true,
-				...(focus ? { focus } : {}),
-				...(settled ? { ended: () => settled() } : {}),
-			});
+			let waiter = awaiting(chat, invoked.delivered);
+			startRun(
+				context,
+				user.login,
+				text,
+				{
+					quiet: true,
+					...(focus ? { focus } : {}),
+					...(settled ? { ended: () => settled() } : {}),
+				},
+				context.claimantSessionId,
+				true,
+			);
+			waiter?.tell("reached");
 			return undefined;
 		}
 		// A background job gives way to a person's instruction, as to their message.
@@ -1264,24 +1389,38 @@ export async function invoke(
 			refusedWhileRunning(context);
 			return "planner-busy" as const;
 		}
-		let entry: Wire.Entry = {
-			id: ulid(),
-			author: { kind: "member", handle: user.login },
-			text,
-			ts: now(),
-		};
-		appendEntries(chat, entry);
-		try {
-			await context.persist();
-		} catch (error) {
-			chat.entries = chat.entries.filter(value => value !== entry);
-			throw error;
+		let reserved = !preempts && !running;
+		if (reserved) reserve();
+		let entry = posted;
+		if (!entry) {
+			let fresh: Wire.Entry = {
+				id: invoked.entryId,
+				author: { kind: "member", handle: user.login },
+				text,
+				ts: now(),
+			};
+			appendEntries(chat, fresh);
+			try {
+				await context.persist();
+			} catch (error) {
+				chat.entries = chat.entries.filter(value => value !== fresh);
+				if (reserved) unreserve();
+				throw error;
+			}
+			if (chat.closed) return "planner-unavailable" as const;
+			// The caller has no socket in the room, so nothing else has told it who they are.
+			introduce(server, room, { login: user.login, avatarUrl: user.avatarUrl });
+			announce(server, room, fresh);
+			entry = fresh;
 		}
 		if (chat.closed) return "planner-unavailable" as const;
+		// A job that ended while the entry was saved leaves nothing to give way: a process that is
+		// stopping starts no turn, and the caller asks again, of the next one.
+		if (preempts && startsHeld && !chat.busy && !chat.starting) {
+			return "planner-unavailable" as const;
+		}
 		if (verified) rememberCheckout(room, verified);
-		// The caller has no socket in the room, so nothing else has told it who they are.
-		introduce(server, room, { login: user.login, avatarUrl: user.avatarUrl });
-		announce(server, room, entry);
+		let waiter = awaiting(chat, invoked.delivered);
 		if (running) {
 			let given = give(context, {
 				entry: entry.id,
@@ -1290,7 +1429,9 @@ export async function invoke(
 				...(focus ? { focus } : {}),
 				userId: user.id,
 				invoked: true,
+				...(waiter ? { waiter } : {}),
 			});
+			void given.then(outcome => waiter?.tell(outcome), () => waiter?.tell("unread"));
 			if (settled) void given.finally(settled).catch(() => {});
 		} else {
 			let asked: Parameters<typeof run> = [
@@ -1299,8 +1440,15 @@ export async function invoke(
 				text,
 				undefined,
 				context.claimantSessionId,
-				false,
-				{ entryId: entry.id, userId: user.id, ...(focus ? { focus } : {}) },
+				reserved,
+				{
+					entryId: entry.id,
+					userId: user.id,
+					...(focus ? { focus } : {}),
+					...(waiter
+						? { delivered: (started: boolean) => waiter.tell(started ? "reached" : "unread") }
+						: {}),
+				},
 				[],
 			];
 			if (preempts) preempt(context, asked);
@@ -1582,6 +1730,8 @@ async function processSend(
 	// away) the message is refused, saying so.
 	let unattached = await context.plannerNotAttached?.();
 	if (unattached) return fail(ws, msg.rid, unattached, "planner-not-attached");
+	let noAccount = await context.aiAccount?.(ws.data.principalId);
+	if (noAccount) return fail(ws, msg.rid, noAccount.message, noAccount.code);
 	if (chat.closed) return refuseClosed(ws, msg.rid);
 
 	chat.initiative?.cancel();
@@ -1799,6 +1949,8 @@ async function processRetry(
 	if ("refusal" in found) return fail(ws, rid, found.refusal);
 	let unattached = await context.plannerNotAttached?.();
 	if (unattached) return fail(ws, rid, unattached, "planner-not-attached");
+	let noAccount = await context.aiAccount?.(ws.data.principalId);
+	if (noAccount) return fail(ws, rid, noAccount.message, noAccount.code);
 	let focus: Focus | undefined;
 	if (found.failure.focus) {
 		let child: Awaited<ReturnType<ChildDocuments["resolve"]>>;
@@ -1885,9 +2037,15 @@ function postNotice(
 		...(comment ? { comment } : {}),
 	};
 	appendEntries(chat, entry);
-	return context.persist().then(() => {
-		announce(server, room, entry);
-	});
+	return context.persist().then(
+		() => {
+			announce(server, room, entry);
+		},
+		error => {
+			chat.entries = chat.entries.filter(value => value !== entry);
+			throw error;
+		},
+	);
 }
 
 /**
@@ -2085,6 +2243,7 @@ let jobState = safeProjection(state);
 let { job, cancelQueuedJobs, stopAfterPersistenceFailure } = createJobQueue({
 	state: jobState,
 	startRun,
+	shut,
 	MAX_QUEUE,
 });
 export { cancelQueuedJobs, job };
@@ -3371,6 +3530,7 @@ async function run(
 	let { chat, plan, room, server } = context;
 	if (chat.closed) {
 		if (jobTurn) finishJob(jobTurn, { status: "failed", reason: "The document closed." });
+		member?.delivered?.(false);
 		return;
 	}
 	let thread = about?.thread;
@@ -3403,6 +3563,7 @@ async function run(
 	if (steered) {
 		for (let message of chat.following?.splice(0) ?? []) void give(context, message);
 	}
+	member?.delivered?.(true);
 	try {
 		about?.started?.();
 	} catch (err) {
@@ -3451,6 +3612,11 @@ async function run(
 
 	let opened: { session: PlannerSession; binding: ActiveOwnerBinding } | undefined;
 	let turnController = new AbortController();
+	let retiring = chat.turn?.id;
+	turnController.signal.addEventListener("abort", () => {
+		chat.retiredTurn = retiring;
+		composed(chat);
+	}, { once: true });
 	let invalidate = () => turnController.abort();
 	if (about?.signal?.aborted) invalidate();
 	else about?.signal?.addEventListener("abort", invalidate, { once: true });
@@ -3571,7 +3737,7 @@ async function run(
 						// Its first call is made: a message given to the turn now reaches it, and
 						// people are told the turn is running, as the machine has its prompt.
 						steered?.open(session);
-						if (reserved && member) state(chat, server, room);
+						if (reserved) state(chat, server, room);
 						return result;
 					},
 				},
@@ -3819,6 +3985,46 @@ async function run(
 	return drain(context, { job: !!jobTurn, outcome });
 }
 
+/** Lets go of the person's turn waiting to start behind another, which will not start now. */
+function dropPreempting(chat: Chat): void {
+	let turn = chat.preempting;
+	chat.preempting = undefined;
+	turn?.[6]?.delivered?.(false);
+}
+
+/**
+ * Holds `delivered` on the Chat until it is told, once, so a Chat that closes before the
+ * instruction reaches a turn tells it so.
+ */
+function awaiting(
+	chat: Chat,
+	delivered: ((outcome: Reached) => void) | undefined,
+): Waiter | undefined {
+	if (!delivered) return undefined;
+	let waiting = chat.deliveries ??= new Set();
+	let waiter: Waiter = {
+		sent: false,
+		tell: outcome => {
+			if (waiting.delete(waiter)) delivered(outcome);
+		},
+	};
+	waiting.add(waiter);
+	return waiter;
+}
+
+/**
+ * Closes the Chat: it starts no turn from now. Every way it closes comes here (`close`, and a save
+ * that failed), so the turn waiting behind another is let go of and every instruction still
+ * waiting to reach a turn hears that it did not, or, if it was steered to a turn that has not
+ * confirmed it, that it may have.
+ */
+function shut(chat: Chat): void {
+	chat.closed = true;
+	dropPreempting(chat);
+	// Each leaves the set as it is told, which a Set's iteration allows.
+	for (let waiter of chat.deliveries ?? []) waiter.tell(waiter.sent ? "unknown" : "unread");
+}
+
 /**
  * Starts the next of Chopin's own waiting turns, if one may start. Called when a turn has ended
  * (`ended` says how) and, with none running, when something that held them is over (`ended`
@@ -3849,6 +4055,7 @@ async function startNext(
 	let preempting = chat.preempting;
 	chat.preempting = undefined;
 	if (preempting && startsHeld) {
+		preempting[6]?.delivered?.(false);
 		let unread = [preempting[1], ...(chat.following?.splice(0) ?? []).map(given => given.handle)];
 		for (let handle of unread) await notRead(context, handle);
 	}
@@ -3932,6 +4139,7 @@ function startRun(
 ): void {
 	if (context.chat.closed) {
 		if (jobTurn) finishJob(jobTurn, { status: "failed", reason: "The document closed." });
+		member?.delivered?.(false);
 		return;
 	}
 	let running = DocumentProvenance.plannerTurn(run)(
@@ -4067,6 +4275,8 @@ export function translate(context: Room, part: TextStreamPart<ToolSet>): void {
 			ids.set(part.id, id);
 			chat.writing = id;
 			chat.tooling = undefined;
+			chat.repliedTurn = undefined;
+			composed(chat);
 			return;
 		}
 		case "text-delta": {
@@ -4080,6 +4290,8 @@ export function translate(context: Room, part: TextStreamPart<ToolSet>): void {
 			if (!entry) {
 				chat.writing = id;
 				chat.tooling = undefined;
+				chat.repliedTurn = undefined;
+				composed(chat);
 				say(chat, server, room, {
 					id,
 					author: { kind: "agent" },
@@ -4102,6 +4314,10 @@ export function translate(context: Room, part: TextStreamPart<ToolSet>): void {
 			if (entry) {
 				delete entry.streaming;
 				announce(server, room, entry);
+				if (entry.text.trim()) {
+					chat.repliedTurn = chat.turn?.id;
+					composed(chat);
+				}
 			}
 			if (chat.writing === id) chat.writing = undefined;
 			return;
@@ -4568,9 +4784,11 @@ export async function close(chat: Chat): Promise<void> {
 		admitted = chat.sending;
 		await admitted;
 	}
-	chat.closed = true;
+	shut(chat);
 	chat.initiative?.close();
 	chat.reactions?.close();
+	chat.typists?.close();
+	composed(chat);
 	chat.job = undefined;
 	chat.jobOutput = undefined;
 	chat.lifecycle++;
@@ -4586,7 +4804,6 @@ export async function close(chat: Chat): Promise<void> {
 		chat.handoffJob = undefined;
 	}
 	chat.waiting = [];
-	chat.preempting = undefined;
 	chat.following = undefined;
 	chat.turnController?.abort();
 	chat.referenceCache.clear();

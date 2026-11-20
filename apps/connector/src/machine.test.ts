@@ -1,6 +1,6 @@
 import { afterAll, afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -9,7 +9,14 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { parseArgs } from "./args";
 import { updateConfig } from "./config";
-import { classifyConnectorError, connectorMessage, machineFile, pair, register } from "./machine";
+import {
+	classifyConnectorError,
+	connectorMessage,
+	machineFile,
+	pair,
+	plannerAiManaged,
+	register,
+} from "./machine";
 import { createOutput } from "./output";
 import { ConnectorError } from "./mcp";
 import { git, stateDirectory } from "./workspace";
@@ -46,10 +53,15 @@ async function checkout() {
  * refuses any machine token but the one it paired with `stale`, machine-revoked by default. It
  * takes PAIRING_KEY once.
  */
-function fakeChopin(options: { connections?: () => Response; stale?: string } = {}) {
+function fakeChopin(
+	options: { connections?: () => Response; stale?: string; store?: () => Response } = {},
+) {
 	let calls: Array<
 		{ path: string; bearer: string; body: unknown; about?: Record<string, string> }
 	> = [];
+	let stores: string[] = [];
+	/** The setup problems a machine reported on the machine-store route, with its token. */
+	let reports: Array<{ bearer: string; problem: unknown }> = [];
 	let waited = Promise.withResolvers<void>();
 	let spent = false;
 	let server = Bun.serve({
@@ -58,13 +70,22 @@ function fakeChopin(options: { connections?: () => Response; stale?: string } = 
 		async fetch(request): Promise<Response> {
 			let path = new URL(request.url).pathname;
 			let bearer = request.headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
+			if (path === "/api/connector/machine-store") {
+				let asked = (await request.json().catch(() => ({}))) as { problem?: unknown };
+				if (asked.problem !== undefined) {
+					reports.push({ bearer, problem: asked.problem });
+					return Response.json({ reported: true });
+				}
+				stores.push(bearer);
+				return options.store?.() ?? Response.json({ error: "not-found" }, { status: 404 });
+			}
 			if (path !== "/connector/mcp") {
 				let body = request.method === "POST"
 					? await request.json().catch(() => undefined)
 					: undefined;
 				let about = Object.fromEntries(
 					[...request.headers].filter(([name]) =>
-						/^chopin-connector-(host|platform|service|planner|agent)/.test(name)
+						/^chopin-connector-(host|platform|service|planner|agent|store)/.test(name)
 					),
 				);
 				calls.push({ path, bearer, body, ...(Object.keys(about).length ? { about } : {}) });
@@ -121,7 +142,7 @@ function fakeChopin(options: { connections?: () => Response; stale?: string } = 
 		},
 	});
 	cleanup.push(() => server.stop(true));
-	return { url: `http://127.0.0.1:${server.port}`, calls, waited: waited.promise };
+	return { url: `http://127.0.0.1:${server.port}`, calls, stores, reports, waited: waited.promise };
 }
 
 /** Agents the connects below name; chopin finds them before it pairs, and they never run. */
@@ -176,6 +197,110 @@ test("pair stores the machine token at 0600 beside its server, and never prints 
 	expect(JSON.parse(await readFile(file, "utf8"))).toEqual({
 		servers: { [chopin.url]: { token: MACHINE_TOKEN, label: "build-box" } },
 	});
+});
+
+const STORE_LOGIN = {
+	url:
+		"postgresql://m_0b5e6f0e7a7b4c1d9e1f2a3b4c5d6e7f@db.example.com:5432/m_0b5e6f0e7a7b4c1d9e1f2a3b4c5d6e7f",
+	password: "fake-machine-store-password-0123456789",
+};
+
+async function installedAdapter(home: string) {
+	let adapter = join(
+		home,
+		"agent-store",
+		"npm",
+		"node_modules",
+		"@bastani",
+		"atomic-storage-postgres",
+	);
+	await mkdir(adapter, { recursive: true });
+	await writeFile(join(adapter, "package.json"), "{}");
+}
+
+test("pairing sets up the machine's database login in the same step, readable only by its owner", async () => {
+	let home = await scratch("chopin-home-");
+	await installedAdapter(home);
+	let chopin = fakeChopin({ store: () => Response.json(STORE_LOGIN) });
+	let paired = cli(["pair", "--label", "build-box"], home, chopin.url);
+	expect(await paired.exited).toBe(0);
+	let output = await paired.output;
+	expect(output).toContain(
+		"Agents here keep their sessions in this machine's own database at db.example.com:5432.",
+	);
+	expect(output).not.toContain(STORE_LOGIN.password);
+	expect(chopin.stores).toEqual([MACHINE_TOKEN]);
+	let password = join(home, "agent-store", "password");
+	let settings = join(home, "agent-store", "settings.json");
+	expect(await readFile(password, "utf8")).toBe(STORE_LOGIN.password);
+	expect(await readFile(settings, "utf8")).not.toContain(STORE_LOGIN.password);
+	if (process.platform !== "win32") {
+		expect((await stat(password)).mode & 0o777).toBe(0o600);
+		expect((await stat(settings)).mode & 0o777).toBe(0o600);
+	}
+	let unpaired = cli(["unpair"], home, chopin.url);
+	expect(await unpaired.exited).toBe(0);
+	expect(await Bun.file(password).exists()).toBe(false);
+});
+
+test("a login Chopin can't make is said plainly, and the machine still pairs and connects", async () => {
+	let home = await scratch("chopin-home-");
+	let root = await checkout();
+	let chopin = fakeChopin({
+		store: () =>
+			Response.json({
+				error: "machine-store-unavailable",
+				message: "a machine could still connect to the database template1",
+			}, { status: 503 }),
+	});
+	expect(await cli(["pair"], home, chopin.url).exited).toBe(0);
+	chopin.calls.length = 0;
+	let connected = cli(["connect", root, "--", "agent-that-never-runs"], home, chopin.url);
+	await Promise.race([chopin.waited, connected.exited]);
+	connected.child.kill("SIGINT");
+	expect(await connected.exited, await connected.output).toBe(0);
+	expect(await connected.output).toContain(
+		"Chopin couldn't set up this machine's database for agent sessions: a machine could still "
+			+ "connect to the database template1. Pairing still worked.",
+	);
+	let registered = chopin.calls.find(call => call.path === "/api/connector/connections");
+	expect(registered?.about?.["chopin-connector-store-problem"]).toBe(
+		"a machine could still connect to the database template1",
+	);
+	expect(chopin.calls.map(call => call.path)).toContain("tool:wait_for_work");
+	expect(await Bun.file(join(home, "agent-store", "password")).exists()).toBe(false);
+});
+
+test("pairing that can't save its login here tells Chopin why at once, without connecting", async () => {
+	let home = await scratch("chopin-home-");
+	// A file where the login's folder goes, so the login can't be saved.
+	await writeFile(join(home, "agent-store"), "");
+	let chopin = fakeChopin({ store: () => Response.json(STORE_LOGIN) });
+	let paired = cli(["pair", "--label", "build-box"], home, chopin.url);
+	expect(await paired.exited).toBe(0);
+	let output = await paired.output;
+	expect(output).toContain(
+		"Chopin couldn't set up this machine's database for agent sessions: its storage adapter "
+			+ "couldn't be set up: EEXIST",
+	);
+	expect(output).not.toContain(STORE_LOGIN.password);
+	expect(chopin.calls.map(call => call.path)).not.toContain("/api/connector/connections");
+	expect(chopin.stores).toEqual([MACHINE_TOKEN]);
+	expect(chopin.reports).toEqual([{
+		bearer: MACHINE_TOKEN,
+		problem: expect.stringMatching(/^its storage adapter couldn't be set up: EEXIST/),
+	}]);
+	expect(chopin.reports[0]!.problem).not.toContain(STORE_LOGIN.password);
+});
+
+test("without a machine database Chopin, pairing and connecting say nothing of one", async () => {
+	let home = await scratch("chopin-home-");
+	let chopin = fakeChopin();
+	let paired = cli(["pair"], home, chopin.url);
+	expect(await paired.exited).toBe(0);
+	expect(await paired.output).not.toContain("database");
+	expect(chopin.stores).toEqual([MACHINE_TOKEN]);
+	expect(await Bun.file(join(home, "agent-store", "settings.json")).exists()).toBe(false);
 });
 
 function quietPair(url: string, label: string, directory: string) {
@@ -741,4 +866,22 @@ test("connect tells Chopin whether agents run in the sandbox, and for a machine 
 		{ "chopin-connector-sandbox": "none", "chopin-connector-sandbox-fix": "sudo true" },
 		{},
 	]);
+});
+
+test("a connector starts its spare Planners on Chopin's AI accounts only where Chopin's versions say so", async () => {
+	for (
+		let [answer, managed] of [
+			[{ protocol: { min: 1, max: 9 }, version: "1", ai: "chopin" }, true],
+			[{ protocol: { min: 1, max: 9 }, version: "1" }, false],
+		] as const
+	) {
+		let server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(answer) });
+		try {
+			expect(await plannerAiManaged(`http://127.0.0.1:${server.port}`)).toBe(managed);
+		} finally {
+			await server.stop(true);
+		}
+	}
+	// One that can't be asked is taken not to: each Planner credential says so again.
+	expect(await plannerAiManaged("http://127.0.0.1:1")).toBe(false);
 });

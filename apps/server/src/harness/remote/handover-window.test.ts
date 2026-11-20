@@ -22,6 +22,7 @@ import type { DocumentRoom } from "../../agent/tools";
 import type { Lease } from "../../storage/model";
 import type { PlannerAttachment, PlannerAttachmentOptions } from "./attachments";
 import type { RemotePlanner } from "./registry";
+import type { AgentAi } from "./endpoint";
 
 const OFFER = "resumable-sessions, restart-notice";
 const WINDOW_MS = 10_000;
@@ -64,7 +65,11 @@ async function until(check: () => boolean | Promise<boolean>, ms = 4_000) {
  */
 const ASK_CONFIRM = { method: "confirm", title: "Ship?", message: "Now." } as const;
 
-async function deploy(input: Record<string, unknown> = ASK_CONFIRM, asked = 1) {
+async function deploy(
+	input: Record<string, unknown> = ASK_CONFIRM,
+	asked = 1,
+	{ ai, offer = OFFER }: { ai?: AgentAi; offer?: string } = {},
+) {
 	let f = await hostInputRoom();
 	let closed = { first: false };
 	cleanups.push(() => (closed.first ? undefined : f.close()));
@@ -82,12 +87,14 @@ async function deploy(input: Record<string, unknown> = ASK_CONFIRM, asked = 1) {
 				put: hold => storage.plannerHolds.put(leaseA, hold),
 				delete: async id => void await storage.plannerHolds.delete(leaseA, id),
 			},
+			...(ai ? { endAi: ai.end } : {}),
 		},
+		...(ai ? { ai } : {}),
 	});
 	cleanups.push(first.stop);
 	linked.revocations.add(id => first.attachments.sessionRevoked(id));
 
-	let raw = await rawLink(first.url, MEMBER_TOKEN, OFFER);
+	let raw = await rawLink(first.url, MEMBER_TOKEN, offer);
 	raw.send({ type: "attach", version: 1, document: channel.id });
 	await raw.next("attached");
 	let planner: RemotePlanner = { channelId: channel.id, isolated: false };
@@ -117,15 +124,22 @@ async function deploy(input: Record<string, unknown> = ASK_CONFIRM, asked = 1) {
 	/**
 	 * What `main.ts` does at its cut, in its order, and then the second process starting. `spent`
 	 * is time the clock says went by in a step: before the hold is written, before the lease is
-	 * released, and before the second process took the lease.
+	 * released, and before the second process took the lease. `frozen` runs between taking the
+	 * hold and writing it.
 	 */
 	async function cut(
 		windowMs = WINDOW_MS,
-		spent: { beforeWrite?: number; beforeRelease?: number; beforeTakeover?: number } = {},
+		spent: {
+			beforeWrite?: number;
+			beforeRelease?: number;
+			beforeTakeover?: number;
+			frozen?: () => Promise<void>;
+		} = {},
 		takeover: { failWrites?: boolean; options?: PlannerAttachmentOptions } = {},
 	) {
 		first.attachments.shutdown();
 		let rows = first.attachments.freeze(windowMs);
+		await spent.frozen?.();
 		skew.ms += spent.beforeWrite ?? 0;
 		await first.attachments.persist(rows);
 		for (let link of first.links) link.restart(windowMs);
@@ -147,6 +161,7 @@ async function deploy(input: Record<string, unknown> = ASK_CONFIRM, asked = 1) {
 			},
 			restoredRuns: (id, outcome) => events.push([`runs:${outcome}`, id]),
 			missed: (id, cause) => events.push([`missed:${cause}`, id]),
+			...(ai ? { endAi: ai.end } : {}),
 			...takeover.options,
 		});
 		let changes: PlannerAttachment[] = [];
@@ -154,6 +169,7 @@ async function deploy(input: Record<string, unknown> = ASK_CONFIRM, asked = 1) {
 		await attachments.restore(await storage.plannerHolds.list());
 		let second = linkServer(secondAuth, 300, undefined, 60_000, undefined, undefined, {
 			attachments,
+			...(ai ? { ai } : {}),
 		});
 		cleanups.push(second.stop);
 		return {
@@ -184,6 +200,7 @@ async function deploy(input: Record<string, unknown> = ASK_CONFIRM, asked = 1) {
 		session,
 		sessionId,
 		card: card!,
+		start,
 		others,
 		events,
 		cut,
@@ -920,5 +937,153 @@ describe("a workflow run its client carries on through a restart", () => {
 			value: true,
 		});
 		await until(() => released === 1);
+	});
+});
+
+describe("a remote Planner session's AI launch across a cut", () => {
+	const AI_OFFER = `${OFFER}, ai-credentials`;
+
+	/** Launches as Chopin would hand them out, each numbered, and the ids of those ended. */
+	function launches() {
+		let ended: string[] = [];
+		let count = 0;
+		let ai: AgentAi = {
+			async launch() {
+				count++;
+				return {
+					launchId: `launch-${count}`,
+					grants: {
+						launch: `chopin_launch_${count}`,
+						expiresAt: Date.now() + HOUR_MS,
+						providers: [{
+							provider: "anthropic",
+							baseUrl: "https://chopin.test/api/v1/ai/anthropic",
+							placeholder: `chopin_ai_${count}`,
+							keyVariable: "ANTHROPIC_API_KEY",
+						}],
+						withheld: [],
+					},
+				};
+			},
+			end: launchId => void ended.push(launchId),
+			onChanged: () => () => {},
+		};
+		return { ai, ended };
+	}
+
+	it("keeps the launch at the cut, and the client's return replaces it, ending the one it held", async () => {
+		let { ai, ended } = launches();
+		let d = await deploy(ASK_CONFIRM, 1, { ai, offer: AI_OFFER });
+		expect(d.start.ai).toMatchObject({ launch: "chopin_launch_1" });
+		let next = await d.cut();
+		let [row] = await d.storage.plannerHolds.list();
+		expect(row!.sessions).toEqual([expect.objectContaining({ aiLaunchId: "launch-1" })]);
+		expect(ended).toEqual([]);
+
+		await next.browserReturns();
+		let client = await rawLink(next.second.url, MEMBER_TOKEN, AI_OFFER);
+		client.send({ type: "attach", version: 1, document: d.channel.id });
+		await client.next("attached");
+		client.send({ type: "resume", sessions: [{ session: d.sessionId, requests: ["ask-1"] }] });
+		await client.next("resumed");
+		expect(await client.next("ai")).toMatchObject({
+			session: d.sessionId,
+			ai: { launch: "chopin_launch_2" },
+		});
+		await until(() => ended.length === 1);
+		expect(ended).toEqual(["launch-1"]);
+	});
+
+	it("ends the launch the cut kept when nothing takes the session back", async () => {
+		for (let ending of ["nothing to resume", "reset", "owner changed"] as const) {
+			let { ai, ended } = launches();
+			let d = await deploy(ASK_CONFIRM, 1, { ai, offer: AI_OFFER });
+			if (ending === "owner changed") {
+				d.first.attachments.shutdown();
+				await d.first.attachments.persist(d.first.attachments.freeze(WINDOW_MS));
+				let held = (await d.storage.channels.readAgent(d.channel.id, new Date()))!.agent!;
+				await d.storage.channels.clearAgentOwner(
+					d.channel.id,
+					held.ownerSessionId!,
+					held.generation,
+					new Date(),
+				);
+			}
+			let next = await d.cut();
+			if (ending === "nothing to resume") {
+				await next.browserReturns();
+				let client = await rawLink(next.second.url, MEMBER_TOKEN, AI_OFFER);
+				client.send({ type: "attach", version: 1, document: d.channel.id });
+				await client.next("attached");
+				client.send({ type: "resume", sessions: [] });
+				await client.next("resumed");
+			} else if (ending === "reset") {
+				next.attachments.ownerReset(d.channel.id);
+			}
+			await until(() => ended.length === 1);
+			expect(ended, ending).toEqual(["launch-1"]);
+		}
+	});
+
+	it("names in the hold the launch its client was last sent, and ends the one a renewal prepared meanwhile unsent", async () => {
+		let ended: string[] = [];
+		let listeners = new Set<(userId: string) => void>();
+		let count = 0;
+		let renewing = Promise.withResolvers<void>();
+		let renewed = Promise.withResolvers<void>();
+		let ai: AgentAi = {
+			async launch() {
+				let n = ++count;
+				if (n === 2) {
+					renewing.resolve();
+					await renewed.promise;
+				}
+				return {
+					launchId: `launch-${n}`,
+					grants: {
+						launch: `chopin_launch_${n}`,
+						expiresAt: Date.now() + HOUR_MS,
+						providers: [{
+							provider: "anthropic",
+							baseUrl: "https://chopin.test/api/v1/ai/anthropic",
+							placeholder: `chopin_ai_${n}`,
+							keyVariable: "ANTHROPIC_API_KEY",
+						}],
+						withheld: [],
+					},
+				};
+			},
+			end: launchId => void ended.push(launchId),
+			onChanged(listener) {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+		};
+		let d = await deploy(ASK_CONFIRM, 1, { ai, offer: AI_OFFER });
+		expect(d.start.ai).toMatchObject({ launch: "chopin_launch_1" });
+		// The person's accounts change: the session's launch is being prepared again as the cut comes.
+		for (let listener of listeners) listener("U_member");
+		await renewing.promise;
+		// The renewal finishes after the hold is taken and before it is written.
+		let next = await d.cut(WINDOW_MS, {
+			frozen: async () => {
+				renewed.resolve();
+				await until(() => ended.length === 1);
+			},
+		});
+		let [row] = await d.storage.plannerHolds.list();
+		expect(d.raw.messages.filter(message => message.type === "ai")).toEqual([]);
+		expect(row!.sessions).toEqual([expect.objectContaining({ aiLaunchId: "launch-1" })]);
+		expect(ended).toEqual(["launch-2"]);
+
+		// The next process ends the session with the launch the hold names: none issued to it is left.
+		await next.browserReturns();
+		let client = await rawLink(next.second.url, MEMBER_TOKEN, AI_OFFER);
+		client.send({ type: "attach", version: 1, document: d.channel.id });
+		await client.next("attached");
+		client.send({ type: "resume", sessions: [] });
+		await client.next("resumed");
+		await until(() => ended.length === 2);
+		expect(ended.toSorted()).toEqual(["launch-1", "launch-2"]);
 	});
 });

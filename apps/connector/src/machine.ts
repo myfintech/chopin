@@ -12,11 +12,24 @@ import {
 	CONNECTOR_SANDBOX_HEADER,
 	CONNECTOR_SANDBOX_REASON_HEADER,
 	CONNECTOR_SERVICE_HEADER,
+	CONNECTOR_STORE_PROBLEM_HEADER,
 	CONNECTOR_UPDATE_REQUIRED,
 	type SandboxReport,
 } from "@chopin/protocol/connector";
 import { redacted } from "./connection";
 import { CONNECTOR_HEADERS, ConnectorError, jsonObject, refusal } from "./mcp";
+import {
+	AI_ACCOUNT_UNCHECKED_RUN,
+	type AiProviderGrant,
+	isAiProvider,
+	NO_AI_ACCOUNT_RUN,
+} from "@chopin/protocol/ai-credentials";
+import {
+	MACHINE_STORE_REASON_LIMIT,
+	type MachineStoreLogin,
+	type MachineStoreReport,
+	passwordlessStoreUrl,
+} from "@chopin/protocol/machine-store";
 import type { Output } from "./output";
 
 /**
@@ -199,6 +212,7 @@ async function post(
 			code,
 			MESSAGES[code] ?? `Chopin refused the request (${code}).`,
 			response.status,
+			typeof value.message === "string" ? value.message : undefined,
 		);
 	}
 	return value;
@@ -292,6 +306,7 @@ export type About = {
 	agent?: { name: string; version?: string };
 	/** Whether agents run in the system's process sandbox, and if not, why and the fix. */
 	sandbox?: SandboxReport;
+	storeProblem?: string;
 };
 
 /** `about` and this machine's hostname and platform, as headers; a value headers can't carry goes. */
@@ -311,6 +326,10 @@ function aboutHeaders(about: About): Record<string, string> {
 				[CONNECTOR_SANDBOX_FIX_HEADER]: about.sandbox.fix,
 			}
 			: {}),
+		[CONNECTOR_STORE_PROBLEM_HEADER]: about.storeProblem?.replace(/[^\x20-\x7e]/g, "?").slice(
+			0,
+			300,
+		),
 	};
 	return Object.fromEntries(
 		Object.entries(headers).filter((entry): entry is [string, string] =>
@@ -372,7 +391,28 @@ export async function plannerCredential(
 		...(typeof repository === "string" && /^[\w.-]+\/[\w.-]+$/.test(repository)
 			? { repository }
 			: {}),
+		// Its sessions run on people's AI accounts in Chopin: the backend gets nothing of the owner's
+		// agent setup. A Chopin from before says nothing, and the backend starts as before.
+		...(value.ai === "chopin" ? { ai: true as const } : {}),
 	};
+}
+
+/**
+ * Whether the Planners `url`'s Chopin asks machines to run take their sessions' models from people's
+ * AI accounts in it (`ai` on `/api/connector/version`), so spares start that way from the first. A
+ * Chopin that says nothing of it, or can't be asked now, is taken not to; each Planner credential
+ * says so again.
+ */
+export async function plannerAiManaged(url: string, signal?: AbortSignal): Promise<boolean> {
+	try {
+		let response = await fetch(`${url}/api/connector/version`, {
+			headers: CONNECTOR_HEADERS,
+			signal: AbortSignal.any([AbortSignal.timeout(5_000), ...signal ? [signal] : []]),
+		});
+		return response.ok && (await jsonObject(response)).ai === "chopin";
+	} catch {
+		return false;
+	}
 }
 
 /** Why a document's Planner backend keeps failing to start, as the connector tells Chopin. */
@@ -498,6 +538,149 @@ export async function machineMcpToken(
 		throw new Error("Missing token for Chopin's tools.");
 	}
 	return { token: value.token, expiresAt: value.expiresAt };
+}
+
+/**
+ * What Chopin hands one run for the models its agent calls: the launch's own credential and
+ * deadline, one stand-in per granted provider, and the providers the person connected that the
+ * launch was not given, with why.
+ */
+export type RunAiLaunch = {
+	launch: string;
+	expiresAt: number;
+	providers: AiProviderGrant[];
+	withheld: Array<{ provider: string; reason: string }>;
+};
+
+/**
+ * Chopin answered a run's launch that the person it runs for has no AI account it can use: the
+ * run starts no agent, and its end says so in these words. The machine owner's own sign-ins are
+ * never used in their place.
+ */
+export class NoAiAccount extends Error {
+	override name = "NoAiAccount";
+}
+
+/**
+ * Withheld for a question nobody answered: GitHub, or the person's own sign-in, couldn't be asked,
+ * or a subscription's sign-in couldn't be renewed.
+ */
+const UNANSWERED = new Set(["copilot-unavailable", "sign-in-unavailable", "renew-unavailable"]);
+
+const VARIABLE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+
+function aiGrant(value: unknown): AiProviderGrant | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	let { provider, baseUrl, placeholder, keyVariable } = value as Record<string, unknown>;
+	if (
+		!isAiProvider(provider) || typeof baseUrl !== "string" || !URL.canParse(baseUrl)
+		|| typeof placeholder !== "string" || !placeholder || typeof keyVariable !== "string"
+		|| !VARIABLE.test(keyVariable)
+	) return undefined;
+	return { provider, baseUrl, placeholder, keyVariable };
+}
+
+/**
+ * Asks Chopin for a run's AI launch with the run's own credential. Undefined from a Chopin that
+ * hands out none (404: one from before AI launches, or without people's AI credentials): the run's
+ * agent then uses its own models, as before. A Chopin that answers the person has no AI account it
+ * can use, refusing with `no-ai-account` or handing out no provider at all, rejects with
+ * `NoAiAccount`, in its words or, for an answer without them, in the same words chosen from what
+ * was withheld: the run starts no agent. Any other refusal rejects with the server's code.
+ */
+export async function machineAiLaunch(
+	url: string,
+	token: string,
+	run: string,
+	signal?: AbortSignal,
+): Promise<RunAiLaunch | undefined> {
+	let value: Record<string, unknown>;
+	try {
+		value = await post(url + "/api/connector/ai-launch", { run }, token, signal);
+	} catch (error) {
+		if (error instanceof ConnectorError && (error.code === "not-found" || error.status === 404)) {
+			return undefined;
+		}
+		if (error instanceof ConnectorError && error.code === "no-ai-account") {
+			throw new NoAiAccount(error.said ?? NO_AI_ACCOUNT_RUN, { cause: error });
+		}
+		throw error;
+	}
+	let providers = Array.isArray(value.providers) ? value.providers.map(aiGrant) : undefined;
+	let withheld = Array.isArray(value.withheld)
+		? value.withheld.flatMap(item => {
+			let { provider, reason } = (item ?? {}) as Record<string, unknown>;
+			return typeof provider === "string" && typeof reason === "string"
+				? [{ provider, reason }]
+				: [];
+		})
+		: [];
+	if (!providers || providers.some(grant => !grant)) {
+		throw new Error("Chopin's answer had no usable AI grants.");
+	}
+	if (!providers.length) {
+		throw new NoAiAccount(
+			withheld.some(item => UNANSWERED.has(item.reason))
+				? AI_ACCOUNT_UNCHECKED_RUN
+				: NO_AI_ACCOUNT_RUN,
+		);
+	}
+	if (typeof value.launch !== "string" || typeof value.expiresAt !== "number") {
+		throw new Error("Chopin's answer had no launch credential for its AI grants.");
+	}
+	return {
+		launch: value.launch,
+		expiresAt: value.expiresAt,
+		providers: providers as AiProviderGrant[],
+		withheld,
+	};
+}
+
+export const UNUSABLE_STORE_LOGIN =
+	"Chopin's answer wasn't a database login without a password in its URL, so it wasn't used.";
+
+export async function machineStoreLogin(
+	url: string,
+	token: string,
+	signal?: AbortSignal,
+): Promise<MachineStoreLogin | undefined> {
+	let value: Record<string, unknown>;
+	try {
+		value = await post(url + "/api/connector/machine-store", {}, token, signal);
+	} catch (error) {
+		if (error instanceof ConnectorError && (error.code === "not-found" || error.status === 404)) {
+			return undefined;
+		}
+		throw error;
+	}
+	if (!passwordlessStoreUrl(value.url) || typeof value.password !== "string" || !value.password) {
+		throw new Error(UNUSABLE_STORE_LOGIN);
+	}
+	return { url: value.url, password: value.password };
+}
+
+/**
+ * Tell Chopin why this machine couldn't set up the database login it was handed, so its Machines
+ * page says so before the machine connects, as a standalone `chopin pair` never does.
+ */
+export async function reportMachineStoreProblem(
+	url: string,
+	token: string,
+	problem: string,
+	signal?: AbortSignal,
+): Promise<void> {
+	let report: MachineStoreReport = { problem: problem.slice(0, MACHINE_STORE_REASON_LIMIT) };
+	await post(url + "/api/connector/machine-store", report, token, signal);
+}
+
+/** Ends a run's AI launch with its own credential, so its stand-ins stop working at once. */
+export async function endMachineAiLaunch(
+	url: string,
+	token: string,
+	launch: string,
+	signal?: AbortSignal,
+): Promise<void> {
+	await post(url + "/api/connector/ai-launch/end", { launch }, token, signal);
 }
 
 /** Why Chopin gives no GitHub token for a launch; none of these is retried. */

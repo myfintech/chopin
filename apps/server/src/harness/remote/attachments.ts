@@ -115,6 +115,10 @@ export type PlannerAttachmentOptions = {
 	 * the client of a hold a restart rebuilt asks while nobody has the document open.
 	 */
 	openDocument?: (channelId: string) => Promise<() => void>;
+	/** Ends an AI launch a rebuilt hold's session kept, once nothing will take it back. */
+	endAi?: (launchId: string) => void;
+	/** Hears that a rebuilt hold's session holds an AI launch, or no longer does. */
+	aiHeld?: (launchId: string, holding: boolean) => void;
 };
 
 /** What a document's members are told about its Planner: only the holder's login and state. */
@@ -575,6 +579,9 @@ export class PlannerAttachments {
 				persisted: true,
 			};
 			if (stale) {
+				for (let { aiLaunchId } of row.sessions) {
+					if (aiLaunchId) this.#options.endAi?.(aiLaunchId);
+				}
 				this.#forgetRow(hold);
 				continue;
 			}
@@ -585,6 +592,8 @@ export class PlannerAttachments {
 					ended: () => this.#runs(hold, "ended"),
 					resumed: () => this.#runs(hold, "up"),
 					...(open ? { open: () => open(row.channelId) } : {}),
+					...(this.#options.endAi ? { endAi: this.#options.endAi } : {}),
+					...(this.#options.aiHeld ? { aiHeld: this.#options.aiHeld } : {}),
 				});
 			}
 			let length = row.handoverUntil
@@ -659,6 +668,9 @@ export class PlannerAttachments {
 		for (let hold of this.#holds.values()) {
 			let source = hold.link ?? hold.parked;
 			if (!source && !hold.restored) continue;
+			// The row names each session's AI launch: none changes after it is read, so a renewal under
+			// way never sends the client one the row doesn't name.
+			source?.freezeAi();
 			let sessions = source?.snapshot() ?? [];
 			let { ownerSessionId, machineId, machine } = hold;
 			let handoverUntil = hold.link

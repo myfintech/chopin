@@ -120,6 +120,8 @@ function buildManagedThread(topChat: Chat.Chat, record: ChatThreadRecord): Manag
 	threadChat.usage = record.usage ? structuredClone(record.usage) : undefined;
 	if (record.usage?.contextWindow) threadChat.contextWindow = record.usage.contextWindow;
 	(topChat.childChats ??= new Map()).set(record.rootId, threadChat);
+	threadChat.composing = (turn, writing) =>
+		topChat.typists?.composing(record.rootId, turn, writing);
 	// What is in both transcripts is one object, so what streams into the thread streams into Chat.
 	let copied = new Set<string>();
 	topChat.entries = topChat.entries.map(entry => {
@@ -647,6 +649,7 @@ function buildThreadRoom(
 		claimantSessionId: topContext.claimantSessionId,
 		repository: topContext.repository,
 		plannerNotAttached: topContext.plannerNotAttached,
+		aiAccount: topContext.aiAccount,
 		plannerStarting: topContext.plannerStarting,
 		// A reply in a thread is the document's conversation too: alone, it goes to the Planner.
 		people: topContext.people,

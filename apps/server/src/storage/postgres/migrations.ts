@@ -152,6 +152,24 @@ const MIGRATIONS = [{
 	id: "043_chat_thread_seq",
 	path: join(import.meta.dir, "migrations/043_chat_thread_seq.sql"),
 }, {
+	id: "044_ai_credentials",
+	path: join(import.meta.dir, "migrations/044_ai_credentials.sql"),
+}, {
+	id: "045_ai_usage",
+	path: join(import.meta.dir, "migrations/045_ai_usage.sql"),
+}, {
+	id: "046_ai_placeholder_owner",
+	path: join(import.meta.dir, "migrations/046_ai_placeholder_owner.sql"),
+}, {
+	id: "047_ai_subscriptions",
+	path: join(import.meta.dir, "migrations/047_ai_subscriptions.sql"),
+}, {
+	id: "048_machine_databases",
+	path: join(import.meta.dir, "migrations/048_machine_databases.sql"),
+}, {
+	id: "049_mcp_invocations",
+	path: join(import.meta.dir, "migrations/049_mcp_invocations.sql"),
+}, {
 	id: "mantl_user_preferences",
 	path: join(import.meta.dir, "migrations/mantl_user_preferences.sql"),
 }, {
